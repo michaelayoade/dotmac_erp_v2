@@ -37,6 +37,7 @@ def _flush_batch(
     batch: list[tuple[str, dict[str, Any]]],
     spec: TransformSpec,
     report: TransformReport,
+    fk_retry: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> None:
     """Insert one batch under a savepoint; binary-split on rejection.
 
@@ -45,6 +46,11 @@ def _flush_batch(
     lines). A rejected batch splits recursively until single rows,
     so each bad row still becomes its own named exception and good
     rows still land - at log-scale savepoint cost, not per-row.
+
+    Single rows rejected for a foreign key go to `fk_retry` (when
+    given) instead of the exception queue: their parent may land
+    later in the same spec (self-FK trees like departments) - the
+    executor retries them once after the main pass.
     """
 
     try:
@@ -54,6 +60,12 @@ def _flush_batch(
         return
     except sa.exc.IntegrityError as exc:
         if len(batch) == 1:
+            orig_name = type(exc.orig).__name__ if exc.orig is not None else ""
+            if fk_retry is not None and (
+                "ForeignKey" in orig_name or "FOREIGN KEY" in str(exc.orig).upper()
+            ):
+                fk_retry.append(batch[0])
+                return
             detail = str(exc.orig).splitlines()[0][:160] if exc.orig is not None else ""
             report.exceptions.append(
                 RowException(
@@ -65,8 +77,8 @@ def _flush_batch(
             )
             return
     midpoint = len(batch) // 2
-    _flush_batch(destination_connection, insert_sql, batch[:midpoint], spec, report)
-    _flush_batch(destination_connection, insert_sql, batch[midpoint:], spec, report)
+    _flush_batch(destination_connection, insert_sql, batch[:midpoint], spec, report, fk_retry)
+    _flush_batch(destination_connection, insert_sql, batch[midpoint:], spec, report, fk_retry)
 
 
 def _map_get(mapping: dict, value: object) -> object:
@@ -159,6 +171,7 @@ def execute_transform(
     # feeding the destination `id`, else the first mapped column.
     key_source = spec.column_map.get("id", source_columns[0])
     batch: list[tuple[str, dict[str, Any]]] = []
+    fk_retry: list[tuple[str, dict[str, Any]]] = []
 
     for row in source_connection.execute(select_sql).mappings():
         report.read += 1
@@ -266,10 +279,21 @@ def execute_transform(
                 params = {k: float(v) if isinstance(v, Decimal) else v for k, v in values.items()}
             batch.append((str(row[key_source]), params))
             if len(batch) >= _BATCH_SIZE:
-                _flush_batch(destination_connection, insert_sql, batch, spec, report)
+                _flush_batch(destination_connection, insert_sql, batch, spec, report, fk_retry)
                 batch = []
     if batch:
-        _flush_batch(destination_connection, insert_sql, batch, spec, report)
+        _flush_batch(destination_connection, insert_sql, batch, spec, report, fk_retry)
+    # One retry pass for FK-rejected rows: parents landing later in
+    # this same spec (self-FK trees) now satisfy them. Rows still
+    # rejected become ordinary named exceptions (fk_retry=None).
+    for start in range(0, len(fk_retry), _BATCH_SIZE):
+        _flush_batch(
+            destination_connection,
+            insert_sql,
+            fk_retry[start : start + _BATCH_SIZE],
+            spec,
+            report,
+        )
     if dry_run:
         # Expectation counts: rows that would have been written.
         report.written = report.read - len({e.source_key for e in report.exceptions})

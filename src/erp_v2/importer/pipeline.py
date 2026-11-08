@@ -28,6 +28,52 @@ from erp_v2.importer.spec import TransformSpec
 from erp_v2.migrate import EXPECTED_HEADS
 
 
+def order_specs(
+    specs: Sequence[TransformSpec],
+    destination_tables: Mapping[str, Any],
+) -> tuple[TransformSpec, ...]:
+    """Topologically order specs so FK parents land before children.
+
+    Gate 4 live finding: wave declaration order put employees
+    before their party parents - every row FK-rejected. The
+    destination metadata FK graph is the authority for execution
+    order; declaration order only breaks ties (stable). Specs
+    sharing a destination stay together in declaration order.
+    Cycles (mutual FKs) keep declaration order for the remainder;
+    the executor's FK retry pass covers intra-run ordering.
+    """
+
+    def _key(table: Any) -> str:
+        return f"{table.schema}.{table.name}" if table.schema else table.name
+
+    groups: dict[str, list[TransformSpec]] = {}
+    for spec in specs:
+        groups.setdefault(spec.destination_table, []).append(spec)
+    parents: dict[str, set[str]] = {}
+    for dest in groups:
+        table = destination_tables.get(dest)
+        deps: set[str] = set()
+        if table is not None:
+            for fk in table.foreign_keys:
+                parent_key = _key(fk.column.table)
+                if parent_key in groups and parent_key != dest:
+                    deps.add(parent_key)
+        parents[dest] = deps
+    ordered_dests: list[str] = []
+    emitted: set[str] = set()
+    remaining = list(groups)
+    while remaining:
+        ready = [d for d in remaining if parents[d] <= emitted]
+        if not ready:  # cycle: declaration order for the rest
+            ordered_dests.extend(remaining)
+            break
+        for dest in ready:
+            ordered_dests.append(dest)
+            emitted.add(dest)
+            remaining.remove(dest)
+    return tuple(spec for dest in ordered_dests for spec in groups[dest])
+
+
 @dataclass(frozen=True)
 class ImportReceipt:
     destination_heads: tuple[str, ...]

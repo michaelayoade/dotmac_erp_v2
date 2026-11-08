@@ -32,7 +32,7 @@ import sqlalchemy as sa
 from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBLIC_SECTOR_PAIRINGS
 from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
 from erp_v2.importer.minting import MintContext, MintResult
-from erp_v2.importer.pipeline import run_import
+from erp_v2.importer.pipeline import order_specs, run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
@@ -502,9 +502,13 @@ def cmd_execute(args: argparse.Namespace) -> int:
     source_engine = sa.create_engine(source_dsn)
     dest_engine = sa.create_engine(dest_dsn)
     present, source_columns, resolution, source_schemas = _resolve_sources(source_engine, _ALL_PAIRINGS)
-    specs, _generated = build_specs(present, source_columns, _destination_tables())
+    dest_tables = _destination_tables()
+    specs, _generated = build_specs(present, source_columns, dest_tables)
     run_constants: dict[str, object] = _execute_run_constants(args, manifest)
-    executable = tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants))
+    executable = order_specs(
+        tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants)),
+        dest_tables,
+    )
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
     mint_context = _mint_context(args, run_constants) if args.mint else None
     post_mints: tuple[MintResult, ...] = ()

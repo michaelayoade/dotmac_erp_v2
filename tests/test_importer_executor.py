@@ -383,3 +383,63 @@ def test_commit_per_spec_persists_each_table(tmp_path) -> None:
     with dst.connect() as d:
         assert d.execute(sa.text("SELECT count(*) FROM alphas")).scalar() == 1
         assert d.execute(sa.text("SELECT count(*) FROM betas")).scalar() == 1
+
+
+def test_order_specs_parents_before_children() -> None:
+    from erp_v2.importer.pipeline import order_specs
+
+    meta = sa.MetaData()
+    parties = sa.Table("parties", meta, sa.Column("id", sa.String, primary_key=True), schema="mod")
+    employees = sa.Table(
+        "employees",
+        meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("party_id", sa.String, sa.ForeignKey("mod.parties.id")),
+        schema="mod",
+    )
+    tables = {"mod.parties": parties, "mod.employees": employees}
+
+    def _spec(dst: str):
+        return build_spec(
+            source_table=dst,
+            destination_table=dst,
+            source_columns=("id",),
+            destination_columns=(DestinationColumn("id", nullable=False, has_default=False),),
+        )
+
+    ordered = order_specs((_spec("mod.employees"), _spec("mod.parties")), tables)
+    assert [s.destination_table for s in ordered] == ["mod.parties", "mod.employees"]
+
+
+def test_fk_rejected_rows_retry_after_parent_lands() -> None:
+    # Self-FK tree arriving child-first: the retry pass lands the
+    # child once its parent (later in the same spec) is written.
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+
+    @sa.event.listens_for(dst, "connect")
+    def _fk_on(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE nodes (node_id TEXT, parent_id TEXT)"))
+        c.execute(sa.text("INSERT INTO nodes VALUES ('child','root'), ('root',NULL), ('orphan','ghost')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE nodes_out (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES nodes_out(id))"))
+    spec = build_spec(
+        source_table="nodes",
+        destination_table="nodes_out",
+        source_columns=("node_id", "parent_id"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("parent_id", nullable=True, has_default=False),
+        ),
+        renames={"id": "node_id"},
+    )
+    with src.connect() as s, dst.begin() as d:
+        report = execute_transform(s, d, spec)
+    assert report.read == 3
+    assert report.written == 2  # root + child (via retry)
+    assert len(report.exceptions) == 1
+    assert report.exceptions[0].source_key == "orphan"
+    assert "FOREIGN KEY" in report.exceptions[0].reason
