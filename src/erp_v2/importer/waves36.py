@@ -103,11 +103,18 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "reverses_journal_id": "reversed_journal_id",
         },
         constants={"status": "DRAFT"},
+        computed={"source_document_id": "source_key"},
+        null_fallbacks={"source_document_kind": "literal:JOURNAL"},
         note="lifecycle-staged: journals must be assembled DRAFT (lines "
         "immutable after); transitions step posts/voids/reverses after "
         "lines + posted ledger land. Legacy approval_request_id is "
         "empty in production data - approval_reference provenance "
-        "stamping is counted in the receipt (Gate 5 ruling)",
+        "stamping is counted in the receipt (Gate 5 ruling). "
+        "source_document_id: legacy records none for 48% of journals "
+        "and duplicates (type, id) across 4,289 documents, so it is "
+        "not a posting identity; the legacy journal row itself is "
+        "the source document of record (source_key) and the legacy "
+        "source_document_id stays residue evidence",
     ),
     Pairing(
         "mod_accounting.journal_lines",
@@ -134,6 +141,10 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "original_credit": "original_credit_amount",
             "source_document_kind": "source_document_type",
             "posted_by": "posted_by_user_id",
+        },
+        null_fallbacks={
+            "source_document_id": "row_id",
+            "source_document_kind": "literal:JOURNAL",
         },
     ),
     *_generated(
@@ -953,6 +964,7 @@ def build_specs(
                 fk_rewrites=pairing.fk_rewrites,
                 lookups=pairing.lookups,
                 computed=pairing.computed,
+                null_fallbacks=pairing.null_fallbacks,
             )
         )
     return tuple(specs), tuple(generated)

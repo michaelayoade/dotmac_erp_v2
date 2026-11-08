@@ -476,3 +476,32 @@ def test_partition_parent_blocked_skips_children_of_unrun_parents() -> None:
     # When the parent runs, nothing is partitioned off.
     kept2, skipped2 = partition_parent_blocked(all_specs, all_specs, tables)
     assert len(kept2) == 3 and not skipped2
+
+
+def test_null_fallbacks_row_id_literal_and_run() -> None:
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE docs (doc_id TEXT, ext_id TEXT, kind TEXT, actor TEXT)"))
+        c.execute(sa.text("INSERT INTO docs VALUES ('d1', NULL, NULL, NULL), ('d2', 'X9', 'INVOICE', 'u7')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE docs_out (id TEXT, ext_id TEXT, kind TEXT, actor TEXT)"))
+    spec = build_spec(
+        source_table="docs",
+        destination_table="docs_out",
+        source_columns=("doc_id", "ext_id", "kind", "actor"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("ext_id", nullable=False, has_default=False),
+            DestinationColumn("kind", nullable=False, has_default=False),
+            DestinationColumn("actor", nullable=False, has_default=False),
+        ),
+        renames={"id": "doc_id"},
+        null_fallbacks={"ext_id": "row_id", "kind": "literal:JOURNAL", "actor": "run:actor"},
+    )
+    with src.connect() as s, dst.begin() as d:
+        report = execute_transform(s, d, spec, run_constants={"actor": "sys"})
+    assert report.written == 2 and report.complete
+    with dst.connect() as d:
+        rows = d.execute(sa.text("SELECT id, ext_id, kind, actor FROM docs_out ORDER BY id")).all()
+    assert rows == [("d1", "d1", "JOURNAL", "sys"), ("d2", "X9", "INVOICE", "u7")]

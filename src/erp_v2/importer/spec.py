@@ -81,6 +81,16 @@ class TransformSpec:
     # amount legacy stored only as quantity x unit price),
     # "uuid5_row" (deterministic CHAR(32) id for natural-key
     # legacy tables with no UUID of their own, e.g. bank_directory).
+    null_fallbacks: Mapping[str, str] = field(default_factory=dict)
+    # destination column -> fallback applied by the executor ONLY
+    # when the mapped source value is NULL. Closed set: "row_id"
+    # (the row's own source key - the legacy row is its own source
+    # document of record), "source_key" (legacy:<table>:<key>),
+    # "literal:<text>", "run:<constant>" (a declared run constant,
+    # e.g. the enrolment actor for created_by_id). Fallbacks never
+    # invent external-world data; columns whose NULL means "the
+    # fact was never recorded" (e.g. a supplier's document number)
+    # must exception instead.
     lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
     # destination column -> (map name, key destination column, field):
     # the value is read at execution from a caller-supplied lookup map
@@ -183,6 +193,7 @@ def build_spec(
     constants: Mapping[str, object] | None = None,
     lookups: Mapping[str, tuple[str, str, str]] | None = None,
     computed: Mapping[str, str] | None = None,
+    null_fallbacks: Mapping[str, str] | None = None,
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -191,6 +202,17 @@ def build_spec(
     renames = dict(renames or {})
     constants = dict(constants or {})
     lookups = dict(lookups or {})
+    null_fallbacks = dict(null_fallbacks or {})
+    for dest_col, strategy in null_fallbacks.items():
+        _check(dest_col)
+        if strategy in ("row_id", "source_key"):
+            continue
+        if strategy.startswith("literal:") and strategy.removeprefix("literal:"):
+            continue
+        if strategy.startswith("run:"):
+            _check(strategy.removeprefix("run:"))
+            continue
+        raise ValueError(f"unknown null fallback {strategy!r} for {dest_col!r}")
     explicit_computed = dict(computed or {})
     for dest_col, strategy in explicit_computed.items():
         _check(dest_col)
@@ -277,6 +299,7 @@ def build_spec(
         run_supplied=tuple(run_supplied),
         computed=computed,
         lookups=lookups,
+        null_fallbacks=null_fallbacks,
     )
 
 

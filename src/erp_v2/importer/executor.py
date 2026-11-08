@@ -195,6 +195,16 @@ def execute_transform(
                     )
                     continue
                 value = rewritten
+            if value is None and dest_col in spec.null_fallbacks:
+                strategy = spec.null_fallbacks[dest_col]
+                if strategy == "row_id":
+                    value = str(row[key_source])
+                elif strategy == "source_key":
+                    value = f"legacy:{spec.source_table}:{row[key_source]}"
+                elif strategy.startswith("literal:"):
+                    value = strategy.removeprefix("literal:")
+                elif strategy.startswith("run:"):
+                    value = run_constants.get(strategy.removeprefix("run:"))
             values[dest_col] = value
         # Lookup columns read from caller-supplied maps keyed by a
         # mapped destination value (post-rewrite). No entry, or an

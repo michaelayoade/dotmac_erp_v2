@@ -33,6 +33,7 @@ class Pairing:
     fk_rewrites: Mapping[str, str] = field(default_factory=dict)
     lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
     computed: Mapping[str, str] = field(default_factory=dict)
+    null_fallbacks: Mapping[str, str] = field(default_factory=dict)
     note: str = ""
 
 
@@ -180,6 +181,7 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "period_start": "start_date",
             "period_end": "end_date",
         },
+        null_fallbacks={"created_by_id": "run:created_by_id"},
         note="minor_units/created_by from tenant/enrolment context",
     ),
     Pairing(
@@ -351,6 +353,7 @@ def build_wave2_specs(
                 fk_rewrites=pairing.fk_rewrites,
                 lookups=pairing.lookups,
                 computed=pairing.computed,
+                null_fallbacks=pairing.null_fallbacks,
             )
         )
     return tuple(specs), tuple(generated)
