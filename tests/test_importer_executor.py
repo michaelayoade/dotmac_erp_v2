@@ -539,3 +539,31 @@ def test_deferred_self_fk_columns_apply_after_inserts() -> None:
     with dst.connect() as d_:
         rows = dict(d_.execute(sa.text("SELECT id, parent_id FROM nodes_out")).all())
     assert rows == {"child": "root", "root": None}
+
+
+def test_data_error_rows_become_exceptions_not_crashes() -> None:
+    # A type-invalid value (text into an integer column) raises
+    # DataError, not IntegrityError; it must land in the exception
+    # queue, never kill the run (Gate 4: hr_interviews.round labels).
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE vals (val_id TEXT, amount TEXT)"))
+        c.execute(sa.text("INSERT INTO vals VALUES ('v1','10'), ('v2','HR_ROUND'), ('v3','30')"))
+    with dst.begin() as c:
+        # STRICT table: sqlite enforces the INTEGER type.
+        c.execute(sa.text("CREATE TABLE vals_out (id TEXT, amount INTEGER) STRICT"))
+    spec = build_spec(
+        source_table="vals",
+        destination_table="vals_out",
+        source_columns=("val_id", "amount"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("amount", nullable=False, has_default=False),
+        ),
+        renames={"id": "val_id"},
+    )
+    with src.connect() as s_, dst.begin() as d_:
+        report = execute_transform(s_, d_, spec)
+    assert report.written == 2
+    assert [e.source_key for e in report.exceptions] == ["v2"]

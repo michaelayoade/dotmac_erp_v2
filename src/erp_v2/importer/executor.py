@@ -58,7 +58,7 @@ def _flush_batch(
             destination_connection.execute(insert_sql, [params for _key, params in batch])
         report.written += len(batch)
         return
-    except sa.exc.IntegrityError as exc:
+    except (sa.exc.IntegrityError, sa.exc.DataError) as exc:
         if len(batch) == 1:
             orig_name = type(exc.orig).__name__ if exc.orig is not None else ""
             if fk_retry is not None and ("ForeignKey" in orig_name or "FOREIGN KEY" in str(exc.orig).upper()):
@@ -165,7 +165,7 @@ def _update_split(
         with destination_connection.begin_nested():
             destination_connection.execute(sql, rows)
         return
-    except sa.exc.IntegrityError as exc:
+    except (sa.exc.IntegrityError, sa.exc.DataError) as exc:
         if len(rows) == 1:
             detail = str(exc.orig).splitlines()[0][:160] if exc.orig is not None else ""
             report.exceptions.append(

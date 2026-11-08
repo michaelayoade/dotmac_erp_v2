@@ -101,7 +101,7 @@ def _update_batch(
         with dest.begin_nested():
             result = dest.execute(sql, rows)
         return int(result.rowcount or 0)
-    except sa.exc.IntegrityError as exc:
+    except (sa.exc.IntegrityError, sa.exc.DataError) as exc:
         if len(rows) == 1:
             detail = str(exc.orig).splitlines()[0][:160] if exc.orig is not None else ""
             outcome.exceptions.append(
