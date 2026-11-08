@@ -74,7 +74,13 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         renames={"account_class": "ifrs_category"},
     ),
     Pairing("mod_accounting.fiscal_years", "public.fiscal_year"),
-    Pairing("mod_accounting.fiscal_periods", "public.fiscal_period"),
+    Pairing(
+        "mod_accounting.fiscal_periods",
+        "public.fiscal_period",
+        constants={"status": "FUTURE"},
+        note="lifecycle-staged: module trigger requires inserts to begin "
+        "FUTURE; transitions step walks OPEN/SOFT_CLOSED after import",
+    ),
     Pairing(
         "mod_accounting.accounting_dimensions",
         "public.coa_segment_definition",
@@ -95,8 +101,12 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "posted_by": "posted_by_user_id",
             "reverses_journal_id": "reversed_journal_id",
         },
-        note="source_owner/source_version run-supplied; approval_reference "
-        "from legacy approval_request_id at rehearsal",
+        constants={"status": "DRAFT"},
+        note="lifecycle-staged: journals must be assembled DRAFT (lines "
+        "immutable after); transitions step posts/voids/reverses after "
+        "lines + posted ledger land. Legacy approval_request_id is "
+        "empty in production data - approval_reference provenance "
+        "stamping is counted in the receipt (Gate 5 ruling)",
     ),
     Pairing(
         "mod_accounting.journal_lines",
@@ -195,14 +205,18 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "number": "invoice_number",
             "supplier_document_number": "supplier_invoice_number",
             "liability_account_ref": "ap_control_account_id",
+            "submitted_by": "submitted_by_user_id",
+            "approved_by": "approved_by_user_id",
         },
+        constants={"status": "DRAFT"},
         lookups={
             "supplier_name_snapshot": ("supplier", "supplier_ref", "name"),
             "payment_schedule": ("supplier_payment_schedule", "id", "payment_schedule"),
         },
         note="payment_schedule: single-instalment JSON assembled at enrolment "
         "from due_date + total (module schedule shape, sums to the total); "
-        "invoices without a due date exception",
+        "invoices without a due date exception. Lifecycle-staged DRAFT; "
+        "transitions step walks SUBMITTED/APPROVED/VOID after lines land",
     ),
     Pairing(
         "mod_payables.supplier_invoice_lines",

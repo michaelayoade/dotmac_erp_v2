@@ -61,9 +61,7 @@ def _flush_batch(
     except sa.exc.IntegrityError as exc:
         if len(batch) == 1:
             orig_name = type(exc.orig).__name__ if exc.orig is not None else ""
-            if fk_retry is not None and (
-                "ForeignKey" in orig_name or "FOREIGN KEY" in str(exc.orig).upper()
-            ):
+            if fk_retry is not None and ("ForeignKey" in orig_name or "FOREIGN KEY" in str(exc.orig).upper()):
                 fk_retry.append(batch[0])
                 return
             detail = str(exc.orig).splitlines()[0][:160] if exc.orig is not None else ""

@@ -35,6 +35,7 @@ from erp_v2.importer.minting import MintContext, MintResult
 from erp_v2.importer.pipeline import order_specs, run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
+from erp_v2.importer.transitions import run_transitions
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
 from erp_v2.importer.wave2 import WAVE2_PAIRINGS, Pairing
 from erp_v2.importer.waves import SOURCE_TABLES
@@ -536,10 +537,23 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # row they reference is imported (same caller transaction;
             # dry-run rollback below covers them).
             post_mints = tuple(enrolment.mint(step) for step in ("pay_rule_bases", "tax_rules"))
+        # Lifecycle staging: fiscal periods / journals / payables
+        # documents were inserted at their module-mandated initial
+        # status; walk them to legacy final states now that every
+        # child row (lines, posted ledger) has landed.
+        transitions = run_transitions(
+            source_conn,
+            dest_conn,
+            executable,
+            dry_run=not args.apply,
+            commit=bool(args.apply),
+        )
         if args.apply:
             dest_conn.commit()  # post-mints; specs committed per spec
         else:
             dest_conn.rollback()
+    transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
+    complete = result.complete and not transition_exceptions
     payload: dict[str, object] = {
         "kind": "execute",
         "manifest": manifest.as_dict(),
@@ -547,7 +561,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         "destination_heads": list(result.destination_heads),
         "read": result.read,
         "written": result.written,
-        "complete": result.complete,
+        "complete": complete,
         "exceptions": [
             {
                 "source_table": e.source_table,
@@ -555,16 +569,25 @@ def cmd_execute(args: argparse.Namespace) -> int:
                 "column": e.column,
                 "reason": e.reason,
             }
-            for e in result.exceptions
+            for e in (*result.exceptions, *transition_exceptions)
         ],
         "specs": _spec_report(specs),
         "specs_skipped_unsupplied_run_constants": unsupplied,
         "source_resolution": resolution,
         "enrolment_maps_built": dict(result.enrolment_maps),
         "mints": [_mint_dict(m) for m in (*result.mints, *post_mints)],
+        "transitions": [
+            {
+                "destination_table": outcome.destination_table,
+                "transitioned": dict(outcome.transitioned),
+                "stamped_approval_refs": outcome.stamped_approval_refs,
+                "exceptions": len(outcome.exceptions),
+            }
+            for outcome in transitions
+        ],
     }
     _write_receipt(Path(args.receipt), payload)
-    return 0 if result.complete else 3
+    return 0 if complete else 3
 
 
 def build_parser() -> argparse.ArgumentParser:
