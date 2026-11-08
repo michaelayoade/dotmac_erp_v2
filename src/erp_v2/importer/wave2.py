@@ -49,6 +49,15 @@ _COMPONENT_LOOKUP: Final[Mapping[str, tuple[str, str, str]]] = {
 }
 
 WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
+    # --- kernel party (FK parent of employees; legacy ERP already
+    # ran on kernel parties - identity preserved 1:1) ---
+    Pairing(
+        "parties",
+        "public.parties",
+        note="kernel identity row; timestamps/custom_fields take module "
+        "server defaults (legacy kernel revision predates them)",
+    ),
+    Pairing("party_persons", "public.party_persons"),
     # --- people (mod_people) ---
     Pairing(
         "mod_people.departments",

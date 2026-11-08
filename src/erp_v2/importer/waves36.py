@@ -185,6 +185,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_banking.bank_statements",
         "public.bank_statements",
         renames={"account_id": "bank_account_id", "imported_by_id": "imported_by"},
+        null_fallbacks={"imported_by_id": "run:imported_by_id"},
     ),
     Pairing(
         "mod_banking.bank_statement_lines",
