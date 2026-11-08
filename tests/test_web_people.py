@@ -127,3 +127,21 @@ def test_templates_render_with_empty_and_full_context() -> None:
     assert "No active leave allocations" in html
     login = env.get_template("auth/login.html").render(next_url="/", error=None, **ctx)
     assert "Sign in to Dotmac ERP" in login
+
+
+def test_finance_templates_render() -> None:
+    from decimal import Decimal as _D
+    from pathlib import Path
+
+    from jinja2 import Environment, FileSystemLoader
+
+    from erp_v2 import ui
+
+    root = Path(__file__).resolve().parents[1] / "src" / "erp_v2" / "templates"
+    env = Environment(loader=FileSystemLoader(root), autoescape=True)
+    ctx = {**ui.template_globals()}
+    home = env.get_template("finance/home.html").render(
+        accounts=[], journals=[], lines=[], total_debit=_D(0), total_credit=_D(0), **ctx
+    )
+    assert "No posted ledger lines" in home
+    assert "No open supplier invoices" in env.get_template("finance/payables.html").render(invoices=[], **ctx)

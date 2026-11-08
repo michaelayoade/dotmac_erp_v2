@@ -58,6 +58,7 @@ def list_employees(db: Session, *, tenant_id: UUID, limit: int = 100) -> list[di
 def leave_overview(db: Session, *, tenant_id: UUID, limit: int = 50) -> dict[str, object]:
     applications = db.execute(
         select(
+            LeaveApplication.id,
             LeaveApplication.number,
             Employee.employee_code,
             LeaveType.name.label("leave_type"),
@@ -92,6 +93,7 @@ def leave_overview(db: Session, *, tenant_id: UUID, limit: int = 50) -> dict[str
     return {
         "applications": [
             {
+                "id": r["id"],
                 "number": r["number"],
                 "employee": r["employee_code"],
                 "leave_type": r["leave_type"],
@@ -115,4 +117,13 @@ def leave_overview(db: Session, *, tenant_id: UUID, limit: int = 50) -> dict[str
     }
 
 
-__all__ = ["leave_overview", "list_employees"]
+def list_leave_types(db: Session, *, tenant_id: UUID) -> list[dict[str, object]]:
+    rows = db.scalars(
+        select(LeaveType)
+        .where(LeaveType.tenant_id == tenant_id, LeaveType.is_active.is_(True))
+        .order_by(LeaveType.code)
+    )
+    return [{"code": t.code, "name": t.name} for t in rows]
+
+
+__all__ = ["leave_overview", "list_employees", "list_leave_types"]

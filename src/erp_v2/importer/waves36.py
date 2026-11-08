@@ -339,7 +339,12 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "opening-window commands (opening receivables/cash/discharges), never row copies; "
         "open items only per billing M8; after Starter billing gap plan (Sub M1 first)",
     ),
-    Pairing("mod_customers.customer_accounts", "public.customer"),
+    Pairing(
+        "mod_customers.customer_accounts",
+        "public.customer",
+        renames={"account_number": "customer_code", "display_name": "legal_name"},
+        note="status from is_active/credit_hold at rehearsal; credit/tax/banking detail lands in customer_profiles",
+    ),
     Pairing(
         "mod_customers.customer_profiles",
         "public.customer",
@@ -361,7 +366,18 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
         ("agreement_lines", "agreement_approval_withdrawals"),
         "GENERATED/split at rehearsal",
     ),
-    Pairing("mod_sales.quotes", "public.quote"),
+    Pairing(
+        "mod_sales.quotes",
+        "public.quote",
+        renames={
+            "currency": "currency_code",
+            "tax_total": "tax_amount",
+            "total": "total_amount",
+            "expires_at": "valid_until",
+            "notes": "customer_notes",
+        },
+        note="sales has no customer FK (lead-based); customer linkage is party/adapter residue",
+    ),
     Pairing("mod_sales.quote_lines", "public.quote_line"),
     *_generated(
         "mod_sales",
@@ -408,13 +424,35 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     # inventory (mod_inventory)
     Pairing("mod_inventory.items", "public.item"),
     Pairing("mod_inventory.warehouses", "public.warehouse"),
-    Pairing("mod_inventory.lots", "public.inventory_lot"),
+    Pairing(
+        "mod_inventory.lots",
+        "public.inventory_lot",
+        renames={"code": "lot_number", "received_at": "received_date", "supplier_lot_ref": "supplier_lot_number"},
+        note="status derives from is_active at rehearsal (value map)",
+    ),
     Pairing("mod_inventory.lot_balances", "public.inventory_lot_balance"),
     Pairing("mod_inventory.serials", "public.inventory_serial"),
-    Pairing("mod_inventory.stock_movements", "public.inventory_transaction"),
+    Pairing(
+        "mod_inventory.stock_movements",
+        "public.inventory_transaction",
+        renames={
+            "movement_group_id": "transaction_id",
+            "kind": "transaction_type",
+            "quantity_delta": "quantity",
+            "value_delta": "total_cost",
+            "occurred_at": "transaction_date",
+            "actor_ref": "created_by_user_id",
+        },
+        note="legacy transactions enrol as singleton movement groups; sign and "
+        "value_after recompute per kind at rehearsal",
+    ),
     Pairing("mod_inventory.movement_serials", "public.inventory_serial_movement"),
     Pairing("mod_inventory.stock_reservations", "public.stock_reservation"),
-    Pairing("mod_inventory.valuation_snapshots", "public.inventory_valuation"),
+    Pairing(
+        "mod_inventory.valuation_snapshots",
+        "public.inventory_valuation",
+        renames={"as_of_date": "valuation_date", "write_down": "write_down_amount"},
+    ),
     *_generated(
         "mod_inventory",
         ("stock_balances",),
@@ -422,8 +460,17 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     ),
     # projects (mod_projects)
     Pairing("mod_projects.projects", "public.project"),
-    Pairing("mod_projects.project_templates", "public.project_template"),
-    Pairing("mod_projects.project_template_tasks", "public.project_template_task"),
+    Pairing(
+        "mod_projects.project_templates",
+        "public.project_template",
+        note="code is generated as a slug from name at rehearsal (legacy has no template code)",
+    ),
+    Pairing(
+        "mod_projects.project_template_tasks",
+        "public.project_template_task",
+        renames={"title": "task_name", "sort_order": "order_index"},
+        note="key/status/priority are template enrolment values (key from title slug)",
+    ),
     Pairing(
         "mod_projects.project_template_task_dependencies",
         "public.project_template_task_dependency",
@@ -440,7 +487,13 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     ),
     # ticketing (mod_tkt, tenant plane)
     Pairing("mod_tkt.tickets", "public.ticket"),
-    Pairing("mod_tkt.ticket_comments", "public.ticket_comment"),
+    Pairing(
+        "mod_tkt.ticket_comments",
+        "public.ticket_comment",
+        renames={"body": "content"},
+        note="tenant from the run extent (legacy comments carry no org column); "
+        "action/old/new deltas are audit residue",
+    ),
     # satellites with no row import
     *_generated(
         "mod_analytics",
@@ -483,8 +536,24 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     # forms (mod_forms): near 1:1 plural shapes
     Pairing("mod_forms.forms", "public.form"),
     Pairing("mod_forms.form_versions", "public.form_version"),
-    Pairing("mod_forms.form_sections", "public.form_section"),
-    Pairing("mod_forms.form_fields", "public.form_field"),
+    Pairing(
+        "mod_forms.form_sections",
+        "public.form_section",
+        renames={"version_id": "form_version_id", "position": "sort_order"},
+        note="key generated from title slug at enrolment",
+    ),
+    Pairing(
+        "mod_forms.form_fields",
+        "public.form_field",
+        renames={
+            "version_id": "form_version_id",
+            "key": "field_key",
+            "required": "is_required",
+            "settings": "settings_json",
+            "validation": "validation_json",
+            "position": "sort_order",
+        },
+    ),
     Pairing("mod_forms.form_field_options", "public.form_field_option"),
     Pairing("mod_forms.form_submissions", "public.form_submission"),
     Pairing("mod_forms.form_answers", "public.form_answer"),

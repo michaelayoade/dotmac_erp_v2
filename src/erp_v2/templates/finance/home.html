@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Finance — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Finance</h1>
+<p><a href="/finance/payables">Open payables</a></p>
+
+<h2>Trial balance (posted ledger)</h2>
+{% if lines %}
+<table>
+  <thead><tr><th>Code</th><th>Account</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead>
+  <tbody>
+  {% for l in lines %}
+    <tr><td>{{ l.code }}</td><td>{{ l.name }}</td><td>{{ l.debit }}</td><td>{{ l.credit }}</td><td>{{ l.balance }}</td></tr>
+  {% endfor %}
+  </tbody>
+  <tfoot><tr><th colspan="2">Totals</th><th>{{ total_debit }}</th><th>{{ total_credit }}</th><th></th></tr></tfoot>
+</table>
+{% else %}
+<p>No posted ledger lines yet.</p>
+{% endif %}
+
+<h2>Chart of accounts</h2>
+{% if accounts %}
+<table>
+  <thead><tr><th>Code</th><th>Name</th><th>Kind</th><th>Normal balance</th><th>Currency</th><th>Active</th></tr></thead>
+  <tbody>
+  {% for a in accounts %}
+    <tr><td>{{ a.code }}</td><td>{{ a.name }}</td><td>{{ a.kind }}</td><td>{{ a.normal_balance }}</td><td>{{ a.currency_code }}</td><td>{{ a.is_active }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No accounts yet. They arrive with the finance data wave.</p>
+{% endif %}
+
+<h2>Recent journals</h2>
+{% if journals %}
+<table>
+  <thead><tr><th>Number</th><th>Kind</th><th>Status</th><th>Date</th><th>Description</th><th>Debit</th><th>Credit</th></tr></thead>
+  <tbody>
+  {% for j in journals %}
+    <tr><td>{{ j.number }}</td><td>{{ j.kind }}</td><td>{{ j.status }}</td><td>{{ j.entry_date }}</td><td>{{ j.description }}</td><td>{{ j.total_debit }}</td><td>{{ j.total_credit }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No journals yet.</p>
+{% endif %}
+{% endblock %}

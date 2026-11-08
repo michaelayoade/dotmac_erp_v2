@@ -4,8 +4,8 @@ Generated from `src/erp_v2/importer/waves36.py` against the real
 legacy census and released module models. Same reading rules as mapping-wave2.md.
 
 ## public.customer -> mod_customers.customer_accounts
-- executable: False; mapped: 4; missing: ['account_number', 'display_name']
-- residue (41): ar_control_account_id, bank_details, billing_address, created_by_user_id, credit_hold, credit_limit, credit_terms_days, currency_code, customer_code, customer_group_id, customer_type, default_revenue_account_id, default_tax_code_id, default_wht_code_id, dotmac_sub_id, dotmac_sub_metrics, dotmac_sub_reseller_id, erpnext_id, is_active, is_related_party, is_vat_exempt, is_wht_applicable, legal_name, parent_customer_id ...
+- executable: True; mapped: 6; missing: none
+- residue (39): ar_control_account_id, bank_details, billing_address, created_by_user_id, credit_hold, credit_limit, credit_terms_days, currency_code, customer_group_id, customer_type, default_revenue_account_id, default_tax_code_id, default_wht_code_id, dotmac_sub_id, dotmac_sub_metrics, dotmac_sub_reseller_id, erpnext_id, is_active, is_related_party, is_vat_exempt, is_wht_applicable, parent_customer_id, payment_terms_id, price_list_id ...
 
 ## public.customer -> mod_customers.customer_profiles
 - executable: False; mapped: 4; missing: ['account_id']
@@ -20,8 +20,8 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (16): amendment_workflow_id, appraisee_id, appraisee_signed_date, appraiser_id, appraiser_signed_date, contract_id, hod_id, hod_signed_date, hr_head_id, hr_head_signed_date, organization_id, original_contract_id, rejected_by_stage, rejection_reason, signoff_note, status
 
 ## public.quote -> mod_sales.quotes
-- executable: False; mapped: 10; missing: ['lead_id', 'currency', 'tax_rate', 'tax_total', 'total', 'authored_by_kind', 'authored_by_opaque_id', 'authored_by_label']
-- residue (23): contact_email, contact_name, converted_at, converted_to_invoice_id, converted_to_so_id, created_by, currency_code, customer_id, customer_notes, exchange_rate, internal_notes, payment_terms_id, quote_date, quote_number, reference, rejection_reason, sent_by, tax_amount, terms_and_conditions, total_amount, updated_by, valid_until, viewed_at
+- executable: False; mapped: 15; missing: ['lead_id', 'tax_rate', 'authored_by_kind', 'authored_by_opaque_id', 'authored_by_label']
+- residue (18): contact_email, contact_name, converted_at, converted_to_invoice_id, converted_to_so_id, created_by, customer_id, exchange_rate, internal_notes, payment_terms_id, quote_date, quote_number, reference, rejection_reason, sent_by, terms_and_conditions, updated_by, viewed_at
 
 ## public.quote_line -> mod_sales.quote_lines
 - executable: False; mapped: 6; missing: ['position', 'gross_amount', 'amount']

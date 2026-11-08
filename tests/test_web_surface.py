@@ -38,6 +38,11 @@ def test_facet_declared_with_kernel_cookie_auth() -> None:
         ("erp_web", "legacy", "home"),
         ("erp_web", "legacy", "people_home"),
         ("erp_web", "legacy", "leave_home"),
+        ("erp_web", "legacy", "leave_apply"),
+        ("erp_web", "legacy", "leave_decide"),
+        ("erp_web", "legacy", "leave_cancel"),
+        ("erp_web", "legacy", "finance_home"),
+        ("erp_web", "legacy", "payables_home"),
     }
     assert assembly.authentication_profiles[0].code == "erp_tenant_session"
     assert {d.code for d in assembly.role_definitions} == {"admin", "staff"}

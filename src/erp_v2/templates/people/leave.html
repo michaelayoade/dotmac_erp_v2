@@ -3,6 +3,22 @@
 {% block content %}
 <h1>Leave</h1>
 <p><a href="/people">Back to people directory</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+
+<h2>Apply for leave</h2>
+<form method="post" action="/people/leave/apply">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token | default('') }}">
+  <label>Leave type
+    <select name="leave_type_code" required>
+      {% for t in leave_types %}<option value="{{ t.code }}">{{ t.name }} ({{ t.code }})</option>{% endfor %}
+    </select>
+  </label>
+  <label>From <input type="date" name="from_date" required></label>
+  <label>To <input type="date" name="to_date" required></label>
+  <label>Half day <input type="checkbox" name="half_day"></label>
+  <label>Reason <input type="text" name="reason"></label>
+  <button type="submit">Apply</button>
+</form>
 
 <h2>Balances</h2>
 {% if balances %}
@@ -21,12 +37,27 @@
 <h2>Applications</h2>
 {% if applications %}
 <table>
-  <thead><tr><th>Number</th><th>Employee</th><th>Type</th><th>From</th><th>To</th><th>Days</th><th>Status</th></tr></thead>
+  <thead><tr><th>Number</th><th>Employee</th><th>Type</th><th>From</th><th>To</th><th>Days</th><th>Status</th><th>Actions</th></tr></thead>
   <tbody>
   {% for a in applications %}
     <tr>
       <td>{{ a.number }}</td><td>{{ a.employee }}</td><td>{{ a.leave_type }}</td>
       <td>{{ a.from_date }}</td><td>{{ a.to_date }}</td><td>{{ a.days }}</td><td>{{ a.status }}</td>
+      <td>
+        {% if a.status == "submitted" %}
+        <form method="post" action="/people/leave/{{ a.id }}/decide">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token | default('') }}">
+          <button type="submit" name="decision" value="approve">Approve</button>
+          <button type="submit" name="decision" value="reject">Reject</button>
+        </form>
+        {% endif %}
+        {% if a.status in ("submitted", "approved") %}
+        <form method="post" action="/people/leave/{{ a.id }}/cancel">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token | default('') }}">
+          <button type="submit">Cancel</button>
+        </form>
+        {% endif %}
+      </td>
     </tr>
   {% endfor %}
   </tbody>

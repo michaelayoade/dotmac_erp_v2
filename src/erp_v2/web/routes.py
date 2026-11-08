@@ -8,8 +8,10 @@ redirects unauthenticated browsers to the facet login route.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Final
 from urllib.parse import quote
+from uuid import UUID
 
 from dotmac_kernel.deps import get_db, require_tenant
 from dotmac_kernel.features import FeatureManifest, NavItem
@@ -23,7 +25,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from erp_v2 import ui
-from erp_v2.web import auth_service, people_queries
+from erp_v2.web import auth_service, finance_queries, people_actions, people_queries
 
 router = APIRouter(tags=["web"])
 
@@ -117,6 +119,17 @@ def people_home(
     )
 
 
+def _leave_context(request: Request, db: Session, tenant: Tenant, party: Party, **extra: object) -> dict[str, object]:
+    overview = people_queries.leave_overview(db, tenant_id=tenant.id)
+    return _context(
+        current_email=getattr(party, "email", None),
+        leave_types=people_queries.list_leave_types(db, tenant_id=tenant.id),
+        csrf_token=getattr(request.state, "csrf_token", ""),
+        **overview,
+        **extra,
+    )
+
+
 @router.get("/people/leave")
 def leave_home(
     request: Request,
@@ -124,11 +137,127 @@ def leave_home(
     tenant: Tenant = Depends(require_tenant),
     party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
 ) -> HTMLResponse:
-    overview = people_queries.leave_overview(db, tenant_id=tenant.id)
+    return render(request, "people/leave.html", _leave_context(request, db, tenant, party))
+
+
+@router.post("/people/leave/apply", response_model=None)
+async def leave_apply(
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse | RedirectResponse:
+    form = await request.form()
+    try:
+        from_date = date.fromisoformat(str(form.get("from_date", "")))
+        to_date = date.fromisoformat(str(form.get("to_date", "")))
+    except ValueError:
+        return render(
+            request,
+            "people/leave.html",
+            _leave_context(request, db, tenant, party, error="Enter both dates (YYYY-MM-DD)"),
+        )
+    try:
+        people_actions.apply_for_leave(
+            db,
+            tenant=tenant,
+            party=party,
+            leave_type_code=str(form.get("leave_type_code", "")),
+            from_date=from_date,
+            to_date=to_date,
+            allocate_number=people_actions.numbering_allocator(db, tenant),
+            half_day=form.get("half_day") == "on",
+            reason=str(form.get("reason", "")) or None,
+        )
+    except people_actions.PeopleActionError as exc:
+        return render(
+            request,
+            "people/leave.html",
+            _leave_context(request, db, tenant, party, error=str(exc)),
+        )
+    return RedirectResponse(url="/people/leave", status_code=303)
+
+
+@router.post("/people/leave/{application_id}/decide", response_model=None)
+async def leave_decide(
+    application_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse | RedirectResponse:
+    form = await request.form()
+    try:
+        people_actions.decide_leave(
+            db,
+            tenant=tenant,
+            party=party,
+            application_id=application_id,
+            approve=form.get("decision") == "approve",
+            rejection_reason=str(form.get("rejection_reason", "")) or None,
+        )
+    except people_actions.PeopleActionError as exc:
+        return render(
+            request,
+            "people/leave.html",
+            _leave_context(request, db, tenant, party, error=str(exc)),
+        )
+    return RedirectResponse(url="/people/leave", status_code=303)
+
+
+@router.post("/people/leave/{application_id}/cancel", response_model=None)
+def leave_cancel(
+    application_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse | RedirectResponse:
+    try:
+        people_actions.cancel_leave(db, tenant=tenant, party=party, application_id=application_id)
+    except people_actions.PeopleActionError as exc:
+        return render(
+            request,
+            "people/leave.html",
+            _leave_context(request, db, tenant, party, error=str(exc)),
+        )
+    return RedirectResponse(url="/people/leave", status_code=303)
+
+
+@router.get("/finance")
+def finance_home(
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse:
+    balance = finance_queries.trial_balance(db, tenant_id=tenant.id)
     return render(
         request,
-        "people/leave.html",
-        _context(current_email=getattr(party, "email", None), **overview),
+        "finance/home.html",
+        _context(
+            current_email=getattr(party, "email", None),
+            accounts=finance_queries.chart_of_accounts(db, tenant_id=tenant.id),
+            journals=finance_queries.recent_journals(db, tenant_id=tenant.id, limit=10),
+            **balance,
+        ),
+    )
+
+
+@router.get("/finance/payables")
+def payables_home(
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse:
+    return render(
+        request,
+        "finance/payables.html",
+        _context(
+            current_email=getattr(party, "email", None),
+            invoices=finance_queries.open_payables(db, tenant_id=tenant.id),
+        ),
     )
 
 
@@ -147,7 +276,7 @@ def home(
 erp_web_feature: Final = FeatureManifest(
     name="erp_web",
     web_routers=(router,),
-    nav=[NavItem("People", "/people")],
+    nav=[NavItem("People", "/people"), NavItem("Finance", "/finance")],
     permissions=(
         PermissionSpec(
             code=ACCESS_PERMISSION,
