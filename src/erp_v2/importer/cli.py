@@ -29,6 +29,7 @@ from pathlib import Path
 import sqlalchemy as sa
 
 from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBLIC_SECTOR_PAIRINGS
+from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
 from erp_v2.importer.pipeline import run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
@@ -92,6 +93,8 @@ def _spec_report(specs: Sequence[TransformSpec]) -> dict[str, object]:
         "specs_executable": sum(s.executable for s in specs),
         "specs_blocked": blocked,
         "residue_columns": sum(len(s.residue) for s in specs),
+        "enrolment_maps_required": sorted(required_maps(specs)),
+        "enrolment_maps_without_builder": sorted(unbuilt_maps(specs)),
     }
 
 
@@ -282,6 +285,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             source_conn,
             dest_conn,
             executable,
+            enrolment=EnrolmentMaps(source_conn, dest_conn),
             run_constants=run_constants,
             dry_run=not args.apply,
         )
@@ -306,6 +310,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         ],
         "specs": _spec_report(specs),
         "specs_skipped_unsupplied_run_constants": unsupplied,
+        "enrolment_maps_built": dict(result.enrolment_maps),
     }
     _write_receipt(Path(args.receipt), payload)
     return 0 if result.complete else 3

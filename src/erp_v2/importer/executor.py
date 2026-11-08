@@ -17,12 +17,36 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 import sqlalchemy as sa
 
 from erp_v2.importer.spec import TransformSpec
+
+_MISSING = object()
+
+
+def _map_get(mapping: dict, value: object) -> object:
+    """Map lookup tolerant of UUID spellings (object / dashed / hex).
+
+    Enrolment maps normalize UUID keys to 32-char hex (the module
+    CHAR(32) id form); legacy source rows may carry uuid.UUID
+    objects or dashed strings for the same id.
+    """
+
+    found = mapping.get(value, _MISSING)
+    if found is not _MISSING:
+        return found
+    candidate: str | None = None
+    if isinstance(value, uuid.UUID):
+        candidate = value.hex
+    elif isinstance(value, str) and len(value) == 36 and value.count("-") == 4:
+        candidate = value.replace("-", "")
+    if candidate is not None:
+        return mapping.get(candidate, _MISSING)
+    return _MISSING
 
 
 @dataclass(frozen=True)
@@ -102,8 +126,8 @@ def execute_transform(
             value = row[source_col]
             map_name = spec.fk_rewrites.get(dest_col)
             if map_name is not None and value is not None:
-                mapping = id_maps.get(map_name, {})
-                if value not in mapping:
+                rewritten = _map_get(id_maps.get(map_name, {}), value)
+                if rewritten is _MISSING:
                     row_exceptions.append(
                         RowException(
                             source_table=spec.source_table,
@@ -113,7 +137,7 @@ def execute_transform(
                         )
                     )
                     continue
-                value = mapping[value]
+                value = rewritten
             values[dest_col] = value
         # Lookup columns read from caller-supplied maps keyed by a
         # mapped destination value (post-rewrite). No entry, or an
@@ -121,8 +145,8 @@ def execute_transform(
         for dest_col, (map_name, key_col, lookup_field) in spec.lookups.items():
             if dest_col in values:
                 continue
-            entry = id_maps.get(map_name, {}).get(values.get(key_col))
-            if entry is None or lookup_field not in entry:
+            entry = _map_get(id_maps.get(map_name, {}), values.get(key_col))
+            if entry is _MISSING or entry is None or lookup_field not in entry:
                 row_exceptions.append(
                     RowException(
                         source_table=spec.source_table,

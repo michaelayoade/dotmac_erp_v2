@@ -21,6 +21,7 @@ from typing import Any
 
 import sqlalchemy as sa
 
+from erp_v2.importer.enrolment import EnrolmentMaps
 from erp_v2.importer.executor import RowException, TransformReport, execute_transform
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.migrate import EXPECTED_HEADS
@@ -31,6 +32,9 @@ class ImportReceipt:
     destination_heads: tuple[str, ...]
     dry_run: bool
     reports: tuple[TransformReport, ...] = field(default_factory=tuple)
+    enrolment_maps: Mapping[str, int] = field(default_factory=dict)
+    # map name -> entry count actually built during the run (evidence
+    # that rewrites/lookups ran against real enrolment data)
 
     @property
     def read(self) -> int:
@@ -55,6 +59,7 @@ def run_import(
     specs: Sequence[TransformSpec],
     *,
     id_maps: Mapping[str, dict[Any, Any]] | None = None,
+    enrolment: EnrolmentMaps | None = None,
     run_constants: Mapping[str, Any] | None = None,
     dry_run: bool = False,
 ) -> ImportReceipt:
@@ -64,23 +69,31 @@ def run_import(
     tables' writes remain the caller's transaction to roll back) —
     building a partial import behind a green receipt is the failure
     mode this pipeline exists to prevent.
+
+    Per spec, enrolment builds (lazily, cached) exactly the maps
+    that spec declares; explicitly passed `id_maps` override the
+    enrolment-built map of the same name.
     """
 
-    reports = tuple(
-        execute_transform(
-            source_connection,
-            destination_connection,
-            spec,
-            id_maps=dict(id_maps or {}),
-            run_constants=dict(run_constants or {}),
-            dry_run=dry_run,
+    explicit = dict(id_maps or {})
+    reports: list[TransformReport] = []
+    for spec in specs:
+        spec_maps = enrolment.for_spec(spec) if enrolment is not None else {}
+        reports.append(
+            execute_transform(
+                source_connection,
+                destination_connection,
+                spec,
+                id_maps={**spec_maps, **explicit},
+                run_constants=dict(run_constants or {}),
+                dry_run=dry_run,
+            )
         )
-        for spec in specs
-    )
     return ImportReceipt(
         destination_heads=tuple(sorted(EXPECTED_HEADS)),
         dry_run=dry_run,
-        reports=reports,
+        reports=tuple(reports),
+        enrolment_maps=enrolment.summary() if enrolment is not None else {},
     )
 
 
