@@ -72,6 +72,36 @@ def _destination_tables() -> dict[str, object]:
     return dict(Base.metadata.tables)
 
 
+_STASHED_ENV: dict[str, str] = {}
+
+
+def _stash_forbidden_env() -> None:
+    """Move owner/source DSN env vars out of the process environment.
+
+    The runtime database binding refuses MIGRATION_/LEGACY_
+    DATABASE_URL in a runtime process - and this CLI's defaults use
+    exactly those names, while _destination_tables imports the
+    assembly (which builds the runtime binding at import). Stashing
+    at CLI entry keeps the guard's intent: the credentials live
+    only in this operator process's memory, never in the env of
+    anything it imports or spawns.
+    """
+
+    for name in ("MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"):
+        if name in os.environ:
+            _STASHED_ENV[name] = os.environ.pop(name)
+
+
+def _take_env(name: str | None) -> str:
+    """Read a DSN env var (stashed first) and remove it from the env."""
+
+    if not name:
+        return ""
+    if name in _STASHED_ENV:
+        return _STASHED_ENV.pop(name)
+    return os.environ.pop(name, "")
+
+
 def _resolve_sources(engine: sa.Engine, pairings: Sequence[Pairing]):
     """Resolve declared pairing sources against the real snapshot schemas.
 
@@ -370,7 +400,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         "manifest": manifest.as_dict(),
         "destination_heads": sorted(EXPECTED_HEADS),
     }
-    dsn = os.environ.get(args.source_url_env or "", "")
+    dsn = _take_env(args.source_url_env)
     if not dsn:
         receipt["mode"] = "pairings-only (no source DSN env set)"
         receipt["pairings"] = _census_receipt()
@@ -428,8 +458,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
     manifest = _load_manifest(args)
     if os.environ.get("ERP_IMPORT_APPROVED") != "1":
         raise CliRefusal("execute requires ERP_IMPORT_APPROVED=1 (named human approval)")
-    source_dsn = os.environ.get(args.source_url_env or "", "")
-    dest_dsn = os.environ.get(args.dest_url_env or "", "")
+    source_dsn = _take_env(args.source_url_env)
+    dest_dsn = _take_env(args.dest_url_env)
     if not source_dsn or not dest_dsn:
         raise CliRefusal("execute requires source and destination DSN env vars")
     if args.apply and os.environ.get("ERP_IMPORT_APPLY_OK") != "1":
@@ -542,6 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _stash_forbidden_env()
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args))

@@ -113,3 +113,55 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
     assert code == 0
     data = json.loads(receipt.read_text())
     assert data["items"] == 1 and data["open_ar_minor"] == 100000
+
+
+def test_reflected_plan_survives_forbidden_runtime_env_names(tmp_path) -> None:
+    """Regression (Gate 4 rehearsal): the CLI's default DSN env
+    names are exactly the ones the runtime binding forbids; the CLI
+    must take them out of the environment before importing the
+    assembly, or every reflected plan/execute crashes."""
+
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        _json.dumps(
+            {
+                "snapshot_sha256": "a" * 64,
+                "source_database": "legacy",
+                "destination_database": "dest",
+                "candidate_revision": "test",
+                "tenant_extent": ["00000000-0000-0000-0000-000000000001"],
+            }
+        )
+    )
+    receipt = tmp_path / "receipt.json"
+    env = {
+        **_os.environ,
+        "LEGACY_DATABASE_URL": "sqlite://",
+        "MIGRATION_DATABASE_URL": "sqlite://",
+    }
+    env.pop("DATABASE_URL", None)
+    proc = _sp.run(  # noqa: S603
+        [
+            _sys.executable,
+            "-m",
+            "erp_v2.importer",
+            "plan",
+            "--manifest",
+            str(manifest),
+            "--receipt",
+            str(receipt),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    payload = _json.loads(receipt.read_text())
+    assert payload["mode"] == "reflected"
+    assert payload["source_resolution"]["missing"], "empty sqlite must report missing sources"
