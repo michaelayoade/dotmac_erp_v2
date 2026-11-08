@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Inventory — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Inventory</h1>
+<p>{{ item_count }} items · total stock value {{ total_value }}</p>
+
+<h2>Stock balances</h2>
+{% if lines %}
+<table>
+  <thead><tr><th>SKU</th><th>Item</th><th>Warehouse</th><th>On hand</th><th>Reserved</th><th>Available</th><th>Unit cost</th><th>Value</th></tr></thead>
+  <tbody>
+  {% for l in lines %}
+    <tr><td>{{ l.sku }}</td><td>{{ l.item }}</td><td>{{ l.warehouse }}</td><td>{{ l.on_hand }}</td><td>{{ l.reserved }}</td><td>{{ l.available }}</td><td>{{ l.unit_cost }}</td><td>{{ l.value }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No stock balances yet.</p>
+{% endif %}
+
+<h2>Recent movements</h2>
+{% if movements %}
+<table>
+  <thead><tr><th>SKU</th><th>Kind</th><th>Quantity Δ</th><th>Value Δ</th><th>Occurred</th><th>Source</th></tr></thead>
+  <tbody>
+  {% for m in movements %}
+    <tr><td>{{ m.sku }}</td><td>{{ m.kind }}</td><td>{{ m.quantity_delta }}</td><td>{{ m.value_delta }}</td><td>{{ m.occurred_at }}</td><td>{{ m.source_ref }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No stock movements yet.</p>
+{% endif %}
+{% endblock %}

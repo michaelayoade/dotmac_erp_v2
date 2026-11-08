@@ -19,7 +19,11 @@ import argparse
 import json
 import os
 import sys
+import uuid as _uuid
 from collections.abc import Sequence
+from datetime import date as _date
+from datetime import datetime as _datetime
+from decimal import Decimal as _Decimal
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -117,6 +121,108 @@ def _load_manifest(args: argparse.Namespace) -> SnapshotManifest:
         raise CliRefusal(str(exc)) from exc
 
 
+def cmd_billing_plan(args: argparse.Namespace) -> int:
+    """Translate exported legacy AR rows (JSON) into an opening receipt.
+
+    Exports are read-only operator extracts; this command writes
+    nothing anywhere except the receipt file.
+    """
+
+    manifest = _load_manifest(args)
+    from dotmac_billing.contracts import (  # lazy: billing contracts are heavy
+        PartyDocumentSnapshotV1,
+        PaymentInstructionsSnapshotV1,
+        PostalAddressSnapshotV1,
+    )
+    from dotmac_billing.opening_contracts import OpeningPartitionV1
+
+    from erp_v2.importer.billing_opening import (
+        OpeningTranslationContext,
+        translate_partition,
+    )
+
+    def _rows(path: str | None) -> list[dict[str, object]]:
+        if not path:
+            return []
+        data = json.loads(Path(path).read_text())
+        if not isinstance(data, list):
+            raise CliRefusal(f"{path} must contain a JSON list of rows")
+        return data  # type: ignore[return-value]
+
+    def _coerce(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        for row in rows:
+            converted: dict[str, object] = {}
+            for key, value in row.items():
+                if key in ("subtotal", "tax_amount", "total_amount", "amount", "amount_allocated"):
+                    converted[key] = _Decimal(str(value))
+                elif key in ("invoice_date", "payment_date", "allocated_at"):
+                    converted[key] = _datetime.fromisoformat(str(value))
+                elif key == "due_date" and value:
+                    converted[key] = _date.fromisoformat(str(value))
+                else:
+                    converted[key] = value
+            out.append(converted)
+        return out
+
+    seller = PartyDocumentSnapshotV1(
+        legal_name=str(os.environ.get("ERP_SELLER_LEGAL_NAME", "")),
+        address=PostalAddressSnapshotV1(
+            line_one=str(os.environ.get("ERP_SELLER_ADDRESS_LINE", "")),
+            country_code=str(os.environ.get("ERP_SELLER_COUNTRY", "NG")),
+        ),
+    )
+    if not seller.legal_name:
+        raise CliRefusal("billing-plan requires ERP_SELLER_LEGAL_NAME (document snapshot authority)")
+    invoices = _coerce(_rows(args.invoices_json))
+    customers: dict[str, PartyDocumentSnapshotV1] = {}
+    for invoice in invoices:
+        key = str(invoice.get("customer_key", ""))
+        legal = invoice.get("customer_legal_name")
+        if key and legal and key not in customers:
+            customers[key] = PartyDocumentSnapshotV1(
+                legal_name=str(legal),
+                address=PostalAddressSnapshotV1(
+                    line_one=str(invoice.get("customer_address_line", "")),
+                    country_code=str(invoice.get("customer_country", "NG")),
+                ),
+            )
+    currencies = sorted({str(i.get("currency_code")) for i in invoices})
+    if len(currencies) != 1:
+        raise CliRefusal(f"billing-plan translates one currency per partition; got {currencies}")
+    context = OpeningTranslationContext(
+        partition=OpeningPartitionV1(
+            source_account_key=str(args.source_account_key),
+            account_id=_uuid.UUID(str(args.account_id)),
+            currency=currencies[0],
+            precision=int(args.precision),
+        ),
+        seller=seller,
+        customer_snapshot=customers.get,
+        payment_instructions=PaymentInstructionsSnapshotV1(method_code="bank_transfer"),
+    )
+    result = translate_partition(
+        context=context,
+        invoices=invoices,
+        allocations=_coerce(_rows(args.allocations_json)),
+        payments=_coerce(_rows(args.payments_json)),
+    )
+    payload: dict[str, object] = {
+        "kind": "billing-plan",
+        "manifest": manifest.as_dict(),
+        "items": len(result.items),
+        "open_ar_minor": result.open_ar_minor,
+        "cash_lots": len(result.cash_lots),
+        "blockers": [{"source_key": b.source_key, "reason": b.reason} for b in result.blockers],
+        "dispositions": [
+            {"key": d.identity.key, "disposition": d.disposition, "residual_minor": d.residual_minor}
+            for d in result.dispositions
+        ],
+    }
+    _write_receipt(Path(args.receipt), payload)
+    return 0 if not result.blockers else 3
+
+
 def cmd_census(args: argparse.Namespace) -> int:
     _write_receipt(Path(args.receipt), _census_receipt())
     return 0
@@ -208,13 +314,25 @@ def cmd_execute(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="erp-v2-import", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, fn in (("census", cmd_census), ("plan", cmd_plan), ("execute", cmd_execute)):
+    for name, fn in (
+        ("census", cmd_census),
+        ("plan", cmd_plan),
+        ("execute", cmd_execute),
+        ("billing-plan", cmd_billing_plan),
+    ):
         cmd = sub.add_parser(name)
         cmd.add_argument("--receipt", required=True, help="receipt JSON output path")
         cmd.set_defaults(func=fn)
         if name != "census":
             cmd.add_argument("--manifest", help="snapshot manifest JSON path")
             cmd.add_argument("--source-url-env", default="LEGACY_DATABASE_URL", help="env var holding the source DSN")
+        if name == "billing-plan":
+            cmd.add_argument("--invoices-json", required=True)
+            cmd.add_argument("--allocations-json")
+            cmd.add_argument("--payments-json")
+            cmd.add_argument("--source-account-key", required=True)
+            cmd.add_argument("--account-id", required=True, help="destination billing account UUID")
+            cmd.add_argument("--precision", default="2")
         if name == "execute":
             cmd.add_argument(
                 "--dest-url-env", default="MIGRATION_DATABASE_URL", help="env var holding the destination DSN"

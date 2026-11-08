@@ -169,6 +169,8 @@ assembly: Final = ProductAssemblySpec(
                 WebRouteRef("erp_web", "legacy", "leave_cancel"),
                 WebRouteRef("erp_web", "legacy", "finance_home"),
                 WebRouteRef("erp_web", "legacy", "payables_home"),
+                WebRouteRef("erp_web", "legacy", "payroll_home"),
+                WebRouteRef("erp_web", "legacy", "inventory_home"),
             ),
             login_route=WebRouteRef("erp_web", "legacy", "login_page"),
             landing_route=WebRouteRef("erp_web", "legacy", "home"),

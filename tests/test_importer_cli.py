@@ -68,3 +68,48 @@ def test_execute_is_triple_locked(tmp_path, monkeypatch) -> None:
         == 2
     )
     assert main(["execute", "--receipt", str(tmp_path / "r.json")]) == 2
+
+
+def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ERP_SELLER_LEGAL_NAME", "Dotmac Ltd")
+    monkeypatch.setenv("ERP_SELLER_ADDRESS_LINE", "1 Harbour Rd")
+    invoices = tmp_path / "inv.json"
+    invoices.write_text(
+        json.dumps(
+            [
+                {
+                    "invoice_id": "inv-1",
+                    "invoice_number": "INV-1",
+                    "customer_key": "cust-1",
+                    "customer_legal_name": "Customer Ltd",
+                    "customer_address_line": "2 Way",
+                    "invoice_date": "2026-01-05T00:00:00+00:00",
+                    "due_date": "2026-02-04",
+                    "currency_code": "NGN",
+                    "subtotal": "930.23",
+                    "tax_amount": "69.77",
+                    "total_amount": "1000.00",
+                    "status": "posted",
+                }
+            ]
+        )
+    )
+    receipt = tmp_path / "r.json"
+    code = main(
+        [
+            "billing-plan",
+            "--manifest",
+            str(_manifest(tmp_path)),
+            "--invoices-json",
+            str(invoices),
+            "--source-account-key",
+            "cust-1",
+            "--account-id",
+            "22222222-2222-2222-2222-222222222222",
+            "--receipt",
+            str(receipt),
+        ]
+    )
+    assert code == 0
+    data = json.loads(receipt.read_text())
+    assert data["items"] == 1 and data["open_ar_minor"] == 100000

@@ -25,7 +25,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from erp_v2 import ui
-from erp_v2.web import auth_service, finance_queries, people_actions, people_queries
+from erp_v2.web import (
+    auth_service,
+    finance_queries,
+    inventory_queries,
+    payroll_queries,
+    people_actions,
+    people_queries,
+)
 
 router = APIRouter(tags=["web"])
 
@@ -261,6 +268,45 @@ def payables_home(
     )
 
 
+@router.get("/payroll")
+def payroll_home(
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse:
+    return render(
+        request,
+        "payroll/home.html",
+        _context(
+            current_email=getattr(party, "email", None),
+            runs=payroll_queries.payroll_runs(db, tenant_id=tenant.id),
+            structures=payroll_queries.pay_structures(db, tenant_id=tenant.id),
+            components=payroll_queries.pay_components(db, tenant_id=tenant.id),
+            assignments_active=payroll_queries.assignment_count(db, tenant_id=tenant.id),
+        ),
+    )
+
+
+@router.get("/inventory")
+def inventory_home(
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse:
+    overview = inventory_queries.stock_overview(db, tenant_id=tenant.id)
+    return render(
+        request,
+        "inventory/home.html",
+        _context(
+            current_email=getattr(party, "email", None),
+            movements=inventory_queries.recent_movements(db, tenant_id=tenant.id),
+            **overview,
+        ),
+    )
+
+
 @router.get("/")
 def home(
     request: Request,
@@ -276,7 +322,12 @@ def home(
 erp_web_feature: Final = FeatureManifest(
     name="erp_web",
     web_routers=(router,),
-    nav=[NavItem("People", "/people"), NavItem("Finance", "/finance")],
+    nav=[
+        NavItem("People", "/people"),
+        NavItem("Finance", "/finance"),
+        NavItem("Payroll", "/payroll"),
+        NavItem("Inventory", "/inventory"),
+    ],
     permissions=(
         PermissionSpec(
             code=ACCESS_PERMISSION,

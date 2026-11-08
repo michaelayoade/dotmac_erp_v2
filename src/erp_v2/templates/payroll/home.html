@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Payroll — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Payroll</h1>
+<p>{{ assignments_active }} active pay assignments.</p>
+
+<h2>Runs</h2>
+{% if runs %}
+<table>
+  <thead><tr><th>Run</th><th>Period</th><th>Status</th><th>Calculations</th><th>Gross</th><th>Net</th></tr></thead>
+  <tbody>
+  {% for r in runs %}
+    <tr><td>{{ r.run_ref }}</td><td>{{ r.period_start }} → {{ r.period_end }}</td><td>{{ r.status }}</td><td>{{ r.calculations }}</td><td>{{ r.gross }} {{ r.currency_code }}</td><td>{{ r.net }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No payroll runs yet.</p>
+{% endif %}
+
+<h2>Structures</h2>
+{% if structures %}
+<table>
+  <thead><tr><th>Code</th><th>Name</th><th>Currency</th><th>Status</th></tr></thead>
+  <tbody>{% for s in structures %}<tr><td>{{ s.code }}</td><td>{{ s.name }}</td><td>{{ s.currency_code }}</td><td>{{ s.status }}</td></tr>{% endfor %}</tbody>
+</table>
+{% else %}<p>No pay structures yet.</p>{% endif %}
+
+<h2>Components</h2>
+{% if components %}
+<table>
+  <thead><tr><th>Code</th><th>Name</th><th>Kind</th></tr></thead>
+  <tbody>{% for c in components %}<tr><td>{{ c.code }}</td><td>{{ c.name }}</td><td>{{ c.kind }}</td></tr>{% endfor %}</tbody>
+</table>
+{% else %}<p>No pay components yet.</p>{% endif %}
+{% endblock %}
