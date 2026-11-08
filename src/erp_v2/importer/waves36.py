@@ -155,6 +155,8 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "currency_code": "literal:NGN",
             "original_debit": "column:debit",
             "original_credit": "column:credit",
+            "exchange_rate": "literal:1",
+            "journal_number": "source_key",
         },
         note="167k legacy ledger lines are functional-only postings "
         "(no original leg recorded); every journal is NGN at rate 1 "
@@ -200,9 +202,13 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "public.bank_statement_lines",
         renames={"direction": "transaction_type", "external_ref": "bank_reference"},
         fk_rewrites={"direction": "bank_direction_by_type"},
+        null_fallbacks={"external_ref": "source_key"},
         note="direction: legacy transaction_type value-mapped to the module "
         "check values (credit/debit) via the enrolment map; unmapped types "
-        "are exceptions. Categorization suggestions are residue (re-derived)",
+        "are exceptions. Categorization suggestions are residue (re-derived). "
+        "Traditional-bank statement lines carry no bank reference (all "
+        "18,187 lines of landed statements) - external_ref falls back "
+        "to the provenance source_key (Gate 5 ruling family)",
     ),
     Pairing(
         "mod_banking.match_allocations",
