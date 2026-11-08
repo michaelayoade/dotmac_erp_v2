@@ -70,6 +70,28 @@ def _systematic_candidates(dest: str, source_columns: set[str], source_table: st
                 return candidate
     if dest == "party_id" and "person_id" in source_columns:
         return "person_id"
+    # Legacy tables prefix their own code/name/number/type columns with
+    # the singular table name (account_code, item_code, po_number...);
+    # modules use the bare names. Opaque module refs (`supplier_ref`)
+    # take the legacy FK (`supplier_id`) stringified at enrolment.
+    singular = source_table.rsplit(".", 1)[-1].removesuffix("s")
+    prefixed = {
+        "code": (f"{singular}_code",),
+        "name": (f"{singular}_name", f"{singular}_title"),
+        "number": (f"{singular}_number",),
+        "sku": (f"{singular}_code",),
+        "kind": (f"{singular}_type", "type", f"{singular}_kind"),
+        "type": (f"{singular}_type",),
+        "title": ("subject", f"{singular}_name", f"{singular}_title"),
+        "priority": (f"{singular}_priority",),
+    }
+    for candidate in prefixed.get(dest, ()):
+        if candidate in source_columns:
+            return candidate
+    if dest.endswith("_ref"):
+        candidate = f"{dest.removesuffix('_ref')}_id"
+        if candidate in source_columns:
+            return candidate
     return None
 
 
