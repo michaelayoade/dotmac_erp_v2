@@ -629,3 +629,32 @@ def test_null_fallback_column_copies_mapped_value() -> None:
     with dst.connect() as d_:
         rows = d_.execute(sa.text("SELECT id, orig_debit FROM led_out ORDER BY id")).all()
     assert rows == [("a", 10.5), ("b", 2.5)]
+
+
+def test_dict_values_serialize_for_json_columns() -> None:
+    # psycopg returns JSONB as dict; raw text() inserts cannot adapt
+    # dicts - the executor serializes them (Gate 4: mod_forms).
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE forms (form_id TEXT)"))
+        c.execute(sa.text("INSERT INTO forms VALUES ('f1')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE forms_out (id TEXT, settings TEXT)"))
+    spec = build_spec(
+        source_table="forms",
+        destination_table="forms_out",
+        source_columns=("form_id",),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("settings", nullable=False, has_default=False),
+        ),
+        renames={"id": "form_id"},
+        lookups={"settings": ("form_settings", "id", "settings")},
+    )
+    with src.connect() as s_, dst.begin() as d_:
+        report = execute_transform(s_, d_, spec, id_maps={"form_settings": {"f1": {"settings": {"a": 1}}}})
+    assert report.written == 1 and report.complete
+    with dst.connect() as d_:
+        stored = d_.execute(sa.text("SELECT settings FROM forms_out")).scalar_one()
+    assert stored == '{"a": 1}'

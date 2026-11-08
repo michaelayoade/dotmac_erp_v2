@@ -16,6 +16,7 @@ Contract (Academy importer rules, `docs/cutover.md` Gate 3):
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
 from collections.abc import Sequence
@@ -476,11 +477,16 @@ def execute_transform(
             continue
         if not dry_run:
             params = values
+            if any(isinstance(v, (dict, list)) for v in values.values()):
+                # Raw text() inserts carry no column types, so psycopg
+                # cannot adapt dict/list for JSONB columns - serialize
+                # explicitly (Gate 4: mod_forms settings).
+                params = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in values.items()}
             if destination_connection.dialect.name == "sqlite":
                 # sqlite3 cannot bind Decimal; NUMERIC affinity stores
                 # the float. Postgres (the rehearsal target) binds
                 # Decimal natively and keeps exactness.
-                params = {k: float(v) if isinstance(v, Decimal) else v for k, v in values.items()}
+                params = {k: float(v) if isinstance(v, Decimal) else v for k, v in params.items()}
             deferred_values = {c: params.pop(c) for c in spec.deferred if params.get(c) is not None}
             for c in spec.deferred:
                 params.pop(c, None)
