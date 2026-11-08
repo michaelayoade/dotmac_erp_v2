@@ -29,7 +29,7 @@ def test_census_receipt(tmp_path) -> None:
     assert main(["census", "--receipt", str(receipt)]) == 0
     data = json.loads(receipt.read_text())
     assert data["legacy_tables_named"] == 426
-    assert "e2_0011_leases" in data["destination_heads"]
+    assert "e2_0012_academy_sync" in data["destination_heads"]
     assert data["pairings_total"] > 100
 
 
@@ -165,3 +165,25 @@ def test_reflected_plan_survives_forbidden_runtime_env_names(tmp_path) -> None:
     payload = _json.loads(receipt.read_text())
     assert payload["mode"] == "reflected"
     assert payload["source_resolution"]["missing"], "empty sqlite must report missing sources"
+
+
+def test_execute_run_constants_declared_supply() -> None:
+    import argparse as _ap
+
+    from erp_v2.importer.cli import _execute_run_constants
+    from erp_v2.importer.snapshot import SnapshotManifest
+
+    manifest = SnapshotManifest(
+        snapshot_sha256="a" * 64,
+        source_database="legacy",
+        destination_database="dest",
+        candidate_revision="rev1",
+        tenant_extent=("00000000-0000-0000-0000-000000000001",),
+    )
+    args = _ap.Namespace(minor_units=2, source_owner="legacy-erp", source_version=None)
+    constants = _execute_run_constants(args, manifest)
+    assert constants["tenant_id"] == "00000000000000000000000000000001"  # CHAR(32) hex
+    assert constants["minor_units"] == 2
+    assert constants["source_owner"] == "legacy-erp"
+    assert constants["source_version"] == "rev1"
+    assert "created_by_id" not in constants  # no actor env in test process

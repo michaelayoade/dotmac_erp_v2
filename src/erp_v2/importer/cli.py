@@ -440,6 +440,41 @@ def _json_arg(path: str | None, label: str) -> dict | None:
     return data
 
 
+def _execute_run_constants(args: argparse.Namespace, manifest) -> dict[str, object]:
+    """Per-run constant supply for spec run-supplied columns.
+
+    Everything here is a declared operator input or a provenance
+    fact of the run itself - never invented row data:
+    tenant (single-extent manifests), currency minor units
+    (operator-declared for the tenant functional currency),
+    source owner/version provenance, and the enrolment actor
+    refs when ERP_ENROLMENT_ACTOR_ID is supplied.
+    """
+
+    constants: dict[str, object] = {
+        "source_owner": args.source_owner,
+        "source_version": args.source_version or manifest.candidate_revision,
+    }
+    if len(manifest.tenant_extent) == 1:
+        # Module tenant_id columns are CHAR(32) hex; a dashed UUID
+        # string would not fit (found live at Gate 4).
+        constants["tenant_id"] = _uuid.UUID(str(manifest.tenant_extent[0])).hex
+    if args.minor_units is not None:
+        constants["minor_units"] = int(args.minor_units)
+    actor = os.environ.get("ERP_ENROLMENT_ACTOR_ID") or None
+    if actor:
+        actor_hex = _uuid.UUID(actor).hex
+        constants.update(
+            {
+                "created_by_id": actor_hex,
+                "imported_by_id": actor_hex,
+                "created_by_ref": actor_hex,
+                "invited_by_ref": actor_hex,
+            }
+        )
+    return constants
+
+
 def _mint_context(args: argparse.Namespace, run_constants: dict[str, object]) -> MintContext:
     tenant = run_constants.get("tenant_id")
     if tenant is None:
@@ -468,11 +503,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
     dest_engine = sa.create_engine(dest_dsn)
     present, source_columns, resolution, source_schemas = _resolve_sources(source_engine, _ALL_PAIRINGS)
     specs, _generated = build_specs(present, source_columns, _destination_tables())
-    run_constants: dict[str, object] = {}
-    if len(manifest.tenant_extent) == 1:
-        # Module tenant_id columns are CHAR(32) hex; a dashed UUID
-        # string would not fit (found live at Gate 4).
-        run_constants["tenant_id"] = _uuid.UUID(str(manifest.tenant_extent[0])).hex
+    run_constants: dict[str, object] = _execute_run_constants(args, manifest)
     executable = tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants))
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
     mint_context = _mint_context(args, run_constants) if args.mint else None
@@ -494,9 +525,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # Non-map-feeding mints run after the specs so every parent
             # row they reference is imported (same caller transaction;
             # dry-run rollback below covers them).
-            post_mints = tuple(
-                enrolment.mint(step) for step in ("pay_rule_bases", "tax_rules")
-            )
+            post_mints = tuple(enrolment.mint(step) for step in ("pay_rule_bases", "tax_rules"))
         if not args.apply:
             dest_conn.rollback()
     payload: dict[str, object] = {
@@ -571,6 +600,17 @@ def build_parser() -> argparse.ArgumentParser:
             )
             cmd.add_argument("--tax-rule-policy-json", help="legacy tax_type -> ruled module codes")
             cmd.add_argument("--tax-band-binding-json", help="legacy tax band name -> legacy tax_code")
+            cmd.add_argument(
+                "--minor-units",
+                type=int,
+                help="tenant functional-currency minor units (e.g. 2 for NGN); "
+                "specs needing it are skipped when unsupplied",
+            )
+            cmd.add_argument("--source-owner", default="legacy-erp", help="provenance source owner")
+            cmd.add_argument(
+                "--source-version",
+                help="provenance source version (default: manifest candidate_revision)",
+            )
     return parser
 
 
