@@ -80,7 +80,11 @@ def _fk_guards(
             continue
         if any(c in spec.deferred or c in spec.fk_rewrites for c in local):
             continue
-        referred_schema = fk.get("referred_schema") or schema
+        # referred_schema=None means the DB default schema, NOT
+        # this table's schema (kernel `tenants` lives in public
+        # while referencing tables live in mod_* schemas) - keep
+        # the bare name and let search_path resolve it.
+        referred_schema = fk.get("referred_schema")
         referred_table = fk.get("referred_table") or ""
         # Self-referential FKs stay DB-arbitrated: parents land
         # later in the same spec (FK retry / deferred columns).
@@ -88,9 +92,13 @@ def _fk_guards(
             continue
         qualified = f"{referred_schema}.{referred_table}" if referred_schema else referred_table
         cols_sql = ", ".join(referred_cols)
-        rows = destination_connection.execute(
-            sa.text(f"SELECT {cols_sql} FROM {qualified}")  # noqa: S608
-        )
+        try:
+            with destination_connection.begin_nested():
+                rows = destination_connection.execute(
+                    sa.text(f"SELECT {cols_sql} FROM {qualified}")  # noqa: S608
+                ).all()
+        except sa.exc.SQLAlchemyError:
+            continue  # unresolvable parent: DB-side checks only
         parents = frozenset(tuple(_norm_key(v) for v in row) for row in rows)
         guards.append(
             _FkGuard(
