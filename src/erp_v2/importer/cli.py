@@ -470,7 +470,9 @@ def cmd_execute(args: argparse.Namespace) -> int:
     specs, _generated = build_specs(present, source_columns, _destination_tables())
     run_constants: dict[str, object] = {}
     if len(manifest.tenant_extent) == 1:
-        run_constants["tenant_id"] = manifest.tenant_extent[0]
+        # Module tenant_id columns are CHAR(32) hex; a dashed UUID
+        # string would not fit (found live at Gate 4).
+        run_constants["tenant_id"] = _uuid.UUID(str(manifest.tenant_extent[0])).hex
     executable = tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants))
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
     mint_context = _mint_context(args, run_constants) if args.mint else None
@@ -478,6 +480,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
     with source_engine.connect() as source_conn, dest_engine.begin() as dest_conn:
         _set_search_path(source_conn, source_schemas)
         enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context)
+        if mint_context is not None:
+            enrolment.mint("kernel_tenants")  # FK parent of every tenant-scoped row
         result = run_import(
             source_conn,
             dest_conn,

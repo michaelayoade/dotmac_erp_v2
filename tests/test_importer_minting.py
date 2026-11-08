@@ -219,3 +219,25 @@ def test_lazy_mint_feeds_structure_revision_map_in_pipeline() -> None:
     revision_id = dst.execute(sa.text("SELECT id FROM mod_payroll.pay_structure_revisions")).scalar()
     written = dst.execute(sa.text("SELECT revision_id FROM employee_pay_assignments")).scalar()
     assert written == revision_id
+
+
+def test_kernel_tenants_mint_and_db_error_refusal() -> None:
+    src = _conn(
+        (
+            "CREATE TABLE organization (organization_id TEXT, organization_code TEXT, legal_name TEXT, "
+            "trading_name TEXT, is_active INTEGER)",
+            "INSERT INTO organization VALUES ('org1','DOTMAC','Dotmac Technologies Ltd',NULL,1)",
+        )
+    )
+    dst = _conn(
+        ("CREATE TABLE tenants (id TEXT, slug TEXT, name TEXT, is_active INTEGER, created_at TEXT, updated_at TEXT)",)
+    )
+    first = run_mint_step("kernel_tenants", src, dst, CTX)
+    assert (first.created, first.existing, first.refused) == (1, 0, None)
+    row = dst.execute(sa.text("SELECT id, slug, name FROM tenants")).one()
+    assert tuple(row) == ("org1", "dotmac", "Dotmac Technologies Ltd")
+    assert run_mint_step("kernel_tenants", src, dst, CTX).existing == 1
+    # A destination without the table records a named refusal, no raise.
+    empty = _conn(())
+    refused = run_mint_step("kernel_tenants", src, empty, CTX)
+    assert refused.refused and "database error" in refused.refused

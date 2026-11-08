@@ -632,7 +632,46 @@ def mint_pay_rule_bases(source: sa.Connection, dest: sa.Connection, ctx: MintCon
     return result
 
 
+def mint_kernel_tenants(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
+    """Kernel tenants from legacy organisations (UUID-preserving).
+
+    Runs before specs: every tenant-scoped destination FKs to
+    tenants.id. Slug from organization_code; duplicate slugs error
+    (recorded refused) rather than silently renamed.
+    """
+
+    result = MintResult("kernel_tenants")
+    existing = {_norm(r[0]) for r in dest.execute(sa.text("SELECT id FROM tenants"))}
+    rows: list[dict[str, Any]] = []
+    legacy = source.execute(
+        sa.text("SELECT organization_id, organization_code, legal_name, trading_name, is_active FROM organization")
+    ).mappings()
+    for row in legacy:
+        tenant_id = _norm(row["organization_id"])
+        if tenant_id in existing:
+            result.existing += 1
+            continue
+        slug = _slug(row["organization_code"] or row["legal_name"])
+        if not slug:
+            result.blockers.append(f"organisation {tenant_id}: no usable slug from code/name")
+            continue
+        rows.append(
+            {
+                "id": tenant_id,
+                "slug": slug,
+                "name": row["trading_name"] or row["legal_name"] or slug,
+                "is_active": bool(row["is_active"]),
+                "created_at": _now(ctx),
+                "updated_at": _now(ctx),
+            }
+        )
+    _insert(dest, "tenants", rows)
+    result.created = len(rows)
+    return result
+
+
 MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
+    ("kernel_tenants", mint_kernel_tenants),
     ("pay_structure_revisions", mint_pay_structure_revisions),
     ("pay_rule_bases", mint_pay_rule_bases),
     ("tax_authorities", mint_tax_authorities),
@@ -660,6 +699,10 @@ def run_mint_step(name: str, source: sa.Connection, dest: sa.Connection, ctx: Mi
         return step(source, dest, ctx)
     except MintRefusal as exc:
         return MintResult(name, refused=str(exc))
+    except sa.exc.SQLAlchemyError as exc:
+        # A mint failure must land in the receipt, not kill the run
+        # (found live at Gate 4: sales pipeline FK before tenants).
+        return MintResult(name, refused=f"database error ({type(exc).__name__})")
 
 
 def mint_all(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> tuple[MintResult, ...]:
