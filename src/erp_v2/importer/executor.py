@@ -54,12 +54,13 @@ def _flush_batch(
         return
     except sa.exc.IntegrityError as exc:
         if len(batch) == 1:
+            detail = str(exc.orig).splitlines()[0][:160] if exc.orig is not None else ""
             report.exceptions.append(
                 RowException(
                     source_table=spec.source_table,
                     source_key=batch[0][0],
                     column="*",
-                    reason=f"destination rejected row ({type(exc.orig).__name__})",
+                    reason=f"destination rejected row ({type(exc.orig).__name__}): {detail}",
                 )
             )
             return
