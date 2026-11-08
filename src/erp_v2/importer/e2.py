@@ -103,7 +103,9 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "hr_case_documents",
         "public.case_document",
-        note="file_id resolves through the files import (legacy file_path -> stored file)",
+        lookups={"file_id": ("case_document_file", "id", "file_id")},
+        note="file_id resolves through the files import: enrolment matches "
+        "legacy file_path to mod_files.stored_files.storage_key exactly",
     ),
     Pairing(
         "hr_grievances",
@@ -218,7 +220,10 @@ FLEET_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "fleet_vehicle_profiles",
         "public.vehicle",
         renames={"code": "vehicle_code", "gps_device_ref": "gps_device_id"},
-        note="asset_id resolves via the assets import; legacy vehicle had no tenant column (single fleet extent)",
+        lookups={"asset_id": ("vehicle_asset", "id", "asset_id")},
+        note="asset_id resolves only on an exact VIN <-> asset serial_number "
+        "match at enrolment; unmatched vehicles exception for manual "
+        "asset linkage (never fuzzy-matched)",
     ),
     Pairing("fleet_fuel_logs", "public.fuel_log_entry", renames={"profile_id": "vehicle_id"}),
     Pairing("fleet_reservations", "public.vehicle_reservation", renames={"profile_id": "vehicle_id"}),
@@ -227,7 +232,10 @@ FLEET_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "fleet_vehicle_documents",
         "public.vehicle_document",
-        note="file_id resolves through the files import (legacy file_path -> stored file)",
+        renames={"profile_id": "vehicle_id"},
+        lookups={"file_id": ("vehicle_document_file", "id", "file_id")},
+        note="file_id resolves through the files import: enrolment matches "
+        "legacy file_path to mod_files.stored_files.storage_key exactly",
     ),
 )
 

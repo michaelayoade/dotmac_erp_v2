@@ -134,3 +134,54 @@ def test_batch2_computations() -> None:
             "channel": "card",
         }
         assert "pi2" not in terms
+
+
+def test_id_systematic_prefix_and_s_ending_names() -> None:
+    from erp_v2.importer.spec import DestinationColumn, build_spec
+
+    def mapped_id(source_table: str, columns: tuple[str, ...]) -> str | None:
+        spec = build_spec(
+            source_table=source_table,
+            destination_table="dest",
+            source_columns=columns,
+            destination_columns=(DestinationColumn("id", nullable=False, has_default=False),),
+        )
+        return spec.column_map.get("id")
+
+    # Gate 4 live findings: s-ending singulars and prefix-form PKs.
+    assert mapped_id("hr.case_witness", ("witness_id",)) == "witness_id"
+    assert mapped_id("fleet.fuel_log_entry", ("fuel_log_id",)) == "fuel_log_id"
+    assert mapped_id("fleet.maintenance_record", ("maintenance_id",)) == "maintenance_id"
+    assert mapped_id("lease.lease_contract", ("lease_id",)) == "lease_id"
+    # Established forms still win in order.
+    assert mapped_id("public.salary_slip", ("slip_id", "salary_id")) == "slip_id"
+    assert mapped_id("public.department", ("department_id",)) == "department_id"
+
+
+def test_file_and_vehicle_asset_links() -> None:
+    src_engine = _engine(
+        (
+            "CREATE TABLE case_document (document_id TEXT, file_path TEXT)",
+            "INSERT INTO case_document VALUES ('cd1','cases/a.pdf')",
+            "INSERT INTO case_document VALUES ('cd2','missing.pdf')",
+            "CREATE TABLE vehicle_document (document_id TEXT, file_path TEXT)",
+            "INSERT INTO vehicle_document VALUES ('vd1','fleet/b.pdf')",
+            "CREATE TABLE vehicle (vehicle_id TEXT, vin TEXT)",
+            "INSERT INTO vehicle VALUES ('v1','vin-123')",
+            "INSERT INTO vehicle VALUES ('v2','vin-999')",
+        )
+    )
+    dst_engine = _engine(())
+    with _conn(dst_engine) as dst:
+        dst.execute(sa.text("ATTACH DATABASE ':memory:' AS mod_files"))
+        dst.execute(sa.text("ATTACH DATABASE ':memory:' AS mod_assets"))
+        dst.execute(sa.text("CREATE TABLE mod_files.stored_files (id TEXT, storage_key TEXT)"))
+        dst.execute(sa.text("INSERT INTO mod_files.stored_files VALUES ('f1','cases/a.pdf')"))
+        dst.execute(sa.text("INSERT INTO mod_files.stored_files VALUES ('f2','fleet/b.pdf')"))
+        dst.execute(sa.text("CREATE TABLE mod_assets.assets (id TEXT, serial_number TEXT)"))
+        dst.execute(sa.text("INSERT INTO mod_assets.assets VALUES ('as1','VIN-123')"))
+        with _conn(src_engine) as src:
+            maps = EnrolmentMaps(src, dst)
+            assert maps.get("case_document_file") == {"cd1": {"file_id": "f1"}}
+            assert maps.get("vehicle_document_file") == {"vd1": {"file_id": "f2"}}
+            assert maps.get("vehicle_asset") == {"v1": {"asset_id": "as1"}}

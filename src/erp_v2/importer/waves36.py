@@ -812,7 +812,7 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_documents.documents",
         "public.hr_document",
-        renames={"metadata": "extra_metadata", "state": "status"},
+        renames={"state": "status"},
         constants={"type_version": 1},
         lookups={
             "library_id": ("document_library", "tenant_id", "library_id"),

@@ -112,18 +112,27 @@ def _systematic_candidates(dest: str, source_columns: set[str], source_table: st
     if dest == "tenant_id" and "organization_id" in source_columns:
         return "organization_id"
     if dest == "id":
-        singular = source_table.rsplit(".", 1)[-1].removesuffix("s")
-        # Full singular first (department_id), then the shortened
-        # forms legacy compound tables use: last two tokens
-        # (posted_ledger_line -> ledger_line_id, project_template_task
-        # -> template_task_id), then the last token (salary_slip ->
-        # slip_id, salary_component -> component_id).
-        tokens = singular.split("_")
-        candidates = [f"{singular}_id", f"{singular}id"]
+        raw = source_table.rsplit(".", 1)[-1]
+        # Legacy PK naming varies: full table name (department_id),
+        # shortened suffix forms (posted_ledger_line -> ledger_line_id,
+        # salary_slip -> slip_id), and prefix forms (fuel_log_entry ->
+        # fuel_log_id, lease_contract -> lease_id). Try raw and
+        # s-stripped token sets - naive singularization mangles
+        # legitimately s-ending names (case_witness -> witness_id,
+        # not witnes_id; found live at Gate 4 rehearsal).
+        candidates: list[str] = []
+        for base in (raw, raw.removesuffix("s")):
+            tokens = base.split("_")
+            candidates.append(f"{base}_id")
+            candidates.append(f"{base}id")
+            if len(tokens) >= 2:
+                candidates.append(f"{tokens[-2]}_{tokens[-1]}_id")
+            candidates.append(f"{tokens[-1]}_id")
+        tokens = raw.split("_")
         if len(tokens) >= 2:
-            candidates.append(f"{tokens[-2]}_{tokens[-1]}_id")
-        candidates.append(f"{tokens[-1]}_id")
-        for candidate in candidates:
+            candidates.append(f"{tokens[0]}_{tokens[1]}_id")
+        candidates.append(f"{tokens[0]}_id")
+        for candidate in dict.fromkeys(candidates):
             if candidate in source_columns:
                 return candidate
     if dest == "party_id" and "person_id" in source_columns:

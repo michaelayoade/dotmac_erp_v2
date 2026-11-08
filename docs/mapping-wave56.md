@@ -68,8 +68,8 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (5): action, comment_type, is_active, new_value, old_value
 
 ## public.hr_document -> mod_documents.documents
-- executable: False; mapped: 10; missing: ['sensitivity', 'handling_instructions']
-- residue (16): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, effective_date, expiry_date, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, updated_by, version
+- executable: False; mapped: 9; missing: ['metadata', 'sensitivity', 'handling_instructions']
+- residue (17): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, effective_date, expiry_date, extra_metadata, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, updated_by, version
 
 ## public.form -> mod_forms.forms
 - executable: True; mapped: 7; missing: none

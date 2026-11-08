@@ -774,7 +774,7 @@ RULED_LEGACY = {
         "applies_to_departments",
         "status",
         "tags",
-        "extra_metadata",
+        "metadata",
         "created_by",
         "created_at",
         "updated_by",

@@ -765,6 +765,59 @@ def _payment_intent_terms(source: sa.Connection, dest: sa.Connection) -> dict[An
     return mapping
 
 
+def _stored_file_map(dest: sa.Connection) -> dict[str, Any]:
+    """storage_key -> stored file id (destination mod_files estate)."""
+
+    by_key: dict[str, Any] = {}
+    ambiguous: set[str] = set()
+    for file_id, storage_key in dest.execute(sa.text("SELECT id, storage_key FROM mod_files.stored_files")):
+        key = str(storage_key)
+        if key in by_key and by_key[key] != _norm(file_id):
+            ambiguous.add(key)
+        by_key[key] = _norm(file_id)
+    return {k: v for k, v in by_key.items() if k not in ambiguous}
+
+
+def _file_by_path(source: sa.Connection, dest: sa.Connection, table: str, pk: str, map_name: str):
+    stored = _stored_file_map(dest)
+    mapping: dict[Any, dict[str, Any]] = {}
+    for doc_id, file_path in source.execute(
+        sa.text(f"SELECT {pk}, file_path FROM {table} WHERE file_path IS NOT NULL")  # noqa: S608
+    ):
+        file_id = stored.get(str(file_path))
+        if file_id is not None:
+            _put(mapping, map_name, doc_id, {"file_id": file_id})
+    return mapping
+
+
+def _case_document_file(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    return _file_by_path(source, dest, "case_document", "document_id", "case_document_file")
+
+
+def _vehicle_document_file(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    return _file_by_path(source, dest, "vehicle_document", "document_id", "vehicle_document_file")
+
+
+def _vehicle_asset(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Vehicle -> fixed-asset link by exact VIN = serial_number match."""
+
+    by_serial: dict[str, Any] = {}
+    ambiguous: set[str] = set()
+    for asset_id, serial in dest.execute(
+        sa.text("SELECT id, serial_number FROM mod_assets.assets WHERE serial_number IS NOT NULL")
+    ):
+        key = str(serial).strip().upper()
+        if key in by_serial and by_serial[key] != _norm(asset_id):
+            ambiguous.add(key)
+        by_serial[key] = _norm(asset_id)
+    mapping: dict[Any, dict[str, Any]] = {}
+    for vehicle_id, vin in source.execute(sa.text("SELECT vehicle_id, vin FROM vehicle WHERE vin IS NOT NULL")):
+        asset_id = by_serial.get(str(vin).strip().upper())
+        if asset_id is not None and str(vin).strip().upper() not in ambiguous:
+            _put(mapping, "vehicle_asset", vehicle_id, {"asset_id": asset_id})
+    return mapping
+
+
 MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "agreement_family": _agreement_family,
     "approval_request_policy": _approval_request_policy,
@@ -774,6 +827,7 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "bank_direction_by_type": _bank_direction_by_type,
     "bank_institution_by_code": _bank_institution_by_code,
     "bid_submission": _bid_submission,
+    "case_document_file": _case_document_file,
     "document_library": _document_library,
     "document_type": _document_type,
     "employee_party": _employee_party,
@@ -801,6 +855,8 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "tenant_currency": _tenant_currency,
     "user_label": _user_label,
     "user_party": _user_party,
+    "vehicle_asset": _vehicle_asset,
+    "vehicle_document_file": _vehicle_document_file,
 }
 
 
