@@ -140,7 +140,6 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "public.posted_ledger_line",
         renames={
             "journal_id": "journal_entry_id",
-            "journal_number": "journal_reference",
             "currency_code": "original_currency_code",
             "debit": "debit_amount",
             "credit": "credit_amount",
@@ -156,8 +155,8 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "original_debit": "column:debit",
             "original_credit": "column:credit",
             "exchange_rate": "literal:1",
-            "journal_number": "source_key",
         },
+        lookups={"journal_number": ("journal_number_by_entry", "journal_id", "journal_number")},
         note="167k legacy ledger lines are functional-only postings "
         "(no original leg recorded); every journal is NGN at rate 1 "
         "in production data, so original falls back to functional "

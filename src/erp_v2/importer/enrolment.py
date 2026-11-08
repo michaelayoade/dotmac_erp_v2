@@ -215,6 +215,17 @@ def _bank_institution_by_code(source: sa.Connection, dest: sa.Connection) -> dic
     return _scalar(rows, "bank_institution_by_code")
 
 
+def _journal_number_by_entry(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    # Posted ledger lines denormalize the entry's journal number.
+    # The ledger's own journal_reference is free text (NULL on 16k
+    # rows, up to 100 chars - not the number); the entry row is the
+    # authority. Dest-side read: entries already imported.
+    rows = dest.execute(
+        sa.text("SELECT id AS key, number AS journal_number FROM mod_accounting.journal_entries")
+    ).mappings()
+    return _lookup(rows, "journal_number_by_entry", ("journal_number",))
+
+
 def _fiscal_period(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     rows = dest.execute(sa.text("SELECT id AS key, end_date AS end_date FROM mod_accounting.fiscal_periods")).mappings()
     return _lookup(rows, "fiscal_period", ("end_date",))
@@ -886,6 +897,7 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "document_type": _document_type,
     "employee_party": _employee_party,
     "expense_evaluation_batch": _expense_evaluation_batch,
+    "journal_number_by_entry": _journal_number_by_entry,
     "fiscal_period": _fiscal_period,
     "inventory_item": _inventory_item,
     "lot_status": _lot_status,
