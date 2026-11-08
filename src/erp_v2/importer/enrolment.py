@@ -93,22 +93,20 @@ def _bank_direction_by_type(source: sa.Connection, dest: sa.Connection) -> dict[
 
 def _employee_party(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
     # Legacy employee.person_id IS the kernel Party UUID (preserved).
-    rows = source.execute(sa.text("SELECT employee_id, person_id FROM public.employee"))
+    rows = source.execute(sa.text("SELECT employee_id, person_id FROM employee"))
     return _scalar(rows, "employee_party")
 
 
 def _user_party(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
     # Legacy user_credentials.id is the user UUID created_by columns
     # reference; person_id is the kernel Party UUID (preserved).
-    rows = source.execute(sa.text("SELECT id, person_id FROM public.user_credentials"))
+    rows = source.execute(sa.text("SELECT id, person_id FROM user_credentials"))
     return _scalar(rows, "user_party")
 
 
 def _supplier(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     rows = source.execute(
-        sa.text(
-            "SELECT supplier_id AS key, COALESCE(NULLIF(legal_name, ''), trading_name) AS name FROM public.supplier"
-        )
+        sa.text("SELECT supplier_id AS key, COALESCE(NULLIF(legal_name, ''), trading_name) AS name FROM supplier")
     ).mappings()
     return _lookup(rows, "supplier", ("name",))
 
@@ -117,7 +115,7 @@ def _payment_intent_by_payment(source: sa.Connection, dest: sa.Connection) -> di
     rows = source.execute(
         sa.text(
             "SELECT customer_payment_id AS key, intent_id AS intent_id "
-            "FROM public.payment_intent WHERE customer_payment_id IS NOT NULL"
+            "FROM payment_intent WHERE customer_payment_id IS NOT NULL"
         )
     ).mappings()
     return _lookup(rows, "payment_intent_by_payment", ("intent_id",))
@@ -125,16 +123,14 @@ def _payment_intent_by_payment(source: sa.Connection, dest: sa.Connection) -> di
 
 def _project_template_task(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     rows = source.execute(
-        sa.text("SELECT template_task_id AS key, template_id AS template_id FROM public.project_template_task")
+        sa.text("SELECT template_task_id AS key, template_id AS template_id FROM project_template_task")
     ).mappings()
     return _lookup(rows, "project_template_task", ("template_id",))
 
 
 def _bid_submission(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     # UUIDs are preserved, so the legacy rfq_id IS the module event id.
-    rows = source.execute(
-        sa.text("SELECT response_id AS key, rfq_id AS event_id FROM public.quotation_response")
-    ).mappings()
+    rows = source.execute(sa.text("SELECT response_id AS key, rfq_id AS event_id FROM quotation_response")).mappings()
     return _lookup(rows, "bid_submission", ("event_id",))
 
 
@@ -186,9 +182,7 @@ def _pay_component(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict
     # which the module stores on rules, not on components.
     prorates = {
         _norm(key): bool(flag)
-        for key, flag in source.execute(
-            sa.text("SELECT component_id, depends_on_payment_days FROM public.salary_component")
-        )
+        for key, flag in source.execute(sa.text("SELECT component_id, depends_on_payment_days FROM salary_component"))
     }
     mapping: dict[Any, dict[str, Any]] = {}
     rows = dest.execute(sa.text("SELECT id, code, name, kind FROM mod_payroll.pay_components")).mappings()
@@ -211,9 +205,7 @@ def _pay_component(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict
 
 
 def _known_abbrs(source: sa.Connection) -> set[str]:
-    return {
-        str(r[0]) for r in source.execute(sa.text("SELECT abbr FROM public.salary_component WHERE abbr IS NOT NULL"))
-    }
+    return {str(r[0]) for r in source.execute(sa.text("SELECT abbr FROM salary_component WHERE abbr IS NOT NULL"))}
 
 
 def _convert_row(row: Mapping[str, Any], abbrs: set[str]):
@@ -240,7 +232,7 @@ def _rule_conversions(source: sa.Connection) -> dict[tuple[Any, Any], Any]:
         rows = source.execute(
             sa.text(
                 f"SELECT structure_id, component_id, amount, amount_based_on_formula, formula, condition "  # noqa: S608
-                f"FROM public.{table}"
+                f"FROM {table}"
             )
         ).mappings()
         for row in rows:
@@ -266,7 +258,7 @@ def _payroll_rule_conversion(source: sa.Connection, dest: sa.Connection) -> dict
     for table, pk in (("salary_structure_earning", "earning_id"), ("salary_structure_deduction", "deduction_id")):
         rows = source.execute(
             sa.text(
-                f"SELECT {pk} AS key, amount, amount_based_on_formula, formula, condition FROM public.{table}"  # noqa: S608
+                f"SELECT {pk} AS key, amount, amount_based_on_formula, formula, condition FROM {table}"  # noqa: S608
             )
         ).mappings()
         for row in rows:
@@ -289,13 +281,12 @@ def _payroll_rule_conversion(source: sa.Connection, dest: sa.Connection) -> dict
 def _payroll_line_method(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     conversions = _rule_conversions(source)
     slip_structure = {
-        _norm(r[0]): _norm(r[1])
-        for r in source.execute(sa.text("SELECT slip_id, structure_id FROM public.salary_slip"))
+        _norm(r[0]): _norm(r[1]) for r in source.execute(sa.text("SELECT slip_id, structure_id FROM salary_slip"))
     }
     mapping: dict[Any, dict[str, Any]] = {}
     for table in ("salary_slip_earning", "salary_slip_deduction"):
         rows = source.execute(
-            sa.text(f"SELECT line_id AS key, slip_id, component_id FROM public.{table}")  # noqa: S608
+            sa.text(f"SELECT line_id AS key, slip_id, component_id FROM {table}")  # noqa: S608
         ).mappings()
         for row in rows:
             conversion = conversions.get((slip_structure.get(_norm(row["slip_id"])), _norm(row["component_id"])))
@@ -336,7 +327,7 @@ def _payroll_calculation(source: sa.Connection, dest: sa.Connection) -> dict[Any
     employer_sums: dict[Any, Decimal] = {}
     for table in ("salary_slip_earning", "salary_slip_deduction"):
         for slip_id, component_id, amount in source.execute(
-            sa.text(f"SELECT slip_id, component_id, amount FROM public.{table}")  # noqa: S608
+            sa.text(f"SELECT slip_id, component_id, amount FROM {table}")  # noqa: S608
         ):
             if _norm(component_id) in employer_components and amount is not None:
                 key = _norm(slip_id)
@@ -344,8 +335,7 @@ def _payroll_calculation(source: sa.Connection, dest: sa.Connection) -> dict[Any
     mapping: dict[Any, dict[str, Any]] = {}
     slips = source.execute(
         sa.text(
-            "SELECT slip_id, employee_id, structure_id, start_date, payment_days, total_working_days "
-            "FROM public.salary_slip"
+            "SELECT slip_id, employee_id, structure_id, start_date, payment_days, total_working_days FROM salary_slip"
         )
     ).mappings()
     for slip in slips:
@@ -385,9 +375,7 @@ def _supplier_payment_schedule(source: sa.Connection, dest: sa.Connection) -> di
     """Single-instalment schedule JSON (module shape, sums to the total)."""
 
     mapping: dict[Any, dict[str, Any]] = {}
-    rows = source.execute(
-        sa.text("SELECT invoice_id AS key, due_date, total_amount FROM public.supplier_invoice")
-    ).mappings()
+    rows = source.execute(sa.text("SELECT invoice_id AS key, due_date, total_amount FROM supplier_invoice")).mappings()
     for row in rows:
         if row["due_date"] is None or row["total_amount"] is None:
             continue
@@ -406,7 +394,7 @@ def _supplier_line_dimensions(source: sa.Connection, dest: sa.Connection) -> dic
 
     mapping: dict[Any, dict[str, Any]] = {}
     rows = source.execute(
-        sa.text("SELECT line_id AS key, cost_center_id, project_id, segment_id FROM public.supplier_invoice_line")
+        sa.text("SELECT line_id AS key, cost_center_id, project_id, segment_id FROM supplier_invoice_line")
     ).mappings()
     for row in rows:
         refs = sorted(
@@ -425,8 +413,7 @@ def _receipt_lines(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict
     grouped: dict[Any, list[dict[str, str]]] = {}
     rows = source.execute(
         sa.text(
-            "SELECT receipt_id, po_line_id, quantity_received, line_number "
-            "FROM public.goods_receipt_line ORDER BY line_number"
+            "SELECT receipt_id, po_line_id, quantity_received, line_number FROM goods_receipt_line ORDER BY line_number"
         )
     ).mappings()
     for row in rows:
@@ -450,13 +437,10 @@ def _receipt_lines(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict
 
 def _approval_request_policy(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     workflows = {
-        _norm(r[0]): r[1]
-        for r in source.execute(sa.text("SELECT workflow_id, workflow_code FROM public.approval_workflow"))
+        _norm(r[0]): r[1] for r in source.execute(sa.text("SELECT workflow_id, workflow_code FROM approval_workflow"))
     }
     mapping: dict[Any, dict[str, Any]] = {}
-    for request_id, workflow_id in source.execute(
-        sa.text("SELECT request_id, workflow_id FROM public.approval_request")
-    ):
+    for request_id, workflow_id in source.execute(sa.text("SELECT request_id, workflow_id FROM approval_request")):
         code = workflows.get(_norm(workflow_id))
         if code is None:
             continue
@@ -467,7 +451,7 @@ def _approval_request_policy(source: sa.Connection, dest: sa.Connection) -> dict
 
 def _expense_evaluation_batch(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     mapping: dict[Any, dict[str, Any]] = {}
-    rows = source.execute(sa.text("SELECT DISTINCT claim_id FROM public.expense_limit_evaluation"))
+    rows = source.execute(sa.text("SELECT DISTINCT claim_id FROM expense_limit_evaluation"))
     for (claim_id,) in rows:
         batch = uuid.uuid5(uuid.NAMESPACE_URL, f"erp-v2-enrolment:expense_evaluation_batch:{_norm(claim_id)}").hex
         _put(mapping, "expense_evaluation_batch", claim_id, {"batch_id": batch})
@@ -491,12 +475,12 @@ def _agreement_family(source: sa.Connection, dest: sa.Connection) -> dict[Any, d
             x = parent[x]
         return x
 
-    contracts = [_norm(r[0]) for r in source.execute(sa.text("SELECT contract_id FROM public.contract"))]
+    contracts = [_norm(r[0]) for r in source.execute(sa.text("SELECT contract_id FROM contract"))]
     for contract in contracts:
         find(contract)
     for contract_id, original_id in source.execute(
         sa.text(
-            "SELECT contract_id, original_contract_id FROM public.contract_amendment_workflow "
+            "SELECT contract_id, original_contract_id FROM contract_amendment_workflow "
             "WHERE original_contract_id IS NOT NULL"
         )
     ):
@@ -512,11 +496,10 @@ def _agreement_family(source: sa.Connection, dest: sa.Connection) -> dict[Any, d
 
 def _asset_kind(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     categories = {
-        _norm(r[0]): r[1]
-        for r in source.execute(sa.text("SELECT category_id, category_code FROM public.asset_category"))
+        _norm(r[0]): r[1] for r in source.execute(sa.text("SELECT category_id, category_code FROM asset_category"))
     }
     mapping: dict[Any, dict[str, Any]] = {}
-    for asset_id, category_id in source.execute(sa.text("SELECT asset_id, category_id FROM public.asset")):
+    for asset_id, category_id in source.execute(sa.text("SELECT asset_id, category_id FROM asset")):
         kind = categories.get(_norm(category_id))
         if kind:
             _put(mapping, "asset_kind", asset_id, {"kind": kind})
@@ -529,7 +512,7 @@ def _lot_status(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[st
     totals: dict[Any, Decimal] = {}
     quarantined: set[Any] = set()
     for lot_id, quantity, is_quarantined in source.execute(
-        sa.text("SELECT lot_id, quantity_on_hand, is_quarantined FROM public.inventory_lot_balance")
+        sa.text("SELECT lot_id, quantity_on_hand, is_quarantined FROM inventory_lot_balance")
     ):
         key = _norm(lot_id)
         try:
@@ -539,7 +522,7 @@ def _lot_status(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[st
         if is_quarantined:
             quarantined.add(key)
     mapping: dict[Any, dict[str, Any]] = {}
-    for (lot_id,) in source.execute(sa.text("SELECT lot_id FROM public.inventory_lot")):
+    for (lot_id,) in source.execute(sa.text("SELECT lot_id FROM inventory_lot")):
         key = _norm(lot_id)
         if key in quarantined:
             status = "quarantined"
@@ -558,7 +541,7 @@ def _quote_lead(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[st
     }
     mapping: dict[Any, dict[str, Any]] = {}
     for quote_id, tenant, customer_id in source.execute(
-        sa.text("SELECT quote_id, organization_id, customer_id FROM public.quote")
+        sa.text("SELECT quote_id, organization_id, customer_id FROM quote")
     ):
         lead = leads.get((_norm(tenant), str(_norm(customer_id)).replace("-", "")))
         if lead is not None:
@@ -567,7 +550,7 @@ def _quote_lead(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[st
 
 
 def _user_label(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
-    rows = source.execute(sa.text("SELECT id AS key, username AS label FROM public.user_credentials")).mappings()
+    rows = source.execute(sa.text("SELECT id AS key, username AS label FROM user_credentials")).mappings()
     return _lookup(rows, "user_label", ("label",))
 
 
@@ -581,7 +564,7 @@ def _document_library(source: sa.Connection, dest: sa.Connection) -> dict[Any, d
 
 def _document_type(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     mapping: dict[Any, dict[str, Any]] = {}
-    rows = source.execute(sa.text("SELECT document_id AS key, category, file_path FROM public.hr_document")).mappings()
+    rows = source.execute(sa.text("SELECT document_id AS key, category, file_path FROM hr_document")).mappings()
     for row in rows:
         type_code = re.sub(r"[^a-z0-9]+", "-", str(row["category"] or "").lower()).strip("-")[:80].rstrip("-")
         folder = posixpath.dirname(str(row["file_path"] or ""))
@@ -591,10 +574,203 @@ def _document_type(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict
     return mapping
 
 
+def _bid_scores(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """scores_json + selected_total_score from legacy per-criterion scores.
+
+    Module canonical shape: [{bid_id, scores: {code: str},
+    weighted_total: str, comments}]. Criterion codes slugify from
+    legacy criterion_name (declared); weighted_total sums the
+    legacy weighted_score column per response.
+    """
+
+    selected = {
+        _norm(r[0]): _norm(r[1])
+        for r in source.execute(sa.text("SELECT evaluation_id, recommended_response_id FROM bid_evaluation"))
+    }
+    grouped: dict[Any, dict[Any, dict[str, Any]]] = {}
+    rows = source.execute(
+        sa.text(
+            "SELECT evaluation_id, response_id, criterion_name, score, weighted_score, comments "
+            "FROM bid_evaluation_score"
+        )
+    ).mappings()
+    for row in rows:
+        per_bid = grouped.setdefault(_norm(row["evaluation_id"]), {})
+        entry = per_bid.setdefault(_norm(row["response_id"]), {"scores": {}, "weighted": Decimal(0), "comments": []})
+        code = re.sub(r"[^a-z0-9]+", "-", str(row["criterion_name"] or "").lower()).strip("-")
+        if code:
+            entry["scores"][code] = str(row["score"])
+        try:
+            entry["weighted"] += Decimal(str(row["weighted_score"] or 0))
+        except InvalidOperation:
+            pass
+        if row["comments"]:
+            entry["comments"].append(str(row["comments"]))
+    mapping: dict[Any, dict[str, Any]] = {}
+    for evaluation_id, per_bid in grouped.items():
+        documents = []
+        selected_total: Decimal | None = None
+        for bid_id, entry in sorted(per_bid.items(), key=lambda kv: str(kv[0])):
+            total = entry["weighted"]
+            documents.append(
+                {
+                    "bid_id": bid_id,
+                    "scores": dict(sorted(entry["scores"].items())),
+                    "weighted_total": format(total.normalize(), "f"),
+                    "comments": "; ".join(entry["comments"]),
+                }
+            )
+            if selected.get(evaluation_id) == bid_id:
+                selected_total = total
+        if selected_total is None:
+            continue
+        _put(
+            mapping,
+            "bid_scores",
+            evaluation_id,
+            {
+                "scores_json": json.dumps(documents, sort_keys=True, separators=(",", ":")),
+                "selected_total_score": selected_total,
+            },
+        )
+    return mapping
+
+
+def _quote_tax_rate(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Single-rate quotes only: every line's tax code at one rate.
+
+    Module semantics: tax_total = taxable x tax_rate / 100, so the
+    rate is a percent. Legacy tax_code.tax_rate is a fraction
+    (0.075) in the census estate - converted x100. Mixed-rate or
+    unrated quotes get no entry.
+    """
+
+    rates = {_norm(r[0]): r[1] for r in source.execute(sa.text("SELECT tax_code_id, tax_rate FROM tax_code"))}
+    per_quote: dict[Any, set[Decimal]] = {}
+    for quote_id, tax_code_id in source.execute(sa.text("SELECT quote_id, tax_code_id FROM quote_line")):
+        rate = rates.get(_norm(tax_code_id))
+        if rate is None:
+            continue
+        per_quote.setdefault(_norm(quote_id), set()).add(Decimal(str(rate)))
+    mapping: dict[Any, dict[str, Any]] = {}
+    for quote_id, found in per_quote.items():
+        if len(found) == 1:
+            _put(mapping, "quote_tax_rate", quote_id, {"tax_rate": next(iter(found)) * 100})
+    return mapping
+
+
+def _tenant_currency(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    rows = source.execute(
+        sa.text("SELECT organization_id AS key, functional_currency_code AS currency_code FROM organization")
+    ).mappings()
+    return _lookup(rows, "tenant_currency", ("currency_code",))
+
+
+def _asset_condition(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Latest assignment condition evidence (enum-exact values only)."""
+
+    valid = {"new", "good", "fair", "poor", "damaged"}
+    latest: dict[Any, tuple[str, str]] = {}
+    rows = source.execute(
+        sa.text(
+            "SELECT asset_id, issued_on, returned_on, condition_on_issue, condition_on_return FROM asset_assignment"
+        )
+    ).mappings()
+    for row in rows:
+        for when, value in (
+            (row["issued_on"], row["condition_on_issue"]),
+            (row["returned_on"], row["condition_on_return"]),
+        ):
+            if when is None or value is None:
+                continue
+            normalized = str(value).strip().lower()
+            if normalized not in valid:
+                continue
+            key = _norm(row["asset_id"])
+            stamp = str(when)[:10]
+            if key not in latest or stamp >= latest[key][0]:
+                latest[key] = (stamp, normalized)
+    return {key: {"condition": value} for key, (_stamp, value) in latest.items()}
+
+
+def _settlement_obligation(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Single-allocation supplier payments -> the invoice's obligation.
+
+    Exact only: the payment allocates to exactly one invoice (AP
+    payment_allocation), allocations sum to the payment amount, and
+    the destination holds exactly one obligation for that invoice
+    (service-derived post-import). Anything else exceptions.
+    """
+
+    obligations: dict[Any, list[Any]] = {}
+    for invoice_id, obligation_id in dest.execute(
+        sa.text("SELECT invoice_id, id FROM mod_payables.payment_obligations")
+    ):
+        obligations.setdefault(_norm(invoice_id), []).append(_norm(obligation_id))
+    allocations: dict[Any, list[tuple[Any, Decimal]]] = {}
+    for payment_id, invoice_id, amount in source.execute(
+        sa.text("SELECT payment_id, invoice_id, allocated_amount FROM payment_allocation")
+    ):
+        try:
+            allocations.setdefault(_norm(payment_id), []).append((_norm(invoice_id), Decimal(str(amount))))
+        except InvalidOperation:
+            continue
+    mapping: dict[Any, dict[str, Any]] = {}
+    for payment_id, amount in source.execute(sa.text("SELECT payment_id, amount FROM supplier_payment")):
+        entries = allocations.get(_norm(payment_id), [])
+        if len(entries) != 1:
+            continue
+        invoice_id, allocated = entries[0]
+        try:
+            if allocated != Decimal(str(amount)):
+                continue
+        except InvalidOperation:
+            continue
+        candidates = obligations.get(invoice_id, [])
+        if len(candidates) == 1:
+            _put(mapping, "settlement_obligation", payment_id, {"obligation_id": candidates[0]})
+    return mapping
+
+
+def _payment_intent_terms(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """payer/purpose/channel for legacy Paystack intents, derivable only.
+
+    Evidence (legacy model): source_type in {INVOICE, EXPENSE_CLAIM,
+    GENERAL}; only INVOICE maps exactly to a module PaymentPurpose.
+    Payer derives for INBOUND intents (the paying customer's email);
+    outbound payer is the organisation itself, which no legacy
+    column names. Channel parses from the gateway response JSON.
+    """
+
+    mapping: dict[Any, dict[str, Any]] = {}
+    rows = source.execute(
+        sa.text("SELECT intent_id AS key, direction, email, source_type, gateway_response FROM payment_intent")
+    ).mappings()
+    for row in rows:
+        entry: dict[str, Any] = {}
+        if str(row["direction"] or "").upper().startswith("IN") and row["email"]:
+            entry["payer_reference"] = str(row["email"])
+        if str(row["source_type"] or "").upper() == "INVOICE":
+            entry["purpose"] = "INVOICE_SETTLEMENT"
+        gateway = row["gateway_response"]
+        if isinstance(gateway, str):
+            try:
+                gateway = json.loads(gateway)
+            except ValueError:
+                gateway = None
+        if isinstance(gateway, Mapping) and gateway.get("channel"):
+            entry["channel"] = str(gateway["channel"])
+        if entry:
+            _put(mapping, "payment_intent_terms", row["key"], entry)
+    return mapping
+
+
 MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "agreement_family": _agreement_family,
     "approval_request_policy": _approval_request_policy,
+    "asset_condition": _asset_condition,
     "asset_kind": _asset_kind,
+    "bid_scores": _bid_scores,
     "bank_direction_by_type": _bank_direction_by_type,
     "bank_institution_by_code": _bank_institution_by_code,
     "bid_submission": _bid_submission,
@@ -609,16 +785,20 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "payment_intent_by_payment": _payment_intent_by_payment,
     "payroll_calculation": _payroll_calculation,
     "payroll_line_method": _payroll_line_method,
+    "payment_intent_terms": _payment_intent_terms,
     "payroll_rule_conversion": _payroll_rule_conversion,
     "project_template_task": _project_template_task,
     "quote_lead": _quote_lead,
+    "quote_tax_rate": _quote_tax_rate,
     "receipt_lines": _receipt_lines,
+    "settlement_obligation": _settlement_obligation,
     "sourcing_line_by_requisition_line": _sourcing_line_by_requisition_line,
     "structure_revision": _structure_revision,
     "supplier": _supplier,
     "supplier_line_dimensions": _supplier_line_dimensions,
     "supplier_payment_schedule": _supplier_payment_schedule,
     "tax_authority_by_level": _tax_authority_by_level,
+    "tenant_currency": _tenant_currency,
     "user_label": _user_label,
     "user_party": _user_party,
 }

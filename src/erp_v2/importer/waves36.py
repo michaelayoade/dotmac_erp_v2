@@ -217,9 +217,11 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_payables.settlement_observations",
         "public.supplier_payment",
         renames={"occurred_at": "payment_date", "recorded_at": "created_at"},
-        note="obligation_id stays MISSING: obligations are service-derived "
-        "rows; enrolment allocates each legacy payment to derived "
-        "obligations (unallocated remainder = exception, never dropped)",
+        lookups={"obligation_id": ("settlement_obligation", "id", "obligation_id")},
+        note="obligation_id resolves only for exact single-allocation "
+        "payments (AP payment_allocation sums to the payment amount and "
+        "the invoice carries exactly one derived obligation); everything "
+        "else exceptions - run after payables obligations derive",
     ),
     *_generated(
         "mod_payables",
@@ -245,10 +247,15 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "settled_at": "paid_at",
         },
         constants={"provider_type": "paystack"},
-        note="payer_reference/purpose/channel stay MISSING: derived per row "
-        "at enrolment from direction (inbound: email + source_type/source_id; "
-        "outbound: recipient_*) and gateway_response channel - no single "
-        "legacy column is an honest source for any of the three",
+        lookups={
+            "payer_reference": ("payment_intent_terms", "id", "payer_reference"),
+            "purpose": ("payment_intent_terms", "id", "purpose"),
+            "channel": ("payment_intent_terms", "id", "channel"),
+        },
+        note="terms derive at enrolment where evidence is exact: INBOUND "
+        "payer = customer email, INVOICE source = INVOICE_SETTLEMENT "
+        "purpose, channel from the gateway response; EXPENSE_CLAIM/"
+        "GENERAL intents have no exact module purpose and exception",
     ),
     Pairing(
         "mod_payments.payment_confirmations",
@@ -395,9 +402,13 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "evaluated_at": "evaluation_date",
             "evaluated_by_ref": "evaluated_by_user_id",
         },
-        note="scores_json/selected_total_score stay MISSING: legacy keeps a "
-        "narrative evaluation_report, no structured scores - enrolment "
-        "re-scores from criteria or exceptions the evaluation",
+        lookups={
+            "scores_json": ("bid_scores", "id", "scores_json"),
+            "selected_total_score": ("bid_scores", "id", "selected_total_score"),
+        },
+        note="scores assemble at enrolment from legacy bid_evaluation_score "
+        "rows (criterion codes slugified from criterion_name; weighted "
+        "totals sum the legacy weighted_score column)",
     ),
     Pairing(
         "mod_procurement.purchase_orders",
@@ -485,10 +496,13 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "acquired_on": "acquisition_date",
             "tag": "barcode",
         },
-        lookups={"kind": ("asset_kind", "id", "kind")},
-        note="kind from the legacy category_code via the asset_kind "
-        "enrolment map. condition stays MISSING: no legacy source - "
-        "assessed at enrolment, never defaulted. Valuation columns are "
+        lookups={
+            "kind": ("asset_kind", "id", "kind"),
+            "condition": ("asset_condition", "id", "condition"),
+        },
+        note="kind from the legacy category_code; condition from the "
+        "latest assignment condition evidence (enum-exact values only, "
+        "assets without evidence exception). Valuation columns are "
         "finance-owned (asset books), not asset-registry data",
     ),
     Pairing(
@@ -538,9 +552,11 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "period_ref": "fiscal_period_id",
             "calculated_at": "calculation_completed_at",
         },
-        lookups={"through_date": ("fiscal_period", "period_ref", "end_date")},
-        note="currency_code stays MISSING: supplied per tenant from the "
-        "functional-currency config at enrolment (not a legacy column)",
+        lookups={
+            "through_date": ("fiscal_period", "period_ref", "end_date"),
+            "currency_code": ("tenant_currency", "tenant_id", "currency_code"),
+        },
+        note="currency from the legacy organisation functional currency via the tenant_currency enrolment map",
     ),
     Pairing(
         "mod_finance.depreciation_lines",
@@ -628,11 +644,13 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
         lookups={
             "lead_id": ("quote_lead", "id", "lead_id"),
             "authored_by_label": ("user_label", "authored_by_opaque_id", "label"),
+            "tax_rate": ("quote_tax_rate", "id", "tax_rate"),
         },
         note="lead_id resolves to the enrolment-minted per-customer lead; "
         "authored_by_kind is the declared enrolment value for legacy user "
         "authors, label from the legacy credential username. tax_rate "
-        "stays MISSING: not derivable per quote (mixed line rates)",
+        "resolves only for single-rate quotes (legacy fraction x100 to "
+        "the module percent semantics)",
     ),
     Pairing(
         "mod_sales.quote_lines",

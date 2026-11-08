@@ -116,7 +116,7 @@ def mint_pay_structure_revisions(source: sa.Connection, dest: sa.Connection, ctx
     rows: list[dict[str, Any]] = []
     not_imported = 0
     legacy = source.execute(
-        sa.text("SELECT structure_id, organization_id, created_at FROM public.salary_structure")
+        sa.text("SELECT structure_id, organization_id, created_at FROM salary_structure")
     ).mappings()
     for row in legacy:
         structure_id = _norm(row["structure_id"])
@@ -163,7 +163,7 @@ def mint_tax_authorities(source: sa.Connection, dest: sa.Connection, ctx: MintCo
     for tenant, level, name in source.execute(
         sa.text(
             "SELECT DISTINCT organization_id, jurisdiction_level, tax_authority_name "
-            "FROM public.tax_jurisdiction WHERE jurisdiction_level IS NOT NULL"
+            "FROM tax_jurisdiction WHERE jurisdiction_level IS NOT NULL"
         )
     ):
         names.setdefault((_norm(tenant), str(level)), set()).add(str(name or ""))
@@ -214,7 +214,7 @@ def mint_tax_rules(source: sa.Connection, dest: sa.Connection, ctx: MintContext)
             sa.text(
                 "SELECT tax_code_id, organization_id, tax_code, tax_type, tax_rate, "
                 "effective_from, effective_to, is_inclusive, recovery_rate, is_recoverable "
-                "FROM public.tax_code WHERE is_active"
+                "FROM tax_code WHERE is_active"
             )
         ).mappings()
     )
@@ -275,7 +275,7 @@ def mint_tax_rules(source: sa.Connection, dest: sa.Connection, ctx: MintContext)
         source.execute(
             sa.text(
                 "SELECT tax_band_id, organization_id, name, min_amount, max_amount, rate, sequence "
-                "FROM public.tax_band WHERE is_active"
+                "FROM tax_band WHERE is_active"
             )
         ).mappings()
     )
@@ -325,13 +325,13 @@ def mint_sourcing_event_lines(source: sa.Connection, dest: sa.Connection, ctx: M
     for line in source.execute(
         sa.text(
             "SELECT line_id, requisition_id, line_number, item_id, description, quantity, "
-            "uom, estimated_unit_price, delivery_date FROM public.purchase_requisition_line"
+            "uom, estimated_unit_price, delivery_date FROM purchase_requisition_line"
         )
     ).mappings():
         lines_by_requisition.setdefault(_norm(line["requisition_id"]), []).append(line)
     rfqs = list(
         source.execute(
-            sa.text("SELECT rfq_id, requisition_id FROM public.request_for_quotation WHERE requisition_id IS NOT NULL")
+            sa.text("SELECT rfq_id, requisition_id FROM request_for_quotation WHERE requisition_id IS NOT NULL")
         ).mappings()
     )
     shared = [req for req, n in _counts(rfq["requisition_id"] for rfq in rfqs).items() if n > 1]
@@ -394,7 +394,7 @@ def mint_sales_leads(source: sa.Connection, dest: sa.Connection, ctx: MintContex
     result = MintResult("sales_leads")
     customers = list(
         source.execute(
-            sa.text("SELECT customer_id, organization_id, legal_name, trading_name, currency_code FROM public.customer")
+            sa.text("SELECT customer_id, organization_id, legal_name, trading_name, currency_code FROM customer")
         ).mappings()
     )
     tenants = sorted({_norm(c["organization_id"]) for c in customers}, key=str)
@@ -505,9 +505,7 @@ def mint_document_libraries_types(source: sa.Connection, dest: sa.Connection, ct
     result = MintResult("document_libraries_types")
     tenants_categories: dict[Any, set[str]] = {}
     uncategorised = 0
-    for tenant, category in source.execute(
-        sa.text("SELECT DISTINCT organization_id, category FROM public.hr_document")
-    ):
+    for tenant, category in source.execute(sa.text("SELECT DISTINCT organization_id, category FROM hr_document")):
         slug = _slug(category)
         if not slug:
             uncategorised += 1
@@ -580,7 +578,7 @@ def mint_pay_rule_bases(source: sa.Connection, dest: sa.Connection, ctx: MintCon
     result = MintResult("pay_rule_bases")
     components = list(
         source.execute(
-            sa.text("SELECT component_id, organization_id, abbr FROM public.salary_component WHERE abbr IS NOT NULL")
+            sa.text("SELECT component_id, organization_id, abbr FROM salary_component WHERE abbr IS NOT NULL")
         ).mappings()
     )
     abbr_component = {(_norm(c["organization_id"]), str(c["abbr"])): _norm(c["component_id"]) for c in components}
@@ -591,14 +589,14 @@ def mint_pay_rule_bases(source: sa.Connection, dest: sa.Connection, ctx: MintCon
     }
     tenant_by_structure = {
         _norm(r[0]): _norm(r[1])
-        for r in source.execute(sa.text("SELECT structure_id, organization_id FROM public.salary_structure"))
+        for r in source.execute(sa.text("SELECT structure_id, organization_id FROM salary_structure"))
     }
     rows: list[dict[str, Any]] = []
     for table, pk in (("salary_structure_earning", "earning_id"), ("salary_structure_deduction", "deduction_id")):
         legacy = source.execute(
             sa.text(
                 f"SELECT {pk} AS rule_id, structure_id, amount, amount_based_on_formula, formula, condition "  # noqa: S608
-                f"FROM public.{table}"
+                f"FROM {table}"
             )
         ).mappings()
         for row in legacy:

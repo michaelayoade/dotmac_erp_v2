@@ -16,7 +16,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (15): approval_status, collectability_assessment, consideration_payable, contract_name, currency_code, financing_rate, has_commercial_substance, is_enforceable, modification_history, noncash_consideration, organization_id, significant_financing, terms_and_conditions, total_contract_value, variable_consideration
 
 ## public.quote -> mod_sales.quotes
-- executable: False; mapped: 16; missing: ['tax_rate']
+- executable: True; mapped: 16; missing: none
 - residue (17): contact_email, contact_name, converted_at, converted_to_invoice_id, converted_to_so_id, customer_id, exchange_rate, internal_notes, payment_terms_id, quote_date, quote_number, reference, rejection_reason, sent_by, terms_and_conditions, updated_by, viewed_at
 
 ## public.quote_line -> mod_sales.quote_lines

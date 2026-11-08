@@ -903,13 +903,8 @@ def test_wave36_rulings_narrow_missing_to_named_decisions() -> None:
     assert set(by_dest) == _RULED_DESTS
 
     expected_missing = {
-        "mod_payables.settlement_observations": ("obligation_id",),
         "mod_expenses.expense_lifecycle_events": ("actor_reference",),
         "mod_expenses.expense_requests": ("needed_by",),
-        "mod_procurement.bid_evaluations": ("scores_json", "selected_total_score"),
-        "mod_assets.assets": ("condition",),
-        "mod_finance.depreciation_runs": ("currency_code",),
-        "mod_sales.quotes": ("tax_rate",),
         "mod_inventory.stock_movements": ("value_after",),
         "mod_documents.documents": ("sensitivity", "handling_instructions"),
     }

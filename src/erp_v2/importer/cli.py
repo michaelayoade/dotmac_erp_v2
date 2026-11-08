@@ -36,7 +36,7 @@ from erp_v2.importer.pipeline import run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
-from erp_v2.importer.wave2 import WAVE2_PAIRINGS
+from erp_v2.importer.wave2 import WAVE2_PAIRINGS, Pairing
 from erp_v2.importer.waves import SOURCE_TABLES
 from erp_v2.importer.waves36 import ALL_WAVE_PAIRINGS, build_specs
 from erp_v2.migrate import EXPECTED_HEADS
@@ -72,18 +72,61 @@ def _destination_tables() -> dict[str, object]:
     return dict(Base.metadata.tables)
 
 
-def _reflect_source_columns(engine: sa.Engine) -> dict[str, tuple[str, ...]]:
+def _resolve_sources(engine: sa.Engine, pairings: Sequence[Pairing]):
+    """Resolve declared pairing sources against the real snapshot schemas.
+
+    Pairings declare legacy tables as `public.<name>` (the census
+    convention), but the legacy database is multi-schema
+    (hr/ar/ap/inv/...). Resolution is by bare table name across
+    every snapshot schema: exactly one holder rewrites the pairing
+    source to the actual qualified name; zero holders is a named
+    missing source; more than one is a named ambiguity and the
+    pairing is excluded - never a guessed schema.
+
+    Returns (resolved_pairings, columns_by_resolved_source, report,
+    source_schemas) where source_schemas feeds the connection
+    search_path enrolment SQL relies on.
+    """
+
+    from dataclasses import replace as _dc_replace
+
     inspector = sa.inspect(engine)
+    schemas = [s for s in inspector.get_schema_names() if s not in ("pg_catalog", "information_schema")]
+    tables_by_schema = {s: set(inspector.get_table_names(schema=s)) for s in schemas}
+    resolution: dict[str, str | None] = {}
+    ambiguous: set[str] = set()
     columns: dict[str, tuple[str, ...]] = {}
-    wanted = {p.source for p in _ALL_PAIRINGS if p.source}
-    for qualified in sorted(wanted):
-        schema, _, table = qualified.partition(".")
-        try:
-            found = inspector.get_columns(table, schema=schema)
-        except sa.exc.NoSuchTableError:
-            continue
-        columns[qualified] = tuple(c["name"] for c in found)
-    return columns
+    for declared in sorted({p.source for p in pairings if p.source}):
+        bare = declared.rpartition(".")[2]
+        holders = [s for s in schemas if bare in tables_by_schema[s]]
+        if len(holders) == 1:
+            actual = f"{holders[0]}.{bare}"
+            resolution[declared] = actual
+            columns[actual] = tuple(c["name"] for c in inspector.get_columns(bare, schema=holders[0]))
+        elif len(holders) > 1:
+            resolution[declared] = None
+            ambiguous.add(declared)
+        else:
+            resolution[declared] = None
+    resolved_pairings = tuple(
+        _dc_replace(p, source=resolution[p.source]) if p.source and resolution.get(p.source) else p
+        for p in pairings
+        if not p.source or resolution.get(p.source)
+    )
+    report = {
+        "resolved": {d: a for d, a in sorted(resolution.items()) if a and a != d},
+        "ambiguous": sorted(ambiguous),
+        "missing": sorted(d for d, a in resolution.items() if a is None and d not in ambiguous),
+    }
+    used_schemas = sorted({a.partition(".")[0] for a in resolution.values() if a})
+    return resolved_pairings, columns, report, used_schemas
+
+
+def _set_search_path(connection: sa.Connection, schemas: Sequence[str]) -> None:
+    """Point unqualified enrolment SQL at the legacy schemas (Postgres)."""
+
+    if connection.dialect.name == "postgresql" and schemas:
+        connection.execute(sa.text(f"SET search_path = {', '.join(schemas)}, public"))
 
 
 def _spec_report(specs: Sequence[TransformSpec]) -> dict[str, object]:
@@ -336,13 +379,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
     engine = sa.create_engine(dsn)
     with engine.connect() as connection:
         connection.execute(sa.text("SELECT 1"))
-    source_columns = _reflect_source_columns(engine)
-    missing_sources = sorted({p.source for p in _ALL_PAIRINGS if p.source} - set(source_columns))
-    present = tuple(p for p in _ALL_PAIRINGS if p.source in source_columns)
+    present, source_columns, resolution, _schemas = _resolve_sources(engine, _ALL_PAIRINGS)
     specs, generated = build_specs(present, source_columns, _destination_tables())
     receipt["mode"] = "reflected"
     receipt["sources_reflected"] = len(source_columns)
-    receipt["sources_missing_on_snapshot"] = missing_sources
+    receipt["source_resolution"] = resolution
+    receipt["sources_missing_on_snapshot"] = resolution["missing"] + resolution["ambiguous"]
     receipt["generated_destinations"] = len(generated)
     receipt["specs"] = _spec_report(specs)
     _write_receipt(Path(args.receipt), receipt)
@@ -394,8 +436,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         raise CliRefusal("--apply additionally requires ERP_IMPORT_APPLY_OK=1")
     source_engine = sa.create_engine(source_dsn)
     dest_engine = sa.create_engine(dest_dsn)
-    source_columns = _reflect_source_columns(source_engine)
-    present = tuple(p for p in _ALL_PAIRINGS if p.source in source_columns)
+    present, source_columns, resolution, source_schemas = _resolve_sources(source_engine, _ALL_PAIRINGS)
     specs, _generated = build_specs(present, source_columns, _destination_tables())
     run_constants: dict[str, object] = {}
     if len(manifest.tenant_extent) == 1:
@@ -405,6 +446,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
     mint_context = _mint_context(args, run_constants) if args.mint else None
     post_mints: tuple[MintResult, ...] = ()
     with source_engine.connect() as source_conn, dest_engine.begin() as dest_conn:
+        _set_search_path(source_conn, source_schemas)
         enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context)
         result = run_import(
             source_conn,
@@ -443,6 +485,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         ],
         "specs": _spec_report(specs),
         "specs_skipped_unsupplied_run_constants": unsupplied,
+        "source_resolution": resolution,
         "enrolment_maps_built": dict(result.enrolment_maps),
         "mints": [_mint_dict(m) for m in (*result.mints, *post_mints)],
     }

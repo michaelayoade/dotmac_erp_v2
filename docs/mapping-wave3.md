@@ -64,11 +64,11 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (16): asset_account_id, asset_category_id, auto_receipt_transaction_id, capitalize_flag, cost_center_id, created_asset_id, goods_receipt_line_id, item_id, po_line_id, project_id, receipt_auto_generate_serials, receipt_reference, receipt_serial_numbers, receipt_warehouse_id, segment_id, tax_code_id
 
 ## public.supplier_payment -> mod_payables.settlement_observations
-- executable: False; mapped: 6; missing: ['obligation_id']
+- executable: True; mapped: 6; missing: none
 - residue (25): approval_request_id, approved_at, approved_by_user_id, bank_account_id, bank_reconciliation_id, correlation_id, created_by_user_id, exchange_rate, functional_currency_amount, gross_amount, journal_entry_id, payment_batch_id, payment_method, payment_number, posted_at, posted_by_user_id, posting_batch_id, reference, remittance_advice_sent, remittance_sent_at, status, supplier_id, updated_at, withholding_tax_amount ...
 
 ## public.payment_intent -> mod_payments.payment_intents
-- executable: False; mapped: 11; missing: ['payer_reference', 'purpose', 'channel']
+- executable: True; mapped: 11; missing: none
 - residue (21): authorization_url, bank_account_id, customer_payment_id, direction, email, fee_amount, fee_journal_id, gateway_response, intent_metadata, last_poll_error, paystack_access_code, paystack_transaction_id, poll_count, recipient_account_name, recipient_account_number, recipient_bank_code, source_id, source_type, transfer_code, transfer_recipient_code, unresolved_since
 
 ## public.customer_payment -> mod_payments.payment_confirmations
@@ -128,7 +128,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (1): delivery_date
 
 ## public.bid_evaluation -> mod_procurement.bid_evaluations
-- executable: False; mapped: 7; missing: ['scores_json', 'selected_total_score']
+- executable: True; mapped: 7; missing: none
 - residue (4): approval_request_id, approved_by_user_id, evaluation_report, recommended_supplier_id
 
 ## public.purchase_order -> mod_procurement.purchase_orders
@@ -156,7 +156,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (6): description, document_type, is_active, threshold_amount, threshold_currency_code, workflow_name
 
 ## public.asset -> mod_assets.assets
-- executable: False; mapped: 14; missing: ['condition']
+- executable: True; mapped: 14; missing: none
 - residue (32): accumulated_depreciation, acquisition_cost, cash_generating_unit_id, category_id, cost_center_id, created_by_user_id, currency_code, current_depreciation_schedule_id, custodian_employee_id, depreciation_method, depreciation_start_date, disposal_date, disposal_gain_loss, disposal_proceeds, functional_currency_cost, impairment_loss, in_service_date, insurance_policy_number, insured_value, invoice_reference, is_component_parent, net_book_value, parent_asset_id, project_id ...
 
 ## public.asset_assignment -> mod_assets.asset_assignments
@@ -172,7 +172,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (10): actor_user_id, event_category, event_payload, new_owner_employee_id, new_status, previous_owner_employee_id, previous_status, source_record_id, source_type, updated_at
 
 ## public.depreciation_run -> mod_finance.depreciation_runs
-- executable: False; mapped: 9; missing: ['currency_code']
+- executable: True; mapped: 9; missing: none
 - residue (7): calculation_started_at, created_at, created_by_user_id, journal_entry_id, posted_by_user_id, posting_batch_id, run_description
 
 ## GENERATED / command-import destinations
