@@ -702,7 +702,11 @@ def run_mint_step(name: str, source: sa.Connection, dest: sa.Connection, ctx: Mi
     if step is None:
         raise KeyError(f"no mint step {name!r}")
     try:
-        return step(source, dest, ctx)
+        # Savepoint-isolated: a DB error must not leave the caller's
+        # transaction aborted for every later spec (found live at
+        # Gate 4 - a caught mint error poisoned the whole apply run).
+        with dest.begin_nested():
+            return step(source, dest, ctx)
     except MintRefusal as exc:
         return MintResult(name, refused=str(exc))
     except sa.exc.SQLAlchemyError as exc:
