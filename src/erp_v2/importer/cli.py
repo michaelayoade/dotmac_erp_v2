@@ -31,6 +31,7 @@ import sqlalchemy as sa
 
 from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBLIC_SECTOR_PAIRINGS
 from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
+from erp_v2.importer.minting import MintContext, MintResult
 from erp_v2.importer.pipeline import run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
@@ -348,6 +349,39 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _mint_dict(result: MintResult) -> dict[str, object]:
+    return {
+        "step": result.step,
+        "created": result.created,
+        "existing": result.existing,
+        "blockers": list(result.blockers),
+        "refused": result.refused,
+    }
+
+
+def _json_arg(path: str | None, label: str) -> dict | None:
+    if not path:
+        return None
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise CliRefusal(f"{label} must be a JSON object")
+    return data
+
+
+def _mint_context(args: argparse.Namespace, run_constants: dict[str, object]) -> MintContext:
+    tenant = run_constants.get("tenant_id")
+    if tenant is None:
+        raise CliRefusal("--mint requires a single-tenant snapshot extent (minting is tenant-scoped)")
+    return MintContext(
+        tenant_id=tenant,
+        actor_id=os.environ.get("ERP_ENROLMENT_ACTOR_ID") or None,
+        occurred_at=_datetime.now(_timezone.utc),
+        payroll_net_payable_account_ref=os.environ.get("ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF") or None,
+        tax_rule_policy=_json_arg(args.tax_rule_policy_json, "--tax-rule-policy-json"),
+        tax_band_rule_binding=_json_arg(args.tax_band_binding_json, "--tax-band-binding-json"),
+    )
+
+
 def cmd_execute(args: argparse.Namespace) -> int:
     manifest = _load_manifest(args)
     if os.environ.get("ERP_IMPORT_APPROVED") != "1":
@@ -368,15 +402,25 @@ def cmd_execute(args: argparse.Namespace) -> int:
         run_constants["tenant_id"] = manifest.tenant_extent[0]
     executable = tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants))
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
+    mint_context = _mint_context(args, run_constants) if args.mint else None
+    post_mints: tuple[MintResult, ...] = ()
     with source_engine.connect() as source_conn, dest_engine.begin() as dest_conn:
+        enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context)
         result = run_import(
             source_conn,
             dest_conn,
             executable,
-            enrolment=EnrolmentMaps(source_conn, dest_conn),
+            enrolment=enrolment,
             run_constants=run_constants,
             dry_run=not args.apply,
         )
+        if mint_context is not None:
+            # Non-map-feeding mints run after the specs so every parent
+            # row they reference is imported (same caller transaction;
+            # dry-run rollback below covers them).
+            post_mints = tuple(
+                enrolment.mint(step) for step in ("tax_rules", "sales_leads", "document_libraries_types")
+            )
         if not args.apply:
             dest_conn.rollback()
     payload: dict[str, object] = {
@@ -399,6 +443,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         "specs": _spec_report(specs),
         "specs_skipped_unsupplied_run_constants": unsupplied,
         "enrolment_maps_built": dict(result.enrolment_maps),
+        "mints": [_mint_dict(m) for m in (*result.mints, *post_mints)],
     }
     _write_receipt(Path(args.receipt), payload)
     return 0 if result.complete else 3
@@ -441,6 +486,14 @@ def build_parser() -> argparse.ArgumentParser:
                 "--dest-url-env", default="MIGRATION_DATABASE_URL", help="env var holding the destination DSN"
             )
             cmd.add_argument("--apply", action="store_true", help="write (default dry-run)")
+            cmd.add_argument(
+                "--mint",
+                action="store_true",
+                help="mint GENERATED enrolment rows (revisions, authorities, sourcing lines, "
+                "leads, document types) in the same transaction",
+            )
+            cmd.add_argument("--tax-rule-policy-json", help="legacy tax_type -> ruled module codes")
+            cmd.add_argument("--tax-band-binding-json", help="legacy tax band name -> legacy tax_code")
     return parser
 
 

@@ -35,6 +35,7 @@ from typing import Any, Final
 
 import sqlalchemy as sa
 
+from erp_v2.importer.minting import MAP_MINTS, MintContext, MintResult, run_mint_step
 from erp_v2.importer.spec import TransformSpec
 
 
@@ -241,18 +242,42 @@ class EnrolmentMaps:
     A destination-built map is read at first need, so spec order in
     the run (parents before consumers) is what makes it complete.
     The cache is per-instance: one instance per import run.
+
+    With a `mint_context`, the GENERATED rows a map reads are
+    minted (once, in the caller's destination transaction) just
+    before that map first builds - see minting.py. Without one,
+    maps read whatever enrolment already placed in the destination.
     """
 
-    def __init__(self, source_connection: sa.Connection, destination_connection: sa.Connection) -> None:
+    def __init__(
+        self,
+        source_connection: sa.Connection,
+        destination_connection: sa.Connection,
+        *,
+        mint_context: MintContext | None = None,
+    ) -> None:
         self._source = source_connection
         self._dest = destination_connection
+        self._mint_context = mint_context
         self._cache: dict[str, dict[Any, Any]] = {}
+        self._mints: dict[str, MintResult] = {}
+
+    def mint(self, step: str) -> MintResult:
+        """Run a mint step once (recorded even when refused)."""
+
+        if step not in self._mints:
+            if self._mint_context is None:
+                raise KeyError(f"mint step {step!r} requires a MintContext")
+            self._mints[step] = run_mint_step(step, self._source, self._dest, self._mint_context)
+        return self._mints[step]
 
     def get(self, name: str) -> dict[Any, Any]:
         if name not in self._cache:
             builder = MAP_BUILDERS.get(name)
             if builder is None:
                 raise KeyError(f"no enrolment builder for map {name!r}")
+            if self._mint_context is not None and name in MAP_MINTS:
+                self.mint(MAP_MINTS[name])
             self._cache[name] = builder(self._source, self._dest)
         return self._cache[name]
 
@@ -263,6 +288,9 @@ class EnrolmentMaps:
         """Built map sizes, for the import receipt."""
 
         return {name: len(mapping) for name, mapping in sorted(self._cache.items())}
+
+    def mint_results(self) -> tuple[MintResult, ...]:
+        return tuple(self._mints[name] for name in sorted(self._mints))
 
 
 __all__ = [

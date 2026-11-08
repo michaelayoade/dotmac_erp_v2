@@ -23,6 +23,7 @@ import sqlalchemy as sa
 
 from erp_v2.importer.enrolment import EnrolmentMaps
 from erp_v2.importer.executor import RowException, TransformReport, execute_transform
+from erp_v2.importer.minting import MintResult
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.migrate import EXPECTED_HEADS
 
@@ -35,6 +36,8 @@ class ImportReceipt:
     enrolment_maps: Mapping[str, int] = field(default_factory=dict)
     # map name -> entry count actually built during the run (evidence
     # that rewrites/lookups ran against real enrolment data)
+    mints: tuple[MintResult, ...] = field(default_factory=tuple)
+    # GENERATED-row minting outcomes (created/existing/blockers/refused)
 
     @property
     def read(self) -> int:
@@ -94,6 +97,7 @@ def run_import(
         dry_run=dry_run,
         reports=tuple(reports),
         enrolment_maps=enrolment.summary() if enrolment is not None else {},
+        mints=enrolment.mint_results() if enrolment is not None else (),
     )
 
 
