@@ -73,7 +73,19 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing("mod_accounting.fiscal_periods", "public.fiscal_period"),
     Pairing("mod_accounting.accounting_dimensions", "public.coa_segment_definition"),
     Pairing("mod_accounting.accounting_dimension_values", "public.coa_segment_value"),
-    Pairing("mod_accounting.journal_entries", "public.journal_entry"),
+    Pairing(
+        "mod_accounting.journal_entries",
+        "public.journal_entry",
+        renames={
+            "number": "journal_number",
+            "kind": "journal_type",
+            "source_document_kind": "source_document_type",
+            "posted_by": "posted_by_user_id",
+            "reverses_journal_id": "reversed_journal_id",
+        },
+        note="source_owner/source_version run-supplied; approval_reference "
+        "from legacy approval_request_id at rehearsal",
+    ),
     Pairing("mod_accounting.journal_lines", "public.journal_entry_line"),
     Pairing("mod_accounting.posted_ledger_lines", "public.posted_ledger_line"),
     *_generated(
@@ -83,7 +95,19 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     ),
     # banking (mod_banking)
     Pairing("mod_banking.bank_institutions", "public.bank_directory"),
-    Pairing("mod_banking.bank_accounts", "public.bank_accounts"),
+    Pairing(
+        "mod_banking.bank_accounts",
+        "public.bank_accounts",
+        renames={
+            "institution_id": "bank_code",
+            "account_code": "account_number",
+            "account_identifier": "account_number",
+            "account_type_code": "account_type",
+            "cash_account_ref": "gl_account_id",
+        },
+        fk_rewrites={"institution_id": "bank_institution_by_code"},
+        note="institutions enrol from bank_directory/bank codes first; mono_* sync state is adapter residue",
+    ),
     Pairing("mod_banking.bank_statements", "public.bank_statements"),
     Pairing("mod_banking.bank_statement_lines", "public.bank_statement_lines"),
     Pairing("mod_banking.match_allocations", "public.bank_statement_line_matches"),
@@ -94,7 +118,16 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "GENERATED: observations arrive via Integrator/adapters; policies are tenant config at enrolment",
     ),
     # payables (mod_payables)
-    Pairing("mod_payables.supplier_invoices", "public.supplier_invoice"),
+    Pairing(
+        "mod_payables.supplier_invoices",
+        "public.supplier_invoice",
+        renames={
+            "number": "invoice_number",
+            "supplier_document_number": "supplier_invoice_number",
+            "liability_account_ref": "ap_control_account_id",
+        },
+        note="supplier_name_snapshot joins supplier master at rehearsal; payment_schedule derives from due_date/terms",
+    ),
     Pairing("mod_payables.supplier_invoice_lines", "public.supplier_invoice_line"),
     Pairing("mod_payables.settlement_observations", "public.supplier_payment"),
     *_generated(
@@ -111,7 +144,19 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "legacy credit notes (invoice type) split at rehearsal",
     ),
     # payments (mod_payments)
-    Pairing("mod_payments.payment_intents", "public.payment_intent"),
+    Pairing(
+        "mod_payments.payment_intents",
+        "public.payment_intent",
+        renames={
+            "reference": "paystack_reference",
+            "requested_amount": "amount",
+            "opened_at": "created_at",
+            "settled_at": "paid_at",
+        },
+        constants={"provider_type": "paystack"},
+        note="legacy intent table is Paystack-specific; payer/purpose/channel "
+        "derive from source_type/source_id at rehearsal",
+    ),
     Pairing(
         "mod_payments.payment_confirmations",
         "public.customer_payment",
@@ -129,7 +174,13 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     ),
     # expenses (mod_expenses)
     Pairing("mod_expenses.expense_categories", "public.expense_category"),
-    Pairing("mod_expenses.expense_claims", "public.expense_claim"),
+    Pairing(
+        "mod_expenses.expense_claims",
+        "public.expense_claim",
+        renames={"reference": "claim_number", "claimant_party_id": "employee_id"},
+        fk_rewrites={"claimant_party_id": "employee_party"},
+        note="claimant is a Party id: rewritten through the employee->party map from the people import",
+    ),
     Pairing("mod_expenses.expense_claim_lines", "public.expense_claim_item"),
     Pairing("mod_expenses.expense_policies", "public.expense_limit_rule"),
     Pairing("mod_expenses.expense_policy_evaluations", "public.expense_limit_evaluation"),
@@ -148,7 +199,16 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing("mod_procurement.bid_submissions", "public.quotation_response"),
     Pairing("mod_procurement.bid_lines", "public.quotation_response_line"),
     Pairing("mod_procurement.bid_evaluations", "public.bid_evaluation"),
-    Pairing("mod_procurement.purchase_orders", "public.purchase_order"),
+    Pairing(
+        "mod_procurement.purchase_orders",
+        "public.purchase_order",
+        renames={
+            "order_number": "po_number",
+            "ordered_on": "po_date",
+            "terms": "terms_and_conditions",
+        },
+        note="source requisition/evaluation links resolve via procurement evidence at rehearsal",
+    ),
     Pairing("mod_procurement.purchase_order_lines", "public.purchase_order_line"),
     Pairing("mod_procurement.receipt_observations", "public.goods_receipt"),
     *_generated(

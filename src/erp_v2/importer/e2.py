@@ -38,6 +38,51 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         note="allocation_id resolved by employee+type+period match; status values "
         "lowercase-map at rehearsal; payroll posting flags are payroll-wave facts",
     ),
+    # attendance slice
+    Pairing(
+        "hr_shift_types",
+        "public.shift_type",
+        renames={
+            "code": "shift_code",
+            "name": "shift_name",
+            "late_entry_grace_minutes": "late_entry_grace_period",
+            "early_exit_grace_minutes": "early_exit_grace_period",
+        },
+    ),
+    Pairing("hr_shift_assignments", "public.shift_assignment"),
+    Pairing(
+        "hr_attendance",
+        "public.attendance",
+        renames={"marked_by_id": "marked_by"},
+        note="late/early booleans derive from minutes at rehearsal; schedule refs are workforce residue",
+    ),
+    Pairing("hr_attendance_requests", "public.attendance_request"),
+    # appraisals slice
+    Pairing(
+        "hr_appraisal_cycles",
+        "public.appraisal_cycle",
+        renames={"code": "cycle_code", "name": "cycle_name"},
+    ),
+    Pairing(
+        "hr_kras",
+        "public.kra",
+        renames={"code": "kra_code", "name": "kra_name"},
+        note="department/designation scoping is template residue",
+    ),
+    Pairing(
+        "hr_appraisal_templates",
+        "public.appraisal_template",
+        renames={"code": "template_code", "name": "template_name"},
+        note="pms_config/template_profile JSON is policy residue for the web slice",
+    ),
+    Pairing("hr_appraisal_template_kras", "public.appraisal_template_kra"),
+    Pairing(
+        "hr_appraisals",
+        "public.appraisal",
+        note="wide legacy row: core flow columns map; calibration/committee/quarterly/"
+        "secondment detail is residue for the feedback/appeals slice",
+    ),
+    Pairing("hr_appraisal_kra_scores", "public.appraisal_kra_score"),
 )
 
 __all__ = ["E2_PAIRINGS"]

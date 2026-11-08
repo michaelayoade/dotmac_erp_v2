@@ -161,7 +161,7 @@ def build_spec(
             if found is None:
                 # No source at all: computed and run-supplied conventions
                 # apply before declaring the column missing.
-                if "fingerprint" in dest.name:
+                if "fingerprint" in dest.name or dest.name.endswith("_sha256"):
                     computed[dest.name] = "sha256_row"
                 elif dest.name in ("evidence_ref", "source_ref", "source_reference"):
                     computed[dest.name] = "source_key"
