@@ -83,6 +83,33 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "secondment detail is residue for the feedback/appeals slice",
     ),
     Pairing("hr_appraisal_kra_scores", "public.appraisal_kra_score"),
+    # feedback + appeals slice
+    Pairing("hr_appraisal_feedback", "public.appraisal_feedback"),
+    Pairing(
+        "hr_appraisal_appeals",
+        "public.appraisal_appeal",
+        note="mediation/committee detail collapses into status+notes at rehearsal",
+    ),
+    Pairing("hr_appraisal_outcome_actions", "public.appraisal_outcome_action"),
+    # discipline slice
+    Pairing(
+        "hr_disciplinary_cases",
+        "public.disciplinary_case",
+        renames={"number": "case_number"},
+    ),
+    Pairing("hr_case_responses", "public.case_response"),
+    Pairing("hr_case_witnesses", "public.case_witness"),
+    Pairing("hr_case_actions", "public.case_action"),
+    Pairing(
+        "hr_case_documents",
+        "public.case_document",
+        note="file_id resolves through the files import (legacy file_path -> stored file)",
+    ),
+    Pairing(
+        "hr_grievances",
+        "public.grievance",
+        renames={"number": "grievance_number"},
+    ),
 )
 
 __all__ = ["E2_PAIRINGS"]

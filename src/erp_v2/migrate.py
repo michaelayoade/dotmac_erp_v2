@@ -57,7 +57,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "cl_0001_collections",  # collections 0.1.0a1
     "cu_0001_customer_accounts",  # customers 0.1.0a1
     "do_0001_documents",  # documents 0.1.0a1
-    "e2_0003_hr_appraisals",  # assembly e2 lineage head (HR leave->attendance->appraisals)
+    "e2_0005_hr_discipline",  # assembly e2 head (leave->attendance->appraisals->feedback->discipline)
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1
     "ex_0001_expenses",  # expenses 0.1.0a1
     "fi_0002_selectable_planes",  # files 0.1.0a7

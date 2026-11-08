@@ -68,11 +68,23 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     # accounting (mod_accounting) - history enters as typed facts;
     # posted lines are immutable ledger evidence.
     Pairing("mod_accounting.accounts", "public.account"),
-    Pairing("mod_accounting.account_categories", "public.account_category"),
+    Pairing(
+        "mod_accounting.account_categories",
+        "public.account_category",
+        renames={"account_class": "ifrs_category"},
+    ),
     Pairing("mod_accounting.fiscal_years", "public.fiscal_year"),
     Pairing("mod_accounting.fiscal_periods", "public.fiscal_period"),
-    Pairing("mod_accounting.accounting_dimensions", "public.coa_segment_definition"),
-    Pairing("mod_accounting.accounting_dimension_values", "public.coa_segment_value"),
+    Pairing(
+        "mod_accounting.accounting_dimensions",
+        "public.coa_segment_definition",
+        renames={"code": "segment_type", "name": "segment_name"},
+    ),
+    Pairing(
+        "mod_accounting.accounting_dimension_values",
+        "public.coa_segment_value",
+        renames={"dimension_id": "segment_def_id", "code": "segment_code", "name": "segment_name"},
+    ),
     Pairing(
         "mod_accounting.journal_entries",
         "public.journal_entry",
@@ -86,15 +98,46 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         note="source_owner/source_version run-supplied; approval_reference "
         "from legacy approval_request_id at rehearsal",
     ),
-    Pairing("mod_accounting.journal_lines", "public.journal_entry_line"),
-    Pairing("mod_accounting.posted_ledger_lines", "public.posted_ledger_line"),
+    Pairing(
+        "mod_accounting.journal_lines",
+        "public.journal_entry_line",
+        renames={
+            "journal_id": "journal_entry_id",
+            "debit": "debit_amount",
+            "credit": "credit_amount",
+            "debit_functional": "debit_amount_functional",
+            "credit_functional": "credit_amount_functional",
+        },
+        note="dimension columns (business_unit/cost_center/project/segment) split into journal_line_dimensions",
+    ),
+    Pairing(
+        "mod_accounting.posted_ledger_lines",
+        "public.posted_ledger_line",
+        renames={
+            "journal_id": "journal_entry_id",
+            "journal_number": "journal_reference",
+            "currency_code": "original_currency_code",
+            "debit": "debit_amount",
+            "credit": "credit_amount",
+            "original_debit": "original_debit_amount",
+            "original_credit": "original_credit_amount",
+            "source_document_kind": "source_document_type",
+            "posted_by": "posted_by_user_id",
+        },
+    ),
     *_generated(
         "mod_accounting",
         ("journal_line_dimensions", "posted_ledger_dimensions", "period_events"),
         "GENERATED: dimension rows split from legacy line columns; period events from fiscal period state",
     ),
     # banking (mod_banking)
-    Pairing("mod_banking.bank_institutions", "public.bank_directory"),
+    Pairing(
+        "mod_banking.bank_institutions",
+        "public.bank_directory",
+        renames={"code": "bank_code", "name": "bank_name"},
+        constants={"status": "active", "country_code": "NG"},
+        note="legacy directory is the Nigerian NIBSS bank list (nibss_code); country fixed NG",
+    ),
     Pairing(
         "mod_banking.bank_accounts",
         "public.bank_accounts",
@@ -108,7 +151,11 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         fk_rewrites={"institution_id": "bank_institution_by_code"},
         note="institutions enrol from bank_directory/bank codes first; mono_* sync state is adapter residue",
     ),
-    Pairing("mod_banking.bank_statements", "public.bank_statements"),
+    Pairing(
+        "mod_banking.bank_statements",
+        "public.bank_statements",
+        renames={"account_id": "bank_account_id"},
+    ),
     Pairing("mod_banking.bank_statement_lines", "public.bank_statement_lines"),
     Pairing("mod_banking.match_allocations", "public.bank_statement_line_matches"),
     Pairing("mod_banking.reconciliations", "public.bank_reconciliations"),
@@ -128,7 +175,12 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         },
         note="supplier_name_snapshot joins supplier master at rehearsal; payment_schedule derives from due_date/terms",
     ),
-    Pairing("mod_payables.supplier_invoice_lines", "public.supplier_invoice_line"),
+    Pairing(
+        "mod_payables.supplier_invoice_lines",
+        "public.supplier_invoice_line",
+        renames={"posting_account_ref": "expense_account_id"},
+        note="dimension_refs assembled from cost_center/project/segment at rehearsal",
+    ),
     Pairing("mod_payables.settlement_observations", "public.supplier_payment"),
     *_generated(
         "mod_payables",
@@ -160,7 +212,14 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_payments.payment_confirmations",
         "public.customer_payment",
-        note="webhook evidence (payment_webhook/remita_rrr) attaches as confirmation provenance at rehearsal",
+        renames={
+            "confirmed_amount": "amount",
+            "observed_at": "payment_date",
+            "external_reference": "reference",
+            "provider_type": "payment_method",
+        },
+        note="intent linkage via payment_intent.customer_payment_id at rehearsal; "
+        "webhook evidence attaches as provenance",
     ),
     *_generated(
         "mod_payments",
@@ -182,8 +241,18 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         note="claimant is a Party id: rewritten through the employee->party map from the people import",
     ),
     Pairing("mod_expenses.expense_claim_lines", "public.expense_claim_item"),
-    Pairing("mod_expenses.expense_policies", "public.expense_limit_rule"),
-    Pairing("mod_expenses.expense_policy_evaluations", "public.expense_limit_evaluation"),
+    Pairing(
+        "mod_expenses.expense_policies",
+        "public.expense_limit_rule",
+        constants={"version": 1},
+        note="legacy rules enrol as policy v1",
+    ),
+    Pairing(
+        "mod_expenses.expense_policy_evaluations",
+        "public.expense_limit_evaluation",
+        renames={"actual_amount": "claim_amount", "reason_code": "result"},
+        note="batch_id groups evaluations per import run at rehearsal",
+    ),
     Pairing("mod_expenses.expense_lifecycle_events", "public.expense_claim_action"),
     Pairing("mod_expenses.expense_requests", "public.expense_entry"),
     *_generated(
@@ -192,8 +261,21 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "GENERATED/split at rehearsal: lines and rules derive from legacy rows; receipts reference files-module ids",
     ),
     # procurement (mod_procurement)
-    Pairing("mod_procurement.purchase_requisitions", "public.purchase_requisition"),
-    Pairing("mod_procurement.purchase_requisition_lines", "public.purchase_requisition_line"),
+    Pairing(
+        "mod_procurement.purchase_requisitions",
+        "public.purchase_requisition",
+        renames={"requested_on": "requisition_date"},
+        note="legacy requisition has no organization column: tenant comes from the run extent",
+    ),
+    Pairing(
+        "mod_procurement.purchase_requisition_lines",
+        "public.purchase_requisition_line",
+        renames={
+            "unit": "uom",
+            "estimated_unit_cost": "estimated_unit_price",
+            "estimated_total": "estimated_amount",
+        },
+    ),
     Pairing("mod_procurement.sourcing_events", "public.request_for_quotation"),
     Pairing("mod_procurement.sourcing_invitations", "public.rfq_invitation"),
     Pairing("mod_procurement.bid_submissions", "public.quotation_response"),

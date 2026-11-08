@@ -59,6 +59,8 @@ from sqlalchemy import engine_from_config, pool
 
 from erp_v2.hr import appraisals as hr_appraisal_models  # noqa: F401
 from erp_v2.hr import attendance as hr_attendance_models  # noqa: F401
+from erp_v2.hr import discipline as hr_discipline_models  # noqa: F401
+from erp_v2.hr import feedback as hr_feedback_models  # noqa: F401
 from erp_v2.hr import models as hr_models  # noqa: F401
 from erp_v2.migration_bindings import (
     ASSEMBLY_MODULE_PLANES,

@@ -8,8 +8,8 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (13): created_by_user_id, default_currency_code, deferral_pair_account_id, is_budgetable, is_cash_equivalent, is_deferral, is_financial_instrument, is_multi_currency, is_posting_allowed, is_reconciliation_required, search_terms, subledger_type, updated_by_user_id
 
 ## public.account_category -> mod_accounting.account_categories
-- executable: False; mapped: 6; missing: ['account_class']
-- residue (6): category_id, display_order, financial_statement_line_id, hierarchy_level, ifrs_category, parent_category_id
+- executable: True; mapped: 7; missing: none
+- residue (5): category_id, display_order, financial_statement_line_id, hierarchy_level, parent_category_id
 
 ## public.fiscal_year -> mod_accounting.fiscal_years
 - executable: True; mapped: 7; missing: none
@@ -20,36 +20,36 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (8): hard_closed_at, hard_closed_by_user_id, is_adjustment_period, is_closing_period, last_reopen_session_id, reopen_count, soft_closed_at, soft_closed_by_user_id
 
 ## public.coa_segment_definition -> mod_accounting.accounting_dimensions
-- executable: False; mapped: 3; missing: ['code']
-- residue (7): code_length, code_position_start, display_order, is_required, segment_def_id, segment_type, separator
+- executable: True; mapped: 4; missing: none
+- residue (6): code_length, code_position_start, display_order, is_required, segment_def_id, separator
 
 ## public.coa_segment_value -> mod_accounting.accounting_dimension_values
-- executable: False; mapped: 5; missing: ['dimension_id']
-- residue (3): parent_segment_value_id, segment_def_id, segment_value_id
+- executable: True; mapped: 6; missing: none
+- residue (2): parent_segment_value_id, segment_value_id
 
 ## public.journal_entry -> mod_accounting.journal_entries
 - executable: True; mapped: 23; missing: none
 - residue (15): approval_request_id, approved_at, approved_by_user_id, auto_reverse_date, correlation_id, created_by_user_id, exchange_rate_type_id, intercompany_org_id, is_intercompany, is_reversal, matching_journal_id, posting_batch_id, source_module, submitted_at, submitted_by_user_id
 
 ## public.journal_entry_line -> mod_accounting.journal_lines
-- executable: False; mapped: 4; missing: ['journal_id']
-- residue (13): business_unit_id, cost_center_id, credit_amount, credit_amount_functional, currency_code, debit_amount, debit_amount_functional, exchange_rate, journal_entry_id, line_id, project_id, reconciliation_id, segment_id
+- executable: True; mapped: 9; missing: none
+- residue (8): business_unit_id, cost_center_id, currency_code, exchange_rate, line_id, project_id, reconciliation_id, segment_id
 
 ## public.posted_ledger_line -> mod_accounting.posted_ledger_lines
-- executable: False; mapped: 11; missing: ['journal_id', 'journal_number', 'currency_code', 'debit', 'credit', 'original_debit', 'original_credit', 'source_document_kind']
-- residue (18): business_unit_id, correlation_id, cost_center_id, credit_amount, debit_amount, journal_entry_id, journal_reference, ledger_line_id, original_credit_amount, original_currency_code, original_debit_amount, posted_by_user_id, posting_batch_id, posting_year, project_id, segment_id, source_document_type, source_module
+- executable: True; mapped: 20; missing: none
+- residue (9): business_unit_id, correlation_id, cost_center_id, ledger_line_id, posting_batch_id, posting_year, project_id, segment_id, source_module
 
 ## public.bank_directory -> mod_banking.bank_institutions
-- executable: False; mapped: 1; missing: ['code', 'name', 'country_code', 'status']
-- residue (6): aliases, bank_code, bank_name, is_active, nibss_code, sort_code_prefix
+- executable: True; mapped: 3; missing: none
+- residue (4): aliases, is_active, nibss_code, sort_code_prefix
 
 ## public.bank_accounts -> mod_banking.bank_accounts
 - executable: True; mapped: 12; missing: none
 - residue (27): allow_overdraft, bank_name, branch_code, branch_name, contact_email, contact_name, contact_phone, created_by, iban, is_primary, last_reconciled_balance, last_reconciled_date, last_statement_balance, last_statement_date, mono_account_id, mono_last_ingest_at, mono_last_sync_error, mono_last_synced_at, mono_last_transaction_date, mono_last_transaction_sync_at, mono_link_failed, mono_sync_buffer_days, mono_sync_from_date, mono_transaction_sync_status ...
 
 ## public.bank_statements -> mod_banking.bank_statements
-- executable: False; mapped: 14; missing: ['account_id']
-- residue (9): bank_account_id, import_filename, import_source, imported_by, notes, statement_date, statement_number, unmatched_lines, updated_at
+- executable: True; mapped: 15; missing: none
+- residue (8): import_filename, import_source, imported_by, notes, statement_date, statement_number, unmatched_lines, updated_at
 
 ## public.bank_statement_lines -> mod_banking.bank_statement_lines
 - executable: False; mapped: 10; missing: ['direction', 'external_ref']
@@ -68,8 +68,8 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (31): amount_paid, approval_request_id, approved_by_user_id, auto_create_inventory_receipt, balance_due, comments, correlation_id, created_by_user_id, due_date, exchange_rate_type_id, functional_currency_amount, intercompany_org_id, inventory_receipt_mode, invoice_id, invoice_type, is_intercompany, is_prepayment, journal_entry_id, posted_at, posted_by_user_id, posting_batch_id, posting_status, prepayment_applied, purpose ...
 
 ## public.supplier_invoice_line -> mod_payables.supplier_invoice_lines
-- executable: False; mapped: 8; missing: ['posting_account_ref', 'dimension_refs']
-- residue (18): asset_account_id, asset_category_id, auto_receipt_transaction_id, capitalize_flag, cost_center_id, created_asset_id, expense_account_id, goods_receipt_line_id, item_id, line_id, po_line_id, project_id, receipt_auto_generate_serials, receipt_reference, receipt_serial_numbers, receipt_warehouse_id, segment_id, tax_code_id
+- executable: False; mapped: 9; missing: ['dimension_refs']
+- residue (17): asset_account_id, asset_category_id, auto_receipt_transaction_id, capitalize_flag, cost_center_id, created_asset_id, goods_receipt_line_id, item_id, line_id, po_line_id, project_id, receipt_auto_generate_serials, receipt_reference, receipt_serial_numbers, receipt_warehouse_id, segment_id, tax_code_id
 
 ## public.supplier_payment -> mod_payables.settlement_observations
 - executable: False; mapped: 3; missing: ['obligation_id', 'occurred_at', 'recorded_at']
@@ -80,8 +80,8 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (22): authorization_url, bank_account_id, customer_payment_id, direction, email, fee_amount, fee_journal_id, gateway_response, intent_id, intent_metadata, last_poll_error, paystack_access_code, paystack_transaction_id, poll_count, recipient_account_name, recipient_account_number, recipient_bank_code, source_id, source_type, transfer_code, transfer_recipient_code, unresolved_since
 
 ## public.customer_payment -> mod_payments.payment_confirmations
-- executable: False; mapped: 4; missing: ['intent_id', 'source', 'provider_type', 'external_reference', 'confirmed_amount', 'observed_at']
-- residue (29): amount, bank_account_id, bank_reconciliation_id, correlation_id, created_by_user_id, customer_id, description, dotmac_sub_id, dotmac_sub_receipt_number, erpnext_id, exchange_rate, functional_currency_amount, gross_amount, journal_entry_id, last_synced_at, payment_date, payment_id, payment_method, payment_number, posted_at, posted_by_user_id, posting_batch_id, reference, splynx_id ...
+- executable: False; mapped: 8; missing: ['intent_id', 'source']
+- residue (25): bank_account_id, bank_reconciliation_id, correlation_id, created_by_user_id, customer_id, description, dotmac_sub_id, dotmac_sub_receipt_number, erpnext_id, exchange_rate, functional_currency_amount, gross_amount, journal_entry_id, last_synced_at, payment_id, payment_number, posted_at, posted_by_user_id, posting_batch_id, splynx_id, splynx_receipt_number, status, wht_amount, wht_certificate_number ...
 
 ## public.expense_category -> mod_expenses.expense_categories
 - executable: True; mapped: 9; missing: none
@@ -96,12 +96,12 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (9): cost_center_id, distance_km, expense_account_id, is_travel_expense, item_id, receipt_number, receipt_url, travel_from, travel_to
 
 ## public.expense_limit_rule -> mod_expenses.expense_policies
-- executable: False; mapped: 9; missing: ['version']
+- executable: True; mapped: 9; missing: none
 - residue (14): action_config, action_type, block_count, custom_period_days, dimension_filters, evaluation_count, is_active, limit_amount, period_type, priority, rule_id, scope_id, scope_type, trigger_count
 
 ## public.expense_limit_evaluation -> mod_expenses.expense_policy_evaluations
-- executable: False; mapped: 7; missing: ['batch_id', 'reason_code', 'actual_amount']
-- residue (7): claim_amount, context_data, evaluated_by_id, evaluation_id, period_spent_amount, result_message, rule_code
+- executable: False; mapped: 9; missing: ['batch_id']
+- residue (6): context_data, evaluated_by_id, evaluation_id, period_spent_amount, result_message, rule_code
 
 ## public.expense_claim_action -> mod_expenses.expense_lifecycle_events
 - executable: False; mapped: 3; missing: ['to_status', 'actor_reference', 'occurred_at']
@@ -112,12 +112,12 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (25): amount, approved_at, approved_by, business_unit_id, cost_center_id, created_by, description, expense_account_id, expense_date, expense_id, expense_number, journal_entry_id, payee, payment_account_id, payment_method, posted_at, posted_by, project_id, receipt_reference, submitted_by, task_id, tax_amount, tax_code_id, ticket_id ...
 
 ## public.purchase_requisition -> mod_procurement.purchase_requisitions
-- executable: False; mapped: 8; missing: ['requested_on']
-- residue (11): approval_request_id, approved_by_user_id, budget_verified, budget_verified_at, budget_verified_by_id, created_by_user_id, department_id, material_request_id, plan_item_id, requisition_date, requisition_id
+- executable: True; mapped: 9; missing: none
+- residue (10): approval_request_id, approved_by_user_id, budget_verified, budget_verified_at, budget_verified_by_id, created_by_user_id, department_id, material_request_id, plan_item_id, requisition_id
 
 ## public.purchase_requisition_line -> mod_procurement.purchase_requisition_lines
-- executable: False; mapped: 6; missing: ['unit', 'estimated_unit_cost', 'estimated_total']
-- residue (7): delivery_date, estimated_amount, estimated_unit_price, expense_account_id, line_id, project_id, uom
+- executable: True; mapped: 9; missing: none
+- residue (4): delivery_date, expense_account_id, line_id, project_id
 
 ## public.request_for_quotation -> mod_procurement.sourcing_events
 - executable: False; mapped: 3; missing: ['event_number', 'method', 'opens_at', 'closes_at', 'criteria_json', 'estimated_amount']
