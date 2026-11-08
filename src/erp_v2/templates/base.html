@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en" {{ dotmac_ui_theme_attribute }}="{{ dotmac_ui_theme }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Dotmac ERP{% endblock %}</title>
+  {% include "_dotmac_ui_head.html" %}
+</head>
+<body>
+  <header>
+    <strong>Dotmac ERP</strong>
+    {% if current_email %}
+    <span>{{ current_email }}</span>
+    <form method="post" action="/logout"><button type="submit">Sign out</button></form>
+    {% endif %}
+  </header>
+  <main id="main-content">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

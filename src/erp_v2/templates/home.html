@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Home — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Dotmac ERP</h1>
+<p>Signed in{% if current_email %} as {{ current_email }}{% endif %}.</p>
+<p>This portal is the first web surface of the composed ERP. Module
+workspaces (finance, people, payroll, inventory, projects) land here
+slice by slice as their data waves rehearse.</p>
+{% endblock %}

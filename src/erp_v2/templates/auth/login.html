@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en" {{ dotmac_ui_theme_attribute }}="{{ dotmac_ui_theme }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — Dotmac ERP</title>
+  {% include "_dotmac_ui_head.html" %}
+</head>
+<body>
+  <main>
+    <h1>Sign in to Dotmac ERP</h1>
+    {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+    <form method="post" action="/login">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label>Email <input type="email" name="email" required autocomplete="username"></label>
+      <label>Password <input type="password" name="password" required autocomplete="current-password"></label>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>

@@ -19,8 +19,12 @@ Composition posture:
 - `tenancy="multi"`: ERP is a multi-tenant product (legacy
   `product_assembly.py` declares the same), declared explicitly rather
   than inherited from the kernel default.
-- `web_enabled=False`: API/health surface only until the first wave
-  mounts a browser surface deliberately (dotmac-ui is pinned ready).
+- Web surface mounts when a database is bound (tenant resolution and
+  identity require one) unless `ERP_WEB_ENABLED=false` forces
+  API-only: one tenant facet at `/` with kernel-cookie login
+  (`erp_v2.web`), admission `erp.web.access`. Identity, sessions and
+  credentials are consumed from the kernel; ERP stores none. The
+  no-DSN shell therefore stays API/health-only by construction.
 - Explicit database binding (`erp_v2.database`): if `DATABASE_URL` is
   declared, the assembly binds its own `DatabaseRuntime` and a startup
   check proves the DSN role is non-superuser + NOBYPASSRLS. Absent DSN
@@ -32,6 +36,8 @@ Composition posture:
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Final
 
 from dotmac_accounting.manifest import module as accounting_module
@@ -55,6 +61,17 @@ from dotmac_inbox.manifest import module as inbox_module
 from dotmac_inventory.manifest import module as inventory_module
 from dotmac_kernel.api_documentation import environment_api_documentation_policy
 from dotmac_kernel.assembly import ProductAssemblySpec, ProductSecurityPolicy
+from dotmac_kernel.permission_provisioning import RoleDefinition, RoleGrant, RoleGrantProfile
+from dotmac_kernel.web_deps import TENANT_COOKIE_AUTHENTICATION
+from dotmac_kernel.web_surfaces import (
+    AuthenticationProfileBinding,
+    BrowserSecurityPlane,
+    BrowserSessionPolicy,
+    NavigationRegion,
+    TemplateRef,
+    WebFacetMount,
+    WebRouteRef,
+)
 from dotmac_numbering.manifest import module as numbering_module
 from dotmac_party.manifest import module as party_module
 from dotmac_payables.manifest import module as payables_module
@@ -66,13 +83,23 @@ from dotmac_projects.manifest import module as projects_module
 from dotmac_sales.manifest import module as sales_module
 from dotmac_tax.manifest import module as tax_module
 from dotmac_ticketing.manifest import module as ticketing_module
+from dotmac_ui import UI_CONTRACT_VERSION, static_dir
 from dotmac_workflow_runtime.manifest import module as workflow_runtime_module
 
+from erp_v2 import ui
 from erp_v2.database import build_database_runtime, database_startup_checks
 from erp_v2.migration_bindings import ASSEMBLY_MODULE_PLANES
 from erp_v2.readiness import readiness_feature
+from erp_v2.web.routes import ACCESS_PERMISSION, erp_web_feature
 
 PRODUCT_NAME: Final = "dotmac-erp"
+
+_ROOT: Final = Path(__file__).resolve().parent
+_WEB_ENABLED: Final = os.environ.get("ERP_WEB_ENABLED", "true").lower() not in (
+    "false",
+    "0",
+    "no",
+)
 
 # Built at import like the reference assembly's settings reads. Engine
 # construction opens no connection; posture is proven by the startup check.
@@ -84,6 +111,7 @@ assembly: Final = ProductAssemblySpec(
     # alphabetically by module code (legacy product_assembly convention).
     modules=(
         readiness_feature,
+        erp_web_feature,
         accounting_module,
         commercial_agreements_module,
         ai_operations_module,
@@ -119,7 +147,50 @@ assembly: Final = ProductAssemblySpec(
     module_planes=ASSEMBLY_MODULE_PLANES,
     tenancy="multi",
     platform_surface_enabled=False,
-    web_enabled=False,
+    web_enabled=_WEB_ENABLED and _database_runtime is not None,
+    ui_contract_version=UI_CONTRACT_VERSION,
+    web_facets=(
+        WebFacetMount(
+            code="staff_admin",
+            url_prefix="/",
+            shell=TemplateRef("base.html"),
+            authentication_profile="erp_tenant_session",
+            admission_permission=ACCESS_PERMISSION,
+            navigation_regions=(NavigationRegion("primary"),),
+            entry_routes=(
+                WebRouteRef("erp_web", "legacy", "login_page"),
+                WebRouteRef("erp_web", "legacy", "login_submit"),
+                WebRouteRef("erp_web", "legacy", "logout"),
+                WebRouteRef("erp_web", "legacy", "home"),
+            ),
+            login_route=WebRouteRef("erp_web", "legacy", "login_page"),
+            landing_route=WebRouteRef("erp_web", "legacy", "home"),
+            logout_route=WebRouteRef("erp_web", "legacy", "logout"),
+        ),
+    ),
+    authentication_profiles=(
+        AuthenticationProfileBinding(
+            code="erp_tenant_session",
+            provider=TENANT_COOKIE_AUTHENTICATION,
+            session=BrowserSessionPolicy(cookie_name="access_token", cookie_path="/"),
+            security_plane=BrowserSecurityPlane.TENANT,
+        ),
+    ),
+    role_definitions=(RoleDefinition("admin"), RoleDefinition("staff")),
+    role_grant_profiles=(
+        RoleGrantProfile(
+            code="erp.web",
+            version=1,
+            grants=(
+                RoleGrant("admin", ACCESS_PERMISSION),
+                RoleGrant("staff", ACCESS_PERMISSION),
+            ),
+        ),
+    ),
+    assembly_template_dir=_ROOT / "templates",
+    assembly_static_dir=_ROOT / "static",
+    packaged_static_dirs=(static_dir(),),
+    stylesheets=(ui.UI_STYLESHEET_URL,),
     database_runtime=_database_runtime,
     require_database_runtime=_database_runtime is not None,
     startup_checks=database_startup_checks(_database_runtime),

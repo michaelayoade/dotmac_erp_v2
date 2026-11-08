@@ -114,5 +114,8 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "S", "RUF"]
 
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "dotmac_kernel.web_deps.require_web_permission"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]

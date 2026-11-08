@@ -13,6 +13,7 @@ from erp_v2.assembly import assembly
 # accounting a2, billing a11, payments a4, ...).
 EXPECTED_MODULE_VERSIONS = {
     "erp_shell.readiness": None,
+    "erp_web": None,
     "accounting": "0.1.0a1",
     "ai_operations": "0.1.0a1",
     "analytics": "0.1.0a1",
