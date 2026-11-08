@@ -79,6 +79,7 @@ def execute_transform(
         + [c for c in spec.constants if c not in spec.column_map]
         + [c for c in spec.run_supplied if c not in spec.column_map]
         + [c for c in spec.computed if c not in spec.column_map]
+        + [c for c in spec.lookups if c not in spec.column_map]
     )
     insert_sql = sa.text(
         # identifiers regex-validated in spec.py; row values are bound params
@@ -113,6 +114,24 @@ def execute_transform(
                     continue
                 value = mapping[value]
             values[dest_col] = value
+        # Lookup columns read from caller-supplied maps keyed by a
+        # mapped destination value (post-rewrite). No entry, or an
+        # entry without the ruled field, is an exception.
+        for dest_col, (map_name, key_col, lookup_field) in spec.lookups.items():
+            if dest_col in values:
+                continue
+            entry = id_maps.get(map_name, {}).get(values.get(key_col))
+            if entry is None or lookup_field not in entry:
+                row_exceptions.append(
+                    RowException(
+                        source_table=spec.source_table,
+                        source_key=str(row[key_source]),
+                        column=dest_col,
+                        reason=f"no {map_name} lookup entry field {lookup_field!r} for {key_col} value",
+                    )
+                )
+                continue
+            values[dest_col] = entry[lookup_field]
         if row_exceptions:
             report.exceptions.extend(row_exceptions)
             continue

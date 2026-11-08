@@ -31,8 +31,19 @@ class Pairing:
     renames: Mapping[str, str] = field(default_factory=dict)
     constants: Mapping[str, object] = field(default_factory=dict)
     fk_rewrites: Mapping[str, str] = field(default_factory=dict)
+    lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
     note: str = ""
 
+
+# Module rules/lines denormalize component identity; the enrolment
+# step builds this map from imported mod_payroll.pay_components rows
+# (fields: code, name, kind) plus legacy depends_on_payment_days for
+# `prorates`. Keyed by the preserved component UUID.
+_COMPONENT_LOOKUP: Final[Mapping[str, tuple[str, str, str]]] = {
+    "component_code": ("pay_component", "component_id", "code"),
+    "component_name": ("pay_component", "component_id", "name"),
+    "component_kind": ("pay_component", "component_id", "kind"),
+}
 
 WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
     # --- people (mod_people) ---
@@ -106,17 +117,36 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_payroll.pay_structure_rules",
         "public.salary_structure_earning",
-        renames={"revision_id": "structure_id", "sequence": "display_order"},
+        renames={
+            "revision_id": "structure_id",
+            "sequence": "display_order",
+            "fixed_amount": "amount",
+        },
         fk_rewrites={"revision_id": "structure_revision"},
+        lookups={
+            **_COMPONENT_LOOKUP,
+            "prorates": ("pay_component", "component_id", "prorates"),
+        },
         note="also fed by salary_structure_deduction (second spec, same destination); "
-        "formula/amount_based_on_formula map to typed calculation rules - "
-        "expression formulas cannot copy; unconvertible formulas are exceptions",
+        "calculation_method stays MISSING until the enrolment formula "
+        "conversion rules it per row (module methods: input/fixed/percentage; "
+        "legacy amount_based_on_formula+formula/condition have no typed "
+        "equivalent for arbitrary expressions) - unconvertible formulas are "
+        "exceptions, so this spec is deliberately not executable yet",
     ),
     Pairing(
         "mod_payroll.pay_structure_rules",
         "public.salary_structure_deduction",
-        renames={"revision_id": "structure_id", "sequence": "display_order"},
+        renames={
+            "revision_id": "structure_id",
+            "sequence": "display_order",
+            "fixed_amount": "amount",
+        },
         fk_rewrites={"revision_id": "structure_revision"},
+        lookups={
+            **_COMPONENT_LOOKUP,
+            "prorates": ("pay_component", "component_id", "prorates"),
+        },
         note="see earning pairing",
     ),
     Pairing(
@@ -149,20 +179,47 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_payroll.payroll_calculations",
         "public.salary_slip",
-        renames={"employee_ref": "employee_id"},
-        note="historical slips import as calculation evidence; run/assignment/"
-        "revision links resolved at rehearsal - parity gate is run-total equality",
+        renames={
+            "employee_ref": "employee_id",
+            "run_id": "payroll_entry_id",
+            "revision_id": "structure_id",
+            "gross_amount": "gross_pay",
+            "deduction_amount": "total_deduction",
+            "net_amount": "net_pay",
+            "calculated_at": "created_at",
+        },
+        constants={"revision_version": 1},
+        fk_rewrites={"revision_id": "structure_revision"},
+        note="historical slips import as calculation evidence; parity gate is "
+        "run-total equality. Still MISSING by design: assignment_id (legacy "
+        "slips link employee+structure, not the generated assignment row - "
+        "resolved per row at enrolment, unmatched = exception), "
+        "proration_factor (legacy payment_days/total_working_days ratio - "
+        "enrolment computation, zero-working-days = exception), "
+        "employer_liability_amount (sum of employer-kind lines - enrolment "
+        "aggregation; never defaulted to zero silently)",
     ),
     Pairing(
         "mod_payroll.payroll_calculation_lines",
         "public.salary_slip_earning",
         renames={"calculation_id": "slip_id", "sequence": "display_order"},
-        note="also fed by salary_slip_deduction (second spec, same destination)",
+        lookups={
+            "component_code": _COMPONENT_LOOKUP["component_code"],
+            "component_kind": _COMPONENT_LOOKUP["component_kind"],
+        },
+        note="also fed by salary_slip_deduction (second spec, same destination); "
+        "component_name copies from the legacy line snapshot; calculation_method "
+        "stays MISSING (method lives on the structure rule that produced the "
+        "line - enrolment resolves it from the converted rule set)",
     ),
     Pairing(
         "mod_payroll.payroll_calculation_lines",
         "public.salary_slip_deduction",
         renames={"calculation_id": "slip_id", "sequence": "display_order"},
+        lookups={
+            "component_code": _COMPONENT_LOOKUP["component_code"],
+            "component_kind": _COMPONENT_LOOKUP["component_kind"],
+        },
         note="see earning pairing",
     ),
     Pairing(
@@ -189,9 +246,13 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "code": "jurisdiction_code",
             "name": "jurisdiction_name",
             "subdivision_code": "state_province",
+            "authority_id": "jurisdiction_level",
         },
         constants={"status": "active"},
-        note="authority_id from generated authorities (fk via enrolment map)",
+        fk_rewrites={"authority_id": "tax_authority_by_level"},
+        note="authority_id: legacy jurisdiction_level rewritten through the "
+        "enrolment map built when authorities are GENERATED (one per level); "
+        "a level with no generated authority is an exception",
     ),
     Pairing(
         "mod_tax.tax_codes",
@@ -208,9 +269,11 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
     ),
     Pairing(
         "mod_tax.tax_rule_bands",
-        "public.tax_band",
-        renames={"lower_bound": "min_amount", "upper_bound": "max_amount"},
-        note="rule_id from generated rules (enrolment map); sequence renames in place",
+        None,
+        note="GENERATED with tax_rules re-publication: legacy public.tax_band "
+        "rows (min_amount/max_amount/rate/sequence per effective window) are "
+        "enrolment INPUT to the v1 rules, not a row copy - legacy bands carry "
+        "no rule FK, so rule_id cannot be copied or honestly defaulted",
     ),
     Pairing(
         "mod_tax.tax_returns",
@@ -276,6 +339,7 @@ def build_wave2_specs(
                 renames=pairing.renames,
                 constants=pairing.constants,
                 fk_rewrites=pairing.fk_rewrites,
+                lookups=pairing.lookups,
             )
         )
     return tuple(specs), tuple(generated)

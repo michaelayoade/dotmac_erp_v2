@@ -141,6 +141,59 @@ def test_run_supplied_and_computed_columns() -> None:
         assert tuple(row) == ("t1", "legacy:journal_entry_line:l1", 64)
 
 
+def test_lookup_columns_resolve_or_exception() -> None:
+    spec = build_spec(
+        source_table="salary_structure_earning",
+        destination_table="pay_structure_rules",
+        source_columns=("earning_id", "component_id", "display_order"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("component_id", nullable=False, has_default=False),
+            DestinationColumn("sequence", nullable=False, has_default=False),
+            DestinationColumn("component_code", nullable=False, has_default=False),
+        ),
+        renames={"id": "earning_id", "sequence": "display_order"},
+        lookups={"component_code": ("pay_component", "component_id", "code")},
+    )
+    assert spec.executable  # lookup covers the required column
+    assert "component_code" not in spec.missing_required
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(
+            sa.text("CREATE TABLE salary_structure_earning (earning_id TEXT, component_id TEXT, display_order INTEGER)")
+        )
+        c.execute(sa.text("INSERT INTO salary_structure_earning VALUES ('r1','c1',1)"))
+        c.execute(sa.text("INSERT INTO salary_structure_earning VALUES ('r2','cX',2)"))
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE pay_structure_rules (id TEXT, component_id TEXT, sequence INTEGER, component_code TEXT)"
+            )
+        )
+    with src.connect() as s, dst.begin() as d:
+        report = execute_transform(s, d, spec, id_maps={"pay_component": {"c1": {"code": "BASIC"}}})
+        assert report.written == 1 and not report.complete
+        assert report.exceptions[0].column == "component_code"
+        assert report.exceptions[0].source_key == "r2"
+        row = d.execute(sa.text("SELECT id, component_code FROM pay_structure_rules")).one()
+        assert tuple(row) == ("r1", "BASIC")
+
+
+def test_lookup_key_must_be_mapped() -> None:
+    with pytest.raises(ValueError, match="unmapped"):
+        build_spec(
+            source_table="salary_structure_earning",
+            destination_table="pay_structure_rules",
+            source_columns=("earning_id",),
+            destination_columns=(
+                DestinationColumn("id", nullable=False, has_default=False),
+                DestinationColumn("component_code", nullable=False, has_default=False),
+            ),
+            lookups={"component_code": ("pay_component", "component_id", "code")},
+        )
+
+
 def test_executor_refuses_non_executable_spec() -> None:
     src, dst = _engines()
     spec = _spec(destination_columns=(DestinationColumn("nope", nullable=False, has_default=False),))

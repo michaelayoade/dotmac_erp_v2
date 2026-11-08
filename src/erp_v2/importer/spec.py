@@ -60,6 +60,14 @@ class TransformSpec:
     # destination column -> computed strategy ("sha256_row"): values
     # derived deterministically from the mapped source row, e.g.
     # source/request fingerprints modules use for idempotent replay.
+    lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
+    # destination column -> (map name, key destination column, field):
+    # the value is read at execution from a caller-supplied lookup map
+    # keyed by an already-mapped destination column's value (module
+    # tables denormalize e.g. component code/name/kind onto rules and
+    # calculation lines; the enrolment step builds the map from the
+    # imported parent rows). A key with no map entry is an exception,
+    # never a default.
 
     @property
     def executable(self) -> bool:
@@ -133,6 +141,7 @@ def build_spec(
     renames: Mapping[str, str] | None = None,
     fk_rewrites: Mapping[str, str] | None = None,
     constants: Mapping[str, object] | None = None,
+    lookups: Mapping[str, tuple[str, str, str]] | None = None,
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -140,6 +149,12 @@ def build_spec(
         _check(part)
     renames = dict(renames or {})
     constants = dict(constants or {})
+    lookups = dict(lookups or {})
+    for dest_col, (map_name, key_col, lookup_field) in lookups.items():
+        _check(dest_col)
+        _check(map_name)
+        _check(key_col)
+        _check(lookup_field)
     source_set = {_check(c) for c in source_columns}
     column_map: dict[str, str] = {}
     missing: list[str] = []
@@ -148,6 +163,8 @@ def build_spec(
     for dest in destination_columns:
         _check(dest.name)
         if dest.name in constants:
+            continue
+        if dest.name in lookups:
             continue
         if dest.name in renames:
             source = renames[dest.name]
@@ -173,6 +190,9 @@ def build_spec(
                 continue
             source = found
         column_map[dest.name] = source
+    for dest_col, (_map, key_col, _field) in lookups.items():
+        if key_col not in column_map:
+            raise ValueError(f"lookup for {dest_col!r} keys on unmapped column {key_col!r}")
     consumed = set(column_map.values())
     residue = tuple(sorted(source_set - consumed))
     return TransformSpec(
@@ -185,6 +205,7 @@ def build_spec(
         constants=constants,
         run_supplied=tuple(run_supplied),
         computed=computed,
+        lookups=lookups,
     )
 
 
