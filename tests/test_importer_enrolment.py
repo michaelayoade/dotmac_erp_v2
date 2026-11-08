@@ -92,7 +92,7 @@ def test_destination_built_maps() -> None:
             "CREATE TABLE mod_payroll.pay_structure_revisions (id TEXT, structure_id TEXT, version INTEGER)",
             "INSERT INTO mod_payroll.pay_structure_revisions VALUES ('rev1','st1',1)",
             "INSERT INTO mod_payroll.pay_structure_revisions VALUES ('rev2','st1',2)",
-            "CREATE TABLE mod_payroll.pay_components (id TEXT, code TEXT, name TEXT, kind TEXT)",
+            "CREATE TABLE mod_payroll.pay_components (id TEXT, component_code TEXT, name TEXT, kind TEXT)",
             "INSERT INTO mod_payroll.pay_components VALUES ('c1','BASIC','Basic pay','earning')",
             "CREATE TABLE mod_tax.tax_authorities (id TEXT, authority_level_code TEXT)",
             "INSERT INTO mod_tax.tax_authorities VALUES ('a1','federal')",

@@ -52,7 +52,7 @@ _PAYROLL_SRC = (
 )
 
 _PAYROLL_DST = (
-    "CREATE TABLE mod_payroll.pay_components (id TEXT, code TEXT, name TEXT, kind TEXT)",
+    "CREATE TABLE mod_payroll.pay_components (id TEXT, component_code TEXT, name TEXT, kind TEXT)",
     "INSERT INTO mod_payroll.pay_components VALUES ('c-basic','BASIC','Basic','earning')",
     "INSERT INTO mod_payroll.pay_components VALUES ('c-employer','EMP_PEN','Employer pension','employer_liability')",
     "CREATE TABLE mod_payroll.pay_structure_revisions (id TEXT, structure_id TEXT, version INTEGER)",

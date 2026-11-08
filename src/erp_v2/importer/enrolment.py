@@ -185,7 +185,9 @@ def _pay_component(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict
         for key, flag in source.execute(sa.text("SELECT component_id, depends_on_payment_days FROM salary_component"))
     }
     mapping: dict[Any, dict[str, Any]] = {}
-    rows = dest.execute(sa.text("SELECT id, code, name, kind FROM mod_payroll.pay_components")).mappings()
+    rows = dest.execute(
+        sa.text("SELECT id, component_code AS code, name, kind FROM mod_payroll.pay_components")
+    ).mappings()
     for row in rows:
         key = _norm(row["id"])
         if key not in prorates:
