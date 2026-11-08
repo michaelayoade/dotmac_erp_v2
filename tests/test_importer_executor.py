@@ -567,3 +567,37 @@ def test_data_error_rows_become_exceptions_not_crashes() -> None:
         report = execute_transform(s_, d_, spec)
     assert report.written == 2
     assert [e.source_key for e in report.exceptions] == ["v2"]
+
+
+def test_fk_guard_prevalidates_parents_without_db_churn() -> None:
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+
+    @sa.event.listens_for(dst, "connect")
+    def _fk_on(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE lines (line_id TEXT, head_id TEXT)"))
+        c.execute(sa.text("INSERT INTO lines VALUES ('l1','h1'), ('l2','ghost'), ('l3','h1')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE heads (id TEXT PRIMARY KEY)"))
+        c.execute(sa.text("INSERT INTO heads VALUES ('h1')"))
+        c.execute(sa.text("CREATE TABLE lines_out (id TEXT PRIMARY KEY, head_id TEXT REFERENCES heads(id))"))
+    spec = build_spec(
+        source_table="lines",
+        destination_table="lines_out",
+        source_columns=("line_id", "head_id"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("head_id", nullable=False, has_default=False),
+        ),
+        renames={"id": "line_id"},
+    )
+    with src.connect() as s_, dst.begin() as d_:
+        report = execute_transform(s_, d_, spec)
+    assert report.written == 2
+    assert len(report.exceptions) == 1
+    exc = report.exceptions[0]
+    assert exc.source_key == "l2" and exc.column == "head_id"
+    assert "foreign key parent absent" in exc.reason

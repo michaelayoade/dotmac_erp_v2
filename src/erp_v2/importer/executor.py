@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -29,6 +30,98 @@ from erp_v2.importer.spec import TransformSpec
 _MISSING = object()
 
 _BATCH_SIZE = 500
+
+
+@dataclass(frozen=True)
+class _FkGuard:
+    """One destination FK pre-validated against preloaded parents."""
+
+    constraint: str
+    local_columns: tuple[str, ...]
+    referred_table: str
+    referred_columns: tuple[str, ...]
+    parents: frozenset[tuple[Any, ...]]
+
+
+def _fk_guards(
+    destination_connection: sa.Connection,
+    spec: TransformSpec,
+    insert_columns: Sequence[str],
+) -> tuple[_FkGuard, ...]:
+    """Preload destination FK parent keys for identity FK columns.
+
+    Gate 4 live finding: discovering missing parents via insert
+    failures costs a binary-split storm (59k bank lines whose
+    statements never landed burned 30+ minutes in savepoint
+    churn). Preloading referred keys once per spec turns those
+    rows into immediate, identically-named exceptions. Deferred
+    columns and columns with id-map rewrites are excluded (their
+    values are not destination keys yet / not inserted); the DB
+    remains the final arbiter for everything else.
+    """
+
+    if "." in spec.destination_table:
+        schema, table = spec.destination_table.split(".", 1)
+    else:
+        schema, table = None, spec.destination_table
+    try:
+        inspector = sa.inspect(destination_connection)
+        foreign_keys = inspector.get_foreign_keys(table, schema=schema)
+    except Exception:  # reflection unavailable: DB-side checks only
+        return ()
+    guards: list[_FkGuard] = []
+    insert_set = set(insert_columns)
+    for fk in foreign_keys:
+        local = tuple(fk.get("constrained_columns") or ())
+        referred_cols = tuple(fk.get("referred_columns") or ())
+        if not local or len(local) != len(referred_cols):
+            continue
+        if not set(local) <= insert_set:
+            continue
+        if any(c in spec.deferred or c in spec.fk_rewrites for c in local):
+            continue
+        referred_schema = fk.get("referred_schema") or schema
+        referred_table = fk.get("referred_table") or ""
+        # Self-referential FKs stay DB-arbitrated: parents land
+        # later in the same spec (FK retry / deferred columns).
+        if referred_table == table and referred_schema in (schema, None):
+            continue
+        qualified = f"{referred_schema}.{referred_table}" if referred_schema else referred_table
+        cols_sql = ", ".join(referred_cols)
+        rows = destination_connection.execute(
+            sa.text(f"SELECT {cols_sql} FROM {qualified}")  # noqa: S608
+        )
+        parents = frozenset(tuple(_norm_key(v) for v in row) for row in rows)
+        guards.append(
+            _FkGuard(
+                constraint=fk.get("name") or "foreign_key",
+                local_columns=local,
+                referred_table=qualified,
+                referred_columns=referred_cols,
+                parents=parents,
+            )
+        )
+    return tuple(guards)
+
+
+def _norm_key(value: Any) -> Any:
+    """UUID -> hex, matching how mapped values may be spelled."""
+
+    return value.hex if isinstance(value, uuid.UUID) else value
+
+
+def _guard_key(values: dict[str, Any], columns: tuple[str, ...]) -> tuple[Any, ...] | None:
+    key: list[Any] = []
+    for col in columns:
+        value = values.get(col)
+        if value is None:
+            return None  # MATCH SIMPLE: any NULL passes the FK
+        if isinstance(value, uuid.UUID):
+            value = value.hex
+        elif isinstance(value, str) and len(value) == 36 and value.count("-") == 4:
+            value = value.replace("-", "")
+        key.append(value)
+    return tuple(key)
 
 
 def _flush_batch(
@@ -231,6 +324,7 @@ def execute_transform(
     )
     # Identify a stable source key for exception records: the column
     # feeding the destination `id`, else the first mapped column.
+    guards = _fk_guards(destination_connection, spec, dest_columns) if not dry_run else ()
     key_source = spec.column_map.get("id", source_columns[0])
     batch: list[tuple[str, dict[str, Any]]] = []
     fk_retry: list[tuple[str, dict[str, Any]]] = []
@@ -349,6 +443,25 @@ def execute_transform(
         # (the row's own evidence), never to import time.
         if values.get("updated_at") is None and values.get("created_at") is not None:
             values["updated_at"] = values["created_at"]
+        guard_exceptions: list[RowException] = []
+        for guard in guards:
+            guard_key = _guard_key(values, guard.local_columns)
+            if guard_key is None:
+                continue
+            if guard_key not in guard.parents:
+                guard_exceptions.append(
+                    RowException(
+                        source_table=spec.source_table,
+                        source_key=str(row[key_source]),
+                        column=guard.local_columns[-1],
+                        reason=(
+                            f"foreign key parent absent in destination {guard.referred_table} ({guard.constraint})"
+                        ),
+                    )
+                )
+        if guard_exceptions:
+            report.exceptions.extend(guard_exceptions)
+            continue
         if not dry_run:
             params = values
             if destination_connection.dialect.name == "sqlite":
