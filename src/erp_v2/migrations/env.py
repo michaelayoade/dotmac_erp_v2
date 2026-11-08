@@ -57,11 +57,17 @@ from dotmac_ticketing import models as ticketing_models  # noqa: F401
 from dotmac_workflow_runtime import models as workflow_runtime_models  # noqa: F401
 from sqlalchemy import engine_from_config, pool
 
+from erp_v2 import fleet as fleet_models  # noqa: F401
+from erp_v2 import leases as lease_models  # noqa: F401
+from erp_v2 import public_sector as public_sector_models  # noqa: F401
 from erp_v2.hr import appraisals as hr_appraisal_models  # noqa: F401
 from erp_v2.hr import attendance as hr_attendance_models  # noqa: F401
 from erp_v2.hr import discipline as hr_discipline_models  # noqa: F401
 from erp_v2.hr import feedback as hr_feedback_models  # noqa: F401
+from erp_v2.hr import lifecycle as hr_lifecycle_models  # noqa: F401
 from erp_v2.hr import models as hr_models  # noqa: F401
+from erp_v2.hr import recruitment as hr_recruitment_models  # noqa: F401
+from erp_v2.hr import training as hr_training_models  # noqa: F401
 from erp_v2.migration_bindings import (
     ASSEMBLY_MODULE_PLANES,
     ASSEMBLY_PREREQUISITE_BINDINGS,

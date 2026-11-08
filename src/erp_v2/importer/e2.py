@@ -110,6 +110,201 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "public.grievance",
         renames={"number": "grievance_number"},
     ),
+    # recruitment slice
+    Pairing(
+        "hr_job_openings",
+        "public.job_opening",
+        renames={"code": "job_code", "title": "job_title"},
+        note="salary band/skills text is careers-surface residue; application_form links forms module",
+    ),
+    Pairing(
+        "hr_job_applicants",
+        "public.job_applicant",
+        note="verification_token/resume_url are discarded for file-id + fresh verification at flip",
+    ),
+    Pairing("hr_interviews", "public.interview"),
+    Pairing(
+        "hr_job_offers",
+        "public.job_offer",
+        renames={"number": "offer_number"},
+        note="candidate_access_token discarded; fresh self-service token issued post-flip",
+    ),
+    # lifecycle slice
+    Pairing(
+        "hr_checklist_templates",
+        "public.checklist_template",
+        renames={"code": "template_code", "name": "template_name"},
+    ),
+    Pairing(
+        "hr_checklist_template_items",
+        "public.checklist_template_item",
+        renames={"name": "item_name"},
+        note="tenant derives from parent template (legacy item has no org column)",
+    ),
+    Pairing(
+        "hr_employee_onboardings",
+        "public.employee_onboarding",
+        note="progress_percentage dropped (derived); self-service token discarded",
+    ),
+    Pairing(
+        "hr_onboarding_activities",
+        "public.employee_onboarding_activity",
+        renames={"name": "activity_name", "document_file_id": "document_id"},
+        note="two status columns collapse to one at rehearsal; tenant from parent onboarding",
+    ),
+    Pairing(
+        "hr_employee_separations",
+        "public.employee_separation",
+        renames={"exit_interview_notes": "exit_interview"},
+    ),
+    Pairing("hr_clearance_items", "public.clearance_item"),
+    Pairing(
+        "hr_employment_changes",
+        "public.employee_promotion",
+        renames={"change_date": "promotion_date"},
+        constants={"change_type": "promotion"},
+        note="also fed by employee_transfer with change_type=transfer (second spec)",
+    ),
+    Pairing(
+        "hr_employment_changes",
+        "public.employee_transfer",
+        renames={"change_date": "transfer_date"},
+        constants={"change_type": "transfer"},
+    ),
+    Pairing(
+        "hr_employment_change_details",
+        "public.employee_promotion_detail",
+        renames={"change_id": "promotion_id"},
+        note="also fed by employee_transfer_detail (change_id: transfer_id)",
+    ),
+    # training + credentials slice
+    Pairing(
+        "hr_training_programs",
+        "public.training_program",
+        renames={"code": "program_code", "name": "program_name"},
+    ),
+    Pairing(
+        "hr_training_events",
+        "public.training_event",
+        renames={"name": "event_name"},
+    ),
+    Pairing("hr_training_attendees", "public.training_attendee"),
+    Pairing(
+        "hr_qualifications",
+        "public.employee_qualification",
+        renames={"name": "qualification_name", "document_file_id": "document_id"},
+    ),
+    Pairing(
+        "hr_certifications",
+        "public.employee_certification",
+        renames={"name": "certification_name", "document_file_id": "document_id"},
+    ),
+    Pairing(
+        "hr_competencies",
+        "public.competency",
+        renames={"code": "competency_code", "name": "competency_name"},
+        note="level_1..5 descriptions are rubric residue for the web slice",
+    ),
+    Pairing(
+        "hr_skills",
+        "public.skill",
+        renames={"name": "skill_name"},
+    ),
+    Pairing("hr_employee_skills", "public.employee_skill"),
 )
 
-__all__ = ["E2_PAIRINGS"]
+FLEET_PAIRINGS: Final[tuple[Pairing, ...]] = (
+    Pairing(
+        "fleet_vehicle_profiles",
+        "public.vehicle",
+        renames={"code": "vehicle_code", "gps_device_ref": "gps_device_id"},
+        note="asset_id resolves via the assets import; legacy vehicle had no tenant column (single fleet extent)",
+    ),
+    Pairing("fleet_fuel_logs", "public.fuel_log_entry", renames={"profile_id": "vehicle_id"}),
+    Pairing("fleet_reservations", "public.vehicle_reservation", renames={"profile_id": "vehicle_id"}),
+    Pairing("fleet_incidents", "public.vehicle_incident", renames={"profile_id": "vehicle_id"}),
+    Pairing("fleet_maintenance_records", "public.maintenance_record", renames={"profile_id": "vehicle_id"}),
+    Pairing(
+        "fleet_vehicle_documents",
+        "public.vehicle_document",
+        note="file_id resolves through the files import (legacy file_path -> stored file)",
+    ),
+)
+
+PUBLIC_SECTOR_PAIRINGS: Final[tuple[Pairing, ...]] = (
+    Pairing("ps_funds", "public.fund", renames={"code": "fund_code", "name": "fund_name"}),
+    Pairing(
+        "ps_appropriations",
+        "public.appropriation",
+        renames={
+            "code": "appropriation_code",
+            "name": "appropriation_name",
+            "fiscal_year_ref": "fiscal_year_id",
+            "account_ref": "account_id",
+        },
+    ),
+    Pairing(
+        "ps_commitments",
+        "public.commitment",
+        renames={"number": "commitment_number"},
+        note="journal refs and allotment/dimension detail are rehearsal residue",
+    ),
+    Pairing("ps_commitment_lines", "public.commitment_line", renames={"account_ref": "account_id"}),
+    Pairing(
+        "ps_virements",
+        "public.virement",
+        renames={"number": "virement_number"},
+        note="account/cost-center granular virements collapse to appropriation-level at rehearsal",
+    ),
+)
+
+LEASE_PAIRINGS: Final[tuple[Pairing, ...]] = (
+    Pairing(
+        "lease_contracts",
+        "public.lease_contract",
+        renames={
+            "number": "lease_number",
+            "name": "lease_name",
+            "lessor_ref": "lessor_supplier_id",
+            "discount_rate": "discount_rate_used",
+        },
+        note="options/index-linkage terms are enrolment residue; schedules regenerate and reconcile",
+    ),
+    Pairing(
+        "lease_liabilities",
+        "public.lease_liability",
+        renames={"current_balance": "current_liability_balance"},
+        note="PV component split and current/non-current portions derive at rehearsal",
+    ),
+    Pairing(
+        "lease_rou_assets",
+        "public.lease_asset",
+        renames={"initial_value": "initial_rou_asset_value"},
+    ),
+    Pairing(
+        "lease_payment_schedule",
+        "public.lease_payment_schedule",
+        renames={
+            "opening_balance": "opening_liability_balance",
+            "closing_balance": "closing_liability_balance",
+        },
+        note="regenerated schedules must reconcile row-for-row; paid rows import as paid evidence",
+    ),
+)
+
+# Consolidation (consolidation_run/elimination_entry/consolidated_*)
+# and coach: no e2 tables by design. Consolidation is cross-entity
+# reporting over accounting balances (platform/reporting concern on
+# top of dotmac-accounting, ruled when the group-reporting surface is
+# designed); coach consumes dotmac-ai-operations with ERP prompts in
+# the web slice. Both stay census-visible in SOURCE_TABLES.
+
+# Deliberately NOT paired: the legacy in-ERP course LMS
+# (training_course*, training_lesson*, training_question*,
+# training_assessment*, training_exam_*) overlaps Academy's
+# dotmac-learning ownership. ERP consumes learning state through the
+# Academy boundary (academy_learning_progress/requirement stay
+# adapter observations in the census); rebuilding an LMS inside ERP
+# would recreate the duplication the composition removes.
+
+__all__ = ["E2_PAIRINGS", "FLEET_PAIRINGS", "LEASE_PAIRINGS", "PUBLIC_SECTOR_PAIRINGS"]
