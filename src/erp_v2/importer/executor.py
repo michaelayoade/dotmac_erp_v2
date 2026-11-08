@@ -378,7 +378,11 @@ def execute_transform(
                     value = strategy.removeprefix("literal:")
                 elif strategy.startswith("run:"):
                     value = run_constants.get(strategy.removeprefix("run:"))
+                # "column:" fallbacks resolve after the mapping loop.
             values[dest_col] = value
+        for dest_col, strategy in spec.null_fallbacks.items():
+            if strategy.startswith("column:") and values.get(dest_col) is None:
+                values[dest_col] = values.get(strategy.removeprefix("column:"))
         # Lookup columns read from caller-supplied maps keyed by a
         # mapped destination value (post-rewrite). No entry, or an
         # entry without the ruled field, is an exception.

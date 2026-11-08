@@ -601,3 +601,31 @@ def test_fk_guard_prevalidates_parents_without_db_churn() -> None:
     exc = report.exceptions[0]
     assert exc.source_key == "l2" and exc.column == "head_id"
     assert "foreign key parent absent" in exc.reason
+
+
+def test_null_fallback_column_copies_mapped_value() -> None:
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE led (led_id TEXT, debit REAL, orig_debit REAL)"))
+        c.execute(sa.text("INSERT INTO led VALUES ('a', 10.5, NULL), ('b', 3.0, 2.5)"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE led_out (id TEXT, debit REAL, orig_debit REAL)"))
+    spec = build_spec(
+        source_table="led",
+        destination_table="led_out",
+        source_columns=("led_id", "debit", "orig_debit"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("debit", nullable=False, has_default=False),
+            DestinationColumn("orig_debit", nullable=False, has_default=False),
+        ),
+        renames={"id": "led_id"},
+        null_fallbacks={"orig_debit": "column:debit"},
+    )
+    with src.connect() as s_, dst.begin() as d_:
+        report = execute_transform(s_, d_, spec)
+    assert report.written == 2 and report.complete
+    with dst.connect() as d_:
+        rows = d_.execute(sa.text("SELECT id, orig_debit FROM led_out ORDER BY id")).all()
+    assert rows == [("a", 10.5), ("b", 2.5)]

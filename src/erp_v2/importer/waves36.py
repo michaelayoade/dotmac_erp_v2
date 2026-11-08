@@ -152,7 +152,15 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         null_fallbacks={
             "source_document_id": "row_id",
             "source_document_kind": "literal:JOURNAL",
+            "currency_code": "literal:NGN",
+            "original_debit": "column:debit",
+            "original_credit": "column:credit",
         },
+        note="167k legacy ledger lines are functional-only postings "
+        "(no original leg recorded); every journal is NGN at rate 1 "
+        "in production data, so original falls back to functional "
+        "in NGN - the POSTED transition trigger verifies the sums "
+        "against entry totals either way",
     ),
     *_generated(
         "mod_accounting",

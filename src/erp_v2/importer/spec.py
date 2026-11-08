@@ -97,7 +97,11 @@ class TransformSpec:
     # (the row's own source key - the legacy row is its own source
     # document of record), "source_key" (legacy:<table>:<key>),
     # "literal:<text>", "run:<constant>" (a declared run constant,
-    # e.g. the enrolment actor for created_by_id). Fallbacks never
+    # e.g. the enrolment actor for created_by_id), "column:<dest>"
+    # (another mapped destination value in the same row, e.g.
+    # original amounts falling back to functional amounts when the
+    # legacy posting never recorded a separate original leg).
+    # Fallbacks never
     # invent external-world data; columns whose NULL means "the
     # fact was never recorded" (e.g. a supplier's document number)
     # must exception instead.
@@ -222,6 +226,9 @@ def build_spec(
             continue
         if strategy.startswith("run:"):
             _check(strategy.removeprefix("run:"))
+            continue
+        if strategy.startswith("column:"):
+            _check(strategy.removeprefix("column:"))
             continue
         raise ValueError(f"unknown null fallback {strategy!r} for {dest_col!r}")
     explicit_computed = dict(computed or {})
