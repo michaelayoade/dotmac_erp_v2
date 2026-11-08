@@ -187,3 +187,59 @@ def test_execute_run_constants_declared_supply() -> None:
     assert constants["source_owner"] == "legacy-erp"
     assert constants["source_version"] == "rev1"
     assert "created_by_id" not in constants  # no actor env in test process
+
+
+def test_execute_apply_commits_per_spec(tmp_path, monkeypatch) -> None:
+    """Regression (Gate 4): --apply commits per spec; wrapping the
+    destination in engine.begin() made the first per-spec commit
+    close the transaction context and every later statement raise
+    'Can't operate on closed transaction inside context manager'.
+    """
+    import sqlalchemy as sa
+
+    from erp_v2.importer import cli
+    from erp_v2.importer.spec import DestinationColumn, build_spec
+
+    src_path, dst_path = tmp_path / "src.db", tmp_path / "dst.db"
+    src = sa.create_engine(f"sqlite:///{src_path}")
+    dst = sa.create_engine(f"sqlite:///{dst_path}")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE widgets (widget_id TEXT, name TEXT)"))
+        c.execute(sa.text("INSERT INTO widgets VALUES ('w1','One'), ('w2','Two')"))
+        c.execute(sa.text("CREATE TABLE gadgets (gadget_id TEXT, name TEXT)"))
+        c.execute(sa.text("INSERT INTO gadgets VALUES ('g1','Gizmo')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE widgets_out (id TEXT, name TEXT)"))
+        c.execute(sa.text("CREATE TABLE gadgets_out (id TEXT, name TEXT)"))
+
+    def _spec(src_name, dst_name, pk):
+        return build_spec(
+            source_table=src_name,
+            destination_table=dst_name,
+            source_columns=(pk, "name"),
+            destination_columns=(
+                DestinationColumn("id", nullable=False, has_default=False),
+                DestinationColumn("name", nullable=False, has_default=False),
+            ),
+            renames={"id": pk},
+        )
+
+    specs = (_spec("widgets", "widgets_out", "widget_id"), _spec("gadgets", "gadgets_out", "gadget_id"))
+    monkeypatch.setattr(
+        cli,
+        "_resolve_sources",
+        lambda engine, pairings: ({"widgets", "gadgets"}, {}, {}, ()),
+    )
+    monkeypatch.setattr(cli, "build_specs", lambda present, cols, dest: (specs, ()))
+    monkeypatch.setenv("ERP_IMPORT_APPROVED", "1")
+    monkeypatch.setenv("ERP_IMPORT_APPLY_OK", "1")
+    monkeypatch.setenv("LEGACY_DATABASE_URL", f"sqlite:///{src_path}")
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", f"sqlite:///{dst_path}")
+    receipt = tmp_path / "r.json"
+    code = main(["execute", "--manifest", str(_manifest(tmp_path)), "--receipt", str(receipt), "--apply"])
+    assert code == 0
+    data = json.loads(receipt.read_text())
+    assert data["written"] == 3 and data["dry_run"] is False
+    with dst.connect() as c:
+        assert c.execute(sa.text("SELECT count(*) FROM widgets_out")).scalar() == 2
+        assert c.execute(sa.text("SELECT count(*) FROM gadgets_out")).scalar() == 1

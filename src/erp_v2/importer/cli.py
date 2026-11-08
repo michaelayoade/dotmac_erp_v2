@@ -508,7 +508,12 @@ def cmd_execute(args: argparse.Namespace) -> int:
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
     mint_context = _mint_context(args, run_constants) if args.mint else None
     post_mints: tuple[MintResult, ...] = ()
-    with source_engine.connect() as source_conn, dest_engine.begin() as dest_conn:
+    # connect(), not begin(): --apply commits per spec, and a commit
+    # inside a begin() context closes it ('Can't operate on closed
+    # transaction inside context manager'). Boundaries are explicit:
+    # per-spec commits in run_import, final commit below on apply,
+    # rollback on dry-run.
+    with source_engine.connect() as source_conn, dest_engine.connect() as dest_conn:
         _set_search_path(source_conn, source_schemas)
         enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context)
         if mint_context is not None:
@@ -527,7 +532,9 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # row they reference is imported (same caller transaction;
             # dry-run rollback below covers them).
             post_mints = tuple(enrolment.mint(step) for step in ("pay_rule_bases", "tax_rules"))
-        if not args.apply:
+        if args.apply:
+            dest_conn.commit()  # post-mints; specs committed per spec
+        else:
             dest_conn.rollback()
     payload: dict[str, object] = {
         "kind": "execute",
