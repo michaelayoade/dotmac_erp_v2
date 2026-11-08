@@ -100,6 +100,7 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "expense_account_ref": "expense_account_id",
             "liability_account_ref": "liability_account_id",
         },
+        fk_rewrites={"kind": "pay_component_kind_by_legacy"},
         constants={"status": "active"},
         note="account refs are opaque strings in the module; legacy UUIDs stringify at enrolment",
     ),

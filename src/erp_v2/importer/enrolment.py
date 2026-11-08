@@ -82,6 +82,55 @@ def _lookup(rows: Any, map_name: str, fields: Sequence[str]) -> dict[Any, dict[s
 # --- static -----------------------------------------------------------------
 
 
+def _account_class_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # Module CHECK uses singular IFRS classes; legacy GL categories
+    # are plural. Literal closed mapping (live values verified on
+    # the production snapshot at Gate 4).
+    return {
+        "ASSETS": "ASSET",
+        "ASSET": "ASSET",
+        "LIABILITIES": "LIABILITY",
+        "LIABILITY": "LIABILITY",
+        "EQUITY": "EQUITY",
+        "REVENUE": "REVENUE",
+        "EXPENSES": "EXPENSE",
+        "EXPENSE": "EXPENSE",
+        "OTHER_COMPREHENSIVE_INCOME": "OTHER_COMPREHENSIVE_INCOME",
+    }
+
+
+def _pay_component_kind_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # Module CHECK: earning/deduction/employer_liability/information.
+    # Legacy payroll component types are uppercase singular.
+    return {
+        "EARNING": "earning",
+        "DEDUCTION": "deduction",
+        "EMPLOYER_LIABILITY": "employer_liability",
+        "INFORMATION": "information",
+        "earning": "earning",
+        "deduction": "deduction",
+        "employer_liability": "employer_liability",
+        "information": "information",
+    }
+
+
+def _workflow_status_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # Module CHECK: pending/running/succeeded/failed/cancelled.
+    # Legacy automation executions record SUCCESS/FAILED.
+    return {
+        "SUCCESS": "succeeded",
+        "FAILED": "failed",
+        "PENDING": "pending",
+        "RUNNING": "running",
+        "CANCELLED": "cancelled",
+        "pending": "pending",
+        "running": "running",
+        "succeeded": "succeeded",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }
+
+
 def _bank_direction_by_type(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
     # Module check constraint: direction IN ('credit','debit'). Only the
     # literal legacy spellings are ruled; anything else exceptions.
@@ -826,6 +875,9 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "asset_condition": _asset_condition,
     "asset_kind": _asset_kind,
     "bid_scores": _bid_scores,
+    "account_class_by_legacy": _account_class_by_legacy,
+    "pay_component_kind_by_legacy": _pay_component_kind_by_legacy,
+    "workflow_status_by_legacy": _workflow_status_by_legacy,
     "bank_direction_by_type": _bank_direction_by_type,
     "bank_institution_by_code": _bank_institution_by_code,
     "bid_submission": _bid_submission,

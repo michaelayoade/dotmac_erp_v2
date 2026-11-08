@@ -72,6 +72,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_accounting.account_categories",
         "public.account_category",
         renames={"account_class": "ifrs_category"},
+        fk_rewrites={"account_class": "account_class_by_legacy"},
     ),
     Pairing("mod_accounting.fiscal_years", "public.fiscal_year"),
     Pairing(
@@ -913,6 +914,7 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "subject_ref": "entity_id",
             "source_event_id": "execution_id",
         },
+        fk_rewrites={"status": "workflow_status_by_legacy"},
         note="definition_digest/request_fingerprint compute over the "
         "imported row; tenant/source_owner from the run extent; only "
         "executions live at the flip enrol (drain-first ruling)",
