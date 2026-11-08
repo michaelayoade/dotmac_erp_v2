@@ -52,10 +52,29 @@ class TransformSpec:
     # destination column -> explicit enrolment constant (e.g. source_ref).
     # Constants are declared in the wave pairing, never invented here;
     # a required column with neither source nor constant stays missing.
+    run_supplied: tuple[str, ...] = ()
+    # Required columns the import RUN supplies per tenant extent
+    # (tenant_id, minor_units, actor provenance). Executable only when
+    # the executor is given values for every one of them.
+    computed: Mapping[str, str] = field(default_factory=dict)
+    # destination column -> computed strategy ("sha256_row"): values
+    # derived deterministically from the mapped source row, e.g.
+    # source/request fingerprints modules use for idempotent replay.
 
     @property
     def executable(self) -> bool:
         return not self.missing_required
+
+
+def _is_run_supplied(dest: str) -> bool:
+    """Columns an import run supplies per tenant extent, by convention."""
+
+    return (
+        dest in ("tenant_id", "minor_units", "source_owner", "source_version")
+        or dest.endswith("_by_id")
+        or dest.endswith("_by_ref")
+        or dest == "posted_by"
+    )
 
 
 def _systematic_candidates(dest: str, source_columns: set[str], source_table: str) -> str | None:
@@ -88,6 +107,16 @@ def _systematic_candidates(dest: str, source_columns: set[str], source_table: st
     for candidate in prefixed.get(dest, ()):
         if candidate in source_columns:
             return candidate
+    # Table-qualified code/name where the table name is compound
+    # (account_category.category_code, fiscal_year.year_code...):
+    # accept a unique *_code / *_name once obvious foreign references
+    # are excluded. Ambiguity stays unmapped, never guessed.
+    if dest in ("code", "name"):
+        suffix = f"_{dest}"
+        foreign = {"currency_code", "country_code", "bank_name", "employee_name"}
+        candidates = sorted(c for c in source_columns if c.endswith(suffix) and c not in foreign)
+        if len(candidates) == 1:
+            return candidates[0]
     if dest.endswith("_ref"):
         candidate = f"{dest.removesuffix('_ref')}_id"
         if candidate in source_columns:
@@ -114,6 +143,8 @@ def build_spec(
     source_set = {_check(c) for c in source_columns}
     column_map: dict[str, str] = {}
     missing: list[str] = []
+    run_supplied: list[str] = []
+    computed: dict[str, str] = {}
     for dest in destination_columns:
         _check(dest.name)
         if dest.name in constants:
@@ -128,7 +159,16 @@ def build_spec(
         else:
             found = _systematic_candidates(dest.name, source_set, source_table)
             if found is None:
-                if not dest.nullable and not dest.has_default:
+                # No source at all: computed and run-supplied conventions
+                # apply before declaring the column missing.
+                if "fingerprint" in dest.name:
+                    computed[dest.name] = "sha256_row"
+                elif dest.name in ("evidence_ref", "source_ref", "source_reference"):
+                    computed[dest.name] = "source_key"
+                elif _is_run_supplied(dest.name):
+                    if not dest.nullable and not dest.has_default:
+                        run_supplied.append(dest.name)
+                elif not dest.nullable and not dest.has_default:
                     missing.append(dest.name)
                 continue
             source = found
@@ -143,6 +183,8 @@ def build_spec(
         residue=residue,
         fk_rewrites=dict(fk_rewrites or {}),
         constants=constants,
+        run_supplied=tuple(run_supplied),
+        computed=computed,
     )
 
 

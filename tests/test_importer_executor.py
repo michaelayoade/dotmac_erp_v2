@@ -44,11 +44,20 @@ def test_spec_missing_required_is_named_not_filled() -> None:
     spec = _spec(
         destination_columns=(
             DestinationColumn("id", nullable=False, has_default=False),
-            DestinationColumn("minor_units", nullable=False, has_default=False),
+            DestinationColumn("no_such_thing", nullable=False, has_default=False),
         )
     )
     assert not spec.executable
-    assert spec.missing_required == ("minor_units",)
+    assert spec.missing_required == ("no_such_thing",)
+    # minor_units is run-supplied instead: spec builds, executor refuses
+    # without the run value (covered in test_run_supplied_and_computed_columns).
+    run_spec = _spec(
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("minor_units", nullable=False, has_default=False),
+        )
+    )
+    assert run_spec.run_supplied == ("minor_units",)
     const_spec = _spec(
         destination_columns=(
             DestinationColumn("id", nullable=False, has_default=False),
@@ -89,6 +98,47 @@ def test_executor_writes_rewrites_and_queues_exceptions() -> None:
         assert report.written == 1
         row = d.execute(sa.text("SELECT id, tenant_id, code FROM departments")).one()
         assert tuple(row) == ("d1", "T1", "FIN")
+
+
+def test_run_supplied_and_computed_columns() -> None:
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    spec = build_spec(
+        source_table="journal_entry_line",
+        destination_table="journal_lines",
+        source_columns=("line_id", "entry_id", "account_id", "debit"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("tenant_id", nullable=False, has_default=False),
+            DestinationColumn("journal_id", nullable=False, has_default=False),
+            DestinationColumn("request_fingerprint", nullable=False, has_default=False),
+            DestinationColumn("evidence_ref", nullable=False, has_default=False),
+        ),
+        renames={"id": "line_id", "journal_id": "entry_id"},
+    )
+    assert spec.executable
+    assert spec.run_supplied == ("tenant_id",)
+    assert spec.computed == {
+        "request_fingerprint": "sha256_row",
+        "evidence_ref": "source_key",
+    }
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE journal_entry_line (line_id TEXT, entry_id TEXT, account_id TEXT, debit TEXT)"))
+        c.execute(sa.text("INSERT INTO journal_entry_line VALUES ('l1','e1','a1','5')"))
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE journal_lines (id TEXT, tenant_id TEXT, journal_id TEXT,"
+                " request_fingerprint TEXT, evidence_ref TEXT)"
+            )
+        )
+    with src.connect() as s, dst.begin() as d:
+        with pytest.raises(ValueError, match="run-supplied"):
+            execute_transform(s, d, spec)
+        report = execute_transform(s, d, spec, run_constants={"tenant_id": "t1"})
+        assert report.complete
+        row = d.execute(sa.text("SELECT tenant_id, evidence_ref, length(request_fingerprint) FROM journal_lines")).one()
+        assert tuple(row) == ("t1", "legacy:journal_entry_line:l1", 64)
 
 
 def test_executor_refuses_non_executable_spec() -> None:

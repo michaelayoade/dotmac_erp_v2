@@ -55,6 +55,7 @@ def run_import(
     specs: Sequence[TransformSpec],
     *,
     id_maps: Mapping[str, dict[Any, Any]] | None = None,
+    run_constants: Mapping[str, Any] | None = None,
     dry_run: bool = False,
 ) -> ImportReceipt:
     """Execute specs in the given order; never skip a named failure.
@@ -71,6 +72,7 @@ def run_import(
             destination_connection,
             spec,
             id_maps=dict(id_maps or {}),
+            run_constants=dict(run_constants or {}),
             dry_run=dry_run,
         )
         for spec in specs

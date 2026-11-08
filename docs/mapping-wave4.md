@@ -24,7 +24,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (23): contact_email, contact_name, converted_at, converted_to_invoice_id, converted_to_so_id, created_by, currency_code, customer_id, customer_notes, exchange_rate, internal_notes, payment_terms_id, quote_date, quote_number, reference, rejection_reason, sent_by, tax_amount, terms_and_conditions, total_amount, updated_by, valid_until, viewed_at
 
 ## public.quote_line -> mod_sales.quote_lines
-- executable: False; mapped: 6; missing: ['tenant_id', 'position', 'gross_amount', 'amount']
+- executable: False; mapped: 6; missing: ['position', 'gross_amount', 'amount']
 - residue (10): cost_center_id, discount_percent, item_code, line_id, line_number, line_total, project_id, revenue_account_id, tax_code_id, unit_of_measure
 
 ## GENERATED / command-import destinations

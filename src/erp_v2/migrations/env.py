@@ -57,6 +57,7 @@ from dotmac_ticketing import models as ticketing_models  # noqa: F401
 from dotmac_workflow_runtime import models as workflow_runtime_models  # noqa: F401
 from sqlalchemy import engine_from_config, pool
 
+from erp_v2.hr import models as hr_models  # noqa: F401
 from erp_v2.migration_bindings import (
     ASSEMBLY_MODULE_PLANES,
     ASSEMBLY_PREREQUISITE_BINDINGS,

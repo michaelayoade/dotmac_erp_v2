@@ -24,7 +24,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (4): is_active, location_id, notes, serial_id
 
 ## public.inventory_transaction -> mod_inventory.stock_movements
-- executable: False; mapped: 9; missing: ['movement_group_id', 'kind', 'quantity_delta', 'value_delta', 'value_after', 'source_ref', 'occurred_at']
+- executable: False; mapped: 9; missing: ['movement_group_id', 'kind', 'quantity_delta', 'value_delta', 'value_after', 'occurred_at']
 - residue (18): created_by_user_id, fiscal_period_id, journal_entry_id, location_id, quantity, quantity_before, reason_code, reference, source_document_id, source_document_line_id, source_document_type, to_location_id, to_warehouse_id, total_cost, transaction_date, transaction_id, transaction_type, uom
 
 ## public.inventory_serial_movement -> mod_inventory.movement_serials
@@ -48,11 +48,11 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (2): project_type, template_id
 
 ## public.project_template_task -> mod_projects.project_template_tasks
-- executable: False; mapped: 3; missing: ['tenant_id', 'key', 'title', 'status', 'priority']
+- executable: False; mapped: 3; missing: ['key', 'title', 'status', 'priority']
 - residue (3): order_index, task_name, template_task_id
 
 ## public.project_template_task_dependency -> mod_projects.project_template_task_dependencies
-- executable: False; mapped: 5; missing: ['tenant_id', 'template_id']
+- executable: False; mapped: 5; missing: ['template_id']
 - residue (1): dependency_id
 
 ## public.milestone -> mod_projects.project_tasks
@@ -64,12 +64,12 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (12): category_id, contact_address, contact_email, contact_phone, customer_id, opening_date, project_id, raised_by_email, raised_by_id, resolution, resolution_date, team_id
 
 ## public.ticket_comment -> mod_tkt.ticket_comments
-- executable: False; mapped: 5; missing: ['tenant_id', 'body']
+- executable: False; mapped: 5; missing: ['body']
 - residue (7): action, comment_id, comment_type, content, is_active, new_value, old_value
 
 ## public.hr_document -> mod_documents.documents
-- executable: False; mapped: 6; missing: ['library_id', 'type_code', 'type_version', 'code', 'folder_path', 'state', 'metadata', 'sensitivity', 'handling_instructions']
-- residue (20): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, document_code, document_id, effective_date, expiry_date, extra_metadata, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, status, updated_by, version
+- executable: False; mapped: 7; missing: ['library_id', 'type_code', 'type_version', 'folder_path', 'state', 'metadata', 'sensitivity', 'handling_instructions']
+- residue (19): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, document_id, effective_date, expiry_date, extra_metadata, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, status, updated_by, version
 
 ## public.form -> mod_forms.forms
 - executable: True; mapped: 7; missing: none
@@ -80,27 +80,27 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (1): settings_json
 
 ## public.form_section -> mod_forms.form_sections
-- executable: False; mapped: 2; missing: ['tenant_id', 'version_id', 'key', 'position']
+- executable: False; mapped: 2; missing: ['version_id', 'key', 'position']
 - residue (3): form_version_id, section_id, sort_order
 
 ## public.form_field -> mod_forms.form_fields
-- executable: False; mapped: 4; missing: ['tenant_id', 'version_id', 'key', 'position']
+- executable: False; mapped: 4; missing: ['version_id', 'key', 'position']
 - residue (12): field_id, field_key, form_version_id, is_filterable, is_required, placeholder, settings_json, show_in_list, sort_order, system_mapping, validation_json, visibility_json
 
 ## public.form_field_option -> mod_forms.form_field_options
-- executable: False; mapped: 3; missing: ['tenant_id', 'position']
+- executable: False; mapped: 3; missing: ['position']
 - residue (3): is_active, option_id, sort_order
 
 ## public.form_submission -> mod_forms.form_submissions
-- executable: False; mapped: 5; missing: ['submission_key', 'request_fingerprint']
+- executable: False; mapped: 5; missing: ['submission_key']
 - residue (3): subject_type, submission_id, submitted_by_email
 
 ## public.form_answer -> mod_forms.form_answers
-- executable: False; mapped: 7; missing: ['tenant_id']
+- executable: True; mapped: 7; missing: none
 - residue (4): answer_id, created_at, file_name, file_url
 
 ## public.workflow_execution -> mod_workflow.workflow_executions
-- executable: False; mapped: 3; missing: ['tenant_id', 'definition_version_ref', 'definition_digest', 'subject_ref', 'source_owner', 'source_event_id', 'request_fingerprint']
+- executable: False; mapped: 3; missing: ['definition_version_ref', 'definition_digest', 'subject_ref', 'source_event_id']
 - residue (14): duration_ms, entity_id, entity_type, error_details, error_message, execution_id, max_retries, result, retry_count, rule_id, trigger_data, trigger_event, triggered_at, triggered_by
 
 ## GENERATED / command-import destinations
