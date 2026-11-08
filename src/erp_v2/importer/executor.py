@@ -210,6 +210,12 @@ def execute_transform(
         if computed_exceptions:
             report.exceptions.extend(computed_exceptions)
             continue
+        # Declared convention: a legacy row never updated carries a
+        # NULL updated_at; module TimestampMixin columns are NOT NULL
+        # with only a Python onupdate default. Coalesce to created_at
+        # (the row's own evidence), never to import time.
+        if values.get("updated_at") is None and values.get("created_at") is not None:
+            values["updated_at"] = values["created_at"]
         if not dry_run:
             params = values
             if destination_connection.dialect.name == "sqlite":
@@ -217,7 +223,22 @@ def execute_transform(
                 # the float. Postgres (the rehearsal target) binds
                 # Decimal natively and keeps exactness.
                 params = {k: float(v) if isinstance(v, Decimal) else v for k, v in values.items()}
-            destination_connection.execute(insert_sql, params)
+            try:
+                # Per-row savepoint: a destination rejection (FK, NOT
+                # NULL, check) becomes a named exception for this row,
+                # never a run-killing abort that loses all evidence.
+                with destination_connection.begin_nested():
+                    destination_connection.execute(insert_sql, params)
+            except sa.exc.IntegrityError as exc:
+                report.exceptions.append(
+                    RowException(
+                        source_table=spec.source_table,
+                        source_key=str(row[key_source]),
+                        column="*",
+                        reason=f"destination rejected row ({type(exc.orig).__name__})",
+                    )
+                )
+                continue
             report.written += 1
     if dry_run:
         # Expectation counts: rows that would have been written.

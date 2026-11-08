@@ -310,3 +310,39 @@ def test_id_preserved_via_last_token_systematic() -> None:
         ),
     )
     assert spec2.column_map["id"] == "ledger_line_id"
+
+
+def test_updated_at_coalesce_and_per_row_integrity_exception() -> None:
+    spec = build_spec(
+        source_table="department",
+        destination_table="departments",
+        source_columns=("department_id", "name", "created_at", "updated_at"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("name", nullable=False, has_default=False),
+            DestinationColumn("created_at", nullable=False, has_default=False),
+            DestinationColumn("updated_at", nullable=False, has_default=False),
+        ),
+    )
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE department (department_id TEXT, name TEXT, created_at TEXT, updated_at TEXT)"))
+        c.execute(sa.text("INSERT INTO department VALUES ('d1','Tech','2025-01-01',NULL)"))
+        c.execute(sa.text("INSERT INTO department VALUES ('d2',NULL,'2025-01-01',NULL)"))  # name NULL -> rejected
+        c.execute(sa.text("INSERT INTO department VALUES ('d3','Ops','2025-01-01','2025-02-01')"))
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE departments (id TEXT, name TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+        )
+    with src.connect() as s, dst.begin() as d:
+        report = execute_transform(s, d, spec)
+        assert report.written == 2 and not report.complete
+        assert len(report.exceptions) == 1
+        assert report.exceptions[0].source_key == "d2"
+        assert "destination rejected" in report.exceptions[0].reason
+        rows = d.execute(sa.text("SELECT id, updated_at FROM departments ORDER BY id")).all()
+        assert [tuple(r) for r in rows] == [("d1", "2025-01-01"), ("d3", "2025-02-01")]
