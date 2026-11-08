@@ -129,6 +129,7 @@ def execute_transform(
     id_maps: dict[str, dict[Any, Any]] | None = None,
     run_constants: dict[str, Any] | None = None,
     dry_run: bool = False,
+    limit: int | None = None,
 ) -> TransformReport:
     """Execute one table transform. Raises if the spec is not executable."""
 
@@ -172,6 +173,8 @@ def execute_transform(
     fk_retry: list[tuple[str, dict[str, Any]]] = []
 
     for row in source_connection.execute(select_sql).mappings():
+        if limit is not None and report.read >= limit:
+            break
         report.read += 1
         values: dict[str, Any] = {
             **dict(spec.defaults),
