@@ -180,14 +180,17 @@ def _run_family(
                 params_extra["approval_ref_prefix"] = f"legacy:{spec.source_table}:"
                 # Count provenance stamps up front (rows whose mapped
                 # approval_reference is NULL at posting time).
-                outcome.stamped_approval_refs += dest.execute(
-                    sa.text(
-                        f"SELECT count(*) FROM {spec.destination_table} "  # noqa: S608
-                        "WHERE status = 'DRAFT' AND approval_reference IS NULL "
-                        "AND id IN :ids"
-                    ).bindparams(sa.bindparam("ids", expanding=True)),
-                    {"ids": moving},
-                ).scalar_one()
+                # Chunked: psycopg caps one statement at 65535 params
+                # and POSTED carries ~197k ids.
+                for start in range(0, len(moving), 10000):
+                    outcome.stamped_approval_refs += dest.execute(
+                        sa.text(
+                            f"SELECT count(*) FROM {spec.destination_table} "  # noqa: S608
+                            "WHERE status = 'DRAFT' AND approval_reference IS NULL "
+                            "AND id IN :ids"
+                        ).bindparams(sa.bindparam("ids", expanding=True)),
+                        {"ids": moving[start : start + 10000]},
+                    ).scalar_one()
             sql = sa.text(
                 f"UPDATE {spec.destination_table} SET status = :target_status{extra} "  # noqa: S608
                 "WHERE id = :row_id AND status = :from_status"
@@ -207,14 +210,23 @@ def _run_family(
             outcome.transitioned[target] = outcome.transitioned.get(target, 0) + moved
             # Only rows that actually moved continue down the path.
             if moved < len(moving):
-                still = dest.execute(
-                    sa.text(
-                        f"SELECT id FROM {spec.destination_table} "  # noqa: S608
-                        "WHERE status = :target_status AND id IN :ids"
-                    ).bindparams(sa.bindparam("ids", expanding=True)),
-                    {"target_status": target, "ids": moving},
-                ).scalars()
-                moving = list(still)
+                still: list[Any] = []
+                for start in range(0, len(moving), 10000):
+                    still.extend(
+                        dest.execute(
+                            sa.text(
+                                f"SELECT id FROM {spec.destination_table} "  # noqa: S608
+                                "WHERE status = :target_status AND id IN :ids"
+                            ).bindparams(sa.bindparam("ids", expanding=True)),
+                            {
+                                "target_status": target,
+                                "ids": moving[start : start + 10000],
+                            },
+                        )
+                        .scalars()
+                        .all()
+                    )
+                moving = still
     return outcome
 
 
