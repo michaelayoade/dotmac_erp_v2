@@ -172,7 +172,13 @@ def execute_transform(
     batch: list[tuple[str, dict[str, Any]]] = []
     fk_retry: list[tuple[str, dict[str, Any]]] = []
 
-    for row in source_connection.execute(select_sql).mappings():
+    # Stream source rows server-side: buffered results made memory
+    # (and wall time) grow superlinearly past ~70k journal rows at
+    # Gate 4 - 70k rows in 30s but 160k never finished.
+    source_rows = source_connection.execution_options(
+        stream_results=True, yield_per=1000
+    ).execute(select_sql)
+    for row in source_rows.mappings():
         if limit is not None and report.read >= limit:
             break
         report.read += 1
@@ -292,6 +298,7 @@ def execute_transform(
             if len(batch) >= _BATCH_SIZE:
                 _flush_batch(destination_connection, insert_sql, batch, spec, report, fk_retry)
                 batch = []
+    source_rows.close()
     if batch:
         _flush_batch(destination_connection, insert_sql, batch, spec, report, fk_retry)
     # One retry pass for FK-rejected rows: parents landing later in
