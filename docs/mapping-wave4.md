@@ -12,16 +12,16 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (41): ar_control_account_id, bank_details, billing_address, created_by_user_id, credit_hold, credit_limit, credit_terms_days, currency_code, customer_code, customer_group_id, customer_type, default_revenue_account_id, default_tax_code_id, default_wht_code_id, dotmac_sub_id, dotmac_sub_metrics, dotmac_sub_reseller_id, erpnext_id, is_active, is_related_party, is_vat_exempt, is_wht_applicable, legal_name, parent_customer_id ...
 
 ## public.contract -> mod_agreements.agreements
-- executable: False; mapped: 9; missing: ['agreement_family_id']
+- executable: True; mapped: 9; missing: none
 - residue (15): approval_status, collectability_assessment, consideration_payable, contract_name, currency_code, financing_rate, has_commercial_substance, is_enforceable, modification_history, noncash_consideration, organization_id, significant_financing, terms_and_conditions, total_contract_value, variable_consideration
 
 ## public.quote -> mod_sales.quotes
-- executable: False; mapped: 16; missing: ['lead_id', 'tax_rate', 'authored_by_kind', 'authored_by_label']
+- executable: False; mapped: 16; missing: ['tax_rate']
 - residue (17): contact_email, contact_name, converted_at, converted_to_invoice_id, converted_to_so_id, customer_id, exchange_rate, internal_notes, payment_terms_id, quote_date, quote_number, reference, rejection_reason, sent_by, terms_and_conditions, updated_by, viewed_at
 
 ## public.quote_line -> mod_sales.quote_lines
-- executable: False; mapped: 8; missing: ['gross_amount']
-- residue (8): cost_center_id, discount_percent, item_code, line_id, project_id, revenue_account_id, tax_code_id, unit_of_measure
+- executable: True; mapped: 9; missing: none
+- residue (7): cost_center_id, discount_percent, item_code, project_id, revenue_account_id, tax_code_id, unit_of_measure
 
 ## GENERATED / command-import destinations
 - mod_billing.settlement_earmarks: COMMAND-IMPORT: legacy invoice/invoice_line/customer_payment enter via opening-window commands (opening receivables/cash/discharges), never 

@@ -421,24 +421,28 @@ def test_wave2_payroll_tax_rulings_narrow_missing_to_named_decisions() -> None:
     assert jurisdictions.executable
     assert jurisdictions.fk_rewrites == {"authority_id": "tax_authority_by_level"}
 
-    # Rules: only the formula-conversion decision remains missing.
+    # Rules are executable: method/rate/fixed_amount resolve from the
+    # enrolment formula conversion (unconvertible rows exception).
     for rules in by_dest["mod_payroll.pay_structure_rules"]:
-        assert rules.missing_required == ("calculation_method",)
+        assert rules.executable, rules.missing_required
         assert rules.lookups["component_code"] == ("pay_component", "component_id", "code")
-        assert rules.column_map["fixed_amount"] == "amount"
+        assert rules.lookups["calculation_method"] == (
+            "payroll_rule_conversion",
+            "id",
+            "calculation_method",
+        )
+        assert "fixed_amount" not in rules.column_map  # lookup-carried
 
-    # Calculations: exact renames landed; enrolment decisions stay named.
+    # Calculations: exact renames landed; enrolment computations cover
+    # assignment/proration/employer liability per slip.
     (calculations,) = by_dest["mod_payroll.payroll_calculations"]
-    assert set(calculations.missing_required) == {
-        "assignment_id",
-        "proration_factor",
-        "employer_liability_amount",
-    }
+    assert calculations.executable, calculations.missing_required
     assert calculations.column_map["run_id"] == "payroll_entry_id"
     assert calculations.column_map["gross_amount"] == "gross_pay"
+    assert calculations.lookups["assignment_id"] == ("payroll_calculation", "id", "assignment_id")
 
     for lines in by_dest["mod_payroll.payroll_calculation_lines"]:
-        assert lines.missing_required == ("calculation_method",)
+        assert lines.executable, lines.missing_required
 
     # Bands are GENERATED with rule re-publication, never row-copied.
     assert "mod_tax.tax_rule_bands" in {p.destination for p in generated}

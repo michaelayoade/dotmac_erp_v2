@@ -19,6 +19,7 @@ import hashlib
 import re
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 import sqlalchemy as sa
@@ -99,12 +100,15 @@ def execute_transform(
     select_sql = sa.text(
         f"SELECT {', '.join(source_columns)} FROM {spec.source_table}"  # noqa: S608
     )
-    dest_columns = (
-        list(spec.column_map)
-        + [c for c in spec.constants if c not in spec.column_map]
-        + [c for c in spec.run_supplied if c not in spec.column_map]
-        + [c for c in spec.computed if c not in spec.column_map]
-        + [c for c in spec.lookups if c not in spec.column_map]
+    dest_columns = list(
+        dict.fromkeys(
+            list(spec.column_map)
+            + list(spec.constants)
+            + list(spec.defaults)
+            + list(spec.run_supplied)
+            + list(spec.computed)
+            + list(spec.lookups)
+        )
     )
     insert_sql = sa.text(
         # identifiers regex-validated in spec.py; row values are bound params
@@ -118,6 +122,7 @@ def execute_transform(
     for row in source_connection.execute(select_sql).mappings():
         report.read += 1
         values: dict[str, Any] = {
+            **dict(spec.defaults),
             **dict(spec.constants),
             **{c: run_constants[c] for c in spec.run_supplied},
         }
@@ -167,6 +172,25 @@ def execute_transform(
                 values[dest_col] = digest
             elif strategy == "source_key":
                 values[dest_col] = f"legacy:{spec.source_table}:{row[key_source]}"
+            elif strategy == "uuid5_row":
+                seed = f"{spec.source_table}:" + repr(sorted((k, str(v)) for k, v in values.items()))
+                values[dest_col] = uuid.uuid5(uuid.NAMESPACE_URL, seed).hex
+            elif strategy.startswith("mul:"):
+                factor_a, factor_b = strategy.removeprefix("mul:").split(":")
+                raw_a, raw_b = values.get(factor_a), values.get(factor_b)
+                try:
+                    product = Decimal(str(raw_a)) * Decimal(str(raw_b))
+                except (ArithmeticError, ValueError, TypeError):
+                    computed_exceptions.append(
+                        RowException(
+                            source_table=spec.source_table,
+                            source_key=str(row[key_source]),
+                            column=dest_col,
+                            reason=f"mul factors {factor_a!r}/{factor_b!r} are not numeric in the source row",
+                        )
+                    )
+                    continue
+                values[dest_col] = product
             elif strategy.startswith("slug:"):
                 raw = values.get(strategy.removeprefix("slug:"))
                 slug = re.sub(r"[^a-z0-9]+", "-", str(raw or "").lower()).strip("-")[:80].rstrip("-")
@@ -187,7 +211,13 @@ def execute_transform(
             report.exceptions.extend(computed_exceptions)
             continue
         if not dry_run:
-            destination_connection.execute(insert_sql, values)
+            params = values
+            if destination_connection.dialect.name == "sqlite":
+                # sqlite3 cannot bind Decimal; NUMERIC affinity stores
+                # the float. Postgres (the rehearsal target) binds
+                # Decimal natively and keeps exactness.
+                params = {k: float(v) if isinstance(v, Decimal) else v for k, v in values.items()}
+            destination_connection.execute(insert_sql, params)
             report.written += 1
     if dry_run:
         # Expectation counts: rows that would have been written.

@@ -121,19 +121,20 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         renames={
             "revision_id": "structure_id",
             "sequence": "display_order",
-            "fixed_amount": "amount",
         },
         fk_rewrites={"revision_id": "structure_revision"},
         lookups={
             **_COMPONENT_LOOKUP,
             "prorates": ("pay_component", "component_id", "prorates"),
+            "calculation_method": ("payroll_rule_conversion", "id", "calculation_method"),
+            "rate": ("payroll_rule_conversion", "id", "rate"),
+            "fixed_amount": ("payroll_rule_conversion", "id", "fixed_amount"),
         },
         note="also fed by salary_structure_deduction (second spec, same destination); "
-        "calculation_method stays MISSING until the enrolment formula "
-        "conversion rules it per row (module methods: input/fixed/percentage; "
-        "legacy amount_based_on_formula+formula/condition have no typed "
-        "equivalent for arbitrary expressions) - unconvertible formulas are "
-        "exceptions, so this spec is deliberately not executable yet",
+        "calculation_method/rate/fixed_amount come from the enrolment "
+        "formula conversion (payroll_formula.py: exact subset only) - "
+        "unconvertible formulas have no map entry and exception per row. "
+        "Percentage bases mint as pay_rule_bases after this spec",
     ),
     Pairing(
         "mod_payroll.pay_structure_rules",
@@ -141,19 +142,22 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         renames={
             "revision_id": "structure_id",
             "sequence": "display_order",
-            "fixed_amount": "amount",
         },
         fk_rewrites={"revision_id": "structure_revision"},
         lookups={
             **_COMPONENT_LOOKUP,
             "prorates": ("pay_component", "component_id", "prorates"),
+            "calculation_method": ("payroll_rule_conversion", "id", "calculation_method"),
+            "rate": ("payroll_rule_conversion", "id", "rate"),
+            "fixed_amount": ("payroll_rule_conversion", "id", "fixed_amount"),
         },
         note="see earning pairing",
     ),
     Pairing(
         "mod_payroll.pay_rule_bases",
         None,
-        note="GENERATED: derived from rule calculation bases at enrolment",
+        note="GENERATED: derived from converted percentage-rule bases by the "
+        "pay_rule_bases mint step (runs after pay_structure_rules)",
     ),
     Pairing(
         "mod_payroll.employee_pay_assignments",
@@ -191,35 +195,39 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         },
         constants={"revision_version": 1},
         fk_rewrites={"revision_id": "structure_revision"},
+        lookups={
+            "assignment_id": ("payroll_calculation", "id", "assignment_id"),
+            "proration_factor": ("payroll_calculation", "id", "proration_factor"),
+            "employer_liability_amount": ("payroll_calculation", "id", "employer_liability_amount"),
+        },
         note="historical slips import as calculation evidence; parity gate is "
-        "run-total equality. Still MISSING by design: assignment_id (legacy "
-        "slips link employee+structure, not the generated assignment row - "
-        "resolved per row at enrolment, unmatched = exception), "
-        "proration_factor (legacy payment_days/total_working_days ratio - "
-        "enrolment computation, zero-working-days = exception), "
-        "employer_liability_amount (sum of employer-kind lines - enrolment "
-        "aggregation; never defaulted to zero silently)",
+        "run-total equality. assignment_id/proration_factor/"
+        "employer_liability_amount come from the payroll_calculation "
+        "enrolment computation (exact assignment match, payment/working "
+        "days ratio, employer-kind line sum) - unresolved slips exception",
     ),
     Pairing(
         "mod_payroll.payroll_calculation_lines",
         "public.salary_slip_earning",
-        renames={"calculation_id": "slip_id", "sequence": "display_order"},
+        renames={"id": "line_id", "calculation_id": "slip_id", "sequence": "display_order"},
         lookups={
             "component_code": _COMPONENT_LOOKUP["component_code"],
             "component_kind": _COMPONENT_LOOKUP["component_kind"],
+            "calculation_method": ("payroll_line_method", "id", "calculation_method"),
         },
         note="also fed by salary_slip_deduction (second spec, same destination); "
-        "component_name copies from the legacy line snapshot; calculation_method "
-        "stays MISSING (method lives on the structure rule that produced the "
-        "line - enrolment resolves it from the converted rule set)",
+        "component_name copies from the legacy line snapshot; "
+        "calculation_method resolves from the converted rule set via the "
+        "payroll_line_method enrolment map",
     ),
     Pairing(
         "mod_payroll.payroll_calculation_lines",
         "public.salary_slip_deduction",
-        renames={"calculation_id": "slip_id", "sequence": "display_order"},
+        renames={"id": "line_id", "calculation_id": "slip_id", "sequence": "display_order"},
         lookups={
             "component_code": _COMPONENT_LOOKUP["component_code"],
             "component_kind": _COMPONENT_LOOKUP["component_kind"],
+            "calculation_method": ("payroll_line_method", "id", "calculation_method"),
         },
         note="see earning pairing",
     ),

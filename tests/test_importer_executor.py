@@ -246,3 +246,67 @@ def test_executor_refuses_non_executable_spec() -> None:
     spec = _spec(destination_columns=(DestinationColumn("nope", nullable=False, has_default=False),))
     with src.connect() as s, dst.connect() as d, pytest.raises(ValueError):
         execute_transform(s, d, spec)
+
+
+def test_scalar_defaults_and_mul_and_uuid5_row() -> None:
+    spec = build_spec(
+        source_table="bank_directory",
+        destination_table="bank_institutions",
+        source_columns=("bank_code", "bank_name", "quantity", "unit_price"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("code", nullable=False, has_default=False),
+            DestinationColumn("name", nullable=False, has_default=False),
+            DestinationColumn("quantity", nullable=False, has_default=False),
+            DestinationColumn("unit_price", nullable=False, has_default=False),
+            DestinationColumn("gross", nullable=False, has_default=False),
+            DestinationColumn("is_active", nullable=False, has_default=False, scalar_default=True),
+        ),
+        renames={"code": "bank_code", "name": "bank_name"},
+        computed={"id": "uuid5_row", "gross": "mul:quantity:unit_price"},
+    )
+    assert spec.executable
+    assert spec.defaults == {"is_active": True}
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(
+            sa.text("CREATE TABLE bank_directory (bank_code TEXT, bank_name TEXT, quantity REAL, unit_price REAL)")
+        )
+        c.execute(sa.text("INSERT INTO bank_directory VALUES ('044','Access',3,2.5)"))
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE bank_institutions (id TEXT, code TEXT, name TEXT, "
+                "quantity REAL, unit_price REAL, gross REAL, is_active INTEGER)"
+            )
+        )
+    with src.connect() as s, dst.begin() as d:
+        report = execute_transform(s, d, spec)
+        assert report.complete
+        row = d.execute(sa.text("SELECT length(id), code, gross, is_active FROM bank_institutions")).one()
+        assert tuple(row) == (32, "044", 7.5, 1)
+
+
+def test_id_preserved_via_last_token_systematic() -> None:
+    spec = build_spec(
+        source_table="salary_slip",
+        destination_table="payroll_calculations",
+        source_columns=("slip_id", "employee_id"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("employee_ref", nullable=False, has_default=False),
+        ),
+        renames={"employee_ref": "employee_id"},
+    )
+    assert spec.column_map["id"] == "slip_id"
+    spec2 = build_spec(
+        source_table="posted_ledger_line",
+        destination_table="posted_ledger_lines",
+        source_columns=("ledger_line_id", "debit"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("debit", nullable=False, has_default=False),
+        ),
+    )
+    assert spec2.column_map["id"] == "ledger_line_id"

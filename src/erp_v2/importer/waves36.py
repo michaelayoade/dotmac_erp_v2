@@ -78,7 +78,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_accounting.accounting_dimensions",
         "public.coa_segment_definition",
-        renames={"code": "segment_type", "name": "segment_name"},
+        renames={"id": "segment_def_id", "code": "segment_type", "name": "segment_name"},
     ),
     Pairing(
         "mod_accounting.accounting_dimension_values",
@@ -136,6 +136,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "public.bank_directory",
         renames={"code": "bank_code", "name": "bank_name"},
         constants={"status": "active", "country_code": "NG"},
+        computed={"id": "uuid5_row"},
         note="legacy directory is the Nigerian NIBSS bank list (nibss_code); country fixed NG",
     ),
     Pairing(
@@ -195,17 +196,22 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "supplier_document_number": "supplier_invoice_number",
             "liability_account_ref": "ap_control_account_id",
         },
-        lookups={"supplier_name_snapshot": ("supplier", "supplier_ref", "name")},
-        note="payment_schedule (JSON) stays MISSING: enrolment builds the "
-        "schedule document from due_date/total per the module schedule "
-        "schema - a JSON assembly, not a column copy",
+        lookups={
+            "supplier_name_snapshot": ("supplier", "supplier_ref", "name"),
+            "payment_schedule": ("supplier_payment_schedule", "id", "payment_schedule"),
+        },
+        note="payment_schedule: single-instalment JSON assembled at enrolment "
+        "from due_date + total (module schedule shape, sums to the total); "
+        "invoices without a due date exception",
     ),
     Pairing(
         "mod_payables.supplier_invoice_lines",
         "public.supplier_invoice_line",
         renames={"posting_account_ref": "expense_account_id"},
-        note="dimension_refs (JSON) stays MISSING: enrolment assembles it "
-        "from cost_center_id/project_id/segment_id per the module refs schema",
+        lookups={"dimension_refs": ("supplier_line_dimensions", "id", "dimension_refs")},
+        note="dimension_refs: enrolment-assembled sorted [CODE, value] JSON "
+        "from cost_center_id/project_id/segment_id (declared codes "
+        "COST_CENTER/PROJECT/SEGMENT)",
     ),
     Pairing(
         "mod_payables.settlement_observations",
@@ -291,8 +297,9 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_expenses.expense_policy_evaluations",
         "public.expense_limit_evaluation",
         renames={"actual_amount": "claim_amount", "reason_code": "result"},
-        note="batch_id stays MISSING: enrolment mints one evaluation batch "
-        "per claim at import (legacy evaluations are unbatched evidence)",
+        lookups={"batch_id": ("expense_evaluation_batch", "claim_id", "batch_id")},
+        note="batch_id: deterministic per-claim batch from the enrolment "
+        "map (legacy evaluations are unbatched evidence)",
     ),
     Pairing(
         "mod_expenses.expense_lifecycle_events",
@@ -306,6 +313,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_expenses.expense_requests",
         "public.expense_entry",
         renames={
+            "id": "expense_id",
             "reference": "expense_number",
             "requester_party_id": "created_by",
             "purpose": "description",
@@ -341,6 +349,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_procurement.sourcing_events",
         "public.request_for_quotation",
         renames={
+            "id": "rfq_id",
             "event_number": "rfq_number",
             "method": "procurement_method",
             "opens_at": "rfq_date",
@@ -394,6 +403,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_procurement.purchase_orders",
         "public.purchase_order",
         renames={
+            "id": "po_id",
             "order_number": "po_number",
             "ordered_on": "po_date",
             "terms": "terms_and_conditions",
@@ -416,9 +426,10 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "source_event_id": "receipt_id",
             "observed_at": "receipt_date",
         },
-        note="lines_json stays MISSING: enrolment assembles it from legacy "
-        "goods_receipt lines per the module observation payload schema; "
-        "payload_sha256 then binds the assembled document",
+        lookups={"lines_json": ("receipt_lines", "id", "lines_json")},
+        note="lines_json assembled at enrolment from legacy goods_receipt "
+        "lines in the module canonical form; payload_sha256 computes "
+        "over the imported row including the assembled lines",
     ),
     *_generated(
         "mod_procurement",
@@ -436,10 +447,14 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "state": "status",
         },
         computed={"idempotency_key": "source_key"},
-        note="policy_code/policy_version stay MISSING: they resolve from "
-        "the legacy workflow_id through the policy enrolment map (policies "
-        "re-publish first); content_digest computes over the imported row; "
-        "state values verified against the module state set at rehearsal",
+        lookups={
+            "policy_code": ("approval_request_policy", "id", "policy_code"),
+            "policy_version": ("approval_request_policy", "id", "policy_version"),
+        },
+        note="policy_code/version resolve from the legacy workflow via the "
+        "approval_request_policy enrolment map (policies enrol as v1); "
+        "content_digest computes over the imported row; state values "
+        "verified against the module state set at rehearsal",
     ),
     Pairing(
         "mod_approvals.approval_decisions",
@@ -470,11 +485,11 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "acquired_on": "acquisition_date",
             "tag": "barcode",
         },
-        note="kind/condition stay MISSING: kind derives from legacy "
-        "category by an explicit enrolment value table (category_id is not "
-        "a module column); condition has no legacy source - assessed at "
-        "enrolment, never defaulted. Valuation columns are finance-owned "
-        "(asset books), not asset-registry data",
+        lookups={"kind": ("asset_kind", "id", "kind")},
+        note="kind from the legacy category_code via the asset_kind "
+        "enrolment map. condition stays MISSING: no legacy source - "
+        "assessed at enrolment, never defaulted. Valuation columns are "
+        "finance-owned (asset books), not asset-registry data",
     ),
     Pairing(
         "mod_assets.asset_assignments",
@@ -579,10 +594,11 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "effective_date": "start_date",
             "expiry_date": "end_date",
         },
+        lookups={"agreement_family_id": ("agreement_family", "id", "family_id")},
         note="commercial contracts only; employment/lease/performance "
-        "contracts are e2. agreement_family_id stays MISSING: enrolment "
-        "mints one family per contract chain (amendment lineage via "
-        "original_contract_id evidence) - no legacy family column exists",
+        "contracts are e2. agreement_family_id: deterministic family per "
+        "contract chain from the agreement_family enrolment map "
+        "(amendment lineage via original_contract_id evidence)",
     ),
     Pairing(
         "mod_agreements.agreement_events",
@@ -608,19 +624,23 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "notes": "customer_notes",
             "authored_by_opaque_id": "created_by",
         },
-        note="lead_id/tax_rate/authored_by_kind/authored_by_label stay "
-        "MISSING: sales is lead-based and ERP has no lead estate (leads "
-        "GENERATED at enrolment, one per customer); tax_rate is not "
-        "derivable per quote (mixed line rates) - enrolment ruling; "
-        "author kind/label resolve from identity enrolment",
+        constants={"authored_by_kind": "user"},
+        lookups={
+            "lead_id": ("quote_lead", "id", "lead_id"),
+            "authored_by_label": ("user_label", "authored_by_opaque_id", "label"),
+        },
+        note="lead_id resolves to the enrolment-minted per-customer lead; "
+        "authored_by_kind is the declared enrolment value for legacy user "
+        "authors, label from the legacy credential username. tax_rate "
+        "stays MISSING: not derivable per quote (mixed line rates)",
     ),
     Pairing(
         "mod_sales.quote_lines",
         "public.quote_line",
         renames={"position": "line_number", "amount": "line_total"},
-        note="gross_amount stays MISSING: quantity*unit_price before "
-        "discount - an enrolment computation, checked against "
-        "amount+discount at rehearsal (mismatch = exception)",
+        computed={"gross_amount": "mul:quantity:unit_price"},
+        note="gross_amount computes as quantity x unit_price (exact "
+        "Decimal); rehearsal parity-checks amount+discount against it",
     ),
     *_generated(
         "mod_sales",
@@ -671,10 +691,10 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_inventory.lots",
         "public.inventory_lot",
         renames={"code": "lot_number", "received_at": "received_date", "supplier_lot_ref": "supplier_lot_number"},
-        note="status stays MISSING: LotStatus is available/quarantined/"
-        "depleted - is_active alone cannot distinguish them; enrolment "
-        "derives status from the imported lot balance (zero = depleted) "
-        "plus quarantine evidence, per-lot",
+        lookups={"status": ("lot_status", "id", "status")},
+        note="status derives at enrolment from balance evidence "
+        "(is_quarantined flag, then on-hand total: zero = depleted, "
+        "else available) via the lot_status map",
     ),
     Pairing("mod_inventory.lot_balances", "public.inventory_lot_balance"),
     Pairing("mod_inventory.serials", "public.inventory_serial"),
@@ -775,11 +795,16 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_documents.documents",
         "public.hr_document",
         renames={"metadata": "extra_metadata", "state": "status"},
-        note="library_id/type_code/type_version/folder_path/sensitivity/"
-        "handling_instructions stay MISSING: libraries and document "
-        "types are enrolment config (legacy category does not map 1:1 "
-        "to module types) and sensitivity/handling are classification "
-        "policy rulings for HR documents - none may be invented per row. "
+        constants={"type_version": 1},
+        lookups={
+            "library_id": ("document_library", "tenant_id", "library_id"),
+            "type_code": ("document_type", "id", "type_code"),
+            "folder_path": ("document_type", "id", "folder_path"),
+        },
+        note="library/type/folder resolve from enrolment (minted HR "
+        "library, category-slug type codes, legacy file_path folders). "
+        "sensitivity/handling_instructions stay MISSING: classification "
+        "policy rulings for HR documents - never invented per row. "
         "state values verified against the module state set at rehearsal",
     ),
     *_generated(
@@ -801,7 +826,11 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     ),
     # forms (mod_forms): near 1:1 plural shapes
     Pairing("mod_forms.forms", "public.form"),
-    Pairing("mod_forms.form_versions", "public.form_version"),
+    Pairing(
+        "mod_forms.form_versions",
+        "public.form_version",
+        renames={"settings": "settings_json"},
+    ),
     Pairing(
         "mod_forms.form_sections",
         "public.form_section",

@@ -12,31 +12,31 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (10): address, contact_email, contact_name, contact_phone, cost_center_id, is_consignment, is_receiving, is_shipping, is_transit, location_id
 
 ## public.inventory_lot -> mod_inventory.lots
-- executable: False; mapped: 10; missing: ['status']
-- residue (7): allocation_reference, certificate_of_analysis, initial_quantity, is_active, lot_id, purchase_order_id, supplier_id
+- executable: True; mapped: 11; missing: none
+- residue (6): allocation_reference, certificate_of_analysis, initial_quantity, is_active, purchase_order_id, supplier_id
 
 ## public.inventory_lot_balance -> mod_inventory.lot_balances
-- executable: True; mapped: 6; missing: none
-- residue (7): is_active, is_quarantined, lot_balance_id, qc_status, quantity_allocated, quantity_available, quarantine_reason
+- executable: True; mapped: 7; missing: none
+- residue (6): is_active, is_quarantined, qc_status, quantity_allocated, quantity_available, quarantine_reason
 
 ## public.inventory_serial -> mod_inventory.serials
-- executable: True; mapped: 8; missing: none
-- residue (4): is_active, location_id, notes, serial_id
+- executable: True; mapped: 9; missing: none
+- residue (3): is_active, location_id, notes
 
 ## public.inventory_transaction -> mod_inventory.stock_movements
-- executable: False; mapped: 15; missing: ['value_after']
+- executable: False; mapped: 16; missing: ['value_after']
 - residue (12): fiscal_period_id, journal_entry_id, location_id, quantity_before, reason_code, reference, source_document_id, source_document_line_id, source_document_type, to_location_id, to_warehouse_id, uom
 
 ## public.inventory_serial_movement -> mod_inventory.movement_serials
-- executable: True; mapped: 4; missing: none
+- executable: True; mapped: 5; missing: none
 - residue (9): created_by_user_id, from_location_id, from_warehouse_id, lot_id, movement_type, reason, to_location_id, to_warehouse_id, transaction_id
 
 ## public.stock_reservation -> mod_inventory.stock_reservations
-- executable: True; mapped: 12; missing: none
+- executable: True; mapped: 13; missing: none
 - residue (7): priority, quantity_cancelled, reserved_at, reserved_by_user_id, source_id, source_line_id, source_type
 
 ## public.inventory_valuation -> mod_inventory.valuation_snapshots
-- executable: True; mapped: 15; missing: none
+- executable: True; mapped: 16; missing: none
 - residue (7): estimated_costs_to_complete, estimated_selling_costs, estimated_selling_price, fiscal_period_id, functional_currency_amount, uom, write_down_journal_entry_id
 
 ## public.project -> mod_projects.projects
@@ -44,16 +44,16 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (15): actual_cost, budget_amount, budget_currency_code, business_unit_id, cost_center_id, customer_id, end_date, estimated_cost, is_capitalizable, percent_complete, project_manager_user_id, project_template_id, project_type, segment_id, start_date
 
 ## public.project_template -> mod_projects.project_templates
-- executable: True; mapped: 4; missing: none
-- residue (2): project_type, template_id
+- executable: True; mapped: 5; missing: none
+- residue (1): project_type
 
 ## public.project_template_task -> mod_projects.project_template_tasks
-- executable: True; mapped: 5; missing: none
-- residue (1): template_task_id
+- executable: True; mapped: 6; missing: none
+- residue (0): 
 
 ## public.project_template_task_dependency -> mod_projects.project_template_task_dependencies
-- executable: True; mapped: 5; missing: none
-- residue (1): dependency_id
+- executable: True; mapped: 6; missing: none
+- residue (0): 
 
 ## public.milestone -> mod_projects.project_tasks
 - executable: True; mapped: 8; missing: none
@@ -64,43 +64,43 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (12): category_id, contact_address, contact_email, contact_phone, customer_id, opening_date, project_id, raised_by_email, raised_by_id, resolution, resolution_date, team_id
 
 ## public.ticket_comment -> mod_tkt.ticket_comments
-- executable: True; mapped: 6; missing: none
-- residue (6): action, comment_id, comment_type, is_active, new_value, old_value
+- executable: True; mapped: 7; missing: none
+- residue (5): action, comment_type, is_active, new_value, old_value
 
 ## public.hr_document -> mod_documents.documents
-- executable: False; mapped: 9; missing: ['library_id', 'type_code', 'type_version', 'folder_path', 'sensitivity', 'handling_instructions']
-- residue (17): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, document_id, effective_date, expiry_date, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, updated_by, version
+- executable: False; mapped: 10; missing: ['sensitivity', 'handling_instructions']
+- residue (16): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, effective_date, expiry_date, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, updated_by, version
 
 ## public.form -> mod_forms.forms
 - executable: True; mapped: 7; missing: none
 - residue (2): owner_entity_id, owner_entity_type
 
 ## public.form_version -> mod_forms.form_versions
-- executable: True; mapped: 7; missing: none
-- residue (1): settings_json
+- executable: True; mapped: 8; missing: none
+- residue (0): 
 
 ## public.form_section -> mod_forms.form_sections
-- executable: True; mapped: 4; missing: none
-- residue (1): section_id
+- executable: True; mapped: 5; missing: none
+- residue (0): 
 
 ## public.form_field -> mod_forms.form_fields
-- executable: True; mapped: 10; missing: none
-- residue (6): field_id, is_filterable, placeholder, show_in_list, system_mapping, visibility_json
+- executable: True; mapped: 11; missing: none
+- residue (5): is_filterable, placeholder, show_in_list, system_mapping, visibility_json
 
 ## public.form_field_option -> mod_forms.form_field_options
-- executable: True; mapped: 5; missing: none
-- residue (1): option_id
+- executable: True; mapped: 6; missing: none
+- residue (0): 
 
 ## public.form_submission -> mod_forms.form_submissions
-- executable: True; mapped: 5; missing: none
-- residue (3): subject_type, submission_id, submitted_by_email
+- executable: True; mapped: 6; missing: none
+- residue (2): subject_type, submitted_by_email
 
 ## public.form_answer -> mod_forms.form_answers
-- executable: True; mapped: 7; missing: none
-- residue (4): answer_id, created_at, file_name, file_url
+- executable: True; mapped: 8; missing: none
+- residue (3): created_at, file_name, file_url
 
 ## public.workflow_execution -> mod_workflow.workflow_executions
-- executable: True; mapped: 6; missing: none
+- executable: True; mapped: 7; missing: none
 - residue (11): duration_ms, entity_type, error_details, error_message, max_retries, result, retry_count, trigger_data, trigger_event, triggered_at, triggered_by
 
 ## GENERATED / command-import destinations

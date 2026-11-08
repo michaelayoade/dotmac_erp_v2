@@ -31,56 +31,56 @@ consumes (e2/adapter/retire by rehearsal ruling).
 - residue (0): none
 
 ## public.salary_component -> mod_payroll.pay_components
-- executable: True; mapped: 9; missing: none
-- residue (10): abbr, component_id, depends_on_payment_days, display_order, do_not_include_in_total, exempted_from_income_tax, is_active, is_statutory, is_tax_applicable, statistical_component
+- executable: True; mapped: 10; missing: none
+- residue (9): abbr, depends_on_payment_days, display_order, do_not_include_in_total, exempted_from_income_tax, is_active, is_statutory, is_tax_applicable, statistical_component
 
 ## public.salary_structure -> mod_payroll.pay_structures
-- executable: True; mapped: 6; missing: none
-- residue (4): description, is_active, payroll_frequency, structure_id
+- executable: True; mapped: 7; missing: none
+- residue (3): description, is_active, payroll_frequency
 
 ## public.salary_structure_earning -> mod_payroll.pay_structure_rules
-- executable: False; mapped: 4; missing: ['calculation_method']
-- residue (4): amount_based_on_formula, condition, earning_id, formula
+- executable: True; mapped: 4; missing: none
+- residue (4): amount, amount_based_on_formula, condition, formula
 
 ## public.salary_structure_deduction -> mod_payroll.pay_structure_rules
-- executable: False; mapped: 4; missing: ['calculation_method']
-- residue (4): amount_based_on_formula, condition, deduction_id, formula
+- executable: True; mapped: 4; missing: none
+- residue (4): amount, amount_based_on_formula, condition, formula
 
 ## public.salary_structure_assignment -> mod_payroll.employee_pay_assignments
-- executable: True; mapped: 7; missing: none
-- residue (4): assignment_id, base, income_tax_slab, variable
+- executable: True; mapped: 8; missing: none
+- residue (3): base, income_tax_slab, variable
 
 ## public.payroll_entry -> mod_payroll.payroll_runs
-- executable: True; mapped: 7; missing: none
-- residue (28): department_id, designation_id, employee_count, employment_type_id, entry_id, entry_name, exchange_rate, expense_account_id, journal_entry_id, notes, payroll_frequency, payroll_month, payroll_year, payslips_email_error_count, payslips_email_last_run_at, payslips_email_processed_count, payslips_email_queued_at, payslips_email_queued_by_id, payslips_email_status, payslips_email_total_count, posting_date, salary_slips_created, salary_slips_submitted, source_bank_account_id, total_deductions, total_gross_pay, total_net_pay, updated_at
+- executable: True; mapped: 8; missing: none
+- residue (27): department_id, designation_id, employee_count, employment_type_id, entry_name, exchange_rate, expense_account_id, journal_entry_id, notes, payroll_frequency, payroll_month, payroll_year, payslips_email_error_count, payslips_email_last_run_at, payslips_email_processed_count, payslips_email_queued_at, payslips_email_queued_by_id, payslips_email_status, payslips_email_total_count, posting_date, salary_slips_created, salary_slips_submitted, source_bank_account_id, total_deductions, total_gross_pay, total_net_pay, updated_at
 
 ## public.salary_slip -> mod_payroll.payroll_calculations
-- executable: False; mapped: 8; missing: ['assignment_id', 'proration_factor', 'employer_liability_amount']
-- residue (36): absent_days, amount_paid, balance_due, bank_account_name, bank_account_number, bank_branch_code, bank_name, cost_center_id, currency_code, employee_name, end_date, exchange_rate, gross_pay_functional, is_auto_generated, journal_entry_id, leave_without_pay, needs_review, net_pay_functional, notes, paid_at, paid_by_id, payment_days, payment_reference, posted_at, posted_by_id, posting_date, review_reasons, reviewed_at, reviewed_by_id, slip_id, slip_number, start_date, status, total_deduction_functional, total_working_days, updated_at
+- executable: True; mapped: 9; missing: none
+- residue (35): absent_days, amount_paid, balance_due, bank_account_name, bank_account_number, bank_branch_code, bank_name, cost_center_id, currency_code, employee_name, end_date, exchange_rate, gross_pay_functional, is_auto_generated, journal_entry_id, leave_without_pay, needs_review, net_pay_functional, notes, paid_at, paid_by_id, payment_days, payment_reference, posted_at, posted_by_id, posting_date, review_reasons, reviewed_at, reviewed_by_id, slip_number, start_date, status, total_deduction_functional, total_working_days, updated_at
 
 ## public.salary_slip_earning -> mod_payroll.payroll_calculation_lines
-- executable: False; mapped: 5; missing: ['calculation_method']
-- residue (7): abbr, additional_amount, default_amount, do_not_include_in_total, line_id, statistical_component, year_to_date
+- executable: True; mapped: 6; missing: none
+- residue (6): abbr, additional_amount, default_amount, do_not_include_in_total, statistical_component, year_to_date
 
 ## public.salary_slip_deduction -> mod_payroll.payroll_calculation_lines
-- executable: False; mapped: 5; missing: ['calculation_method']
-- residue (7): abbr, additional_amount, default_amount, do_not_include_in_total, line_id, statistical_component, year_to_date
+- executable: True; mapped: 6; missing: none
+- residue (6): abbr, additional_amount, default_amount, do_not_include_in_total, statistical_component, year_to_date
 
 ## public.tax_jurisdiction -> mod_tax.tax_jurisdictions
-- executable: True; mapped: 9; missing: none
-- residue (20): current_tax_expense_account_id, current_tax_payable_account_id, current_tax_rate, deferred_tax_asset_account_id, deferred_tax_expense_account_id, deferred_tax_liability_account_id, description, extension_months, filing_due_months, fiscal_year_end_month, future_rate_effective_from, future_tax_rate, has_reduced_rate, is_active, jurisdiction_id, reduced_rate, reduced_rate_threshold, tax_authority_name, tax_id_number, tax_rate_effective_from
+- executable: True; mapped: 10; missing: none
+- residue (19): current_tax_expense_account_id, current_tax_payable_account_id, current_tax_rate, deferred_tax_asset_account_id, deferred_tax_expense_account_id, deferred_tax_liability_account_id, description, extension_months, filing_due_months, fiscal_year_end_month, future_rate_effective_from, future_tax_rate, has_reduced_rate, is_active, reduced_rate, reduced_rate_threshold, tax_authority_name, tax_id_number, tax_rate_effective_from
 
 ## public.tax_code -> mod_tax.tax_codes
 - executable: True; mapped: 9; missing: none
 - residue (16): applies_to_purchases, applies_to_sales, effective_from, effective_to, is_active, is_compound, is_fixed_amount, is_inclusive, is_recoverable, recovery_rate, reporting_code, tax_collected_account_id, tax_expense_account_id, tax_paid_account_id, tax_rate, tax_return_box
 
 ## public.tax_return -> mod_tax.tax_returns
-- executable: False; mapped: 7; missing: ['report_id', 'obligation_id', 'report_amount', 'adjustment_amount', 'payable_amount', 'currency_code']
-- residue (22): adjustments, box_values, filed_by_user_id, filed_date, final_amount, is_amendment, is_paid, jurisdiction_id, net_tax_payable, payment_date, payment_journal_entry_id, payment_reference, prepared_by_user_id, return_id, return_reference, return_type, reviewed_at, reviewed_by_user_id, tax_period_id, total_input_tax, total_output_tax, updated_at
+- executable: False; mapped: 8; missing: ['report_id', 'obligation_id', 'report_amount', 'adjustment_amount', 'payable_amount', 'currency_code']
+- residue (21): adjustments, box_values, filed_by_user_id, filed_date, final_amount, is_amendment, is_paid, jurisdiction_id, net_tax_payable, payment_date, payment_journal_entry_id, payment_reference, prepared_by_user_id, return_reference, return_type, reviewed_at, reviewed_by_user_id, tax_period_id, total_input_tax, total_output_tax, updated_at
 
 ## GENERATED destinations (no row copy)
 - mod_payroll.pay_structure_revisions: GENERATED: one published v1 revision per structure at enrolment
-- mod_payroll.pay_rule_bases: GENERATED: derived from rule calculation bases at enrolment
+- mod_payroll.pay_rule_bases: GENERATED: derived from converted percentage-rule bases by the pay_rule_bases mint step (runs after pay_structure_rules)
 - mod_payroll.payroll_liabilities: GENERATED by payroll service from calculations; open legacy balances enter as enrolment liabilities with evidence refs
 - mod_payroll.payroll_liability_settlements: GENERATED post-flip; legacy settlements stay calculation evidence
 - mod_tax.tax_authorities: GENERATED: one authority per legacy jurisdiction level at enrolment

@@ -567,8 +567,76 @@ def mint_document_libraries_types(source: sa.Connection, dest: sa.Connection, ct
     return result
 
 
+def mint_pay_rule_bases(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
+    """Basis rows for converted percentage rules (runs post-specs).
+
+    Rule ids are the preserved legacy earning/deduction ids; basis
+    components resolve from formula abbreviations through the
+    legacy salary_component estate of the same tenant.
+    """
+
+    from erp_v2.importer.payroll_formula import convert_rule
+
+    result = MintResult("pay_rule_bases")
+    components = list(
+        source.execute(
+            sa.text("SELECT component_id, organization_id, abbr FROM public.salary_component WHERE abbr IS NOT NULL")
+        ).mappings()
+    )
+    abbr_component = {(_norm(c["organization_id"]), str(c["abbr"])): _norm(c["component_id"]) for c in components}
+    known_abbrs = {str(c["abbr"]) for c in components}
+    existing = {
+        (_norm(r[0]), _norm(r[1]))
+        for r in dest.execute(sa.text("SELECT rule_id, component_id FROM mod_payroll.pay_rule_bases"))
+    }
+    tenant_by_structure = {
+        _norm(r[0]): _norm(r[1])
+        for r in source.execute(sa.text("SELECT structure_id, organization_id FROM public.salary_structure"))
+    }
+    rows: list[dict[str, Any]] = []
+    for table, pk in (("salary_structure_earning", "earning_id"), ("salary_structure_deduction", "deduction_id")):
+        legacy = source.execute(
+            sa.text(
+                f"SELECT {pk} AS rule_id, structure_id, amount, amount_based_on_formula, formula, condition "  # noqa: S608
+                f"FROM public.{table}"
+            )
+        ).mappings()
+        for row in legacy:
+            conversion = convert_rule(
+                amount=row["amount"],
+                amount_based_on_formula=row["amount_based_on_formula"],
+                formula=row["formula"],
+                condition=row["condition"],
+                known_abbrs=known_abbrs,
+            )
+            if conversion is None or conversion.method != "percentage":
+                continue
+            tenant = tenant_by_structure.get(_norm(row["structure_id"]))
+            rule_id = _norm(row["rule_id"])
+            for abbr in conversion.basis_abbrs:
+                component_id = abbr_component.get((tenant, abbr))
+                if component_id is None:
+                    result.blockers.append(f"rule {rule_id}: basis abbreviation {abbr!r} has no component")
+                    continue
+                if (rule_id, component_id) in existing:
+                    result.existing += 1
+                    continue
+                rows.append(
+                    {
+                        "id": _mint_id("pay_rule_bases", tenant, f"{rule_id}:{component_id}"),
+                        "tenant_id": tenant,
+                        "rule_id": rule_id,
+                        "component_id": component_id,
+                    }
+                )
+    _insert(dest, "mod_payroll.pay_rule_bases", rows)
+    result.created = len(rows)
+    return result
+
+
 MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("pay_structure_revisions", mint_pay_structure_revisions),
+    ("pay_rule_bases", mint_pay_rule_bases),
     ("tax_authorities", mint_tax_authorities),
     ("tax_rules", mint_tax_rules),
     ("sourcing_event_lines", mint_sourcing_event_lines),

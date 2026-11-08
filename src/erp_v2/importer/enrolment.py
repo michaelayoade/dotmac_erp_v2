@@ -29,13 +29,18 @@ agnostic; the tenant extent still bounds which source rows import.
 
 from __future__ import annotations
 
+import json
+import posixpath
+import re
 import uuid
 from collections.abc import Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from typing import Any, Final
 
 import sqlalchemy as sa
 
 from erp_v2.importer.minting import MAP_MINTS, MintContext, MintResult, run_mint_step
+from erp_v2.importer.payroll_formula import convert_rule
 from erp_v2.importer.spec import TransformSpec
 
 
@@ -202,20 +207,419 @@ def _pay_component(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict
     return mapping
 
 
+# --- enrolment computations (derived values, never copied columns) --------
+
+
+def _known_abbrs(source: sa.Connection) -> set[str]:
+    return {
+        str(r[0]) for r in source.execute(sa.text("SELECT abbr FROM public.salary_component WHERE abbr IS NOT NULL"))
+    }
+
+
+def _convert_row(row: Mapping[str, Any], abbrs: set[str]):
+    return convert_rule(
+        amount=row["amount"],
+        amount_based_on_formula=row["amount_based_on_formula"],
+        formula=row["formula"],
+        condition=row["condition"],
+        known_abbrs=abbrs,
+    )
+
+
+def _rule_conversions(source: sa.Connection) -> dict[tuple[Any, Any], Any]:
+    """(structure_id, component_id) -> RuleConversion for line methods.
+
+    Ambiguous keys (same component twice in one structure with
+    different conversions) are dropped - lines then exception.
+    """
+
+    abbrs = _known_abbrs(source)
+    conversions: dict[tuple[Any, Any], Any] = {}
+    ambiguous: set[tuple[Any, Any]] = set()
+    for table in ("salary_structure_earning", "salary_structure_deduction"):
+        rows = source.execute(
+            sa.text(
+                f"SELECT structure_id, component_id, amount, amount_based_on_formula, formula, condition "  # noqa: S608
+                f"FROM public.{table}"
+            )
+        ).mappings()
+        for row in rows:
+            conversion = _convert_row(row, abbrs)
+            if conversion is None:
+                continue
+            key = (_norm(row["structure_id"]), _norm(row["component_id"]))
+            if key in conversions and conversions[key] != conversion:
+                ambiguous.add(key)
+            conversions[key] = conversion
+    return {k: v for k, v in conversions.items() if k not in ambiguous}
+
+
+def _payroll_rule_conversion(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Per legacy rule row: typed method, rate, and fixed amount (fixed only).
+
+    Unconvertible formulas produce NO entry - the executor then
+    exception-queues the rule for a human ruling (see payroll_formula).
+    """
+
+    abbrs = _known_abbrs(source)
+    mapping: dict[Any, dict[str, Any]] = {}
+    for table, pk in (("salary_structure_earning", "earning_id"), ("salary_structure_deduction", "deduction_id")):
+        rows = source.execute(
+            sa.text(
+                f"SELECT {pk} AS key, amount, amount_based_on_formula, formula, condition FROM public.{table}"  # noqa: S608
+            )
+        ).mappings()
+        for row in rows:
+            conversion = _convert_row(row, abbrs)
+            if conversion is None:
+                continue
+            _put(
+                mapping,
+                "payroll_rule_conversion",
+                row["key"],
+                {
+                    "calculation_method": conversion.method,
+                    "rate": conversion.rate,
+                    "fixed_amount": row["amount"] if conversion.method == "fixed" else None,
+                },
+            )
+    return mapping
+
+
+def _payroll_line_method(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    conversions = _rule_conversions(source)
+    slip_structure = {
+        _norm(r[0]): _norm(r[1])
+        for r in source.execute(sa.text("SELECT slip_id, structure_id FROM public.salary_slip"))
+    }
+    mapping: dict[Any, dict[str, Any]] = {}
+    for table in ("salary_slip_earning", "salary_slip_deduction"):
+        rows = source.execute(
+            sa.text(f"SELECT line_id AS key, slip_id, component_id FROM public.{table}")  # noqa: S608
+        ).mappings()
+        for row in rows:
+            conversion = conversions.get((slip_structure.get(_norm(row["slip_id"])), _norm(row["component_id"])))
+            if conversion is None:
+                continue
+            _put(mapping, "payroll_line_method", row["key"], {"calculation_method": conversion.method})
+    return mapping
+
+
+def _same_id(a: object, b: object) -> bool:
+    return str(a).replace("-", "") == str(b).replace("-", "")
+
+
+def _payroll_calculation(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Per legacy slip: assignment, proration factor, employer liability.
+
+    Assignment resolution is exact-match only (employee + structure
+    revision + slip start inside the effective window); ambiguous or
+    unmatched slips get no entry and exception at execution.
+    """
+
+    revision_structure = {
+        _norm(r[0]): _norm(r[1])
+        for r in dest.execute(sa.text("SELECT id, structure_id FROM mod_payroll.pay_structure_revisions"))
+    }
+    assignments = list(
+        dest.execute(
+            sa.text(
+                "SELECT id, employee_ref, revision_id, effective_from, effective_to "
+                "FROM mod_payroll.employee_pay_assignments"
+            )
+        ).mappings()
+    )
+    employer_components = {
+        _norm(r[0])
+        for r in dest.execute(sa.text("SELECT id FROM mod_payroll.pay_components WHERE kind = 'employer_liability'"))
+    }
+    employer_sums: dict[Any, Decimal] = {}
+    for table in ("salary_slip_earning", "salary_slip_deduction"):
+        for slip_id, component_id, amount in source.execute(
+            sa.text(f"SELECT slip_id, component_id, amount FROM public.{table}")  # noqa: S608
+        ):
+            if _norm(component_id) in employer_components and amount is not None:
+                key = _norm(slip_id)
+                employer_sums[key] = employer_sums.get(key, Decimal(0)) + Decimal(str(amount))
+    mapping: dict[Any, dict[str, Any]] = {}
+    slips = source.execute(
+        sa.text(
+            "SELECT slip_id, employee_id, structure_id, start_date, payment_days, total_working_days "
+            "FROM public.salary_slip"
+        )
+    ).mappings()
+    for slip in slips:
+        try:
+            working = Decimal(str(slip["total_working_days"]))
+            factor = Decimal(str(slip["payment_days"])) / working if working else None
+        except (InvalidOperation, TypeError, ValueError):
+            factor = None
+        if factor is None:
+            continue
+        start = str(slip["start_date"])[:10]
+        candidates = [
+            a
+            for a in assignments
+            if _same_id(a["employee_ref"], slip["employee_id"])
+            and _same_id(revision_structure.get(_norm(a["revision_id"])), slip["structure_id"])
+            and str(a["effective_from"])[:10] <= start
+            and (a["effective_to"] is None or start <= str(a["effective_to"])[:10])
+        ]
+        if len(candidates) != 1:
+            continue
+        slip_key = _norm(slip["slip_id"])
+        _put(
+            mapping,
+            "payroll_calculation",
+            slip_key,
+            {
+                "assignment_id": _norm(candidates[0]["id"]),
+                "proration_factor": factor,
+                "employer_liability_amount": employer_sums.get(slip_key, Decimal(0)),
+            },
+        )
+    return mapping
+
+
+def _supplier_payment_schedule(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Single-instalment schedule JSON (module shape, sums to the total)."""
+
+    mapping: dict[Any, dict[str, Any]] = {}
+    rows = source.execute(
+        sa.text("SELECT invoice_id AS key, due_date, total_amount FROM public.supplier_invoice")
+    ).mappings()
+    for row in rows:
+        if row["due_date"] is None or row["total_amount"] is None:
+            continue
+        schedule = [{"due_date": str(row["due_date"])[:10], "amount": format(Decimal(str(row["total_amount"])), "f")}]
+        _put(mapping, "supplier_payment_schedule", row["key"], {"payment_schedule": json.dumps(schedule)})
+    return mapping
+
+
+def _supplier_line_dimensions(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """dimension_refs JSON: sorted [CODE, value] pairs (module shape).
+
+    Codes COST_CENTER/PROJECT/SEGMENT are the declared enrolment
+    dimension codes; the rehearsal dimension enrolment must define
+    them (accounting_dimensions) for reporting to join up.
+    """
+
+    mapping: dict[Any, dict[str, Any]] = {}
+    rows = source.execute(
+        sa.text("SELECT line_id AS key, cost_center_id, project_id, segment_id FROM public.supplier_invoice_line")
+    ).mappings()
+    for row in rows:
+        refs = sorted(
+            [code, str(_norm(row[col]))]
+            for code, col in (("COST_CENTER", "cost_center_id"), ("PROJECT", "project_id"), ("SEGMENT", "segment_id"))
+            if row[col] is not None
+        )
+        _put(mapping, "supplier_line_dimensions", row["key"], {"dimension_refs": json.dumps(refs)})
+    return mapping
+
+
+def _receipt_lines(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """lines_json in the module's canonical form (sorted-keys compact JSON
+    of [{order_line_id, quantity_received}], dashed UUID spellings)."""
+
+    grouped: dict[Any, list[dict[str, str]]] = {}
+    rows = source.execute(
+        sa.text(
+            "SELECT receipt_id, po_line_id, quantity_received, line_number "
+            "FROM public.goods_receipt_line ORDER BY line_number"
+        )
+    ).mappings()
+    for row in rows:
+        try:
+            quantity = Decimal(str(row["quantity_received"]))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if quantity <= 0 or row["po_line_id"] is None:
+            continue
+        try:
+            order_line = str(uuid.UUID(str(_norm(row["po_line_id"]))))
+        except ValueError:
+            order_line = str(row["po_line_id"])
+        grouped.setdefault(_norm(row["receipt_id"]), []).append(
+            {"order_line_id": order_line, "quantity_received": format(quantity.normalize(), "f")}
+        )
+    return {
+        key: {"lines_json": json.dumps(lines, sort_keys=True, separators=(",", ":"))} for key, lines in grouped.items()
+    }
+
+
+def _approval_request_policy(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    workflows = {
+        _norm(r[0]): r[1]
+        for r in source.execute(sa.text("SELECT workflow_id, workflow_code FROM public.approval_workflow"))
+    }
+    mapping: dict[Any, dict[str, Any]] = {}
+    for request_id, workflow_id in source.execute(
+        sa.text("SELECT request_id, workflow_id FROM public.approval_request")
+    ):
+        code = workflows.get(_norm(workflow_id))
+        if code is None:
+            continue
+        # Policies enrol as v1 (approval_policies pairing constant).
+        _put(mapping, "approval_request_policy", request_id, {"policy_code": code, "policy_version": 1})
+    return mapping
+
+
+def _expense_evaluation_batch(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    mapping: dict[Any, dict[str, Any]] = {}
+    rows = source.execute(sa.text("SELECT DISTINCT claim_id FROM public.expense_limit_evaluation"))
+    for (claim_id,) in rows:
+        batch = uuid.uuid5(uuid.NAMESPACE_URL, f"erp-v2-enrolment:expense_evaluation_batch:{_norm(claim_id)}").hex
+        _put(mapping, "expense_evaluation_batch", claim_id, {"batch_id": batch})
+    return mapping
+
+
+def _agreement_family(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """One deterministic family id per contract chain.
+
+    Amendment links (contract_amendment_workflow.contract_id ->
+    original_contract_id) union contracts; the family id is uuid5
+    of the chain root (smallest id in the component, deterministic).
+    """
+
+    parent: dict[Any, Any] = {}
+
+    def find(x: Any) -> Any:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    contracts = [_norm(r[0]) for r in source.execute(sa.text("SELECT contract_id FROM public.contract"))]
+    for contract in contracts:
+        find(contract)
+    for contract_id, original_id in source.execute(
+        sa.text(
+            "SELECT contract_id, original_contract_id FROM public.contract_amendment_workflow "
+            "WHERE original_contract_id IS NOT NULL"
+        )
+    ):
+        ra, rb = find(_norm(contract_id)), find(_norm(original_id))
+        if ra != rb:
+            parent[max(ra, rb, key=str)] = min(ra, rb, key=str)
+    mapping: dict[Any, dict[str, Any]] = {}
+    for contract in contracts:
+        family = uuid.uuid5(uuid.NAMESPACE_URL, f"erp-v2-enrolment:agreement_family:{find(contract)}").hex
+        _put(mapping, "agreement_family", contract, {"family_id": family})
+    return mapping
+
+
+def _asset_kind(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    categories = {
+        _norm(r[0]): r[1]
+        for r in source.execute(sa.text("SELECT category_id, category_code FROM public.asset_category"))
+    }
+    mapping: dict[Any, dict[str, Any]] = {}
+    for asset_id, category_id in source.execute(sa.text("SELECT asset_id, category_id FROM public.asset")):
+        kind = categories.get(_norm(category_id))
+        if kind:
+            _put(mapping, "asset_kind", asset_id, {"kind": kind})
+    return mapping
+
+
+def _lot_status(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """LotStatus from balance evidence: quarantined > depleted > available."""
+
+    totals: dict[Any, Decimal] = {}
+    quarantined: set[Any] = set()
+    for lot_id, quantity, is_quarantined in source.execute(
+        sa.text("SELECT lot_id, quantity_on_hand, is_quarantined FROM public.inventory_lot_balance")
+    ):
+        key = _norm(lot_id)
+        try:
+            totals[key] = totals.get(key, Decimal(0)) + Decimal(str(quantity or 0))
+        except InvalidOperation:
+            continue
+        if is_quarantined:
+            quarantined.add(key)
+    mapping: dict[Any, dict[str, Any]] = {}
+    for (lot_id,) in source.execute(sa.text("SELECT lot_id FROM public.inventory_lot")):
+        key = _norm(lot_id)
+        if key in quarantined:
+            status = "quarantined"
+        elif totals.get(key, Decimal(0)) <= 0:
+            status = "depleted"
+        else:
+            status = "available"
+        _put(mapping, "lot_status", lot_id, {"status": status})
+    return mapping
+
+
+def _quote_lead(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    leads = {
+        (_norm(r[0]), str(r[1]).replace("-", "")): _norm(r[2])
+        for r in dest.execute(sa.text("SELECT tenant_id, subject_opaque_id, id FROM mod_sales.leads"))
+    }
+    mapping: dict[Any, dict[str, Any]] = {}
+    for quote_id, tenant, customer_id in source.execute(
+        sa.text("SELECT quote_id, organization_id, customer_id FROM public.quote")
+    ):
+        lead = leads.get((_norm(tenant), str(_norm(customer_id)).replace("-", "")))
+        if lead is not None:
+            _put(mapping, "quote_lead", quote_id, {"lead_id": lead})
+    return mapping
+
+
+def _user_label(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    rows = source.execute(sa.text("SELECT id AS key, username AS label FROM public.user_credentials")).mappings()
+    return _lookup(rows, "user_label", ("label",))
+
+
+def _document_library(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    # The enrolment HR library (minting default code "hr").
+    rows = dest.execute(
+        sa.text("SELECT tenant_id AS key, id AS library_id FROM mod_documents.document_libraries WHERE code = 'hr'")
+    ).mappings()
+    return _lookup(rows, "document_library", ("library_id",))
+
+
+def _document_type(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    mapping: dict[Any, dict[str, Any]] = {}
+    rows = source.execute(sa.text("SELECT document_id AS key, category, file_path FROM public.hr_document")).mappings()
+    for row in rows:
+        type_code = re.sub(r"[^a-z0-9]+", "-", str(row["category"] or "").lower()).strip("-")[:80].rstrip("-")
+        folder = posixpath.dirname(str(row["file_path"] or ""))
+        if not type_code or not folder:
+            continue
+        _put(mapping, "document_type", row["key"], {"type_code": type_code, "folder_path": folder})
+    return mapping
+
+
 MAP_BUILDERS: Final[Mapping[str, Any]] = {
+    "agreement_family": _agreement_family,
+    "approval_request_policy": _approval_request_policy,
+    "asset_kind": _asset_kind,
     "bank_direction_by_type": _bank_direction_by_type,
     "bank_institution_by_code": _bank_institution_by_code,
     "bid_submission": _bid_submission,
+    "document_library": _document_library,
+    "document_type": _document_type,
     "employee_party": _employee_party,
+    "expense_evaluation_batch": _expense_evaluation_batch,
     "fiscal_period": _fiscal_period,
     "inventory_item": _inventory_item,
+    "lot_status": _lot_status,
     "pay_component": _pay_component,
     "payment_intent_by_payment": _payment_intent_by_payment,
+    "payroll_calculation": _payroll_calculation,
+    "payroll_line_method": _payroll_line_method,
+    "payroll_rule_conversion": _payroll_rule_conversion,
     "project_template_task": _project_template_task,
+    "quote_lead": _quote_lead,
+    "receipt_lines": _receipt_lines,
     "sourcing_line_by_requisition_line": _sourcing_line_by_requisition_line,
     "structure_revision": _structure_revision,
     "supplier": _supplier,
+    "supplier_line_dimensions": _supplier_line_dimensions,
+    "supplier_payment_schedule": _supplier_payment_schedule,
     "tax_authority_by_level": _tax_authority_by_level,
+    "user_label": _user_label,
     "user_party": _user_party,
 }
 

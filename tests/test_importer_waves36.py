@@ -903,33 +903,15 @@ def test_wave36_rulings_narrow_missing_to_named_decisions() -> None:
     assert set(by_dest) == _RULED_DESTS
 
     expected_missing = {
-        "mod_payables.supplier_invoices": ("payment_schedule",),
         "mod_payables.settlement_observations": ("obligation_id",),
         "mod_expenses.expense_lifecycle_events": ("actor_reference",),
         "mod_expenses.expense_requests": ("needed_by",),
         "mod_procurement.bid_evaluations": ("scores_json", "selected_total_score"),
-        "mod_procurement.receipt_observations": ("lines_json",),
-        "mod_approvals.approval_requests": ("policy_code", "policy_version"),
-        "mod_assets.assets": ("kind", "condition"),
+        "mod_assets.assets": ("condition",),
         "mod_finance.depreciation_runs": ("currency_code",),
-        "mod_agreements.agreements": ("agreement_family_id",),
-        "mod_sales.quotes": (
-            "lead_id",
-            "tax_rate",
-            "authored_by_kind",
-            "authored_by_label",
-        ),
-        "mod_sales.quote_lines": ("gross_amount",),
-        "mod_inventory.lots": ("status",),
+        "mod_sales.quotes": ("tax_rate",),
         "mod_inventory.stock_movements": ("value_after",),
-        "mod_documents.documents": (
-            "library_id",
-            "type_code",
-            "type_version",
-            "folder_path",
-            "sensitivity",
-            "handling_instructions",
-        ),
+        "mod_documents.documents": ("sensitivity", "handling_instructions"),
     }
     for dest, spec in by_dest.items():
         assert tuple(sorted(spec.missing_required)) == tuple(sorted(expected_missing.get(dest, ()))), dest
@@ -937,6 +919,12 @@ def test_wave36_rulings_narrow_missing_to_named_decisions() -> None:
     # Spot-check the mechanisms the rulings rely on.
     assert by_dest["mod_banking.bank_statement_lines"].fk_rewrites == {"direction": "bank_direction_by_type"}
     assert by_dest["mod_payments.payment_confirmations"].constants == {"source": "MANUAL"}
+    assert by_dest["mod_approvals.approval_requests"].lookups["policy_code"] == (
+        "approval_request_policy",
+        "id",
+        "policy_code",
+    )
+    assert by_dest["mod_sales.quote_lines"].computed["gross_amount"] == "mul:quantity:unit_price"
     assert by_dest["mod_approvals.approval_requests"].computed["idempotency_key"] == "source_key"
     assert by_dest["mod_approvals.approval_policies"].computed["document_digest"] == "sha256_row"
     assert by_dest["mod_projects.project_templates"].computed["code"] == "slug:name"

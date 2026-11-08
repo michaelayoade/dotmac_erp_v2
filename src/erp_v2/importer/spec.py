@@ -32,11 +32,21 @@ def _check(identifier: str) -> str:
     return identifier
 
 
+_NO_DEFAULT = object()
+
+
 @dataclass(frozen=True)
 class DestinationColumn:
     name: str
     nullable: bool
-    has_default: bool
+    has_default: bool  # SERVER default only: raw-SQL inserts never see
+    # Python-side column defaults, so those do not satisfy a column.
+    scalar_default: object = _NO_DEFAULT
+    # A module-declared Python SCALAR default (bool/int/str/Decimal):
+    # part of the destination shape, surfaced on the spec as a
+    # default the executor writes explicitly. Callable defaults
+    # (uuid4, now, dict) never qualify - identity and timestamps
+    # must come from the source row or stay missing.
 
 
 @dataclass(frozen=True)
@@ -52,6 +62,10 @@ class TransformSpec:
     # destination column -> explicit enrolment constant (e.g. source_ref).
     # Constants are declared in the wave pairing, never invented here;
     # a required column with neither source nor constant stays missing.
+    defaults: Mapping[str, object] = field(default_factory=dict)
+    # destination column -> module-declared scalar default carried
+    # from DestinationColumn (see there). Written explicitly by the
+    # executor; pairing constants override them.
     run_supplied: tuple[str, ...] = ()
     # Required columns the import RUN supplies per tenant extent
     # (tenant_id, minor_units, actor provenance). Executable only when
@@ -62,7 +76,11 @@ class TransformSpec:
     # (fingerprints/digests), "source_key" (stable legacy key, e.g.
     # idempotency/submission keys), "slug:<dest column>" (human key
     # slugified from an already-mapped destination value, e.g.
-    # template codes legacy never stored).
+    # template codes legacy never stored), "mul:<dest a>:<dest b>"
+    # (exact Decimal product of two mapped values, e.g. a gross
+    # amount legacy stored only as quantity x unit price),
+    # "uuid5_row" (deterministic CHAR(32) id for natural-key
+    # legacy tables with no UUID of their own, e.g. bank_directory).
     lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
     # destination column -> (map name, key destination column, field):
     # the value is read at execution from a caller-supplied lookup map
@@ -95,7 +113,17 @@ def _systematic_candidates(dest: str, source_columns: set[str], source_table: st
         return "organization_id"
     if dest == "id":
         singular = source_table.rsplit(".", 1)[-1].removesuffix("s")
-        for candidate in (f"{singular}_id", f"{singular}id"):
+        # Full singular first (department_id), then the shortened
+        # forms legacy compound tables use: last two tokens
+        # (posted_ledger_line -> ledger_line_id, project_template_task
+        # -> template_task_id), then the last token (salary_slip ->
+        # slip_id, salary_component -> component_id).
+        tokens = singular.split("_")
+        candidates = [f"{singular}_id", f"{singular}id"]
+        if len(tokens) >= 2:
+            candidates.append(f"{tokens[-2]}_{tokens[-1]}_id")
+        candidates.append(f"{tokens[-1]}_id")
+        for candidate in candidates:
             if candidate in source_columns:
                 return candidate
     if dest == "party_id" and "person_id" in source_columns:
@@ -157,10 +185,17 @@ def build_spec(
     explicit_computed = dict(computed or {})
     for dest_col, strategy in explicit_computed.items():
         _check(dest_col)
-        if strategy in ("sha256_row", "source_key"):
+        if strategy in ("sha256_row", "source_key", "uuid5_row"):
             continue
         if strategy.startswith("slug:"):
             _check(strategy.removeprefix("slug:"))
+            continue
+        if strategy.startswith("mul:"):
+            factors = strategy.removeprefix("mul:").split(":")
+            if len(factors) != 2:
+                raise ValueError(f"mul strategy needs two factors: {strategy!r}")
+            for factor in factors:
+                _check(factor)
             continue
         raise ValueError(f"unknown computed strategy {strategy!r} for {dest_col!r}")
     for dest_col, (map_name, key_col, lookup_field) in lookups.items():
@@ -173,6 +208,7 @@ def build_spec(
     missing: list[str] = []
     run_supplied: list[str] = []
     computed: dict[str, str] = {}
+    defaults: dict[str, object] = {}
     for dest in destination_columns:
         _check(dest.name)
         if dest.name in constants:
@@ -200,6 +236,8 @@ def build_spec(
                 elif _is_run_supplied(dest.name):
                     if not dest.nullable and not dest.has_default:
                         run_supplied.append(dest.name)
+                elif dest.scalar_default is not _NO_DEFAULT:
+                    defaults[dest.name] = dest.scalar_default
                 elif not dest.nullable and not dest.has_default:
                     missing.append(dest.name)
                 continue
@@ -209,6 +247,10 @@ def build_spec(
     for dest_col, strategy in computed.items():
         if strategy.startswith("slug:") and strategy.removeprefix("slug:") not in column_map:
             raise ValueError(f"slug for {dest_col!r} reads unmapped column {strategy!r}")
+        if strategy.startswith("mul:"):
+            unmapped = [f for f in strategy.removeprefix("mul:").split(":") if f not in column_map]
+            if unmapped:
+                raise ValueError(f"mul for {dest_col!r} reads unmapped columns {unmapped}")
     for dest_col, (_map, key_col, _field) in lookups.items():
         if key_col not in column_map:
             raise ValueError(f"lookup for {dest_col!r} keys on unmapped column {key_col!r}")
@@ -222,14 +264,34 @@ def build_spec(
         residue=residue,
         fk_rewrites=dict(fk_rewrites or {}),
         constants=constants,
+        defaults=defaults,
         run_supplied=tuple(run_supplied),
         computed=computed,
         lookups=lookups,
     )
 
 
+def _scalar_default(col: object) -> object:
+    """A column's Python scalar default, or _NO_DEFAULT when callable/other."""
+
+    default = getattr(col, "default", None)
+    if default is None or getattr(default, "is_callable", True) or getattr(default, "is_sequence", True):
+        return _NO_DEFAULT
+    arg = getattr(default, "arg", _NO_DEFAULT)
+    if isinstance(arg, bool | int | float | str) or type(arg).__name__ == "Decimal":
+        return arg
+    return _NO_DEFAULT
+
+
 def destination_columns_from_table(table: object) -> tuple[DestinationColumn, ...]:
-    """Adapt a SQLAlchemy Table (module metadata) into DestinationColumns."""
+    """Adapt a SQLAlchemy Table (module metadata) into DestinationColumns.
+
+    `has_default` counts SERVER defaults only: the executor issues
+    raw SQL inserts, where Python-side defaults (uuid4 ids, bool
+    flags) never fire - omitting such a column would fail the
+    insert outright on Postgres. Python scalar defaults are still
+    honoured, as explicit spec defaults (see DestinationColumn).
+    """
 
     columns = getattr(table, "columns", None)
     if columns is None:
@@ -238,7 +300,8 @@ def destination_columns_from_table(table: object) -> tuple[DestinationColumn, ..
         DestinationColumn(
             name=col.name,
             nullable=bool(col.nullable),
-            has_default=col.default is not None or col.server_default is not None,
+            has_default=col.server_default is not None,
+            scalar_default=_scalar_default(col),
         )
         for col in columns
     )
