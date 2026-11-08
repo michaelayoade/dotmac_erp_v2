@@ -495,8 +495,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # row they reference is imported (same caller transaction;
             # dry-run rollback below covers them).
             post_mints = tuple(
-                enrolment.mint(step)
-                for step in ("pay_rule_bases", "tax_rules", "sales_leads", "document_libraries_types")
+                enrolment.mint(step) for step in ("pay_rule_bases", "tax_rules")
             )
         if not args.apply:
             dest_conn.rollback()

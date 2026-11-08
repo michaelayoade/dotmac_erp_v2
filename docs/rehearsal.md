@@ -68,7 +68,11 @@ store). Exit codes: 0 ok, 2 refusal (named), 3 incomplete receipt.
 
    Read the receipt as the exception queue: every unresolved
    exception is a rehearsal finding, never edited away.
-   `mints[].refused` names missing rulings/config.
+   `mints[].refused` names missing rulings/config. Note dry-run
+   fidelity: destination-reading enrolment maps see an empty
+   destination (spec writes roll back), so map-dependent rows
+   over-report exceptions in dry-run - the apply run is the true
+   measure for those families.
 
 6. **Apply** (same command + `--apply`, additionally
    `ERP_IMPORT_APPLY_OK=1`). One destination transaction.

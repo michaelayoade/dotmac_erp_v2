@@ -686,6 +686,12 @@ MAP_MINTS: Final[Mapping[str, str]] = {
     "structure_revision": "pay_structure_revisions",
     "tax_authority_by_level": "tax_authorities",
     "sourcing_line_by_requisition_line": "sourcing_event_lines",
+    # Source-driven mints whose rows other specs' maps read: they must
+    # run lazily BEFORE the consuming spec, not as post-specs steps
+    # (Gate 4 dry-run: quote_lead built 0 leads because sales_leads
+    # minted after the quotes spec had already run).
+    "quote_lead": "sales_leads",
+    "document_library": "document_libraries_types",
 }
 
 
