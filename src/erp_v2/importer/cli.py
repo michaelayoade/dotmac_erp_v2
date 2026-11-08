@@ -32,7 +32,7 @@ import sqlalchemy as sa
 from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBLIC_SECTOR_PAIRINGS
 from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
 from erp_v2.importer.minting import MintContext, MintResult
-from erp_v2.importer.pipeline import order_specs, run_import
+from erp_v2.importer.pipeline import order_specs, partition_parent_blocked, run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.transitions import run_transitions
@@ -506,10 +506,9 @@ def cmd_execute(args: argparse.Namespace) -> int:
     dest_tables = _destination_tables()
     specs, _generated = build_specs(present, source_columns, dest_tables)
     run_constants: dict[str, object] = _execute_run_constants(args, manifest)
-    executable = order_specs(
-        tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants)),
-        dest_tables,
-    )
+    supplied = tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants))
+    kept, parent_blocked = partition_parent_blocked(specs, supplied, dest_tables)
+    executable = order_specs(kept, dest_tables)
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
     mint_context = _mint_context(args, run_constants) if args.mint else None
     post_mints: tuple[MintResult, ...] = ()
@@ -573,6 +572,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         ],
         "specs": _spec_report(specs),
         "specs_skipped_unsupplied_run_constants": unsupplied,
+        "specs_skipped_parent_not_imported": [s.destination_table for s in parent_blocked],
         "source_resolution": resolution,
         "enrolment_maps_built": dict(result.enrolment_maps),
         "mints": [_mint_dict(m) for m in (*result.mints, *post_mints)],

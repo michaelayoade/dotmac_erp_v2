@@ -28,6 +28,55 @@ from erp_v2.importer.spec import TransformSpec
 from erp_v2.migrate import EXPECTED_HEADS
 
 
+def _fk_parents(
+    dest: str,
+    destination_tables: Mapping[str, Any],
+    known_dests: set[str],
+) -> set[str]:
+    table = destination_tables.get(dest)
+    if table is None:
+        return set()
+    parents: set[str] = set()
+    for fk in table.foreign_keys:
+        parent = fk.column.table
+        key = f"{parent.schema}.{parent.name}" if parent.schema else parent.name
+        if key in known_dests and key != dest:
+            parents.add(key)
+    return parents
+
+
+def partition_parent_blocked(
+    all_specs: Sequence[TransformSpec],
+    runnable: Sequence[TransformSpec],
+    destination_tables: Mapping[str, Any],
+) -> tuple[tuple[TransformSpec, ...], tuple[TransformSpec, ...]]:
+    """Split off specs whose FK parent has a spec that is not running.
+
+    Gate 4 live finding: bank_statements was skipped for an
+    unsupplied run constant, and its 59k statement lines then
+    FK-failed one batch-split at a time for ~15 minutes - receipt
+    noise and rehearsal time burned on a foregone conclusion. A
+    child whose parent spec exists but is not running (blocked or
+    unsupplied) is skipped by name instead; the skip is recursive
+    (grandchildren follow). Parents with NO spec at all (kernel
+    tenants minted separately, genesis-seeded config) never block.
+    """
+
+    all_dests = {s.destination_table for s in all_specs}
+    runnable_dests = {s.destination_table for s in runnable}
+    changed = True
+    while changed:
+        changed = False
+        for dest in sorted(runnable_dests):
+            parents = _fk_parents(dest, destination_tables, all_dests)
+            if parents - runnable_dests:
+                runnable_dests.discard(dest)
+                changed = True
+    kept = tuple(s for s in runnable if s.destination_table in runnable_dests)
+    skipped = tuple(s for s in runnable if s.destination_table not in runnable_dests)
+    return kept, skipped
+
+
 def order_specs(
     specs: Sequence[TransformSpec],
     destination_tables: Mapping[str, Any],

@@ -443,3 +443,36 @@ def test_fk_rejected_rows_retry_after_parent_lands() -> None:
     assert len(report.exceptions) == 1
     assert report.exceptions[0].source_key == "orphan"
     assert "FOREIGN KEY" in report.exceptions[0].reason
+
+
+def test_partition_parent_blocked_skips_children_of_unrun_parents() -> None:
+    from erp_v2.importer.pipeline import partition_parent_blocked
+
+    meta = sa.MetaData()
+    parents = sa.Table("parents", meta, sa.Column("id", sa.String, primary_key=True), schema="mod")
+    children = sa.Table(
+        "children",
+        meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("parent_id", sa.String, sa.ForeignKey("mod.parents.id")),
+        schema="mod",
+    )
+    free = sa.Table("free", meta, sa.Column("id", sa.String, primary_key=True), schema="mod")
+    tables = {"mod.parents": parents, "mod.children": children, "mod.free": free}
+
+    def _spec(dst: str):
+        return build_spec(
+            source_table=dst,
+            destination_table=dst,
+            source_columns=("id",),
+            destination_columns=(DestinationColumn("id", nullable=False, has_default=False),),
+        )
+
+    all_specs = (_spec("mod.parents"), _spec("mod.children"), _spec("mod.free"))
+    runnable = (_spec("mod.children"), _spec("mod.free"))  # parents spec not running
+    kept, skipped = partition_parent_blocked(all_specs, runnable, tables)
+    assert [s.destination_table for s in kept] == ["mod.free"]
+    assert [s.destination_table for s in skipped] == ["mod.children"]
+    # When the parent runs, nothing is partitioned off.
+    kept2, skipped2 = partition_parent_blocked(all_specs, all_specs, tables)
+    assert len(kept2) == 3 and not skipped2
