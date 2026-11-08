@@ -23,6 +23,7 @@ import uuid as _uuid
 from collections.abc import Sequence
 from datetime import date as _date
 from datetime import datetime as _datetime
+from datetime import timezone as _timezone
 from decimal import Decimal as _Decimal
 from pathlib import Path
 
@@ -124,12 +125,8 @@ def _load_manifest(args: argparse.Namespace) -> SnapshotManifest:
         raise CliRefusal(str(exc)) from exc
 
 
-def cmd_billing_plan(args: argparse.Namespace) -> int:
-    """Translate exported legacy AR rows (JSON) into an opening receipt.
-
-    Exports are read-only operator extracts; this command writes
-    nothing anywhere except the receipt file.
-    """
+def _translate_billing_args(args: argparse.Namespace):
+    """Shared billing-plan/preflight input path: JSON rows -> translation."""
 
     manifest = _load_manifest(args)
     from dotmac_billing.contracts import (  # lazy: billing contracts are heavy
@@ -210,6 +207,17 @@ def cmd_billing_plan(args: argparse.Namespace) -> int:
         allocations=_coerce(_rows(args.allocations_json)),
         payments=_coerce(_rows(args.payments_json)),
     )
+    return manifest, context, result
+
+
+def cmd_billing_plan(args: argparse.Namespace) -> int:
+    """Translate exported legacy AR rows (JSON) into an opening receipt.
+
+    Exports are read-only operator extracts; this command writes
+    nothing anywhere except the receipt file.
+    """
+
+    manifest, _context, result = _translate_billing_args(args)
     payload: dict[str, object] = {
         "kind": "billing-plan",
         "manifest": manifest.as_dict(),
@@ -224,6 +232,86 @@ def cmd_billing_plan(args: argparse.Namespace) -> int:
     }
     _write_receipt(Path(args.receipt), payload)
     return 0 if not result.blockers else 3
+
+
+def cmd_billing_preflight(args: argparse.Namespace) -> int:
+    """Verifier round-trip for one partition. Pure: executes nothing.
+
+    The target fingerprint/watermark come from the destination
+    observation at rehearsal; the migration authority ref is the
+    named approval. Without an injected signed-grant verifier the
+    module preview reports verifier_unavailable - the honest state
+    until Starter billing M1 lands Sub-first.
+    """
+
+    from dotmac_billing import OpeningTargetV1
+    from dotmac_billing.opening_contracts import OpeningCaptureV1
+    from dotmac_kernel.cache import TenantScope
+
+    from erp_v2.importer.billing_opening import (
+        MAPPING_VERSION,
+        OpeningTranslationError,
+        build_manifest,
+        preflight_opening_import,
+    )
+
+    manifest, context, result = _translate_billing_args(args)
+    if len(manifest.tenant_extent) != 1:
+        raise CliRefusal("billing-preflight requires a single-tenant snapshot extent")
+    tenant_id = _uuid.UUID(str(manifest.tenant_extent[0]))
+    economic_cutoff = _datetime.fromisoformat(str(args.economic_cutoff))
+    recorded_cutoff = _datetime.fromisoformat(str(args.recorded_cutoff))
+    capture = OpeningCaptureV1(
+        source_system="legacy-erp",
+        source_repository_sha=manifest.candidate_revision,
+        installation_id=manifest.source_database,
+        schema_heads=tuple(h.strip() for h in str(args.source_schema_heads).split(",") if h.strip()),
+        snapshot_id=manifest.snapshot_sha256,
+        captured_at=_datetime.now(_timezone.utc),
+        economic_cutoff=economic_cutoff,
+        recorded_cutoff=recorded_cutoff,
+        isolation=str(args.isolation),
+        population_version="1",
+        source_authority_ref=str(args.source_authority_ref),
+        account_mapping_version=MAPPING_VERSION,
+        cash_mapping_version=MAPPING_VERSION,
+    )
+    partition = context.partition
+    target = OpeningTargetV1(
+        scope=TenantScope(tenant_id),
+        account_id=partition.account_id,
+        currency=partition.currency,
+        precision=partition.precision,
+        expected_position_fingerprint=str(args.expected_position_fingerprint),
+        posting_watermark=str(args.posting_watermark),
+    )
+    try:
+        opening_manifest = build_manifest(tenant_id=tenant_id, capture=capture, translation=result)
+        preflight = preflight_opening_import(
+            translation=result,
+            manifest=opening_manifest,
+            target=target,
+            migration_authority_ref=str(args.migration_authority_ref),
+            occurred_at=recorded_cutoff,
+        )
+    except OpeningTranslationError as exc:
+        raise CliRefusal(str(exc)) from exc
+    payload: dict[str, object] = {
+        "kind": "billing-preflight",
+        "manifest": manifest.as_dict(),
+        "manifest_fingerprint": preflight.manifest_fingerprint,
+        "idempotency_key": preflight.idempotency_key,
+        "admissible": preflight.admissible,
+        "importable": preflight.importable,
+        "cash_residual_minor": preflight.cash_residual_minor,
+        "receivable_residual_minor": preflight.receivable_residual_minor,
+        "preview_blocker_codes": list(preflight.preview_blocker_codes),
+        "translation_blockers": [
+            {"source_key": b.source_key, "reason": b.reason} for b in preflight.translation_blockers
+        ],
+    }
+    _write_receipt(Path(args.receipt), payload)
+    return 0 if preflight.importable else 3
 
 
 def cmd_census(args: argparse.Namespace) -> int:
@@ -324,6 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("plan", cmd_plan),
         ("execute", cmd_execute),
         ("billing-plan", cmd_billing_plan),
+        ("billing-preflight", cmd_billing_preflight),
     ):
         cmd = sub.add_parser(name)
         cmd.add_argument("--receipt", required=True, help="receipt JSON output path")
@@ -331,13 +420,22 @@ def build_parser() -> argparse.ArgumentParser:
         if name != "census":
             cmd.add_argument("--manifest", help="snapshot manifest JSON path")
             cmd.add_argument("--source-url-env", default="LEGACY_DATABASE_URL", help="env var holding the source DSN")
-        if name == "billing-plan":
+        if name in ("billing-plan", "billing-preflight"):
             cmd.add_argument("--invoices-json", required=True)
             cmd.add_argument("--allocations-json")
             cmd.add_argument("--payments-json")
             cmd.add_argument("--source-account-key", required=True)
             cmd.add_argument("--account-id", required=True, help="destination billing account UUID")
             cmd.add_argument("--precision", default="2")
+        if name == "billing-preflight":
+            cmd.add_argument("--expected-position-fingerprint", required=True)
+            cmd.add_argument("--posting-watermark", required=True)
+            cmd.add_argument("--migration-authority-ref", required=True)
+            cmd.add_argument("--source-authority-ref", required=True)
+            cmd.add_argument("--economic-cutoff", required=True, help="ISO datetime")
+            cmd.add_argument("--recorded-cutoff", required=True, help="ISO datetime")
+            cmd.add_argument("--source-schema-heads", required=True, help="comma-separated legacy schema heads")
+            cmd.add_argument("--isolation", default="repeatable-read-dump")
         if name == "execute":
             cmd.add_argument(
                 "--dest-url-env", default="MIGRATION_DATABASE_URL", help="env var holding the destination DSN"

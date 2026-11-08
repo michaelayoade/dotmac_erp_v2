@@ -29,6 +29,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from dotmac_billing import (
+    ImportOpeningAccountV2,
+    OpeningAccountImportVerifierV2,
+    OpeningTargetV1,
+    opening_manifest_fingerprint_v2,
+    preview_opening_account_import_v2,
+)
 from dotmac_billing.contracts import (
     DueDateBasisV1,
     PartyDocumentSnapshotV1,
@@ -376,13 +383,114 @@ def build_manifest(
     )
 
 
+@dataclass(frozen=True)
+class OpeningPreflight:
+    """Verifier round-trip evidence for ONE partition. Never executes."""
+
+    manifest_fingerprint: str
+    idempotency_key: str
+    admissible: bool  # the module preview's own verdict
+    importable: bool  # admissible AND zero local translation blockers
+    cash_residual_minor: int
+    receivable_residual_minor: int
+    preview_blocker_codes: tuple[str, ...]
+    translation_blockers: tuple[OpeningBlocker, ...]
+
+
+def build_import_command(
+    *,
+    manifest: OpeningManifestV2,
+    target: OpeningTargetV1,
+    migration_authority_ref: str,
+    occurred_at: datetime,
+    idempotency_key: str | None = None,
+) -> ImportOpeningAccountV2:
+    """Assemble the V2 command after local target/partition agreement.
+
+    `target` is read from the destination at rehearsal (the module's
+    `get_opening_cash_target`); `migration_authority_ref` is the
+    named approval reference. Neither is derivable here, and neither
+    is ever defaulted: a mismatch between target, partition and
+    manifest scope is a structural refusal, not a per-row blocker.
+    """
+
+    if not manifest.receivables:
+        raise OpeningTranslationError("cannot build an import command with no receivables")
+    partition = manifest.receivables[0].partition
+    mismatches = []
+    if target.account_id != partition.account_id:
+        mismatches.append("account_id")
+    if target.currency != partition.currency:
+        mismatches.append("currency")
+    if target.precision != partition.precision:
+        mismatches.append("precision")
+    if target.scope != manifest.scope:
+        mismatches.append("scope")
+    if mismatches:
+        raise OpeningTranslationError(f"opening target disagrees with manifest partition/scope: {mismatches}")
+    if not migration_authority_ref:
+        raise OpeningTranslationError("migration_authority_ref is required (named approval, never defaulted)")
+    fingerprint = opening_manifest_fingerprint_v2(manifest)
+    return ImportOpeningAccountV2(
+        scope=manifest.scope,
+        manifest=manifest,
+        partition=partition,
+        target=target,
+        migration_authority_ref=migration_authority_ref,
+        idempotency_key=idempotency_key or f"erp-opening:{partition.source_account_key}:{fingerprint[:16]}",
+        occurred_at=_as_utc(occurred_at),
+    )
+
+
+def preflight_opening_import(
+    *,
+    translation: OpeningTranslation,
+    manifest: OpeningManifestV2,
+    target: OpeningTargetV1,
+    migration_authority_ref: str,
+    occurred_at: datetime,
+    verifier: OpeningAccountImportVerifierV2 | None = None,
+) -> OpeningPreflight:
+    """Run the module's own preview + verifier round-trip. Pure.
+
+    With no verifier configured the module preview itself reports
+    `verifier_unavailable` - that is the honest rehearsal state
+    until the signed-grant verifier (Starter billing M1, Sub-first)
+    is injected. This function never executes the import.
+    """
+
+    fingerprint = opening_manifest_fingerprint_v2(manifest)
+    command = build_import_command(
+        manifest=manifest,
+        target=target,
+        migration_authority_ref=migration_authority_ref,
+        occurred_at=occurred_at,
+    )
+    preview = preview_opening_account_import_v2(command, verifier=verifier)
+    if preview.manifest_fingerprint != fingerprint:
+        raise OpeningTranslationError("module preview fingerprint disagrees with local fingerprint")
+    return OpeningPreflight(
+        manifest_fingerprint=fingerprint,
+        idempotency_key=command.idempotency_key,
+        admissible=preview.admissible,
+        importable=preview.admissible and not translation.blockers,
+        cash_residual_minor=preview.cash_residual_minor,
+        receivable_residual_minor=preview.receivable_residual_minor,
+        preview_blocker_codes=tuple(b.code for b in preview.blockers),
+        translation_blockers=tuple(translation.blockers),
+    )
+
+
 __all__ = [
     "MAPPING_VERSION",
     "SOURCE_SYSTEM",
     "OpeningBlocker",
+    "OpeningPreflight",
     "OpeningTranslation",
     "OpeningTranslationContext",
     "OpeningTranslationError",
+    "build_import_command",
     "build_manifest",
+    "preflight_opening_import",
     "translate_partition",
 ]

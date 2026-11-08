@@ -148,3 +148,75 @@ def test_manifest_controls_and_counts() -> None:
     assert manifest.controls[0].open_ar_minor == 100000
     assert manifest.controls[0].collectible_receivable_minor == 0
     assert manifest.receivables[0].residual_minor == 100000
+
+
+def _capture() -> OpeningCaptureV1:
+    return OpeningCaptureV1(
+        source_system="legacy-erp",
+        source_repository_sha="74fa788a",
+        installation_id="prod",
+        schema_heads=("legacy-head",),
+        snapshot_id="snap-1",
+        captured_at=datetime(2026, 11, 8, tzinfo=UTC),
+        economic_cutoff=datetime(2026, 11, 8, tzinfo=UTC),
+        recorded_cutoff=datetime(2026, 11, 8, tzinfo=UTC),
+        isolation="repeatable-read-dump",
+        population_version="1",
+        source_authority_ref="ops:2026-11-08",
+        account_mapping_version="erp-billing-opening/1",
+        cash_mapping_version="erp-billing-opening/1",
+    )
+
+
+def test_preflight_round_trip_without_verifier_is_honest() -> None:
+    import pytest
+    from dotmac_billing import OpeningTargetV1, opening_manifest_fingerprint_v2
+    from dotmac_kernel.cache import TenantScope
+
+    from erp_v2.importer.billing_opening import (
+        OpeningTranslationError,
+        build_import_command,
+        preflight_opening_import,
+    )
+
+    result = translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[])
+    tenant_id = uuid.uuid4()
+    manifest = build_manifest(tenant_id=tenant_id, capture=_capture(), translation=result)
+    target = OpeningTargetV1(
+        scope=TenantScope(tenant_id),
+        account_id=PARTITION.account_id,
+        currency="NGN",
+        precision=2,
+        expected_position_fingerprint="dest-observed-fingerprint",
+        posting_watermark="dest-watermark",
+    )
+    preflight = preflight_opening_import(
+        translation=result,
+        manifest=manifest,
+        target=target,
+        migration_authority_ref="approval:2026-11-08",
+        occurred_at=datetime(2026, 11, 8, tzinfo=UTC),
+    )
+    # Fingerprint agrees with the module's own computation, residuals
+    # round-trip, and with no verifier configured the module preview
+    # refuses admissibility - never importable in this state.
+    assert preflight.manifest_fingerprint == opening_manifest_fingerprint_v2(manifest)
+    assert preflight.receivable_residual_minor == 100000
+    assert preflight.importable is False
+    assert "verifier_unavailable" in preflight.preview_blocker_codes
+
+    bad_target = OpeningTargetV1(
+        scope=TenantScope(tenant_id),
+        account_id=PARTITION.account_id,
+        currency="USD",
+        precision=2,
+        expected_position_fingerprint="x",
+        posting_watermark="y",
+    )
+    with pytest.raises(OpeningTranslationError, match="disagrees"):
+        build_import_command(
+            manifest=manifest,
+            target=bad_target,
+            migration_authority_ref="approval:2026-11-08",
+            occurred_at=datetime(2026, 11, 8, tzinfo=UTC),
+        )

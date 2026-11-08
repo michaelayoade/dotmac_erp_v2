@@ -38,5 +38,12 @@ One translation per partition (billing account + currency):
 3. Capture binding: `OpeningCaptureV1` from the snapshot manifest
    (source sha, schema heads, cutoffs) — fields are wired in
    `build_manifest`; values come from the rehearsal runbook.
-4. Target fingerprints/watermarks (`OpeningTargetV1`) and the
-   verifier round-trip before `ImportOpeningAccountV2` executes.
+4. ~~Target fingerprints/watermarks (`OpeningTargetV1`) and the
+   verifier round-trip~~ DONE 2026-11-08: `preflight_opening_import`
+   (CLI `billing-preflight`) builds the manifest, binds
+   `OpeningTargetV1` + migration authority, checks the module's
+   fingerprint locally, and runs `preview_opening_account_import_v2`.
+   With no signed-grant verifier injected the module itself reports
+   `verifier_unavailable` and nothing is importable - execution
+   still waits on the M1 verifier (Sub-first) plus rehearsal/flip
+   approvals. Preflight never executes.
