@@ -65,6 +65,7 @@ def run_import(
     enrolment: EnrolmentMaps | None = None,
     run_constants: Mapping[str, Any] | None = None,
     dry_run: bool = False,
+    commit_per_spec: bool = False,
 ) -> ImportReceipt:
     """Execute specs in the given order; never skip a named failure.
 
@@ -76,6 +77,11 @@ def run_import(
     Per spec, enrolment builds (lazily, cached) exactly the maps
     that spec declares; explicitly passed `id_maps` override the
     enrolment-built map of the same name.
+
+    `commit_per_spec` (apply runs): commit the destination after
+    each spec so landed tables stay landed and lock growth stays
+    bounded - one mega-transaction across ~780k rows exhausted
+    the lock table and made all progress disposable (Gate 4).
     """
 
     explicit = dict(id_maps or {})
@@ -92,6 +98,8 @@ def run_import(
                 dry_run=dry_run,
             )
         )
+        if commit_per_spec and not dry_run:
+            destination_connection.commit()
     return ImportReceipt(
         destination_heads=tuple(sorted(EXPECTED_HEADS)),
         dry_run=dry_run,

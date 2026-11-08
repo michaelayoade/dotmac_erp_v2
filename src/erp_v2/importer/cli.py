@@ -520,6 +520,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             enrolment=enrolment,
             run_constants=run_constants,
             dry_run=not args.apply,
+            commit_per_spec=bool(args.apply),
         )
         if mint_context is not None:
             # Non-map-feeding mints run after the specs so every parent

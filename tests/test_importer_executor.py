@@ -346,3 +346,40 @@ def test_updated_at_coalesce_and_per_row_integrity_exception() -> None:
         assert "destination rejected" in report.exceptions[0].reason
         rows = d.execute(sa.text("SELECT id, updated_at FROM departments ORDER BY id")).all()
         assert [tuple(r) for r in rows] == [("d1", "2025-01-01"), ("d3", "2025-02-01")]
+
+
+def test_commit_per_spec_persists_each_table(tmp_path) -> None:
+    from erp_v2.importer.pipeline import run_import
+
+    def _spec(src: str, dst: str):
+        return build_spec(
+            source_table=src,
+            destination_table=dst,
+            source_columns=(f"{src}_id", "name"),
+            destination_columns=(
+                DestinationColumn("id", nullable=False, has_default=False),
+                DestinationColumn("name", nullable=False, has_default=False),
+            ),
+            renames={"id": f"{src}_id"},
+        )
+
+    src = sa.create_engine("sqlite://")
+    dest_path = tmp_path / "dest.db"
+    dst = sa.create_engine(f"sqlite:///{dest_path}")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE alpha (alpha_id TEXT, name TEXT)"))
+        c.execute(sa.text("INSERT INTO alpha VALUES ('a1','A')"))
+        c.execute(sa.text("CREATE TABLE beta (beta_id TEXT, name TEXT)"))
+        c.execute(sa.text("INSERT INTO beta VALUES ('b1','B')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE alphas (id TEXT, name TEXT)"))
+        c.execute(sa.text("CREATE TABLE betas (id TEXT, name TEXT)"))
+    with src.connect() as s, dst.connect() as d:
+        receipt = run_import(s, d, (_spec("alpha", "alphas"), _spec("beta", "betas")), commit_per_spec=True)
+        assert receipt.complete
+        # No explicit commit of the second spec by the caller: close
+        # without committing - per-spec commits already persisted.
+        d.rollback()
+    with dst.connect() as d:
+        assert d.execute(sa.text("SELECT count(*) FROM alphas")).scalar() == 1
+        assert d.execute(sa.text("SELECT count(*) FROM betas")).scalar() == 1
