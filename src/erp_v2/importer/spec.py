@@ -57,9 +57,12 @@ class TransformSpec:
     # (tenant_id, minor_units, actor provenance). Executable only when
     # the executor is given values for every one of them.
     computed: Mapping[str, str] = field(default_factory=dict)
-    # destination column -> computed strategy ("sha256_row"): values
-    # derived deterministically from the mapped source row, e.g.
-    # source/request fingerprints modules use for idempotent replay.
+    # destination column -> computed strategy: values derived
+    # deterministically from the mapped row. Closed set: "sha256_row"
+    # (fingerprints/digests), "source_key" (stable legacy key, e.g.
+    # idempotency/submission keys), "slug:<dest column>" (human key
+    # slugified from an already-mapped destination value, e.g.
+    # template codes legacy never stored).
     lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
     # destination column -> (map name, key destination column, field):
     # the value is read at execution from a caller-supplied lookup map
@@ -142,6 +145,7 @@ def build_spec(
     fk_rewrites: Mapping[str, str] | None = None,
     constants: Mapping[str, object] | None = None,
     lookups: Mapping[str, tuple[str, str, str]] | None = None,
+    computed: Mapping[str, str] | None = None,
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -150,6 +154,15 @@ def build_spec(
     renames = dict(renames or {})
     constants = dict(constants or {})
     lookups = dict(lookups or {})
+    explicit_computed = dict(computed or {})
+    for dest_col, strategy in explicit_computed.items():
+        _check(dest_col)
+        if strategy in ("sha256_row", "source_key"):
+            continue
+        if strategy.startswith("slug:"):
+            _check(strategy.removeprefix("slug:"))
+            continue
+        raise ValueError(f"unknown computed strategy {strategy!r} for {dest_col!r}")
     for dest_col, (map_name, key_col, lookup_field) in lookups.items():
         _check(dest_col)
         _check(map_name)
@@ -166,6 +179,8 @@ def build_spec(
             continue
         if dest.name in lookups:
             continue
+        if dest.name in explicit_computed:
+            continue
         if dest.name in renames:
             source = renames[dest.name]
             if source not in source_set:
@@ -178,7 +193,7 @@ def build_spec(
             if found is None:
                 # No source at all: computed and run-supplied conventions
                 # apply before declaring the column missing.
-                if "fingerprint" in dest.name or dest.name.endswith("_sha256"):
+                if "fingerprint" in dest.name or dest.name.endswith("_sha256") or dest.name.endswith("_digest"):
                     computed[dest.name] = "sha256_row"
                 elif dest.name in ("evidence_ref", "source_ref", "source_reference"):
                     computed[dest.name] = "source_key"
@@ -190,6 +205,10 @@ def build_spec(
                 continue
             source = found
         column_map[dest.name] = source
+    computed = {**computed, **explicit_computed}
+    for dest_col, strategy in computed.items():
+        if strategy.startswith("slug:") and strategy.removeprefix("slug:") not in column_map:
+            raise ValueError(f"slug for {dest_col!r} reads unmapped column {strategy!r}")
     for dest_col, (_map, key_col, _field) in lookups.items():
         if key_col not in column_map:
             raise ValueError(f"lookup for {dest_col!r} keys on unmapped column {key_col!r}")

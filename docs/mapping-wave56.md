@@ -44,19 +44,19 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (15): actual_cost, budget_amount, budget_currency_code, business_unit_id, cost_center_id, customer_id, end_date, estimated_cost, is_capitalizable, percent_complete, project_manager_user_id, project_template_id, project_type, segment_id, start_date
 
 ## public.project_template -> mod_projects.project_templates
-- executable: False; mapped: 4; missing: ['code']
+- executable: True; mapped: 4; missing: none
 - residue (2): project_type, template_id
 
 ## public.project_template_task -> mod_projects.project_template_tasks
-- executable: False; mapped: 5; missing: ['key', 'status', 'priority']
+- executable: True; mapped: 5; missing: none
 - residue (1): template_task_id
 
 ## public.project_template_task_dependency -> mod_projects.project_template_task_dependencies
-- executable: False; mapped: 5; missing: ['template_id']
+- executable: True; mapped: 5; missing: none
 - residue (1): dependency_id
 
 ## public.milestone -> mod_projects.project_tasks
-- executable: False; mapped: 8; missing: ['priority']
+- executable: True; mapped: 8; missing: none
 - residue (4): actual_date, linked_task_id, milestone_code, target_date
 
 ## public.ticket -> mod_tkt.tickets
@@ -68,8 +68,8 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (6): action, comment_id, comment_type, is_active, new_value, old_value
 
 ## public.hr_document -> mod_documents.documents
-- executable: False; mapped: 7; missing: ['library_id', 'type_code', 'type_version', 'folder_path', 'state', 'metadata', 'sensitivity', 'handling_instructions']
-- residue (19): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, document_id, effective_date, expiry_date, extra_metadata, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, status, updated_by, version
+- executable: False; mapped: 9; missing: ['library_id', 'type_code', 'type_version', 'folder_path', 'sensitivity', 'handling_instructions']
+- residue (17): acknowledgment_deadline_days, applies_to_all_employees, applies_to_departments, category, content_hash, content_type, description, document_id, effective_date, expiry_date, file_name, file_path, file_size_bytes, previous_version_id, requires_acknowledgment, updated_by, version
 
 ## public.form -> mod_forms.forms
 - executable: True; mapped: 7; missing: none
@@ -80,7 +80,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (1): settings_json
 
 ## public.form_section -> mod_forms.form_sections
-- executable: False; mapped: 4; missing: ['key']
+- executable: True; mapped: 4; missing: none
 - residue (1): section_id
 
 ## public.form_field -> mod_forms.form_fields
@@ -88,11 +88,11 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (6): field_id, is_filterable, placeholder, show_in_list, system_mapping, visibility_json
 
 ## public.form_field_option -> mod_forms.form_field_options
-- executable: False; mapped: 3; missing: ['position']
-- residue (3): is_active, option_id, sort_order
+- executable: True; mapped: 5; missing: none
+- residue (1): option_id
 
 ## public.form_submission -> mod_forms.form_submissions
-- executable: False; mapped: 5; missing: ['submission_key']
+- executable: True; mapped: 5; missing: none
 - residue (3): subject_type, submission_id, submitted_by_email
 
 ## public.form_answer -> mod_forms.form_answers
@@ -100,8 +100,8 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (4): answer_id, created_at, file_name, file_url
 
 ## public.workflow_execution -> mod_workflow.workflow_executions
-- executable: False; mapped: 3; missing: ['definition_version_ref', 'definition_digest', 'subject_ref', 'source_event_id']
-- residue (14): duration_ms, entity_id, entity_type, error_details, error_message, execution_id, max_retries, result, retry_count, rule_id, trigger_data, trigger_event, triggered_at, triggered_by
+- executable: True; mapped: 6; missing: none
+- residue (11): duration_ms, entity_type, error_details, error_message, max_retries, result, retry_count, trigger_data, trigger_event, triggered_at, triggered_by
 
 ## GENERATED / command-import destinations
 - mod_inventory.stock_balances: GENERATED: rebuildable projection from movements (parity-checked, never imported)

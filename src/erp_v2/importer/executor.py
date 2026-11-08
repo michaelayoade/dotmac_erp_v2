@@ -16,6 +16,7 @@ Contract (Academy importer rules, `docs/cutover.md` Gate 3):
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -135,14 +136,32 @@ def execute_transform(
         if row_exceptions:
             report.exceptions.extend(row_exceptions)
             continue
+        computed_exceptions: list[RowException] = []
         for dest_col, strategy in spec.computed.items():
             if strategy == "sha256_row":
                 digest = hashlib.sha256(repr(sorted((k, str(v)) for k, v in values.items())).encode()).hexdigest()
                 values[dest_col] = digest
             elif strategy == "source_key":
                 values[dest_col] = f"legacy:{spec.source_table}:{row[key_source]}"
+            elif strategy.startswith("slug:"):
+                raw = values.get(strategy.removeprefix("slug:"))
+                slug = re.sub(r"[^a-z0-9]+", "-", str(raw or "").lower()).strip("-")[:80].rstrip("-")
+                if not slug:
+                    computed_exceptions.append(
+                        RowException(
+                            source_table=spec.source_table,
+                            source_key=str(row[key_source]),
+                            column=dest_col,
+                            reason=f"slug source {strategy!r} produced an empty key",
+                        )
+                    )
+                    continue
+                values[dest_col] = slug
             else:  # pragma: no cover - strategies are closed in spec.py
                 raise ValueError(f"unknown computed strategy {strategy!r}")
+        if computed_exceptions:
+            report.exceptions.extend(computed_exceptions)
+            continue
         if not dry_run:
             destination_connection.execute(insert_sql, values)
             report.written += 1

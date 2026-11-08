@@ -32,6 +32,7 @@ class Pairing:
     constants: Mapping[str, object] = field(default_factory=dict)
     fk_rewrites: Mapping[str, str] = field(default_factory=dict)
     lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
+    computed: Mapping[str, str] = field(default_factory=dict)
     note: str = ""
 
 
@@ -340,6 +341,7 @@ def build_wave2_specs(
                 constants=pairing.constants,
                 fk_rewrites=pairing.fk_rewrites,
                 lookups=pairing.lookups,
+                computed=pairing.computed,
             )
         )
     return tuple(specs), tuple(generated)

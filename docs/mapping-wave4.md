@@ -8,24 +8,20 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (39): ar_control_account_id, bank_details, billing_address, created_by_user_id, credit_hold, credit_limit, credit_terms_days, currency_code, customer_group_id, customer_type, default_revenue_account_id, default_tax_code_id, default_wht_code_id, dotmac_sub_id, dotmac_sub_metrics, dotmac_sub_reseller_id, erpnext_id, is_active, is_related_party, is_vat_exempt, is_wht_applicable, parent_customer_id, payment_terms_id, price_list_id ...
 
 ## public.customer -> mod_customers.customer_profiles
-- executable: False; mapped: 4; missing: ['account_id']
+- executable: True; mapped: 5; missing: none
 - residue (41): ar_control_account_id, bank_details, billing_address, created_by_user_id, credit_hold, credit_limit, credit_terms_days, currency_code, customer_code, customer_group_id, customer_type, default_revenue_account_id, default_tax_code_id, default_wht_code_id, dotmac_sub_id, dotmac_sub_metrics, dotmac_sub_reseller_id, erpnext_id, is_active, is_related_party, is_vat_exempt, is_wht_applicable, legal_name, parent_customer_id ...
 
 ## public.contract -> mod_agreements.agreements
-- executable: False; mapped: 4; missing: ['reference', 'agreement_family_id', 'counterparty_ref', 'agreement_type', 'effective_date', 'expiry_date']
-- residue (20): approval_status, collectability_assessment, consideration_payable, contract_name, contract_number, contract_type, currency_code, customer_id, end_date, financing_rate, has_commercial_substance, is_enforceable, modification_history, noncash_consideration, organization_id, significant_financing, start_date, terms_and_conditions, total_contract_value, variable_consideration
-
-## public.contract_amendment_workflow -> mod_agreements.agreement_events
-- executable: False; mapped: 2; missing: ['agreement_id', 'sequence', 'event_type', 'to_status', 'command_id']
-- residue (16): amendment_workflow_id, appraisee_id, appraisee_signed_date, appraiser_id, appraiser_signed_date, contract_id, hod_id, hod_signed_date, hr_head_id, hr_head_signed_date, organization_id, original_contract_id, rejected_by_stage, rejection_reason, signoff_note, status
+- executable: False; mapped: 9; missing: ['agreement_family_id']
+- residue (15): approval_status, collectability_assessment, consideration_payable, contract_name, currency_code, financing_rate, has_commercial_substance, is_enforceable, modification_history, noncash_consideration, organization_id, significant_financing, terms_and_conditions, total_contract_value, variable_consideration
 
 ## public.quote -> mod_sales.quotes
-- executable: False; mapped: 15; missing: ['lead_id', 'tax_rate', 'authored_by_kind', 'authored_by_opaque_id', 'authored_by_label']
-- residue (18): contact_email, contact_name, converted_at, converted_to_invoice_id, converted_to_so_id, created_by, customer_id, exchange_rate, internal_notes, payment_terms_id, quote_date, quote_number, reference, rejection_reason, sent_by, terms_and_conditions, updated_by, viewed_at
+- executable: False; mapped: 16; missing: ['lead_id', 'tax_rate', 'authored_by_kind', 'authored_by_label']
+- residue (17): contact_email, contact_name, converted_at, converted_to_invoice_id, converted_to_so_id, customer_id, exchange_rate, internal_notes, payment_terms_id, quote_date, quote_number, reference, rejection_reason, sent_by, terms_and_conditions, updated_by, viewed_at
 
 ## public.quote_line -> mod_sales.quote_lines
-- executable: False; mapped: 6; missing: ['position', 'gross_amount', 'amount']
-- residue (10): cost_center_id, discount_percent, item_code, line_id, line_number, line_total, project_id, revenue_account_id, tax_code_id, unit_of_measure
+- executable: False; mapped: 8; missing: ['gross_amount']
+- residue (8): cost_center_id, discount_percent, item_code, line_id, project_id, revenue_account_id, tax_code_id, unit_of_measure
 
 ## GENERATED / command-import destinations
 - mod_billing.settlement_earmarks: COMMAND-IMPORT: legacy invoice/invoice_line/customer_payment enter via opening-window commands (opening receivables/cash/discharges), never 
@@ -64,6 +60,7 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - mod_billing.receivable_position_facts: COMMAND-IMPORT: legacy invoice/invoice_line/customer_payment enter via opening-window commands (opening receivables/cash/discharges), never 
 - mod_billing.receivable_exposure_facts: COMMAND-IMPORT: legacy invoice/invoice_line/customer_payment enter via opening-window commands (opening receivables/cash/discharges), never 
 - mod_customers.customer_party_references: GENERATED: party link resolved against kernel Party import
+- mod_agreements.agreement_events: GENERATED post-flip: legacy contract_amendment_workflow rows are HR sign-off chains (appraisee/appraiser/hod/hr_head columns - e2 appraisals
 - mod_agreements.agreement_lines: GENERATED/split at rehearsal
 - mod_agreements.agreement_approval_withdrawals: GENERATED/split at rehearsal
 - mod_sales.pipelines: GENERATED: pipeline is enrolment config; no legacy lead estate in ERP

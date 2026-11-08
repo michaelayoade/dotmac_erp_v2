@@ -156,9 +156,31 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "public.bank_statements",
         renames={"account_id": "bank_account_id"},
     ),
-    Pairing("mod_banking.bank_statement_lines", "public.bank_statement_lines"),
-    Pairing("mod_banking.match_allocations", "public.bank_statement_line_matches"),
-    Pairing("mod_banking.reconciliations", "public.bank_reconciliations"),
+    Pairing(
+        "mod_banking.bank_statement_lines",
+        "public.bank_statement_lines",
+        renames={"direction": "transaction_type", "external_ref": "bank_reference"},
+        fk_rewrites={"direction": "bank_direction_by_type"},
+        note="direction: legacy transaction_type value-mapped to the module "
+        "check values (credit/debit) via the enrolment map; unmapped types "
+        "are exceptions. Categorization suggestions are residue (re-derived)",
+    ),
+    Pairing(
+        "mod_banking.match_allocations",
+        None,
+        note="GENERATED: allocations are outputs of match decisions over "
+        "cash observations (both GENERATED); legacy bank_statement_line_matches "
+        "rows are rehearsal evidence for re-derivation, never row copies - "
+        "they carry neither decision nor observation ids",
+    ),
+    Pairing(
+        "mod_banking.reconciliations",
+        None,
+        note="GENERATED: a module reconciliation binds one statement snapshot; "
+        "legacy bank_reconciliations are per-account period reports with no "
+        "statement link and ambiguous total_* semantics - recomputed per "
+        "statement at enrolment, legacy rows are parity evidence",
+    ),
     *_generated(
         "mod_banking",
         ("cash_account_observations", "match_policies", "match_decisions"),
@@ -173,15 +195,26 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "supplier_document_number": "supplier_invoice_number",
             "liability_account_ref": "ap_control_account_id",
         },
-        note="supplier_name_snapshot joins supplier master at rehearsal; payment_schedule derives from due_date/terms",
+        lookups={"supplier_name_snapshot": ("supplier", "supplier_ref", "name")},
+        note="payment_schedule (JSON) stays MISSING: enrolment builds the "
+        "schedule document from due_date/total per the module schedule "
+        "schema - a JSON assembly, not a column copy",
     ),
     Pairing(
         "mod_payables.supplier_invoice_lines",
         "public.supplier_invoice_line",
         renames={"posting_account_ref": "expense_account_id"},
-        note="dimension_refs assembled from cost_center/project/segment at rehearsal",
+        note="dimension_refs (JSON) stays MISSING: enrolment assembles it "
+        "from cost_center_id/project_id/segment_id per the module refs schema",
     ),
-    Pairing("mod_payables.settlement_observations", "public.supplier_payment"),
+    Pairing(
+        "mod_payables.settlement_observations",
+        "public.supplier_payment",
+        renames={"occurred_at": "payment_date", "recorded_at": "created_at"},
+        note="obligation_id stays MISSING: obligations are service-derived "
+        "rows; enrolment allocates each legacy payment to derived "
+        "obligations (unallocated remainder = exception, never dropped)",
+    ),
     *_generated(
         "mod_payables",
         (
@@ -206,20 +239,27 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "settled_at": "paid_at",
         },
         constants={"provider_type": "paystack"},
-        note="legacy intent table is Paystack-specific; payer/purpose/channel "
-        "derive from source_type/source_id at rehearsal",
+        note="payer_reference/purpose/channel stay MISSING: derived per row "
+        "at enrolment from direction (inbound: email + source_type/source_id; "
+        "outbound: recipient_*) and gateway_response channel - no single "
+        "legacy column is an honest source for any of the three",
     ),
     Pairing(
         "mod_payments.payment_confirmations",
         "public.customer_payment",
         renames={
+            "id": "payment_id",
             "confirmed_amount": "amount",
             "observed_at": "payment_date",
             "external_reference": "reference",
             "provider_type": "payment_method",
         },
-        note="intent linkage via payment_intent.customer_payment_id at rehearsal; "
-        "webhook evidence attaches as provenance",
+        constants={"source": "MANUAL"},
+        lookups={"intent_id": ("payment_intent_by_payment", "id", "intent_id")},
+        note="source=MANUAL (ConfirmationSource): legacy rows are recorded "
+        "payments, not provider callbacks. intent_id via the enrolment map "
+        "built from legacy payment_intent.customer_payment_id; payments "
+        "with no intent exception to manual review (module requires one)",
     ),
     *_generated(
         "mod_payments",
@@ -251,10 +291,31 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_expenses.expense_policy_evaluations",
         "public.expense_limit_evaluation",
         renames={"actual_amount": "claim_amount", "reason_code": "result"},
-        note="batch_id groups evaluations per import run at rehearsal",
+        note="batch_id stays MISSING: enrolment mints one evaluation batch "
+        "per claim at import (legacy evaluations are unbatched evidence)",
     ),
-    Pairing("mod_expenses.expense_lifecycle_events", "public.expense_claim_action"),
-    Pairing("mod_expenses.expense_requests", "public.expense_entry"),
+    Pairing(
+        "mod_expenses.expense_lifecycle_events",
+        "public.expense_claim_action",
+        renames={"to_status": "status", "occurred_at": "created_at"},
+        note="actor_reference stays MISSING: legacy actions record no actor "
+        "column; enrolment rules system-actor attribution or exceptions "
+        "per action_type at rehearsal - never invented here",
+    ),
+    Pairing(
+        "mod_expenses.expense_requests",
+        "public.expense_entry",
+        renames={
+            "reference": "expense_number",
+            "requester_party_id": "created_by",
+            "purpose": "description",
+            "total_requested_amount": "amount",
+        },
+        fk_rewrites={"requester_party_id": "user_party"},
+        note="needed_by stays MISSING (legacy expense_date is when the "
+        "expense was incurred, not a need-by date); requester rewritten "
+        "through the user->party map from identity enrolment",
+    ),
     *_generated(
         "mod_expenses",
         ("expense_request_lines", "expense_policy_rules", "expense_receipts"),
@@ -276,11 +337,59 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "estimated_total": "estimated_amount",
         },
     ),
-    Pairing("mod_procurement.sourcing_events", "public.request_for_quotation"),
-    Pairing("mod_procurement.sourcing_invitations", "public.rfq_invitation"),
-    Pairing("mod_procurement.bid_submissions", "public.quotation_response"),
-    Pairing("mod_procurement.bid_lines", "public.quotation_response_line"),
-    Pairing("mod_procurement.bid_evaluations", "public.bid_evaluation"),
+    Pairing(
+        "mod_procurement.sourcing_events",
+        "public.request_for_quotation",
+        renames={
+            "event_number": "rfq_number",
+            "method": "procurement_method",
+            "opens_at": "rfq_date",
+            "closes_at": "closing_date",
+            "criteria_json": "evaluation_criteria",
+            "estimated_amount": "estimated_value",
+            "created_by_ref": "created_by_user_id",
+        },
+        note="tenant from the run extent (legacy RFQ carries no org column)",
+    ),
+    Pairing(
+        "mod_procurement.sourcing_invitations",
+        "public.rfq_invitation",
+        renames={"event_id": "rfq_id"},
+        note="tenant/invited_by from the run extent",
+    ),
+    Pairing(
+        "mod_procurement.bid_submissions",
+        "public.quotation_response",
+        renames={"event_id": "rfq_id", "source_event_id": "response_id"},
+        note="source_event_id is the legacy response's own id in the source "
+        "system; content_sha256 computes over the imported row",
+    ),
+    Pairing(
+        "mod_procurement.bid_lines",
+        "public.quotation_response_line",
+        renames={
+            "bid_id": "response_id",
+            "sourcing_line_id": "requisition_line_id",
+            "line_total": "line_amount",
+        },
+        fk_rewrites={"sourcing_line_id": "sourcing_line_by_requisition_line"},
+        lookups={"event_id": ("bid_submission", "bid_id", "event_id")},
+        note="sourcing lines are GENERATED snapshots of requisition lines - "
+        "the rewrite map binds them; event via the parent bid lookup",
+    ),
+    Pairing(
+        "mod_procurement.bid_evaluations",
+        "public.bid_evaluation",
+        renames={
+            "event_id": "rfq_id",
+            "selected_bid_id": "recommended_response_id",
+            "evaluated_at": "evaluation_date",
+            "evaluated_by_ref": "evaluated_by_user_id",
+        },
+        note="scores_json/selected_total_score stay MISSING: legacy keeps a "
+        "narrative evaluation_report, no structured scores - enrolment "
+        "re-scores from criteria or exceptions the evaluation",
+    ),
     Pairing(
         "mod_procurement.purchase_orders",
         "public.purchase_order",
@@ -291,20 +400,60 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         },
         note="source requisition/evaluation links resolve via procurement evidence at rehearsal",
     ),
-    Pairing("mod_procurement.purchase_order_lines", "public.purchase_order_line"),
-    Pairing("mod_procurement.receipt_observations", "public.goods_receipt"),
+    Pairing(
+        "mod_procurement.purchase_order_lines",
+        "public.purchase_order_line",
+        renames={"order_id": "po_id"},
+        lookups={"unit": ("inventory_item", "item_ref", "base_uom")},
+        note="unit from the item's base_uom via the enrolment item map; "
+        "free-text lines without item_id exception for a unit ruling",
+    ),
+    Pairing(
+        "mod_procurement.receipt_observations",
+        "public.goods_receipt",
+        renames={
+            "order_id": "po_id",
+            "source_event_id": "receipt_id",
+            "observed_at": "receipt_date",
+        },
+        note="lines_json stays MISSING: enrolment assembles it from legacy "
+        "goods_receipt lines per the module observation payload schema; "
+        "payload_sha256 then binds the assembled document",
+    ),
     *_generated(
         "mod_procurement",
         ("sourcing_event_lines", "procurement_evidence"),
         "GENERATED: sourcing lines snapshot from requisition lines; evidence is digest-bound input",
     ),
     # approvals (mod_approvals, tenant plane)
-    Pairing("mod_approvals.approval_requests", "public.approval_request"),
-    Pairing("mod_approvals.approval_decisions", "public.approval_decision"),
+    Pairing(
+        "mod_approvals.approval_requests",
+        "public.approval_request",
+        renames={
+            "subject_type": "document_type",
+            "subject_id": "document_id",
+            "requested_by": "requested_by_user_id",
+            "state": "status",
+        },
+        computed={"idempotency_key": "source_key"},
+        note="policy_code/policy_version stay MISSING: they resolve from "
+        "the legacy workflow_id through the policy enrolment map (policies "
+        "re-publish first); content_digest computes over the imported row; "
+        "state values verified against the module state set at rehearsal",
+    ),
+    Pairing(
+        "mod_approvals.approval_decisions",
+        "public.approval_decision",
+        renames={"actor_id": "approver_user_id"},
+        note="tenant from the run extent (legacy decisions carry no org column)",
+    ),
     Pairing(
         "mod_approvals.approval_policies",
         "public.approval_workflow",
-        note="policy is re-published as a version through the approvals service at enrolment",
+        renames={"policy_code": "workflow_code", "levels": "approval_levels"},
+        constants={"version": 1},
+        note="enrols as policy v1 (re-published through the approvals "
+        "service); document_digest computes over the imported row",
     ),
     *_generated(
         "mod_approvals",
@@ -312,17 +461,80 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "GENERATED post-flip (no legacy withdrawal state)",
     ),
     # finance / fixed assets (mod_finance) + assets (mod_assets)
-    Pairing("mod_assets.assets", "public.asset"),
-    Pairing("mod_assets.asset_assignments", "public.asset_assignment"),
-    Pairing("mod_assets.asset_disposals", "public.asset_disposal"),
-    Pairing("mod_assets.asset_lifecycle_events", "public.asset_lifecycle_event"),
+    Pairing(
+        "mod_assets.assets",
+        "public.asset",
+        renames={
+            "code": "asset_number",
+            "state": "status",
+            "acquired_on": "acquisition_date",
+            "tag": "barcode",
+        },
+        note="kind/condition stay MISSING: kind derives from legacy "
+        "category by an explicit enrolment value table (category_id is not "
+        "a module column); condition has no legacy source - assessed at "
+        "enrolment, never defaulted. Valuation columns are finance-owned "
+        "(asset books), not asset-registry data",
+    ),
+    Pairing(
+        "mod_assets.asset_assignments",
+        "public.asset_assignment",
+        renames={"custodian_id": "employee_id", "starts_on": "issued_on"},
+        fk_rewrites={"custodian_id": "employee_party"},
+        note="custodian rewritten through the employee->party map",
+    ),
+    Pairing(
+        "mod_assets.asset_disposals",
+        "public.asset_disposal",
+        renames={
+            "method": "disposal_type",
+            "requested_on": "disposal_date",
+            "requested_by_id": "created_by_user_id",
+            "reason": "disposal_reason",
+            "disposed_on": "disposal_date",
+            "approved_by_id": "approved_by_user_id",
+            "recipient_ref": "buyer_reference",
+            "external_authorization_ref": "authorization_reference",
+            "external_finance_ref": "journal_entry_id",
+        },
+        constants={"status": "completed"},
+        note="legacy disposal rows are completed facts (DisposalStatus); "
+        "tenant from the run extent (no org column); proceeds/gain-loss "
+        "amounts are finance consequences, not registry columns",
+    ),
+    Pairing(
+        "mod_assets.asset_lifecycle_events",
+        "public.asset_lifecycle_event",
+        renames={"occurred_at": "event_at"},
+    ),
     Pairing(
         "mod_assets.asset_maintenance",
-        "public.asset_tracking_event",
-        note="maintenance-shaped tracking events only; remainder is lifecycle evidence",
+        None,
+        note="GENERATED post-flip: legacy asset_tracking_event rows are "
+        "GPS/scan tracking observations (latitude/longitude/tracked_at), "
+        "not maintenance records - they stay lifecycle/fleet evidence and "
+        "must not be copied into maintenance. Corrected 2026-11-08",
     ),
-    Pairing("mod_finance.depreciation_runs", "public.depreciation_run"),
-    Pairing("mod_finance.depreciation_lines", "public.depreciation_schedule"),
+    Pairing(
+        "mod_finance.depreciation_runs",
+        "public.depreciation_run",
+        renames={
+            "run_ref": "run_number",
+            "period_ref": "fiscal_period_id",
+            "calculated_at": "calculation_completed_at",
+        },
+        lookups={"through_date": ("fiscal_period", "period_ref", "end_date")},
+        note="currency_code stays MISSING: supplied per tenant from the "
+        "functional-currency config at enrolment (not a legacy column)",
+    ),
+    Pairing(
+        "mod_finance.depreciation_lines",
+        None,
+        note="GENERATED: module lines are computed from enrolled asset "
+        "books incl. the unimpaired-carrying shadow legacy never stored; "
+        "legacy depreciation_schedule rows are run-parity evidence "
+        "(amount equality per run), never row copies",
+    ),
     *_generated(
         "mod_finance",
         ("asset_books", "accounting_events", "accounting_consequences", "accounting_consequence_lines"),
@@ -348,7 +560,9 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_customers.customer_profiles",
         "public.customer",
-        note="second spec from the same legacy row (profile columns split)",
+        renames={"account_id": "customer_id"},
+        note="second spec from the same legacy row (profile columns split); "
+        "account_id is the preserved customer UUID (customer_accounts.id)",
     ),
     *_generated(
         "mod_customers",
@@ -358,9 +572,26 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_agreements.agreements",
         "public.contract",
-        note="commercial contracts only; employment/lease/performance contracts are e2",
+        renames={
+            "reference": "contract_number",
+            "counterparty_ref": "customer_id",
+            "agreement_type": "contract_type",
+            "effective_date": "start_date",
+            "expiry_date": "end_date",
+        },
+        note="commercial contracts only; employment/lease/performance "
+        "contracts are e2. agreement_family_id stays MISSING: enrolment "
+        "mints one family per contract chain (amendment lineage via "
+        "original_contract_id evidence) - no legacy family column exists",
     ),
-    Pairing("mod_agreements.agreement_events", "public.contract_amendment_workflow"),
+    Pairing(
+        "mod_agreements.agreement_events",
+        None,
+        note="GENERATED post-flip: legacy contract_amendment_workflow rows "
+        "are HR sign-off chains (appraisee/appraiser/hod/hr_head columns - "
+        "e2 appraisals evidence), not agreement events; copying them here "
+        "would fabricate agreement history. Corrected 2026-11-08",
+    ),
     *_generated(
         "mod_agreements",
         ("agreement_lines", "agreement_approval_withdrawals"),
@@ -375,10 +606,22 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "total": "total_amount",
             "expires_at": "valid_until",
             "notes": "customer_notes",
+            "authored_by_opaque_id": "created_by",
         },
-        note="sales has no customer FK (lead-based); customer linkage is party/adapter residue",
+        note="lead_id/tax_rate/authored_by_kind/authored_by_label stay "
+        "MISSING: sales is lead-based and ERP has no lead estate (leads "
+        "GENERATED at enrolment, one per customer); tax_rate is not "
+        "derivable per quote (mixed line rates) - enrolment ruling; "
+        "author kind/label resolve from identity enrolment",
     ),
-    Pairing("mod_sales.quote_lines", "public.quote_line"),
+    Pairing(
+        "mod_sales.quote_lines",
+        "public.quote_line",
+        renames={"position": "line_number", "amount": "line_total"},
+        note="gross_amount stays MISSING: quantity*unit_price before "
+        "discount - an enrolment computation, checked against "
+        "amount+discount at rehearsal (mismatch = exception)",
+    ),
     *_generated(
         "mod_sales",
         ("pipelines", "pipeline_stages", "leads", "lead_origins", "quote_discount_revisions"),
@@ -428,7 +671,10 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_inventory.lots",
         "public.inventory_lot",
         renames={"code": "lot_number", "received_at": "received_date", "supplier_lot_ref": "supplier_lot_number"},
-        note="status derives from is_active at rehearsal (value map)",
+        note="status stays MISSING: LotStatus is available/quarantined/"
+        "depleted - is_active alone cannot distinguish them; enrolment "
+        "derives status from the imported lot balance (zero = depleted) "
+        "plus quarantine evidence, per-lot",
     ),
     Pairing("mod_inventory.lot_balances", "public.inventory_lot_balance"),
     Pairing("mod_inventory.serials", "public.inventory_serial"),
@@ -443,8 +689,10 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "occurred_at": "transaction_date",
             "actor_ref": "created_by_user_id",
         },
-        note="legacy transactions enrol as singleton movement groups; sign and "
-        "value_after recompute per kind at rehearsal",
+        note="value_after stays MISSING by design: movements replay "
+        "through the inventory costing engine in transaction order and "
+        "value_after is its output (parity-checked against the legacy "
+        "WAC ledger); copying any legacy column here would fake costing",
     ),
     Pairing("mod_inventory.movement_serials", "public.inventory_serial_movement"),
     Pairing("mod_inventory.stock_reservations", "public.stock_reservation"),
@@ -463,22 +711,34 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_projects.project_templates",
         "public.project_template",
-        note="code is generated as a slug from name at rehearsal (legacy has no template code)",
+        computed={"code": "slug:name"},
+        note="code slugified from name (legacy has no template code); "
+        "slug collisions surface as enrolment conflicts to rename, "
+        "never silently suffixed",
     ),
     Pairing(
         "mod_projects.project_template_tasks",
         "public.project_template_task",
         renames={"title": "task_name", "sort_order": "order_index"},
-        note="key/status/priority are template enrolment values (key from title slug)",
+        constants={"status": "todo", "priority": "medium"},
+        computed={"key": "slug:title"},
+        note="status/priority are declared enrolment values for template "
+        "definitions (TaskStatus.TODO / Priority.MEDIUM) - explicit "
+        "constants here, re-ruled per tenant at rehearsal if wanted",
     ),
     Pairing(
         "mod_projects.project_template_task_dependencies",
         "public.project_template_task_dependency",
+        lookups={"template_id": ("project_template_task", "template_task_id", "template_id")},
+        note="template via the parent-task lookup; tenant from the run extent",
     ),
     Pairing(
         "mod_projects.project_tasks",
         "public.milestone",
-        note="legacy task estate (tasks/time entries) re-ruled per-file at rehearsal; project finance stays e2",
+        constants={"priority": "medium"},
+        note="priority is a declared enrolment value (Priority.MEDIUM) - "
+        "legacy milestones carry none; legacy task estate re-ruled "
+        "per-file at rehearsal; project finance stays e2",
     ),
     *_generated(
         "mod_projects",
@@ -514,7 +774,13 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_documents.documents",
         "public.hr_document",
-        note="also generated_document/vehicle_document at rehearsal; templates become document types",
+        renames={"metadata": "extra_metadata", "state": "status"},
+        note="library_id/type_code/type_version/folder_path/sensitivity/"
+        "handling_instructions stay MISSING: libraries and document "
+        "types are enrolment config (legacy category does not map 1:1 "
+        "to module types) and sensitivity/handling are classification "
+        "policy rulings for HR documents - none may be invented per row. "
+        "state values verified against the module state set at rehearsal",
     ),
     *_generated(
         "mod_documents",
@@ -540,7 +806,8 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_forms.form_sections",
         "public.form_section",
         renames={"version_id": "form_version_id", "position": "sort_order"},
-        note="key generated from title slug at enrolment",
+        computed={"key": "slug:title"},
+        note="key slugified from title; tenant from the run extent",
     ),
     Pairing(
         "mod_forms.form_fields",
@@ -554,8 +821,18 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "position": "sort_order",
         },
     ),
-    Pairing("mod_forms.form_field_options", "public.form_field_option"),
-    Pairing("mod_forms.form_submissions", "public.form_submission"),
+    Pairing(
+        "mod_forms.form_field_options",
+        "public.form_field_option",
+        renames={"position": "sort_order", "active": "is_active"},
+        note="tenant from the run extent",
+    ),
+    Pairing(
+        "mod_forms.form_submissions",
+        "public.form_submission",
+        computed={"submission_key": "source_key"},
+        note="submission_key is the stable legacy source key; request_fingerprint computes over the imported row",
+    ),
     Pairing("mod_forms.form_answers", "public.form_answer"),
     *_generated(
         "mod_inbox",
@@ -567,7 +844,18 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
         ("timers", "timer_acceptances", "timer_rejections"),
         "GENERATED post-flip: timers are live scheduling state, re-armed by owners at the flip",
     ),
-    Pairing("mod_workflow.workflow_executions", "public.workflow_execution"),
+    Pairing(
+        "mod_workflow.workflow_executions",
+        "public.workflow_execution",
+        renames={
+            "definition_version_ref": "rule_id",
+            "subject_ref": "entity_id",
+            "source_event_id": "execution_id",
+        },
+        note="definition_digest/request_fingerprint compute over the "
+        "imported row; tenant/source_owner from the run extent; only "
+        "executions live at the flip enrol (drain-first ruling)",
+    ),
     *_generated(
         "mod_workflow",
         ("workflow_checkpoints", "workflow_repairs"),
@@ -600,6 +888,8 @@ def build_specs(
                 renames=pairing.renames,
                 constants=pairing.constants,
                 fk_rewrites=pairing.fk_rewrites,
+                lookups=pairing.lookups,
+                computed=pairing.computed,
             )
         )
     return tuple(specs), tuple(generated)

@@ -194,6 +194,53 @@ def test_lookup_key_must_be_mapped() -> None:
         )
 
 
+def test_slug_computed_and_digest_convention() -> None:
+    spec = build_spec(
+        source_table="project_template",
+        destination_table="project_templates",
+        source_columns=("template_id", "name"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("code", nullable=False, has_default=False),
+            DestinationColumn("name", nullable=False, has_default=False),
+            DestinationColumn("document_digest", nullable=False, has_default=False),
+        ),
+        renames={"id": "template_id"},
+        computed={"code": "slug:name"},
+    )
+    assert spec.executable
+    assert spec.computed == {"code": "slug:name", "document_digest": "sha256_row"}
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE project_template (template_id TEXT, name TEXT)"))
+        c.execute(sa.text("INSERT INTO project_template VALUES ('t1','Site Rollout (Phase 2)')"))
+        c.execute(sa.text("INSERT INTO project_template VALUES ('t2','!!!')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE project_templates (id TEXT, code TEXT, name TEXT, document_digest TEXT)"))
+    with src.connect() as s, dst.begin() as d:
+        report = execute_transform(s, d, spec)
+        assert report.written == 1 and not report.complete
+        assert report.exceptions[0].column == "code"
+        row = d.execute(sa.text("SELECT code, length(document_digest) FROM project_templates")).one()
+        assert tuple(row) == ("site-rollout-phase-2", 64)
+
+
+def test_slug_source_must_be_mapped() -> None:
+    with pytest.raises(ValueError, match="slug"):
+        build_spec(
+            source_table="project_template",
+            destination_table="project_templates",
+            source_columns=("template_id",),
+            destination_columns=(
+                DestinationColumn("id", nullable=False, has_default=False),
+                DestinationColumn("code", nullable=False, has_default=False),
+            ),
+            renames={"id": "template_id"},
+            computed={"code": "slug:name"},
+        )
+
+
 def test_executor_refuses_non_executable_spec() -> None:
     src, dst = _engines()
     spec = _spec(destination_columns=(DestinationColumn("nope", nullable=False, has_default=False),))
