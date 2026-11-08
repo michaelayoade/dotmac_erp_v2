@@ -44,6 +44,10 @@ class MigrationConfigurationError(RuntimeError):
 # Composed heads at the pinned releases (kernel + 31 modules, waves
 # 1-6). The migrate-entrypoint test asserts ScriptDirectory heads equal
 # this set; each future pin bump updates its head in the same change.
+# Live STAMPED heads after a full genesis are EXPECTED_STAMPED_HEADS:
+# e2_0001 depends_on the kernel + people heads, so Alembic absorbs
+# their stamps into the e2 lineage (verified live at Gate 4 genesis
+# on the dedicated test server, 2026-11-08: 31 stamped, 333 tables).
 EXPECTED_HEADS: tuple[str, ...] = (
     "0030_credential_tenant_key",  # kernel 0.1.0a107
     "ac_0001_accounting",  # accounting 0.1.0a1
@@ -79,6 +83,12 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "tx_0005_tax_dependencies",  # tax 0.1.0a7
     "wr_0001_runtime",  # workflow-runtime 0.1.0a1
 )
+
+_ABSORBED_HEADS: tuple[str, ...] = (
+    "0030_credential_tenant_key",
+    "pe_0001_people_directory",
+)
+EXPECTED_STAMPED_HEADS: tuple[str, ...] = tuple(h for h in EXPECTED_HEADS if h not in _ABSORBED_HEADS)
 
 
 def _module_dir(package: str) -> Path:
