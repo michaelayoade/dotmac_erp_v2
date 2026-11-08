@@ -1,0 +1,34 @@
+name: ci
+
+# Qualification only: lint + maintained tests against the released
+# wheels. Needs the FORGEJO_READ_TOKEN repository secret (OpenBao
+# secret/dotmac/forgejo/read-token) before the sync step can pass.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Sync (released wheels)
+        env:
+          UV_INDEX_FORGEJO_USERNAME: ci-reader
+          UV_INDEX_FORGEJO_PASSWORD: ${{ secrets.FORGEJO_READ_TOKEN }}
+        run: uv sync --extra test
+
+      - name: Lint
+        run: |
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+
+      - name: Test
+        run: uv run pytest -q
