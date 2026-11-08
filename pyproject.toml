@@ -51,6 +51,12 @@ dependencies = [
     "dotmac-inbox==0.1.0a3",  # wave 6
     "dotmac-ticketing==0.1.0a4",  # wave 6
     "dotmac-workflow-runtime==0.1.0a1",  # wave 6
+    # App-sync pilot (2026-11-08, Michael: land the Academy->ERP receiver
+    # here): contract library only, no module mount. Deliberately NOT a
+    # released pin — dotmac-app-sync 0.1.0a1 is source-only by its own
+    # release gate; the pilot exact-pins the source build via git rev
+    # below until the pilot proves one receiver and it can release.
+    "dotmac-app-sync==0.1.0a1",
     # Driver is an assembly concern (kernel excludes it deliberately).
     "psycopg[binary]==3.1.19",
     "uvicorn>=0.29",
@@ -67,6 +73,7 @@ url = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/"
 explicit = true
 
 [tool.uv.sources]
+dotmac-app-sync = { git = "https://github.com/michaelayoade/dotmac_starter_mt.git", subdirectory = "packages/dotmac-app-sync", rev = "e1bfa54e23bd8184c20beb2dc1d9f0938fa336f6" }
 dotmac-kernel = { index = "forgejo" }
 dotmac-ui = { index = "forgejo" }
 dotmac-accounting = { index = "forgejo" }

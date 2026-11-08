@@ -87,6 +87,7 @@ from dotmac_ui import UI_CONTRACT_VERSION, static_dir
 from dotmac_workflow_runtime.manifest import module as workflow_runtime_module
 
 from erp_v2 import ui
+from erp_v2.academy_sync.routes import academy_sync_feature
 from erp_v2.database import build_database_runtime, database_startup_checks
 from erp_v2.migration_bindings import ASSEMBLY_MODULE_PLANES
 from erp_v2.readiness import readiness_feature
@@ -111,6 +112,7 @@ assembly: Final = ProductAssemblySpec(
     # alphabetically by module code (legacy product_assembly convention).
     modules=(
         readiness_feature,
+        academy_sync_feature,
         erp_web_feature,
         accounting_module,
         commercial_agreements_module,

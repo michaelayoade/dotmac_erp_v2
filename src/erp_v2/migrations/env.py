@@ -60,6 +60,7 @@ from sqlalchemy import engine_from_config, pool
 from erp_v2 import fleet as fleet_models  # noqa: F401
 from erp_v2 import leases as lease_models  # noqa: F401
 from erp_v2 import public_sector as public_sector_models  # noqa: F401
+from erp_v2.academy_sync import models as academy_sync_models  # noqa: F401
 from erp_v2.hr import appraisals as hr_appraisal_models  # noqa: F401
 from erp_v2.hr import attendance as hr_attendance_models  # noqa: F401
 from erp_v2.hr import discipline as hr_discipline_models  # noqa: F401
