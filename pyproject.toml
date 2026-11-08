@@ -1,0 +1,118 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dotmac-erp-v2"
+version = "0.1.0a0"
+description = "Dotmac ERP, composed thin from Starter (kernel + released modules + ERP-unique domain). Waves 1-6: all released ERP-relevant modules mounted, no product traffic."
+requires-python = ">=3.12,<3.14"
+# Released pins only, exact versions: adopting a kernel or module release
+# is a deliberate act with a changelog to read (Academy v2 convention).
+# Product modules are pinned wave by wave as their slice ports, per
+# docs/classification.md. Mounting is not a flip: no consumer reads a
+# mounted module through this app until its data wave rehearses.
+# Wave-1 pin notes: dotmac-files a7 = latest release tag (legacy ERP's
+# pin). dotmac-imports 0.2.0a1 = latest release tag. dotmac-numbering
+# a3 = latest released (a4 changelog marks it UNRELEASED/unpublished);
+# a3 has no migration change vs legacy ERP's a2.
+dependencies = [
+    "alembic==1.13.2",
+    "dotmac-kernel==0.1.0a107",
+    "dotmac-ui==0.1.0a9",
+    "dotmac-files==0.1.0a7",  # wave 1
+    "dotmac-imports==0.2.0a1",  # wave 1
+    "dotmac-numbering==0.1.0a3",  # wave 1
+    "dotmac-payroll==0.1.0a2",  # wave 2
+    "dotmac-people==0.1.0a2",  # wave 2
+    "dotmac-tax==0.1.0a7",  # wave 2
+    "dotmac-accounting==0.1.0a1",  # wave 3
+    "dotmac-approvals==0.1.0a8",  # wave 3
+    "dotmac-assets==0.1.0a1",  # wave 3
+    "dotmac-banking==0.1.0a1",  # wave 3
+    "dotmac-expenses==0.1.0a1",  # wave 3
+    "dotmac-finance==0.2.0a1",  # wave 3
+    "dotmac-payables==0.1.0a1",  # wave 3
+    "dotmac-payments==0.1.0a3",  # wave 3
+    "dotmac-procurement==0.1.0a1",  # wave 3
+    "dotmac-commercial-agreements==0.1.0a4",  # wave 4
+    "dotmac-billing==0.1.0a10",  # wave 4
+    "dotmac-collections==0.1.0a1",  # wave 4
+    "dotmac-customers==0.1.0a1",  # wave 4
+    "dotmac-party==0.1.0a1",  # wave 4
+    "dotmac-sales==0.1.0a1",  # wave 4
+    "dotmac-inventory==0.2.0a1",  # wave 5
+    "dotmac-projects==0.1.0a1",  # wave 5
+    "dotmac-ai-operations==0.1.0a1",  # wave 6
+    "dotmac-analytics==0.1.0a1",  # wave 6
+    "dotmac-documents==0.1.0a1",  # wave 6
+    "dotmac-durable-timers==0.1.0a1",  # wave 6
+    "dotmac-forms==0.2.0a1",  # wave 6
+    "dotmac-inbox==0.1.0a3",  # wave 6
+    "dotmac-ticketing==0.1.0a4",  # wave 6
+    "dotmac-workflow-runtime==0.1.0a1",  # wave 6
+    # Driver is an assembly concern (kernel excludes it deliberately).
+    "psycopg[binary]==3.1.19",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.27", "pytest>=8", "ruff==0.16.10"]
+
+# Private Dotmac package index (Forgejo). URL only — credentials live in
+# the operator environment, never in this file.
+[[tool.uv.index]]
+name = "forgejo"
+url = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/"
+explicit = true
+
+[tool.uv.sources]
+dotmac-kernel = { index = "forgejo" }
+dotmac-ui = { index = "forgejo" }
+dotmac-accounting = { index = "forgejo" }
+dotmac-ai-operations = { index = "forgejo" }
+dotmac-analytics = { index = "forgejo" }
+dotmac-approvals = { index = "forgejo" }
+dotmac-assets = { index = "forgejo" }
+dotmac-banking = { index = "forgejo" }
+dotmac-billing = { index = "forgejo" }
+dotmac-collections = { index = "forgejo" }
+dotmac-commercial-agreements = { index = "forgejo" }
+dotmac-customers = { index = "forgejo" }
+dotmac-documents = { index = "forgejo" }
+dotmac-durable-timers = { index = "forgejo" }
+dotmac-expenses = { index = "forgejo" }
+dotmac-files = { index = "forgejo" }
+dotmac-finance = { index = "forgejo" }
+dotmac-forms = { index = "forgejo" }
+dotmac-imports = { index = "forgejo" }
+dotmac-inbox = { index = "forgejo" }
+dotmac-inventory = { index = "forgejo" }
+dotmac-numbering = { index = "forgejo" }
+dotmac-party = { index = "forgejo" }
+dotmac-payables = { index = "forgejo" }
+dotmac-payments = { index = "forgejo" }
+dotmac-payroll = { index = "forgejo" }
+dotmac-people = { index = "forgejo" }
+dotmac-procurement = { index = "forgejo" }
+dotmac-projects = { index = "forgejo" }
+dotmac-sales = { index = "forgejo" }
+dotmac-tax = { index = "forgejo" }
+dotmac-ticketing = { index = "forgejo" }
+dotmac-workflow-runtime = { index = "forgejo" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/erp_v2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
