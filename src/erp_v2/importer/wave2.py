@@ -34,6 +34,7 @@ class Pairing:
     lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
     computed: Mapping[str, str] = field(default_factory=dict)
     null_fallbacks: Mapping[str, str] = field(default_factory=dict)
+    deferred: tuple[str, ...] = ()
     note: str = ""
 
 
@@ -57,6 +58,7 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "name": "department_name",
             "parent_id": "parent_department_id",
         },
+        deferred=("parent_id",),
         note="residue: head_id/cost_center_id are e2/reporting facts",
     ),
     Pairing(
@@ -88,6 +90,7 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "name": "position_name",
             "parent_id": "parent_position_id",
         },
+        deferred=("parent_id",),
         note="is_department_head has no legacy source - derived at enrolment if required",
     ),
     Pairing("mod_people.position_assignments", "public.position_assignment"),
@@ -354,6 +357,7 @@ def build_wave2_specs(
                 lookups=pairing.lookups,
                 computed=pairing.computed,
                 null_fallbacks=pairing.null_fallbacks,
+                deferred=pairing.deferred,
             )
         )
     return tuple(specs), tuple(generated)

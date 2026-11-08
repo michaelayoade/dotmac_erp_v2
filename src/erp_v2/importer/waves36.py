@@ -67,7 +67,13 @@ def _generated(schema: str, tables: Sequence[str], note: str) -> tuple[Pairing, 
 WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     # accounting (mod_accounting) - history enters as typed facts;
     # posted lines are immutable ledger evidence.
-    Pairing("mod_accounting.accounts", "public.account"),
+    Pairing(
+        "mod_accounting.accounts",
+        "public.account",
+        renames={"posting_allowed": "is_posting_allowed"},
+        note="legacy CONTROL/STATISTICAL accounts with posting allowed "
+        "violate the module invariant - named exceptions (16 live)",
+    ),
     Pairing(
         "mod_accounting.account_categories",
         "public.account_category",
@@ -104,6 +110,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         },
         constants={"status": "DRAFT"},
         computed={"source_document_id": "source_key"},
+        deferred=("reverses_journal_id", "reversal_journal_id"),
         null_fallbacks={"source_document_kind": "literal:JOURNAL"},
         note="lifecycle-staged: journals must be assembled DRAFT (lines "
         "immutable after); transitions step posts/voids/reverses after "
@@ -965,6 +972,7 @@ def build_specs(
                 lookups=pairing.lookups,
                 computed=pairing.computed,
                 null_fallbacks=pairing.null_fallbacks,
+                deferred=pairing.deferred,
             )
         )
     return tuple(specs), tuple(generated)

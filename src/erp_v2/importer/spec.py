@@ -81,6 +81,16 @@ class TransformSpec:
     # amount legacy stored only as quantity x unit price),
     # "uuid5_row" (deterministic CHAR(32) id for natural-key
     # legacy tables with no UUID of their own, e.g. bank_directory).
+    deferred: tuple[str, ...] = ()
+    # destination columns excluded from the INSERT and applied by
+    # the executor in a post-pass UPDATE keyed by destination id.
+    # For self-referential FKs (journal reversal links, department
+    # parents): heap order interleaves parents and children, so a
+    # direct insert FK-fails a few percent of rows and poisons
+    # nearly every insert batch into split fallbacks (Gate 4:
+    # ~39k FK errors, journal import 10x slower). Deferred columns
+    # must be nullable and mapped; updates that still fail (parent
+    # row itself exceptioned) become named exceptions.
     null_fallbacks: Mapping[str, str] = field(default_factory=dict)
     # destination column -> fallback applied by the executor ONLY
     # when the mapped source value is NULL. Closed set: "row_id"
@@ -194,6 +204,7 @@ def build_spec(
     lookups: Mapping[str, tuple[str, str, str]] | None = None,
     computed: Mapping[str, str] | None = None,
     null_fallbacks: Mapping[str, str] | None = None,
+    deferred: tuple[str, ...] = (),
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -285,6 +296,10 @@ def build_spec(
     for dest_col, (_map, key_col, _field) in lookups.items():
         if key_col not in column_map:
             raise ValueError(f"lookup for {dest_col!r} keys on unmapped column {key_col!r}")
+    for dest_col in deferred:
+        _check(dest_col)
+        if dest_col not in column_map:
+            raise ValueError(f"deferred column {dest_col!r} is not mapped from the source")
     consumed = set(column_map.values())
     residue = tuple(sorted(source_set - consumed))
     return TransformSpec(
@@ -300,6 +315,7 @@ def build_spec(
         computed=computed,
         lookups=lookups,
         null_fallbacks=null_fallbacks,
+        deferred=tuple(deferred),
     )
 
 

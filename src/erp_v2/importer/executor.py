@@ -121,6 +121,67 @@ class TransformReport:
         return not self.exceptions and self.read == self.written
 
 
+def _apply_deferred(
+    destination_connection: sa.Connection,
+    spec: TransformSpec,
+    updates: list[tuple[str, Any, dict[str, Any]]],
+    report: TransformReport,
+) -> None:
+    """Post-pass UPDATEs for deferred (self-FK) columns, by dest id.
+
+    Runs after every insert (including the FK retry pass), so the
+    referenced parent rows exist. Grouped by column set; batched
+    with binary-split fallback. Updates matching no row (the row
+    itself was exceptioned at insert) are no-ops; updates rejected
+    by the destination become named exceptions.
+    """
+
+    if not updates:
+        return
+    by_columns: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for source_key, dest_id, values in updates:
+        if dest_id is None:
+            continue
+        by_columns.setdefault(tuple(sorted(values)), []).append({"_src_key": source_key, "_dest_id": dest_id, **values})
+    for columns, rows in by_columns.items():
+        set_clause = ", ".join(f"{c} = :{c}" for c in columns)
+        sql = sa.text(
+            f"UPDATE {spec.destination_table} SET {set_clause} WHERE id = :_dest_id"  # noqa: S608
+        )
+        batch = [{k: v for k, v in r.items() if k != "_src_key"} for r in rows]
+        keys = [r["_src_key"] for r in rows]
+        _update_split(destination_connection, sql, batch, keys, spec, report)
+
+
+def _update_split(
+    destination_connection: sa.Connection,
+    sql: sa.TextClause,
+    rows: list[dict[str, Any]],
+    keys: list[str],
+    spec: TransformSpec,
+    report: TransformReport,
+) -> None:
+    try:
+        with destination_connection.begin_nested():
+            destination_connection.execute(sql, rows)
+        return
+    except sa.exc.IntegrityError as exc:
+        if len(rows) == 1:
+            detail = str(exc.orig).splitlines()[0][:160] if exc.orig is not None else ""
+            report.exceptions.append(
+                RowException(
+                    source_table=spec.source_table,
+                    source_key=keys[0],
+                    column="*",
+                    reason=f"deferred update rejected ({type(exc.orig).__name__}): {detail}",
+                )
+            )
+            return
+    midpoint = len(rows) // 2
+    _update_split(destination_connection, sql, rows[:midpoint], keys[:midpoint], spec, report)
+    _update_split(destination_connection, sql, rows[midpoint:], keys[midpoint:], spec, report)
+
+
 def execute_transform(
     source_connection: sa.Connection,
     destination_connection: sa.Connection,
@@ -151,8 +212,9 @@ def execute_transform(
     select_sql = sa.text(
         f"SELECT {', '.join(source_columns)} FROM {spec.source_table}"  # noqa: S608
     )
-    dest_columns = list(
-        dict.fromkeys(
+    dest_columns = [
+        c
+        for c in dict.fromkeys(
             list(spec.column_map)
             + list(spec.constants)
             + list(spec.defaults)
@@ -160,7 +222,8 @@ def execute_transform(
             + list(spec.computed)
             + list(spec.lookups)
         )
-    )
+        if c not in spec.deferred
+    ]
     insert_sql = sa.text(
         # identifiers regex-validated in spec.py; row values are bound params
         f"INSERT INTO {spec.destination_table} ({', '.join(dest_columns)}) "  # noqa: S608
@@ -171,13 +234,12 @@ def execute_transform(
     key_source = spec.column_map.get("id", source_columns[0])
     batch: list[tuple[str, dict[str, Any]]] = []
     fk_retry: list[tuple[str, dict[str, Any]]] = []
+    deferred_updates: list[tuple[str, Any, dict[str, Any]]] = []
 
     # Stream source rows server-side: buffered results made memory
     # (and wall time) grow superlinearly past ~70k journal rows at
     # Gate 4 - 70k rows in 30s but 160k never finished.
-    source_rows = source_connection.execution_options(
-        stream_results=True, yield_per=1000
-    ).execute(select_sql)
+    source_rows = source_connection.execution_options(stream_results=True, yield_per=1000).execute(select_sql)
     for row in source_rows.mappings():
         if limit is not None and report.read >= limit:
             break
@@ -294,6 +356,11 @@ def execute_transform(
                 # the float. Postgres (the rehearsal target) binds
                 # Decimal natively and keeps exactness.
                 params = {k: float(v) if isinstance(v, Decimal) else v for k, v in values.items()}
+            deferred_values = {c: params.pop(c) for c in spec.deferred if params.get(c) is not None}
+            for c in spec.deferred:
+                params.pop(c, None)
+            if deferred_values:
+                deferred_updates.append((str(row[key_source]), params.get("id"), deferred_values))
             batch.append((str(row[key_source]), params))
             if len(batch) >= _BATCH_SIZE:
                 _flush_batch(destination_connection, insert_sql, batch, spec, report, fk_retry)
@@ -312,6 +379,7 @@ def execute_transform(
             spec,
             report,
         )
+    _apply_deferred(destination_connection, spec, deferred_updates, report)
     if dry_run:
         # Expectation counts: rows that would have been written.
         report.written = report.read - len({e.source_key for e in report.exceptions})

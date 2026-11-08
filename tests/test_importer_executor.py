@@ -505,3 +505,37 @@ def test_null_fallbacks_row_id_literal_and_run() -> None:
     with dst.connect() as d:
         rows = d.execute(sa.text("SELECT id, ext_id, kind, actor FROM docs_out ORDER BY id")).all()
     assert rows == [("d1", "d1", "JOURNAL", "sys"), ("d2", "X9", "INVOICE", "u7")]
+
+
+def test_deferred_self_fk_columns_apply_after_inserts() -> None:
+    # Child-first self-FK rows: deferred parent links apply in the
+    # post-pass, so no FK retry churn and no exceptions.
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+
+    @sa.event.listens_for(dst, "connect")
+    def _fk_on(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE nodes (node_id TEXT, parent_id TEXT)"))
+        c.execute(sa.text("INSERT INTO nodes VALUES ('child','root'), ('root',NULL)"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE nodes_out (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES nodes_out(id))"))
+    spec = build_spec(
+        source_table="nodes",
+        destination_table="nodes_out",
+        source_columns=("node_id", "parent_id"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("parent_id", nullable=True, has_default=False),
+        ),
+        renames={"id": "node_id"},
+        deferred=("parent_id",),
+    )
+    with src.connect() as s_, dst.begin() as d_:
+        report = execute_transform(s_, d_, spec)
+    assert report.written == 2 and report.complete
+    with dst.connect() as d_:
+        rows = dict(d_.execute(sa.text("SELECT id, parent_id FROM nodes_out")).all())
+    assert rows == {"child": "root", "root": None}
