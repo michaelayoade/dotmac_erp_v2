@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}People — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>People</h1>
+<p><a href="/people/leave">Leave balances &amp; applications</a></p>
+{% if employees %}
+<table>
+  <thead>
+    <tr><th>Code</th><th>Name</th><th>Department</th><th>Designation</th><th>Status</th><th>Joined</th></tr>
+  </thead>
+  <tbody>
+  {% for e in employees %}
+    <tr>
+      <td>{{ e.code }}</td><td>{{ e.name }}</td><td>{{ e.department }}</td>
+      <td>{{ e.designation }}</td><td>{{ e.status }}</td><td>{{ e.joined }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No employees yet. They arrive with the people data wave.</p>
+{% endif %}
+{% endblock %}

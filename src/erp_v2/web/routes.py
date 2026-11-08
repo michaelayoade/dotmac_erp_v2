@@ -12,7 +12,7 @@ from typing import Final
 from urllib.parse import quote
 
 from dotmac_kernel.deps import get_db, require_tenant
-from dotmac_kernel.features import FeatureManifest
+from dotmac_kernel.features import FeatureManifest, NavItem
 from dotmac_kernel.models import Party, Tenant
 from dotmac_kernel.permissions import PermissionSpec
 from dotmac_kernel.templating import render
@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from erp_v2 import ui
-from erp_v2.web import auth_service
+from erp_v2.web import auth_service, people_queries
 
 router = APIRouter(tags=["web"])
 
@@ -100,6 +100,38 @@ def logout(
     return response
 
 
+@router.get("/people")
+def people_home(
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse:
+    return render(
+        request,
+        "people/employees.html",
+        _context(
+            current_email=getattr(party, "email", None),
+            employees=people_queries.list_employees(db, tenant_id=tenant.id),
+        ),
+    )
+
+
+@router.get("/people/leave")
+def leave_home(
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(ACCESS_PERMISSION)),
+) -> HTMLResponse:
+    overview = people_queries.leave_overview(db, tenant_id=tenant.id)
+    return render(
+        request,
+        "people/leave.html",
+        _context(current_email=getattr(party, "email", None), **overview),
+    )
+
+
 @router.get("/")
 def home(
     request: Request,
@@ -115,6 +147,7 @@ def home(
 erp_web_feature: Final = FeatureManifest(
     name="erp_web",
     web_routers=(router,),
+    nav=[NavItem("People", "/people")],
     permissions=(
         PermissionSpec(
             code=ACCESS_PERMISSION,

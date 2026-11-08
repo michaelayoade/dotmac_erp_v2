@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Leave — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Leave</h1>
+<p><a href="/people">Back to people directory</a></p>
+
+<h2>Balances</h2>
+{% if balances %}
+<table>
+  <thead><tr><th>Employee</th><th>Leave type</th><th>Allocated</th><th>Used</th><th>Balance</th></tr></thead>
+  <tbody>
+  {% for b in balances %}
+    <tr><td>{{ b.employee }}</td><td>{{ b.leave_type }}</td><td>{{ b.allocated }}</td><td>{{ b.used }}</td><td>{{ b.balance }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No active leave allocations.</p>
+{% endif %}
+
+<h2>Applications</h2>
+{% if applications %}
+<table>
+  <thead><tr><th>Number</th><th>Employee</th><th>Type</th><th>From</th><th>To</th><th>Days</th><th>Status</th></tr></thead>
+  <tbody>
+  {% for a in applications %}
+    <tr>
+      <td>{{ a.number }}</td><td>{{ a.employee }}</td><td>{{ a.leave_type }}</td>
+      <td>{{ a.from_date }}</td><td>{{ a.to_date }}</td><td>{{ a.days }}</td><td>{{ a.status }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No leave applications yet.</p>
+{% endif %}
+{% endblock %}
