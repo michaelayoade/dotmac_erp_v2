@@ -28,6 +28,47 @@ from erp_v2.importer.spec import TransformSpec
 
 _MISSING = object()
 
+_BATCH_SIZE = 500
+
+
+def _flush_batch(
+    destination_connection: sa.Connection,
+    insert_sql: sa.TextClause,
+    batch: list[tuple[str, dict[str, Any]]],
+    spec: TransformSpec,
+    report: TransformReport,
+) -> None:
+    """Insert one batch under a savepoint; fall back per row on rejection.
+
+    Batched executemany is the fast path (a per-row savepoint for
+    every row made the Gate 4 apply untenable on ~478k journal
+    lines). If the batch is rejected, retry its rows singly under
+    per-row savepoints so each bad row still becomes its own named
+    exception and good rows in the batch still land.
+    """
+
+    try:
+        with destination_connection.begin_nested():
+            destination_connection.execute(insert_sql, [params for _key, params in batch])
+        report.written += len(batch)
+        return
+    except sa.exc.IntegrityError:
+        pass  # per-row fallback below
+    for source_key, params in batch:
+        try:
+            with destination_connection.begin_nested():
+                destination_connection.execute(insert_sql, params)
+            report.written += 1
+        except sa.exc.IntegrityError as exc:
+            report.exceptions.append(
+                RowException(
+                    source_table=spec.source_table,
+                    source_key=source_key,
+                    column="*",
+                    reason=f"destination rejected row ({type(exc.orig).__name__})",
+                )
+            )
+
 
 def _map_get(mapping: dict, value: object) -> object:
     """Map lookup tolerant of UUID spellings (object / dashed / hex).
@@ -118,6 +159,7 @@ def execute_transform(
     # Identify a stable source key for exception records: the column
     # feeding the destination `id`, else the first mapped column.
     key_source = spec.column_map.get("id", source_columns[0])
+    batch: list[tuple[str, dict[str, Any]]] = []
 
     for row in source_connection.execute(select_sql).mappings():
         report.read += 1
@@ -223,23 +265,12 @@ def execute_transform(
                 # the float. Postgres (the rehearsal target) binds
                 # Decimal natively and keeps exactness.
                 params = {k: float(v) if isinstance(v, Decimal) else v for k, v in values.items()}
-            try:
-                # Per-row savepoint: a destination rejection (FK, NOT
-                # NULL, check) becomes a named exception for this row,
-                # never a run-killing abort that loses all evidence.
-                with destination_connection.begin_nested():
-                    destination_connection.execute(insert_sql, params)
-            except sa.exc.IntegrityError as exc:
-                report.exceptions.append(
-                    RowException(
-                        source_table=spec.source_table,
-                        source_key=str(row[key_source]),
-                        column="*",
-                        reason=f"destination rejected row ({type(exc.orig).__name__})",
-                    )
-                )
-                continue
-            report.written += 1
+            batch.append((str(row[key_source]), params))
+            if len(batch) >= _BATCH_SIZE:
+                _flush_batch(destination_connection, insert_sql, batch, spec, report)
+                batch = []
+    if batch:
+        _flush_batch(destination_connection, insert_sql, batch, spec, report)
     if dry_run:
         # Expectation counts: rows that would have been written.
         report.written = report.read - len({e.source_key for e in report.exceptions})
