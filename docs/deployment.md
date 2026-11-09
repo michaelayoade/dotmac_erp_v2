@@ -4,6 +4,26 @@ Status: packet prepared 2026-11-09 after Gate 4 terminal receipt
 (candidate `4a38b05`). The traffic switch itself needs Michael's
 explicit flip-day confirmation after the readiness list below.
 
+Beside-legacy staging DONE 2026-11-09 (candidate `0721ce9`):
+`erp_v2` database and `dotmac_erp_v2_app` run on the prod host,
+loopback `127.0.0.1:8013` only, imported from snapshot
+`legacy-20261109T104205Z.dump` (sha256 `b5e75399...`, receipt
+at `/root/erp-v2-candidate/prod-receipt.json` on the host:
+written 1,342,827, exact ledger parity, JE0001/JE0002 POSTED).
+nginx and legacy are untouched; the staging copy goes stale
+from the snapshot moment and is discarded at the flip.
+Operator files live in `/root/erp-v2-candidate/` (env files
+600, compose copy, dump, logs). Prod-specific mechanics proven
+there: genesis needs `erp_owner` to be a member of
+`app_admin`/`app_user` (migrations ALTER ... OWNER TO them);
+runtime connects as dedicated login `erp_v2_runtime`
+(NOBYPASSRLS, member of `app_user`) so the shared `app_user`
+password is never reused; database traffic goes over the
+`dotmac_default` compose network by container name because
+host-gateway to the published PG port is firewall-blocked; the
+snapshot copy has RLS disabled so the least-privilege reader
+role can read it (legacy RLS untouched).
+
 ## Current production topology (surveyed read-only 2026-11-09)
 
 - Host `dotmac-erp` (149.102.158.167), nginx `erp.dotmac.io` ->
@@ -29,10 +49,12 @@ explicit flip-day confirmation after the readiness list below.
   in the surface-gap list.
 - Database: new database `erp_v2` in `dotmac_pg_local` (legacy
   `dotmac_erp` untouched as rollback). Roles mirror rehearsal:
-  migration owner (CREATEROLE+BYPASSRLS, non-superuser) for
-  genesis/import only; runtime `app_user` non-superuser
-  NOBYPASSRLS (enforced at startup by `erp_v2.database`).
-  `MIGRATION_DATABASE_URL` never enters the app container env.
+  migration owner `erp_owner` (CREATEROLE+BYPASSRLS,
+  non-superuser, member of `app_admin`/`app_user`) for
+  genesis/import only; runtime `erp_v2_runtime` (dedicated
+  login, NOBYPASSRLS, member of `app_user`; posture enforced at
+  startup by `erp_v2.database`). `MIGRATION_DATABASE_URL` never
+  enters the app container env.
 - Tenant host: `erp.dotmac.io` resolves via a verified
   `tenant_domains` row (custom domain), proven at Gate 4 + packet
   prep. Root-domain default (`localhost`) is not relied on.
