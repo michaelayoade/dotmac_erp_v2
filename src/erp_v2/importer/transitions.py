@@ -84,6 +84,8 @@ class TransitionOutcome:
     transitioned: dict[str, int] = field(default_factory=dict)
     # destination status -> rows that reached it via this step
     stamped_approval_refs: int = 0
+    stamped_posted_by: int = 0
+    recomputed_totals: int = 0
     exceptions: list[RowException] = field(default_factory=list)
 
 
@@ -165,6 +167,41 @@ def _run_family(
                 {"ids": chunk},
             )
 
+    if spec.destination_table == "mod_accounting.journal_entries" and not dry_run:
+        # Evidence completion (Gate 4 findings on production data):
+        # 601 posted journals carry zero header totals in legacy
+        # while their lines/ledger balance - the module trigger
+        # compares ledger sums to the header, so recompute the
+        # denormalized totals from the entry's own imported lines
+        # (only where all four totals are zero and lines balance).
+        # Still DRAFT at this point, so the edit is legal.
+        scope_ids = by_status.get("POSTED", []) + by_status.get("REVERSED", [])
+        for start in range(0, len(scope_ids), 10000):
+            chunk = scope_ids[start : start + 10000]
+            result = dest.execute(
+                sa.text(
+                    f"UPDATE {spec.destination_table} SET "  # noqa: S608
+                    "total_debit = agg.d, total_credit = agg.c, "
+                    "total_debit_functional = agg.fd, "
+                    "total_credit_functional = agg.fc "
+                    "FROM (SELECT journal_id, sum(debit) d, sum(credit) c, "
+                    "sum(debit_functional) fd, sum(credit_functional) fc "
+                    "FROM mod_accounting.journal_lines GROUP BY journal_id) agg "
+                    f"WHERE agg.journal_id = {spec.destination_table}.id "
+                    f"AND {spec.destination_table}.status = 'DRAFT' "
+                    f"AND {spec.destination_table}.total_debit = 0 "
+                    f"AND {spec.destination_table}.total_credit = 0 "
+                    f"AND {spec.destination_table}.total_debit_functional = 0 "
+                    f"AND {spec.destination_table}.total_credit_functional = 0 "
+                    "AND agg.d = agg.c AND agg.fd = agg.fc AND agg.d > 0 "
+                    f"AND {spec.destination_table}.id IN :ids"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": chunk},
+            )
+            outcome.recomputed_totals += int(result.rowcount or 0)
+        if commit:
+            dest.commit()
+
     for legacy_status in sorted(by_status):
         ids = by_status[legacy_status]
         if legacy_status not in paths:
@@ -205,7 +242,21 @@ def _run_family(
             if spec.destination_table == "mod_accounting.journal_entries" and target == "REVERSED":
                 extra = ", reversal_journal_id = :reversal_journal_id"
             if spec.destination_table == "mod_accounting.journal_entries" and target == "POSTED":
-                extra = _JOURNAL_POSTED_SET
+                # 206 legacy postings have no poster recorded (system
+                # postings); the trigger requires posted_by/posted_at.
+                # Stamp the provenance label, receipt-counted like the
+                # approval references - same Gate 5 ruling family.
+                for start in range(0, len(moving), 10000):
+                    outcome.stamped_posted_by += dest.execute(
+                        sa.text(
+                            f"SELECT count(*) FROM {spec.destination_table} "  # noqa: S608
+                            "WHERE status = 'DRAFT' AND posted_by IS NULL AND id IN :ids"
+                        ).bindparams(sa.bindparam("ids", expanding=True)),
+                        {"ids": moving[start : start + 10000]},
+                    ).scalar_one()
+                extra = _JOURNAL_POSTED_SET + (
+                    ", posted_by = COALESCE(posted_by, 'legacy-system'), posted_at = COALESCE(posted_at, updated_at)"
+                )
                 params_extra["approval_ref_prefix"] = f"legacy:{spec.source_table}:"
                 # Count provenance stamps up front (rows whose mapped
                 # approval_reference is NULL at posting time).

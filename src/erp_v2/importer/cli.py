@@ -581,6 +581,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
                 "destination_table": outcome.destination_table,
                 "transitioned": dict(outcome.transitioned),
                 "stamped_approval_refs": outcome.stamped_approval_refs,
+                "stamped_posted_by": outcome.stamped_posted_by,
+                "recomputed_totals": outcome.recomputed_totals,
                 "exceptions": len(outcome.exceptions),
             }
             for outcome in transitions
