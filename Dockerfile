@@ -17,7 +17,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
     PATH="/root/.local/bin:/app/.venv/bin:$PATH"
 
-RUN pip install --no-cache-dir uv==0.13.7
+# git: dotmac-app-sync is a git-sourced dependency (uv needs git to fetch it)
+RUN pip install --no-cache-dir uv==0.13.7 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
