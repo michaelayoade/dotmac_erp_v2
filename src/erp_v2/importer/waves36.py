@@ -897,6 +897,7 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_forms.form_versions",
         "public.form_version",
         renames={"settings": "settings_json"},
+        fk_rewrites={"status": "form_version_status_by_legacy"},
     ),
     Pairing(
         "mod_forms.form_sections",

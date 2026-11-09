@@ -101,6 +101,47 @@ def _attendance_status_by_legacy(source: sa.Connection, dest: sa.Connection) -> 
     }
 
 
+def _form_version_status_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # mod_forms CHECK: draft/published/archived; legacy enum is
+    # uppercase. Closed literal mapping over both spellings.
+    return {
+        "DRAFT": "draft",
+        "PUBLISHED": "published",
+        "ARCHIVED": "archived",
+        "draft": "draft",
+        "published": "published",
+        "archived": "archived",
+    }
+
+
+def _legacy_lowercase_status(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # Closed token set: e2 HR enums are lowercase, legacy HR enums
+    # are uppercase. Only tokens that are valid destination values
+    # in the columns using this map are listed; anything else
+    # (e.g. disciplinary MODERATE/CRITICAL, which e2 does not
+    # model) exceptions by name.
+    tokens = (
+        "DRAFT",
+        "SUBMITTED",
+        "APPROVED",
+        "REJECTED",
+        "CANCELLED",
+        "IN_PROGRESS",
+        "COMPLETED",
+        "OPEN",
+        "CLOSED",
+        "MINOR",
+        "MAJOR",
+        "GROSS",
+        "FINALIZED",
+    )
+    mapping: dict[Any, Any] = {}
+    for token in tokens:
+        mapping[token] = token.lower()
+        mapping[token.lower()] = token.lower()
+    return mapping
+
+
 def _account_class_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
     # Module CHECK uses singular IFRS classes; legacy GL categories
     # are plural. Literal closed mapping (live values verified on
@@ -926,6 +967,8 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "bid_scores": _bid_scores,
     "account_class_by_legacy": _account_class_by_legacy,
     "attendance_status_by_legacy": _attendance_status_by_legacy,
+    "form_version_status_by_legacy": _form_version_status_by_legacy,
+    "legacy_lowercase_status": _legacy_lowercase_status,
     "pay_component_kind_by_legacy": _pay_component_kind_by_legacy,
     "workflow_status_by_legacy": _workflow_status_by_legacy,
     "bank_direction_by_type": _bank_direction_by_type,

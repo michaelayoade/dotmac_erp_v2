@@ -35,6 +35,7 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "hr_leave_applications",
         "public.leave_application",
         renames={"number": "application_number", "decided_by_id": "approved_by_id"},
+        fk_rewrites={"status": "legacy_lowercase_status"},
         note="allocation_id resolved by employee+type+period match; status values "
         "lowercase-map at rehearsal; payroll posting flags are payroll-wave facts",
     ),
@@ -58,7 +59,11 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "not a user id - residue; marked_by_id stays NULL. Status is "
         "legacy uppercase enum -> e2 lowercase via closed value map",
     ),
-    Pairing("hr_attendance_requests", "public.attendance_request"),
+    Pairing(
+        "hr_attendance_requests",
+        "public.attendance_request",
+        fk_rewrites={"status": "legacy_lowercase_status"},
+    ),
     # appraisals slice
     Pairing(
         "hr_appraisal_cycles",
@@ -98,6 +103,8 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "hr_disciplinary_cases",
         "public.disciplinary_case",
         renames={"number": "case_number"},
+        fk_rewrites={"severity": "legacy_lowercase_status"},
+        note="MODERATE/CRITICAL severities have no e2 equivalent - named exceptions",
     ),
     Pairing("hr_case_responses", "public.case_response"),
     Pairing("hr_case_witnesses", "public.case_witness"),
@@ -119,6 +126,7 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "hr_job_openings",
         "public.job_opening",
         renames={"code": "job_code", "title": "job_title"},
+        fk_rewrites={"status": "legacy_lowercase_status"},
         note="salary band/skills text is careers-surface residue; application_form links forms module",
     ),
     Pairing(
@@ -148,6 +156,7 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "hr_employee_onboardings",
         "public.employee_onboarding",
+        fk_rewrites={"status": "legacy_lowercase_status"},
         note="progress_percentage dropped (derived); self-service token discarded",
     ),
     Pairing(
@@ -160,6 +169,7 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "hr_employee_separations",
         "public.employee_separation",
         renames={"exit_interview_notes": "exit_interview"},
+        fk_rewrites={"status": "legacy_lowercase_status"},
     ),
     Pairing("hr_clearance_items", "public.clearance_item"),
     Pairing(
