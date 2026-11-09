@@ -210,3 +210,20 @@ def test_caller_rollback_removes_receipt_and_statement(banking):
             raise RuntimeError("cancel")
     assert db.scalar(sa.select(sa.func.count()).select_from(BankStatement)) == 0
     assert db.scalar(sa.select(sa.func.count()).select_from(BankingObservationReceipt)) == 0
+
+
+@pytest.mark.parametrize("model", [BankingProviderBinding, BankingObservationReceipt])
+def test_foreign_keys_reference_actual_owner_unique_keys(model):
+    # SQLite accepts a composite FK whose remote columns are not unique;
+    # clean PostgreSQL genesis correctly refuses it. Check the released
+    # owner metadata as well as exercising genesis on the test server.
+    for foreign_key in model.__table__.foreign_key_constraints:
+        target = foreign_key.referred_table
+        referenced = {element.column.name for element in foreign_key.elements}
+        unique_keys = [set(target.primary_key.columns.keys())]
+        unique_keys.extend(
+            set(constraint.columns.keys())
+            for constraint in target.constraints
+            if isinstance(constraint, sa.UniqueConstraint)
+        )
+        assert referenced in unique_keys, (model.__name__, target.fullname, referenced)

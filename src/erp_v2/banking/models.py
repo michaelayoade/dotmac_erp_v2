@@ -19,9 +19,7 @@ class BankingProviderBinding(Base, TimestampMixin):
         UniqueConstraint(
             "tenant_id", "installation_id", "provider_account_id", name="uq_banking_provider_bindings_source"
         ),
-        ForeignKeyConstraint(
-            ["tenant_id", "credential_id"], ["machine_credentials.tenant_id", "machine_credentials.id"]
-        ),
+        ForeignKeyConstraint(["credential_id"], ["machine_credentials.id"]),
         ForeignKeyConstraint(
             ["tenant_id", "account_id"], ["mod_banking.bank_accounts.tenant_id", "mod_banking.bank_accounts.id"]
         ),

@@ -43,9 +43,7 @@ def upgrade() -> None:
         sa.UniqueConstraint(
             "tenant_id", "installation_id", "provider_account_id", name="uq_banking_provider_bindings_source"
         ),
-        sa.ForeignKeyConstraint(
-            ["tenant_id", "credential_id"], ["machine_credentials.tenant_id", "machine_credentials.id"]
-        ),
+        sa.ForeignKeyConstraint(["credential_id"], ["machine_credentials.id"]),
         sa.ForeignKeyConstraint(
             ["tenant_id", "account_id"], ["mod_banking.bank_accounts.tenant_id", "mod_banking.bank_accounts.id"]
         ),
@@ -80,6 +78,12 @@ def upgrade() -> None:
             "USING (tenant_id = public.app_current_tenant_id()) "
             "WITH CHECK (tenant_id = public.app_current_tenant_id())"
         )
+
+    # The runtime can lock an existing trusted binding but cannot create it.
+    # PostgreSQL SELECT FOR UPDATE requires UPDATE privilege. Accepted
+    # observation receipts are append-only through the service contract.
+    op.execute("GRANT SELECT, UPDATE ON public.banking_provider_bindings TO app_user")
+    op.execute("GRANT SELECT, INSERT ON public.banking_observation_receipts TO app_user")
 
 
 def downgrade() -> None:

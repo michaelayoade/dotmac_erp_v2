@@ -277,3 +277,11 @@ Mounted browser tests exposed and fixed two existing prerequisites: the
 locked runtime now includes python-multipart for form/CSRF parsing, and
 ERP declares browser display/branding SettingSpecs through the public
 kernel registry without seeding runtime settings rows.
+
+The first exact-image clean PostgreSQL proof caught an invalid composite
+credential FK: the released kernel exposes only the credential's global
+primary key. The draft migration now references that supported key; trusted
+principal tenant/credential matching remains mandatory in the banking
+service, and bank-account/statement relationships retain composite tenant
+FKs. Explicit app_user SELECT/UPDATE (binding lock) and SELECT/INSERT
+(receipt append) grants are part of genesis; runtime cannot create bindings.
