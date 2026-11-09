@@ -291,7 +291,7 @@ def mint_tax_rules(source: sa.Connection, dest: sa.Connection, ctx: MintContext)
     if bands and not ctx.tax_band_rule_binding:
         unbound = sorted({str(b["name"]) for b in bands})
         result.blockers.append(f"tax bands not minted: no tax_band_rule_binding for band names {unbound}")
-        return result
+        bands = []  # rules still publish below (deferred trigger)
     existing_bands = {
         (_norm(r[0]), r[1]) for r in dest.execute(sa.text("SELECT rule_id, sequence FROM mod_tax.tax_rule_bands"))
     }
