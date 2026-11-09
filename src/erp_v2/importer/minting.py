@@ -670,6 +670,66 @@ def mint_kernel_tenants(source: sa.Connection, dest: sa.Connection, ctx: MintCon
     return result
 
 
+def mint_bank_institutions_from_accounts(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
+    """Enrol institutions the tenant banks with but the directory lacks.
+
+    Legacy bank_accounts name institutions absent from the imported
+    CBN directory (fintechs: Paystack, Flutterwave, TAJ). One
+    directory row is minted per unmatched legacy bank name, with a
+    declared directory-local code (slug of the name) - the legacy
+    bank_code on those rows is placeholder text ('0000', account
+    numbers), never a sort code, so it is not reused as one.
+    Accounts whose bank_code or name already matches an imported
+    institution mint nothing.
+    """
+
+    result = MintResult("bank_institutions_from_accounts")
+    existing_codes: dict[str, str] = {}
+    existing_names: dict[str, str] = {}
+    for code, name, _inst_id in dest.execute(
+        sa.text("SELECT code, name, id FROM mod_banking.bank_institutions WHERE tenant_id = :t"),
+        {"t": ctx.tenant_id},
+    ):
+        existing_codes[str(code)] = str(name)
+        existing_names[str(name).casefold()] = str(code)
+    rows: list[dict[str, Any]] = []
+    seen_names: dict[str, str] = {}
+    legacy = source.execute(sa.text("SELECT DISTINCT bank_name, bank_code FROM bank_accounts")).mappings()
+    for row in legacy:
+        name = str(row["bank_name"] or "").strip()
+        code = str(row["bank_code"] or "").strip()
+        if not name:
+            continue
+        if code and code in existing_codes:
+            continue
+        if name.casefold() in existing_names:
+            continue
+        if name.casefold() in seen_names:
+            continue
+        mint_code = _slug(name).upper().replace("-", "_")[:60]
+        if mint_code in existing_codes or mint_code in seen_names.values():
+            result.blockers.append(
+                f"bank institution {name!r}: minted code {mint_code!r} collides with an existing directory code"
+            )
+            continue
+        seen_names[name.casefold()] = mint_code
+        rows.append(
+            {
+                "id": _mint_id("bank_institutions_from_accounts", ctx.tenant_id, mint_code),
+                "tenant_id": ctx.tenant_id,
+                "code": mint_code,
+                "name": name,
+                "country_code": "NG",
+                "status": "active",
+                "created_at": _now(ctx),
+                "updated_at": _now(ctx),
+            }
+        )
+    _insert(dest, "mod_banking.bank_institutions", rows)
+    result.created = len(rows)
+    return result
+
+
 MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("kernel_tenants", mint_kernel_tenants),
     ("pay_structure_revisions", mint_pay_structure_revisions),
@@ -679,6 +739,7 @@ MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("sourcing_event_lines", mint_sourcing_event_lines),
     ("sales_leads", mint_sales_leads),
     ("document_libraries_types", mint_document_libraries_types),
+    ("bank_institutions_from_accounts", mint_bank_institutions_from_accounts),
 )
 
 # Enrolment map name -> mint step that must run before the map builds.
@@ -692,6 +753,7 @@ MAP_MINTS: Final[Mapping[str, str]] = {
     # minted after the quotes spec had already run).
     "quote_lead": "sales_leads",
     "document_library": "document_libraries_types",
+    "bank_institution_by_account": "bank_institutions_from_accounts",
 }
 
 

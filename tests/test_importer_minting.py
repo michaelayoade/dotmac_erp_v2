@@ -241,3 +241,39 @@ def test_kernel_tenants_mint_and_db_error_refusal() -> None:
     empty = _conn(())
     refused = run_mint_step("kernel_tenants", src, empty, CTX)
     assert refused.refused and "database error" in refused.refused
+
+
+def test_bank_institutions_from_accounts_mint_and_map() -> None:
+    src = _conn(
+        (
+            "CREATE TABLE public.bank_accounts (bank_account_id TEXT, bank_name TEXT, bank_code TEXT)",
+            "INSERT INTO public.bank_accounts VALUES ('a1','Zenith Bank','057')",
+            "INSERT INTO public.bank_accounts VALUES ('a2','Paystack','0000')",
+            "INSERT INTO public.bank_accounts VALUES ('a3','Paystack',NULL)",
+        )
+    )
+    schema_ddl = "ATTACH DATABASE ':memory:' AS mod_banking"
+    src.execute(sa.text(schema_ddl))
+    dst = _conn((schema_ddl,))
+    dst.execute(
+        sa.text(
+            "CREATE TABLE mod_banking.bank_institutions "
+            "(id TEXT, tenant_id TEXT, code TEXT, name TEXT, country_code TEXT, "
+            "status TEXT, created_at TEXT, updated_at TEXT)"
+        )
+    )
+    dst.execute(
+        sa.text(
+            "INSERT INTO mod_banking.bank_institutions VALUES "
+            "('inst-zen','t1','057','Zenith Bank','NG','active','2026-01-01','2026-01-01')"
+        )
+    )
+    result = run_mint_step("bank_institutions_from_accounts", src, dst, CTX)
+    assert result.created == 1 and result.refused is None
+    again = run_mint_step("bank_institutions_from_accounts", src, dst, CTX)
+    assert again.created == 0
+    enrol = EnrolmentMaps(src, dst, mint_context=CTX)
+    mapping = enrol.get("bank_institution_by_account")
+    assert mapping["a1"] == "inst-zen"
+    assert mapping["a2"] == mapping["a3"]
+    assert mapping["a2"] != "inst-zen"

@@ -181,14 +181,16 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_banking.bank_accounts",
         "public.bank_accounts",
         renames={
-            "institution_id": "bank_code",
+            "institution_id": "bank_account_id",
             "account_code": "account_number",
             "account_identifier": "account_number",
             "account_type_code": "account_type",
             "cash_account_ref": "gl_account_id",
         },
-        fk_rewrites={"institution_id": "bank_institution_by_code"},
-        note="institutions enrol from bank_directory/bank codes first; mono_* sync state is adapter residue",
+        fk_rewrites={"institution_id": "bank_institution_by_account"},
+        note="institution resolves per account (CBN code, else name; "
+        "fintech institutions mint from legacy accounts first); "
+        "mono_* sync state is adapter residue",
     ),
     Pairing(
         "mod_banking.bank_statements",

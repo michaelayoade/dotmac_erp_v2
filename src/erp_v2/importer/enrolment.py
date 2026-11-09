@@ -229,9 +229,28 @@ def _sourcing_line_by_requisition_line(source: sa.Connection, dest: sa.Connectio
     return _scalar(rows, "sourcing_line_by_requisition_line")
 
 
-def _bank_institution_by_code(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
-    rows = dest.execute(sa.text("SELECT code, id FROM mod_banking.bank_institutions"))
-    return _scalar(rows, "bank_institution_by_code")
+def _bank_institution_by_account(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # Legacy accounts reference institutions by free bank_code
+    # (CBN sort code for traditional banks, placeholder text for
+    # fintechs) plus bank_name. Resolve per account: exact code
+    # match first, then case-folded name match (the mint step
+    # enrols unmatched names before this map builds).
+    by_code: dict[str, Any] = {}
+    by_name: dict[str, Any] = {}
+    for code, name, inst_id in dest.execute(sa.text("SELECT code, name, id FROM mod_banking.bank_institutions")):
+        by_code[str(code)] = _norm(inst_id)
+        by_name[str(name).casefold()] = _norm(inst_id)
+    mapping: dict[Any, Any] = {}
+    rows = source.execute(sa.text("SELECT bank_account_id, bank_name, bank_code FROM bank_accounts")).mappings()
+    for row in rows:
+        code = str(row["bank_code"] or "").strip()
+        name = str(row["bank_name"] or "").strip()
+        inst_id = by_code.get(code) if code else None
+        if inst_id is None and name:
+            inst_id = by_name.get(name.casefold())
+        if inst_id is not None:
+            _put(mapping, "bank_institution_by_account", row["bank_account_id"], inst_id)
+    return mapping
 
 
 def _journal_number_by_entry(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
@@ -910,7 +929,7 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "pay_component_kind_by_legacy": _pay_component_kind_by_legacy,
     "workflow_status_by_legacy": _workflow_status_by_legacy,
     "bank_direction_by_type": _bank_direction_by_type,
-    "bank_institution_by_code": _bank_institution_by_code,
+    "bank_institution_by_account": _bank_institution_by_account,
     "bid_submission": _bid_submission,
     "case_document_file": _case_document_file,
     "document_library": _document_library,
