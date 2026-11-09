@@ -20,16 +20,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN pip install --no-cache-dir uv==0.13.7
 
 WORKDIR /app
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock .python-version ./
 COPY src ./src
 
+# --locked: install exactly the committed uv.lock (Gate 1);
+# a drifting resolution fails the build loudly instead.
 RUN --mount=type=secret,id=forgejo_token \
     UV_INDEX_FORGEJO_USERNAME=ci-reader \
     UV_INDEX_FORGEJO_PASSWORD="$(cat /run/secrets/forgejo_token)" \
-    uv sync --no-dev --no-install-project \
+    uv sync --locked --no-dev --no-install-project \
     && UV_INDEX_FORGEJO_USERNAME=ci-reader \
     UV_INDEX_FORGEJO_PASSWORD="$(cat /run/secrets/forgejo_token)" \
-    uv sync --no-dev
+    uv sync --locked --no-dev
 
 # Runtime imports the app only; importer/migrate run as one-off
 # commands from this same image with their own env (never bake

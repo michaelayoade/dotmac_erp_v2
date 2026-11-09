@@ -1,0 +1,40 @@
+name: image
+
+# Manual exact-wheel candidate image build (Gate 1). Installs
+# exactly the committed uv.lock from the Forgejo index; the read
+# token is a BuildKit secret, never a layer. Pushes to GHCR.
+# Deployment itself stays a separate, explicit step.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build candidate image
+        env:
+          FORGEJO_READ_TOKEN: ${{ secrets.FORGEJO_READ_TOKEN }}
+          DOCKER_BUILDKIT: "1"
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          docker build \
+            --secret id=forgejo_token,env=FORGEJO_READ_TOKEN \
+            -t "ghcr.io/michaelayoade/dotmac_erp_v2:sha-$SHORT_SHA" \
+            -t "ghcr.io/michaelayoade/dotmac_erp_v2:candidate" \
+            .
+
+      - name: Push candidate image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "ghcr.io/michaelayoade/dotmac_erp_v2:sha-$SHORT_SHA"
+          docker push "ghcr.io/michaelayoade/dotmac_erp_v2:candidate"
+          docker buildx imagetools inspect "ghcr.io/michaelayoade/dotmac_erp_v2:sha-$SHORT_SHA" | head -12
