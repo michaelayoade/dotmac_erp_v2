@@ -658,3 +658,30 @@ def test_dict_values_serialize_for_json_columns() -> None:
     with dst.connect() as d_:
         stored = d_.execute(sa.text("SELECT settings FROM forms_out")).scalar_one()
     assert stored == '{"a": 1}'
+
+
+def test_json_columns_encode_scalar_answers() -> None:
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE answers (answer_id TEXT, value_json TEXT)"))
+        c.execute(sa.text("INSERT INTO answers VALUES ('a1','plain text'), ('a2','42'), ('a3',NULL)"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE answers_out (id TEXT, value_json TEXT)"))
+    spec = build_spec(
+        source_table="answers",
+        destination_table="answers_out",
+        source_columns=("answer_id", "value_json"),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("value_json", nullable=True, has_default=False),
+        ),
+        renames={"id": "answer_id"},
+        json_columns=("value_json",),
+    )
+    with src.connect() as s_, dst.begin() as d_:
+        report = execute_transform(s_, d_, spec)
+    assert report.written == 3
+    with dst.connect() as d_:
+        rows = d_.execute(sa.text("SELECT id, value_json FROM answers_out ORDER BY id")).all()
+    assert rows == [("a1", '"plain text"'), ("a2", '"42"'), ("a3", None)]

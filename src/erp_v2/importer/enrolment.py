@@ -142,6 +142,24 @@ def _legacy_lowercase_status(source: sa.Connection, dest: sa.Connection) -> dict
     return mapping
 
 
+def _payroll_run_status_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # mod_payroll run statuses: draft/approved/finalized/cancelled.
+    # Legacy POSTED runs are locked with slips + GL evidence, which
+    # is the module's finalized. SUBMITTED/SLIPS_CREATED have no
+    # exact module state - unmapped, named exceptions (2 live runs).
+    return {
+        "POSTED": "finalized",
+        "FINALIZED": "finalized",
+        "APPROVED": "approved",
+        "DRAFT": "draft",
+        "CANCELLED": "cancelled",
+        "draft": "draft",
+        "approved": "approved",
+        "finalized": "finalized",
+        "cancelled": "cancelled",
+    }
+
+
 def _account_class_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
     # Module CHECK uses singular IFRS classes; legacy GL categories
     # are plural. Literal closed mapping (live values verified on
@@ -969,6 +987,7 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "attendance_status_by_legacy": _attendance_status_by_legacy,
     "form_version_status_by_legacy": _form_version_status_by_legacy,
     "legacy_lowercase_status": _legacy_lowercase_status,
+    "payroll_run_status_by_legacy": _payroll_run_status_by_legacy,
     "pay_component_kind_by_legacy": _pay_component_kind_by_legacy,
     "workflow_status_by_legacy": _workflow_status_by_legacy,
     "bank_direction_by_type": _bank_direction_by_type,

@@ -81,6 +81,12 @@ class TransformSpec:
     # amount legacy stored only as quantity x unit price),
     # "uuid5_row" (deterministic CHAR(32) id for natural-key
     # legacy tables with no UUID of their own, e.g. bank_directory).
+    json_columns: tuple[str, ...] = ()
+    # destination JSON/JSONB columns: psycopg returns JSON scalars
+    # as bare Python str/int/bool, which the destination rejects
+    # as invalid JSON input unless re-encoded (Gate 5:
+    # form_answers.value_json text answers). The executor
+    # json-encodes declared columns' values before insert.
     deferred: tuple[str, ...] = ()
     # destination columns excluded from the INSERT and applied by
     # the executor in a post-pass UPDATE keyed by destination id.
@@ -209,6 +215,7 @@ def build_spec(
     computed: Mapping[str, str] | None = None,
     null_fallbacks: Mapping[str, str] | None = None,
     deferred: tuple[str, ...] = (),
+    json_columns: tuple[str, ...] = (),
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -303,6 +310,8 @@ def build_spec(
     for dest_col, (_map, key_col, _field) in lookups.items():
         if key_col not in column_map:
             raise ValueError(f"lookup for {dest_col!r} keys on unmapped column {key_col!r}")
+    for dest_col in json_columns:
+        _check(dest_col)
     for dest_col in deferred:
         _check(dest_col)
         if dest_col not in column_map:
@@ -323,6 +332,7 @@ def build_spec(
         lookups=lookups,
         null_fallbacks=null_fallbacks,
         deferred=tuple(deferred),
+        json_columns=tuple(json_columns),
     )
 
 

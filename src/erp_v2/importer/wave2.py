@@ -35,6 +35,7 @@ class Pairing:
     computed: Mapping[str, str] = field(default_factory=dict)
     null_fallbacks: Mapping[str, str] = field(default_factory=dict)
     deferred: tuple[str, ...] = ()
+    json_columns: tuple[str, ...] = ()
     note: str = ""
 
 
@@ -193,6 +194,7 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "period_start": "start_date",
             "period_end": "end_date",
         },
+        fk_rewrites={"status": "payroll_run_status_by_legacy"},
         null_fallbacks={"created_by_id": "run:created_by_id"},
         note="minor_units/created_by from tenant/enrolment context",
     ),
@@ -367,6 +369,7 @@ def build_wave2_specs(
                 computed=pairing.computed,
                 null_fallbacks=pairing.null_fallbacks,
                 deferred=pairing.deferred,
+                json_columns=pairing.json_columns,
             )
         )
     return tuple(specs), tuple(generated)

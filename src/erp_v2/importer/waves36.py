@@ -930,7 +930,12 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
         computed={"submission_key": "source_key"},
         note="submission_key is the stable legacy source key; request_fingerprint computes over the imported row",
     ),
-    Pairing("mod_forms.form_answers", "public.form_answer"),
+    Pairing(
+        "mod_forms.form_answers",
+        "public.form_answer",
+        json_columns=("value_json",),
+        note="legacy answers include bare text JSON scalars, re-encoded for the json column",
+    ),
     *_generated(
         "mod_inbox",
         ("conversations", "messages", "conversation_read_states", "message_transport_refs"),
@@ -990,6 +995,7 @@ def build_specs(
                 computed=pairing.computed,
                 null_fallbacks=pairing.null_fallbacks,
                 deferred=pairing.deferred,
+                json_columns=pairing.json_columns,
             )
         )
     return tuple(specs), tuple(generated)

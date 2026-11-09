@@ -271,14 +271,19 @@ def mint_tax_rules(source: sa.Connection, dest: sa.Connection, ctx: MintContext)
     result.created += len(rows)
 
     # Bands attach only under an explicit name -> tax_code binding.
-    bands = list(
-        source.execute(
-            sa.text(
-                "SELECT tax_band_id, organization_id, name, min_amount, max_amount, rate, sequence "
-                "FROM tax_band WHERE is_active"
+    # Legacy deployments without a tax_band table have no bands.
+    try:
+        with source.begin_nested():
+            bands = list(
+                source.execute(
+                    sa.text(
+                        "SELECT tax_band_id, organization_id, name, min_amount, max_amount, rate, sequence "
+                        "FROM tax_band WHERE is_active"
+                    )
+                ).mappings()
             )
-        ).mappings()
-    )
+    except sa.exc.SQLAlchemyError:
+        bands = []
     if bands and not ctx.tax_band_rule_binding:
         unbound = sorted({str(b["name"]) for b in bands})
         result.blockers.append(f"tax bands not minted: no tax_band_rule_binding for band names {unbound}")

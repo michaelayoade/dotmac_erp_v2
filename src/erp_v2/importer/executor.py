@@ -477,6 +477,10 @@ def execute_transform(
             continue
         if not dry_run:
             params = values
+            if spec.json_columns and any(values.get(c) is not None for c in spec.json_columns):
+                params = {
+                    k: json.dumps(v) if k in spec.json_columns and v is not None else v for k, v in values.items()
+                }
             if any(isinstance(v, (dict, list)) for v in values.values()):
                 # Raw text() inserts carry no column types, so psycopg
                 # cannot adapt dict/list for JSONB columns - serialize
