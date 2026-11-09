@@ -37,4 +37,7 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           docker push "ghcr.io/michaelayoade/dotmac_erp_v2:sha-$SHORT_SHA"
           docker push "ghcr.io/michaelayoade/dotmac_erp_v2:candidate"
-          docker buildx imagetools inspect "ghcr.io/michaelayoade/dotmac_erp_v2:sha-$SHORT_SHA" | head -12
+          # Verify with the job's own login (the new package is
+          # private; anonymous reads are denied).
+          docker manifest inspect "ghcr.io/michaelayoade/dotmac_erp_v2:sha-$SHORT_SHA" > /dev/null
+          echo "manifest verified for sha-$SHORT_SHA"
