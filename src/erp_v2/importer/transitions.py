@@ -175,26 +175,35 @@ def _run_family(
         # denormalized totals from the entry's own imported lines
         # (only where all four totals are zero and lines balance).
         # Still DRAFT at this point, so the edit is legal.
+        # One set-based statement scoped to zero-total DRAFT
+        # entries in the POSTED/REVERSED groups - the per-chunk
+        # form re-aggregated all 478k lines per chunk (Gate 5
+        # re-rehearsal: 40+ minutes). The id list is chunked only
+        # for the parameter cap; the aggregate itself joins
+        # through the scoped entries, so it stays small.
         scope_ids = by_status.get("POSTED", []) + by_status.get("REVERSED", [])
-        for start in range(0, len(scope_ids), 10000):
-            chunk = scope_ids[start : start + 10000]
+        for start in range(0, len(scope_ids), 60000):
+            chunk = scope_ids[start : start + 60000]
             result = dest.execute(
                 sa.text(
                     f"UPDATE {spec.destination_table} SET "  # noqa: S608
                     "total_debit = agg.d, total_credit = agg.c, "
                     "total_debit_functional = agg.fd, "
                     "total_credit_functional = agg.fc "
-                    "FROM (SELECT journal_id, sum(debit) d, sum(credit) c, "
-                    "sum(debit_functional) fd, sum(credit_functional) fc "
-                    "FROM mod_accounting.journal_lines GROUP BY journal_id) agg "
+                    "FROM (SELECT jl.journal_id, sum(jl.debit) d, "
+                    "sum(jl.credit) c, sum(jl.debit_functional) fd, "
+                    "sum(jl.credit_functional) fc "
+                    f"FROM mod_accounting.journal_lines jl "
+                    f"JOIN {spec.destination_table} je0 ON je0.id = jl.journal_id "
+                    "AND je0.status = 'DRAFT' AND je0.total_debit = 0 "
+                    "AND je0.total_credit = 0 "
+                    "AND je0.total_debit_functional = 0 "
+                    "AND je0.total_credit_functional = 0 "
+                    "AND je0.id IN :ids "
+                    "GROUP BY jl.journal_id) agg "
                     f"WHERE agg.journal_id = {spec.destination_table}.id "
                     f"AND {spec.destination_table}.status = 'DRAFT' "
-                    f"AND {spec.destination_table}.total_debit = 0 "
-                    f"AND {spec.destination_table}.total_credit = 0 "
-                    f"AND {spec.destination_table}.total_debit_functional = 0 "
-                    f"AND {spec.destination_table}.total_credit_functional = 0 "
-                    "AND agg.d = agg.c AND agg.fd = agg.fc AND agg.d > 0 "
-                    f"AND {spec.destination_table}.id IN :ids"
+                    "AND agg.d = agg.c AND agg.fd = agg.fc AND agg.d > 0"
                 ).bindparams(sa.bindparam("ids", expanding=True)),
                 {"ids": chunk},
             )
