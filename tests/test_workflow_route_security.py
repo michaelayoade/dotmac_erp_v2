@@ -24,7 +24,8 @@ from dotmac_kernel.deps import get_db
 from dotmac_kernel.middleware import tenant as tenant_middleware
 from dotmac_kernel.models import AuthSession, Base, Party, PartyRoleGrant, PartyType, Role, Tenant, TenantDomain
 from dotmac_kernel.security import hash_token, issue_access_token
-from dotmac_kernel.settings_models import DomainSetting
+from dotmac_kernel.settings_models import DomainSetting, SettingDomain
+from dotmac_kernel.settings_resolver import get_spec
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -214,3 +215,13 @@ def test_mounted_read_pages_enforce_their_permission(browser: Browser, path, rol
         read.assert_not_called()
     for action in browser.actions:
         action.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "key,default",
+    [("timezone", "UTC"), ("date_format", "%Y-%m-%d"), ("datetime_format", "%Y-%m-%d %H:%M")],
+)
+def test_assembly_registers_browser_display_settings(key: str, default: str) -> None:
+    # Cookie authentication resolves display settings before route dispatch.
+    # Specs must come from production assembly imports, not fixture bootstrap.
+    assert get_spec(SettingDomain.display, key).default == default

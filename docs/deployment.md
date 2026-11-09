@@ -272,3 +272,8 @@ this does not authorize adjusting balances or switching traffic.
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
 depends on `bk_0001_banking`; its stamped head is absorbed by that lineage.
+
+Mounted browser tests exposed and fixed two existing prerequisites: the
+locked runtime now includes python-multipart for form/CSRF parsing, and
+ERP declares browser display/branding SettingSpecs through the public
+kernel registry without seeding runtime settings rows.

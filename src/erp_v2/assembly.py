@@ -86,7 +86,10 @@ from dotmac_ticketing.manifest import module as ticketing_module
 from dotmac_ui import UI_CONTRACT_VERSION, static_dir
 from dotmac_workflow_runtime.manifest import module as workflow_runtime_module
 
-from erp_v2 import ui
+from erp_v2 import (
+    settings_specs,  # noqa: F401 - registers browser setting declarations
+    ui,
+)
 from erp_v2.academy_sync.routes import academy_sync_feature
 from erp_v2.banking.routes import banking_web_feature
 from erp_v2.database import build_database_runtime, database_startup_checks
