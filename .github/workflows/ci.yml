@@ -23,7 +23,7 @@ jobs:
         env:
           UV_INDEX_FORGEJO_USERNAME: ci-reader
           UV_INDEX_FORGEJO_PASSWORD: ${{ secrets.FORGEJO_READ_TOKEN }}
-        run: uv sync --extra test
+        run: uv sync --locked --extra test
 
       - name: Lint
         run: |
