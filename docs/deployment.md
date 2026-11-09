@@ -96,7 +96,9 @@ it must be a conscious operations decision, not a surprise.
 
 ## Gate 5 readiness still owed
 
-- Rulings: 201,697 provenance `approval_reference` stamps;
+- Rulings: `approval_reference` provenance decided 2026-11-09
+  (migrated journals post with legacy journal ID + posting
+  date as the source; stamps stay receipt-counted);
   14,265 APPROVED/SUBMITTED journals held in DRAFT; 1,208
   supplier invoices without supplier document numbers; 7 fintech
   bank institutions (Paystack/Flutterwave/TAJ) enrolment;

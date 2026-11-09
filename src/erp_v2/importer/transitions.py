@@ -22,12 +22,14 @@ state, after every child row has landed:
   exception, stays DRAFT.
 
 Journal posting requires an approval_reference. 70,756 of 197,751
-legacy POSTED journals carry no approver (system postings). The
-transition stamps a provenance reference (`legacy:<source
-table>:<id>`, the importer's source_key format) where the legacy
-row itself is the approval record of truth; the stamped count is
-receipt-visible and Gate 5 is blocked on a human ruling for this
-family (see docs/rehearsal.md). Nothing is stamped silently.
+legacy POSTED journals carry no approver (system postings).
+Ruling (Michael, 2026-11-09): migrated journals need no approval
+provenance - they post through the import path with their legacy
+journal ID and posting date as the source. The transition stamps
+`legacy:<source table>:<legacy journal id>@<posting date>`
+(posting_date, falling back to entry_date) where no legacy
+approval reference exists; the stamped count stays
+receipt-visible. Nothing is stamped silently.
 
 Every failure becomes a named RowException (column="status");
 the row keeps its last legal status.
@@ -75,7 +77,13 @@ _LIFECYCLES: dict[str, dict[str, tuple[str, ...] | None]] = {
 }
 
 # Extra SET clause applied on the journal DRAFT->POSTED step.
-_JOURNAL_POSTED_SET = ", approval_reference = COALESCE(approval_reference, :approval_ref_prefix || CAST(id AS TEXT))"
+# Source = legacy journal ID (UUIDs are preserved, so `id` IS the
+# legacy journal id) + posting date, per the 2026-11-09 ruling.
+_JOURNAL_POSTED_SET = (
+    ", approval_reference = COALESCE(approval_reference, "
+    ":approval_ref_prefix || CAST(id AS TEXT) || '@' || "
+    "CAST(COALESCE(posting_date, entry_date) AS TEXT))"
+)
 
 
 @dataclass

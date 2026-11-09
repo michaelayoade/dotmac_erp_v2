@@ -134,10 +134,22 @@ Written 1,342,535/1,401,472 (95.8%), 83,976 named exceptions
 journal entries 217,600/217,600, journal lines 477,789/477,789,
 posted ledger 445,941/445,950. The 9 missing ledger lines
 (D 18,296,921.25) belong to JE0001/JE0002 — balanced payroll
-journals whose POST refused on empty `approval_reference`.
-They are not orphans; posting them needs an approval provenance
-ruling. Tenant smoke green incl. verified `erp.dotmac.io`;
-unknown host returns 404.
+journals whose legacy ledger rows reference phantom
+`journal_line_id`s that never existed as entry lines, so the FK
+guard dropped the ledger evidence and POST refused on
+"requires complete balanced ledger evidence" (corrected
+2026-11-09; an earlier revision of this section wrongly blamed
+empty `approval_reference`). Fix: the `journal_line` enrolment
+map resolves a phantom only to the unique entry line in the
+same journal with the same account and amounts (all 9 resolve
+uniquely); ambiguous phantoms stay named exceptions. Approval
+provenance is separately ruled (Michael, 2026-11-09): migrated
+journals need no approver — the posting stamp is the legacy
+journal ID + posting date. Three further POSTED rejects are
+legacy journals unbalanced by 0.000001 in the source itself;
+they stay named exceptions (no amounts are adjusted). Tenant
+smoke green incl. verified `erp.dotmac.io`; unknown host
+returns 404.
 
 Tax minting now follows the module publication lifecycle
 (`tx_0004`): insert unpublished, attach bands, then a

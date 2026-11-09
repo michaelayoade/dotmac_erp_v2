@@ -312,6 +312,54 @@ def _bank_institution_by_account(source: sa.Connection, dest: sa.Connection) -> 
     return mapping
 
 
+def _journal_line(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # Ledger -> entry-line identity (UUIDs preserved), plus
+    # phantom resolution: some legacy postings (payroll JE0001/
+    # JE0002; 9 rows in production data) wrote ledger rows whose
+    # journal_line_id never existed as an entry line, so the FK
+    # guard dropped the ledger evidence and the journals could
+    # not post. A phantom resolves ONLY to the unique entry line
+    # in the same journal with the same account and amounts;
+    # ambiguous or unmatched phantoms stay unmapped and the
+    # executor names them as exceptions.
+    mapping: dict[Any, Any] = {}
+    by_fact: dict[tuple[Any, ...], list[Any]] = {}
+    lines = source.execute(
+        sa.text("SELECT line_id, journal_entry_id, account_id, debit_amount, credit_amount FROM journal_entry_line")
+    ).mappings()
+    for row in lines:
+        line_id = _norm(row["line_id"])
+        _put(mapping, "journal_line", line_id, line_id)
+        fact = (
+            _norm(row["journal_entry_id"]),
+            _norm(row["account_id"]),
+            row["debit_amount"],
+            row["credit_amount"],
+        )
+        by_fact.setdefault(fact, []).append(line_id)
+    candidates: dict[Any, set[Any]] = {}
+    ledger_refs = source.execute(
+        sa.text(
+            "SELECT journal_line_id, journal_entry_id, account_id, debit_amount, credit_amount FROM posted_ledger_line"
+        )
+    ).mappings()
+    for row in ledger_refs:
+        ref = _norm(row["journal_line_id"])
+        if ref is None or ref in mapping:
+            continue
+        fact = (
+            _norm(row["journal_entry_id"]),
+            _norm(row["account_id"]),
+            row["debit_amount"],
+            row["credit_amount"],
+        )
+        candidates.setdefault(ref, set()).update(by_fact.get(fact, ()))
+    for ref, found in candidates.items():
+        if len(found) == 1:
+            _put(mapping, "journal_line", ref, next(iter(found)))
+    return mapping
+
+
 def _journal_number_by_entry(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     # Posted ledger lines denormalize the entry's journal number.
     # The ledger's own journal_reference is free text (NULL on 16k
@@ -998,6 +1046,7 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "document_type": _document_type,
     "employee_party": _employee_party,
     "expense_evaluation_batch": _expense_evaluation_batch,
+    "journal_line": _journal_line,
     "journal_number_by_entry": _journal_number_by_entry,
     "fiscal_period": _fiscal_period,
     "inventory_item": _inventory_item,

@@ -159,3 +159,30 @@ def test_pipeline_builds_maps_per_spec_with_uuid_tolerance() -> None:
     assert receipt.enrolment_maps == {"structure_revision": 1}
     row = dst.execute(sa.text("SELECT revision_id FROM employee_pay_assignments")).one()
     assert row[0] == revision.hex
+
+
+def test_journal_line_map_identity_and_unique_phantom_resolution() -> None:
+    # Legacy ledger rows normally reference real entry lines
+    # (identity). Some legacy postings (payroll JE0001/JE0002)
+    # wrote phantom journal_line_ids; those resolve ONLY to the
+    # unique entry line in the same journal with the same account
+    # and amounts. Ambiguous phantoms stay unmapped (executor
+    # names them as exceptions).
+    src = _conn(
+        (
+            "CREATE TABLE public.journal_entry_line (line_id TEXT, journal_entry_id TEXT, "
+            "account_id TEXT, debit_amount REAL, credit_amount REAL)",
+            "INSERT INTO public.journal_entry_line VALUES ('l1','j1','a1',100,0)",
+            "INSERT INTO public.journal_entry_line VALUES ('l2','j1','a2',0,100)",
+            "INSERT INTO public.journal_entry_line VALUES ('l3','j2','a1',50,0)",
+            "INSERT INTO public.journal_entry_line VALUES ('l4','j2','a1',50,0)",
+            "CREATE TABLE public.posted_ledger_line (ledger_line_id TEXT, journal_line_id TEXT, "
+            "journal_entry_id TEXT, account_id TEXT, debit_amount REAL, credit_amount REAL)",
+            "INSERT INTO public.posted_ledger_line VALUES ('pl1','l1','j1','a1',100,0)",
+            "INSERT INTO public.posted_ledger_line VALUES ('pl2','phantom1','j1','a2',0,100)",
+            "INSERT INTO public.posted_ledger_line VALUES ('pl3','phantom2','j2','a1',50,0)",
+        )
+    )
+    dst = _conn(())
+    mapping = EnrolmentMaps(src, dst).get("journal_line")
+    assert mapping == {"l1": "l1", "l2": "l2", "l3": "l3", "l4": "l4", "phantom1": "l2"}

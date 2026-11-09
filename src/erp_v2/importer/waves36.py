@@ -115,8 +115,9 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         note="lifecycle-staged: journals must be assembled DRAFT (lines "
         "immutable after); transitions step posts/voids/reverses after "
         "lines + posted ledger land. Legacy approval_request_id is "
-        "empty in production data - approval_reference provenance "
-        "stamping is counted in the receipt (Gate 5 ruling). "
+        "empty in production data - migrated journals need no "
+        "approval provenance (ruling 2026-11-09): the posting stamp "
+        "is the legacy journal ID + posting date, receipt-counted. "
         "source_document_id: legacy records none for 48% of journals "
         "and duplicates (type, id) across 4,289 documents, so it is "
         "not a posting identity; the legacy journal row itself is "
@@ -156,8 +157,14 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "original_credit": "column:credit",
             "exchange_rate": "literal:1",
         },
+        fk_rewrites={"journal_line_id": "journal_line"},
         lookups={"journal_number": ("journal_number_by_entry", "journal_id", "journal_number")},
-        note="167k legacy ledger lines are functional-only postings "
+        note="journal_line_id rewrites through the journal_line map: "
+        "identity for real entry lines; 9 production ledger rows "
+        "carry phantom line ids (payroll JE0001/JE0002) that resolve "
+        "only to the unique same-journal/account/amount entry line, "
+        "else named exceptions. "
+        "167k legacy ledger lines are functional-only postings "
         "(no original leg recorded); every journal is NGN at rate 1 "
         "in production data, so original falls back to functional "
         "in NGN - the POSTED transition trigger verifies the sums "

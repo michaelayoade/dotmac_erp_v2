@@ -80,17 +80,18 @@ def test_journal_evidence_completion_recomputes_and_stamps() -> None:
                 "CREATE TABLE mod_accounting.journal_entries (id TEXT PRIMARY KEY, status TEXT, "
                 "total_debit NUMERIC, total_credit NUMERIC, total_debit_functional NUMERIC, "
                 "total_credit_functional NUMERIC, approval_reference TEXT, posted_by TEXT, "
-                "posted_at TEXT, updated_at TEXT, reversal_journal_id TEXT)"
+                "posted_at TEXT, updated_at TEXT, reversal_journal_id TEXT, "
+                "entry_date TEXT, posting_date TEXT)"
             )
         )
         c.execute(
             sa.text(
                 "INSERT INTO mod_accounting.journal_entries "
                 "(id, status, total_debit, total_credit, total_debit_functional, "
-                "total_credit_functional, updated_at) VALUES "
-                "('j1','DRAFT',0,0,0,0,'2026-01-02'), "
-                "('j2','DRAFT',50,50,50,50,'2026-01-02'), "
-                "('j3','DRAFT',0,0,0,0,'2026-01-02')"
+                "total_credit_functional, updated_at, entry_date, posting_date) VALUES "
+                "('j1','DRAFT',0,0,0,0,'2026-01-02','2026-01-10','2026-01-15'), "
+                "('j2','DRAFT',50,50,50,50,'2026-01-02','2026-01-20',NULL), "
+                "('j3','DRAFT',0,0,0,0,'2026-01-02','2026-01-25',NULL)"
             )
         )
         c.execute(
@@ -129,11 +130,16 @@ def test_journal_evidence_completion_recomputes_and_stamps() -> None:
     assert len(outcome.exceptions) == 1
     with dst.connect() as d_:
         rows = {
-            r[0]: (r[1], float(r[2]), r[3])
+            r[0]: (r[1], float(r[2]), r[3], r[4])
             for r in d_.execute(
-                sa.text("SELECT id, status, total_debit, posted_by FROM mod_accounting.journal_entries")
+                sa.text(
+                    "SELECT id, status, total_debit, posted_by, approval_reference FROM mod_accounting.journal_entries"
+                )
             )
         }
-    assert rows["j1"] == ("POSTED", 70.0, "legacy-system")
-    assert rows["j2"] == ("POSTED", 50.0, "legacy-system")
-    assert rows["j3"][0] == "DRAFT"
+    # Migrated journals need no approval provenance (ruling
+    # 2026-11-09): the stamp is the legacy journal ID + posting
+    # date as the source (entry_date when no posting_date).
+    assert rows["j1"] == ("POSTED", 70.0, "legacy-system", "legacy:journal_entry:j1@2026-01-15")
+    assert rows["j2"] == ("POSTED", 50.0, "legacy-system", "legacy:journal_entry:j2@2026-01-20")
+    assert rows["j3"] == ("DRAFT", 0.0, None, None)
