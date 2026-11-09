@@ -1,0 +1,23 @@
+# Gate 5 candidate service, run BESIDE legacy on the production
+# host until the nginx switch. Loopback only. Legacy project at
+# /root/dotmac stays untouched; rollback = remove this service.
+#
+#   docker compose -f deploy/docker-compose.candidate.yml up -d
+#
+# Image must be built first (see repo Dockerfile). Env values come
+# from an operator env file on the host (never Git):
+#   ERP_V2_IMAGE=dotmac-erp-v2:<candidate-sha>
+#   ERP_V2_DATABASE_URL=postgresql+psycopg://app_user:...@host.docker.internal:9001/erp_v2
+services:
+  erp_v2_app:
+    image: ${ERP_V2_IMAGE:?candidate image required}
+    container_name: dotmac_erp_v2_app
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: ${ERP_V2_DATABASE_URL:?runtime DSN required}
+      ERP_WEB_ENABLED: "true"
+      APP_ENV: production
+    ports:
+      - "127.0.0.1:8013:8000"
