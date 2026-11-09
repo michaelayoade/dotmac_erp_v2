@@ -126,3 +126,22 @@ ON mod_accounting.posted_ledger_lines (tenant_id, journal_id);
 
 Measured at Gate 4: journal transitions 251s total with the index
 vs still unfinished after 14 minutes without it.
+
+## Gate 5 family-fix re-rehearsal (2026-11-09, commits af60bf5..25a7374)
+
+Written 1,342,535/1,401,472 (95.8%), 83,976 named exceptions
+(Gate 4: 184,891), `complete=False` exit 3 by design. Parity:
+journal entries 217,600/217,600, journal lines 477,789/477,789,
+posted ledger 445,941/445,950. The 9 missing ledger lines
+(D 18,296,921.25) belong to JE0001/JE0002 — balanced payroll
+journals whose POST refused on empty `approval_reference`.
+They are not orphans; posting them needs an approval provenance
+ruling. Tenant smoke green incl. verified `erp.dotmac.io`;
+unknown host returns 404.
+
+Tax minting now follows the module publication lifecycle
+(`tx_0004`): insert unpublished, attach bands, then a
+publish-only `UPDATE` flips `is_published` (a deferred trigger
+requires published by commit). Validated live: 6 rules
+created+published. PAYE bands (NTA 2025) stay an explicit
+blocker — legacy has no PAYE `tax_code` to bind bands to.
