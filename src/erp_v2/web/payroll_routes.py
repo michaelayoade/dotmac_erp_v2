@@ -6,7 +6,9 @@ from typing import Final
 from uuid import UUID
 
 from dotmac_kernel.deps import get_db, require_tenant
+from dotmac_kernel.features import FeatureManifest
 from dotmac_kernel.models import Party, Tenant
+from dotmac_kernel.permissions import PermissionSpec
 from dotmac_kernel.templating import render
 from dotmac_kernel.web_deps import require_web_permission
 from dotmac_payroll.models import EmployeePayAssignment, PayrollCalculation, PayrollRun
@@ -110,3 +112,16 @@ async def payroll_calculate(
     except payroll_actions.PayrollActionError as exc:
         return _page(request, db, tenant, party, str(exc))
     return RedirectResponse("/payroll/actions", status_code=303)
+
+
+payroll_web_feature = FeatureManifest(
+    name="erp_payroll",
+    web_routers=(router,),
+    permissions=(
+        PermissionSpec(
+            code=PAYROLL_MANAGE_PERMISSION,
+            description="Create payroll drafts and calculate employee payroll.",
+            default_roles=("admin",),
+        ),
+    ),
+)

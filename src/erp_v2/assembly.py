@@ -92,7 +92,7 @@ from erp_v2.banking.routes import banking_web_feature
 from erp_v2.database import build_database_runtime, database_startup_checks
 from erp_v2.migration_bindings import ASSEMBLY_MODULE_PLANES
 from erp_v2.readiness import readiness_feature
-from erp_v2.web.payroll_routes import PAYROLL_MANAGE_PERMISSION
+from erp_v2.web.payroll_routes import PAYROLL_MANAGE_PERMISSION, payroll_web_feature
 from erp_v2.web.revenue_routes import WRITE_PERMISSION, revenue_web_feature
 from erp_v2.web.routes import ACCESS_PERMISSION, erp_web_feature
 
@@ -118,6 +118,7 @@ assembly: Final = ProductAssemblySpec(
         academy_sync_feature,
         erp_web_feature,
         revenue_web_feature,
+        payroll_web_feature,
         banking_web_feature,
         accounting_module,
         commercial_agreements_module,
@@ -178,9 +179,9 @@ assembly: Final = ProductAssemblySpec(
                 WebRouteRef("erp_web", "legacy", "payables_home"),
                 WebRouteRef("erp_web", "legacy", "payroll_home"),
                 WebRouteRef("erp_web", "legacy", "inventory_home"),
-                WebRouteRef("erp_web", "legacy", "payroll_actions_page"),
-                WebRouteRef("erp_web", "legacy", "payroll_create"),
-                WebRouteRef("erp_web", "legacy", "payroll_calculate"),
+                WebRouteRef("erp_payroll", "legacy", "payroll_actions_page"),
+                WebRouteRef("erp_payroll", "legacy", "payroll_create"),
+                WebRouteRef("erp_payroll", "legacy", "payroll_calculate"),
                 WebRouteRef("erp_revenue", "legacy", "receivables_register"),
                 WebRouteRef("erp_revenue", "legacy", "supplier_invoices"),
                 WebRouteRef("erp_revenue", "legacy", "supplier_invoice_new"),
