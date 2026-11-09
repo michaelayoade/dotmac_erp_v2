@@ -252,7 +252,11 @@ def mint_tax_rules(source: sa.Connection, dest: sa.Connection, ctx: MintContext)
             {
                 "id": rule_id,
                 "tenant_id": tenant,
-                "is_published": True,
+                # mod_tax publication lifecycle (tx_0004): inserts
+                # must begin unpublished; bands attach; then a
+                # publish-only UPDATE flips is_published (deferred
+                # trigger requires published by commit).
+                "is_published": False,
                 "tax_code_id": _norm(row["tax_code_id"]),
                 "version": 1,
                 "effective_from": effective_from,
@@ -315,6 +319,14 @@ def mint_tax_rules(source: sa.Connection, dest: sa.Connection, ctx: MintContext)
         )
     _insert(dest, "mod_tax.tax_rule_bands", band_rows)
     result.created += len(band_rows)
+    minted_rule_ids = [r["id"] for r in rows]
+    for start in range(0, len(minted_rule_ids), 10000):
+        dest.execute(
+            sa.text(
+                "UPDATE mod_tax.tax_rules SET is_published = true WHERE id IN :ids AND NOT is_published"
+            ).bindparams(sa.bindparam("ids", expanding=True)),
+            {"ids": minted_rule_ids[start : start + 10000]},
+        )
     return result
 
 
