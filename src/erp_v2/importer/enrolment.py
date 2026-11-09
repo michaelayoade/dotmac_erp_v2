@@ -82,6 +82,25 @@ def _lookup(rows: Any, map_name: str, fields: Sequence[str]) -> dict[Any, dict[s
 # --- static -----------------------------------------------------------------
 
 
+def _attendance_status_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
+    # e2 AttendanceStatus is lowercase; legacy HR enum is uppercase.
+    # Closed literal mapping over both spellings.
+    return {
+        "PRESENT": "present",
+        "ABSENT": "absent",
+        "HALF_DAY": "half_day",
+        "ON_LEAVE": "on_leave",
+        "HOLIDAY": "holiday",
+        "WEEKLY_OFF": "weekly_off",
+        "present": "present",
+        "absent": "absent",
+        "half_day": "half_day",
+        "on_leave": "on_leave",
+        "holiday": "holiday",
+        "weekly_off": "weekly_off",
+    }
+
+
 def _account_class_by_legacy(source: sa.Connection, dest: sa.Connection) -> dict[Any, Any]:
     # Module CHECK uses singular IFRS classes; legacy GL categories
     # are plural. Literal closed mapping (live values verified on
@@ -887,6 +906,7 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "asset_kind": _asset_kind,
     "bid_scores": _bid_scores,
     "account_class_by_legacy": _account_class_by_legacy,
+    "attendance_status_by_legacy": _attendance_status_by_legacy,
     "pay_component_kind_by_legacy": _pay_component_kind_by_legacy,
     "workflow_status_by_legacy": _workflow_status_by_legacy,
     "bank_direction_by_type": _bank_direction_by_type,

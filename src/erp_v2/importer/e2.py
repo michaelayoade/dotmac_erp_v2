@@ -53,8 +53,10 @@ E2_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "hr_attendance",
         "public.attendance",
-        renames={"marked_by_id": "marked_by"},
-        note="late/early booleans derive from minutes at rehearsal; schedule refs are workforce residue",
+        fk_rewrites={"status": "attendance_status_by_legacy"},
+        note="legacy marked_by is a method label (MANUAL/SYSTEM/SELFCARE), "
+        "not a user id - residue; marked_by_id stays NULL. Status is "
+        "legacy uppercase enum -> e2 lowercase via closed value map",
     ),
     Pairing("hr_attendance_requests", "public.attendance_request"),
     # appraisals slice
