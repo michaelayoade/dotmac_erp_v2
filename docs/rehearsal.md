@@ -127,29 +127,57 @@ ON mod_accounting.posted_ledger_lines (tenant_id, journal_id);
 Measured at Gate 4: journal transitions 251s total with the index
 vs still unfinished after 14 minutes without it.
 
-## Gate 5 family-fix re-rehearsal (2026-11-09, commits af60bf5..25a7374)
+The index must exist BEFORE `execute` starts: creating it
+mid-run does not help, because the posting trigger's cached
+plan never picks it up (Gate 5 clean re-run, 2026-11-09: ~12k
+postings in 25 minutes without a usable plan; the run was
+killed, rolled back cleanly, and relaunched with the index
+created right after genesis).
 
-Written 1,342,535/1,401,472 (95.8%), 83,976 named exceptions
-(Gate 4: 184,891), `complete=False` exit 3 by design. Parity:
-journal entries 217,600/217,600, journal lines 477,789/477,789,
-posted ledger 445,941/445,950. The 9 missing ledger lines
-(D 18,296,921.25) belong to JE0001/JE0002 — balanced payroll
-journals whose legacy ledger rows reference phantom
-`journal_line_id`s that never existed as entry lines, so the FK
-guard dropped the ledger evidence and POST refused on
-"requires complete balanced ledger evidence" (corrected
-2026-11-09; an earlier revision of this section wrongly blamed
-empty `approval_reference`). Fix: the `journal_line` enrolment
-map resolves a phantom only to the unique entry line in the
-same journal with the same account and amounts (all 9 resolve
-uniquely); ambiguous phantoms stay named exceptions. Approval
-provenance is separately ruled (Michael, 2026-11-09): migrated
-journals need no approver — the posting stamp is the legacy
-journal ID + posting date. Three further POSTED rejects are
-legacy journals unbalanced by 0.000001 in the source itself;
-they stay named exceptions (no amounts are adjusted). Tenant
-smoke green incl. verified `erp.dotmac.io`; unknown host
-returns 404.
+## Gate 5 family-fix re-rehearsal (2026-11-09, commits af60bf5..f3f8ff6)
+
+Clean genesis + execute at `f3f8ff6`: written
+1,342,544/1,401,472 (95.8%), 83,965 named exceptions (Gate 4:
+184,891), `complete=False` exit 3 by design. Parity is now
+exact: journal entries 217,600/217,600, journal lines
+477,789/477,789, posted ledger 445,950/445,950 with debit =
+credit = 11,234,343,218.68 on both sides. Transitions: POSTED
+201,694, REVERSED 3,946, VOID 1,263; 201,697 approval stamps
+and 206 posted_by stamps receipt-counted; 601 zero-total
+headers recomputed from their own lines. Tax mint landed 6/6
+rules published. Tenant smoke green incl. verified
+`erp.dotmac.io`; unknown host returns 404.
+
+The previous run's 9 missing ledger lines (D 18,296,921.25)
+belonged to JE0001/JE0002 — balanced payroll journals whose
+legacy ledger rows reference phantom `journal_line_id`s that
+never existed as entry lines, so the FK guard dropped the
+ledger evidence and POST refused on "requires complete
+balanced ledger evidence" (corrected 2026-11-09; an earlier
+revision of this section wrongly blamed empty
+`approval_reference`). Fix: the `journal_line` enrolment map
+resolves a phantom only to the unique entry line in the same
+journal with the same account and amounts (all 9 resolve
+uniquely, verified pair-for-pair against SQL); ambiguous
+phantoms stay named exceptions. JE0001/JE0002 now post:
+`approval_reference = legacy:gl.journal_entry:<id>@2026-01-31`.
+
+Approval provenance is ruled (Michael, 2026-11-09): migrated
+journals need no approver — they post through the import path
+with their legacy journal ID and posting date as the source.
+Three POSTED rejects remain: legacy journals unbalanced by
+0.000001 in the source itself; they stay named exceptions (no
+amounts are adjusted).
+
+Two operational findings from the clean run:
+
+- A savepoint probe on the shared source connection crashes
+  once executor streaming has put it in psycopg server-cursor
+  mode (`DECLARE CURSOR FOR SAVEPOINT`). Existence probes on
+  that connection must be error-free SELECTs (`to_regclass`),
+  never savepoints.
+- The cutover ledger index (previous section) must be created
+  right after genesis, before `execute`.
 
 Tax minting now follows the module publication lifecycle
 (`tx_0004`): insert unpublished, attach bands, then a
