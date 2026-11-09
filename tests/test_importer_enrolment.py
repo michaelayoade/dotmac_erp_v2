@@ -85,6 +85,8 @@ def test_destination_built_maps() -> None:
         (
             "CREATE TABLE public.salary_component (component_id TEXT, depends_on_payment_days INTEGER)",
             "INSERT INTO public.salary_component VALUES ('c1',1)",
+            "CREATE TABLE public.bank_accounts (bank_account_id TEXT, bank_name TEXT, bank_code TEXT)",
+            "INSERT INTO public.bank_accounts VALUES ('ba1','Access','044')",
         )
     )
     dst = _conn(
@@ -99,8 +101,8 @@ def test_destination_built_maps() -> None:
             "CREATE TABLE mod_procurement.sourcing_event_lines (id TEXT, source_requisition_line_id TEXT)",
             "INSERT INTO mod_procurement.sourcing_event_lines VALUES ('sl1','rl1')",
             "INSERT INTO mod_procurement.sourcing_event_lines VALUES ('sl2',NULL)",
-            "CREATE TABLE mod_banking.bank_institutions (id TEXT, code TEXT)",
-            "INSERT INTO mod_banking.bank_institutions VALUES ('b1','044')",
+            "CREATE TABLE mod_banking.bank_institutions (id TEXT, code TEXT, name TEXT)",
+            "INSERT INTO mod_banking.bank_institutions VALUES ('b1','044','Access')",
             "CREATE TABLE mod_accounting.fiscal_periods (id TEXT, end_date TEXT)",
             "INSERT INTO mod_accounting.fiscal_periods VALUES ('fp1','2026-01-31')",
             "CREATE TABLE mod_inventory.items (id TEXT, base_uom TEXT)",
@@ -111,7 +113,7 @@ def test_destination_built_maps() -> None:
     assert maps.get("structure_revision") == {"st1": "rev1"}  # v1 only
     assert maps.get("tax_authority_by_level") == {"federal": "a1"}
     assert maps.get("sourcing_line_by_requisition_line") == {"rl1": "sl1"}
-    assert maps.get("bank_institution_by_code") == {"044": "b1"}
+    assert maps.get("bank_institution_by_account") == {"ba1": "b1"}
     assert maps.get("fiscal_period") == {"fp1": {"end_date": "2026-01-31"}}
     assert maps.get("inventory_item") == {"it1": {"base_uom": "each"}}
     assert maps.get("pay_component") == {
