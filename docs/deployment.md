@@ -108,11 +108,14 @@ it must be a conscious operations decision, not a surprise.
   replay, HR document sensitivity/handling).
 - Inputs: real enrolment actor UUID, payroll-payable account
   ref, tax rule policy + band binding JSONs.
-- Gate 1 reproducibility: `FORGEJO_READ_TOKEN` secret +
-  committed `uv.lock` + green exact-wheel CI. Until then the
-  candidate image build uses the Forgejo index with a build
-  secret; the rehearsal proved the same pins from released
-  sources (labelled deviation).
+- Gate 1 reproducibility: DONE 2026-11-09. `FORGEJO_READ_TOKEN`
+  set, `uv.lock` committed (80 packages, exact Forgejo wheel
+  hashes), CI green with `uv sync --locked` (119 tests).
+  Candidate image builds from the same lock
+  (`ghcr.io/michaelayoade/dotmac_erp_v2:sha-0721ce9`,
+  digest `sha256:dc09acf0...`); the GHCR package is currently
+  private — make it public (or provide pull credentials)
+  before hosts can pull it.
 - Billing command import stays Sub-M1-gated (no execution).
 
 ## Cleanup after a successful flip
