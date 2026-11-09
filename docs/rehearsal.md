@@ -106,3 +106,23 @@ store). Exit codes: 0 ok, 2 refusal (named), 3 incomplete receipt.
 sensitivity/handling (classification ruling). Their rows stay in
 legacy as the system of record until ruled — they block Gate 5,
 not Gate 4 findings collection.
+
+## Cutover DDL: ledger journal index (Gate 4 finding)
+
+The released accounting module has no index on
+`mod_accounting.posted_ledger_lines (tenant_id, journal_id)`, but its
+posting trigger aggregates ledger lines by journal on every
+DRAFT -> POSTED transition. At production scale (446k ledger lines)
+each posting seq-scans the ledger (~27k cost units); 197k journal
+transitions would take hours. Until a released module migration
+adds the index (reported upstream), the cutover procedure creates
+it on the destination right after genesis — additive DDL, stamped
+heads unaffected:
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_cutover_ledger_tenant_journal
+ON mod_accounting.posted_ledger_lines (tenant_id, journal_id);
+```
+
+Measured at Gate 4: journal transitions 251s total with the index
+vs still unfinished after 14 minutes without it.

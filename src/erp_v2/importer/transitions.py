@@ -138,6 +138,32 @@ def _run_family(
     for row in source.execute(select_sql).mappings():
         by_status.setdefault(str(row["status"]), []).append(row[id_source])
 
+    # Journal REVERSED rows: the module trigger only accepts the
+    # POSTED -> REVERSED update when reversal_journal_id changes
+    # from NULL in the same statement. The importer's deferred
+    # post-pass already populated it (while DRAFT), so stash and
+    # clear it now, then re-apply it inside the REVERSED update.
+    reversal_links: dict[Any, Any] = {}
+    if spec.destination_table == "mod_accounting.journal_entries" and not dry_run:
+        reversed_ids = by_status.get("REVERSED", [])
+        for start in range(0, len(reversed_ids), 10000):
+            chunk = reversed_ids[start : start + 10000]
+            rows = dest.execute(
+                sa.text(
+                    f"SELECT id, reversal_journal_id FROM {spec.destination_table} "  # noqa: S608
+                    "WHERE id IN :ids"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": chunk},
+            )
+            reversal_links.update({r[0]: r[1] for r in rows if r[1] is not None})
+            dest.execute(
+                sa.text(
+                    f"UPDATE {spec.destination_table} SET reversal_journal_id = NULL "  # noqa: S608
+                    "WHERE status = 'DRAFT' AND id IN :ids"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": chunk},
+            )
+
     for legacy_status in sorted(by_status):
         ids = by_status[legacy_status]
         if legacy_status not in paths:
@@ -175,6 +201,8 @@ def _run_family(
                 continue
             extra = ""
             params_extra: dict[str, Any] = {}
+            if spec.destination_table == "mod_accounting.journal_entries" and target == "REVERSED":
+                extra = ", reversal_journal_id = :reversal_journal_id"
             if spec.destination_table == "mod_accounting.journal_entries" and target == "POSTED":
                 extra = _JOURNAL_POSTED_SET
                 params_extra["approval_ref_prefix"] = f"legacy:{spec.source_table}:"
@@ -203,7 +231,13 @@ def _run_family(
             moved = 0
             for start in range(0, len(moving), _BATCH):
                 chunk = [
-                    {"row_id": row_id, "target_status": target, "from_status": from_status, **params_extra}
+                    {
+                        "row_id": row_id,
+                        "target_status": target,
+                        "from_status": from_status,
+                        **params_extra,
+                        **({"reversal_journal_id": reversal_links.get(row_id)} if target == "REVERSED" else {}),
+                    }
                     for row_id in moving[start : start + _BATCH]
                 ]
                 moved += _update_batch(dest, sql, chunk, spec, outcome, target)
