@@ -135,9 +135,8 @@ it must be a conscious operations decision, not a surprise.
   hashes), CI green with `uv sync --locked` (119 tests).
   Candidate image builds from the same lock
   (`ghcr.io/michaelayoade/dotmac_erp_v2:sha-0721ce9`,
-  digest `sha256:dc09acf0...`); the GHCR package is currently
-  private — make it public (or provide pull credentials)
-  before hosts can pull it.
+  digest `sha256:dc09acf0...`); the GHCR package is public
+  (anonymous pull verified on test-server and prod).
 - Billing command import stays Sub-M1-gated (no execution).
 
 ## Cleanup after a successful flip
