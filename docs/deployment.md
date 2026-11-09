@@ -283,5 +283,5 @@ credential FK: the released kernel exposes only the credential's global
 primary key. The draft migration now references that supported key; trusted
 principal tenant/credential matching remains mandatory in the banking
 service, and bank-account/statement relationships retain composite tenant
-FKs. Explicit app_user SELECT/UPDATE (binding lock) and SELECT/INSERT
+FKs. Explicit app_user SELECT plus UPDATE(updated_at) (binding lock), and SELECT/INSERT
 (receipt append) grants are part of genesis; runtime cannot create bindings.

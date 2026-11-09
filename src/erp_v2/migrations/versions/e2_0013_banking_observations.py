@@ -82,7 +82,8 @@ def upgrade() -> None:
     # The runtime can lock an existing trusted binding but cannot create it.
     # PostgreSQL SELECT FOR UPDATE requires UPDATE privilege. Accepted
     # observation receipts are append-only through the service contract.
-    op.execute("GRANT SELECT, UPDATE ON public.banking_provider_bindings TO app_user")
+    op.execute("GRANT SELECT ON public.banking_provider_bindings TO app_user")
+    op.execute("GRANT UPDATE (updated_at) ON public.banking_provider_bindings TO app_user")
     op.execute("GRANT SELECT, INSERT ON public.banking_observation_receipts TO app_user")
 
 
