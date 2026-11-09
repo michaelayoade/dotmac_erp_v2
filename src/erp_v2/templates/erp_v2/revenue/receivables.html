@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Receivables — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Receivables</h1>
+<p><a href="/finance">Finance</a> · <a href="/finance/supplier-invoices">Supplier invoices</a></p>
+<p>Invoice issuance is unavailable until commercial, tax and due-date evidence is connected. Collection allocation is unavailable until the confirmation and allocation workflow is connected.</p>
+<h2>Billing documents</h2>
+<p>Showing up to 100 most recent documents. Document totals are original amounts, not outstanding balances.</p>
+<table><thead><tr><th>Number</th><th>Account</th><th>Kind</th><th>Status</th><th>Issued at</th><th>Due at</th><th>Currency</th><th>Document total</th></tr></thead>
+<tbody>{% for d in documents %}<tr><td>{{ d.document_number or 'Draft' }}</td><td>{{ billing_accounts.get(d.billing_account_id, d.billing_account_id) }}</td><td>{{ d.document_kind }}</td><td>{{ d.lifecycle }}</td><td>{{ d.issued_at or '—' }}</td><td>{{ d.due_at or '—' }}</td><td>{{ d.currency }}</td><td>{{ d.grand_total }}</td></tr>
+{% else %}<tr><td colspan="8">No billing documents.</td></tr>{% endfor %}</tbody></table>
+<h2>Confirmed receipts</h2>
+<p>Showing up to 100 most recent receipts. Receipt amounts do not indicate remaining allocatable credit.</p>
+<table><thead><tr><th>Occurred at</th><th>Account</th><th>Source</th><th>Reference</th><th>Confirmation evidence</th><th>Currency</th><th>Amount</th></tr></thead>
+<tbody>{% for r in receipts %}<tr><td>{{ r.occurred_at }}</td><td>{{ billing_accounts.get(r.billing_account_id, r.billing_account_id) }}</td><td>{{ r.source_system }}</td><td>{{ r.source_settlement_key }}</td><td>{{ r.confirmation_evidence }}</td><td>{{ r.currency }}</td><td>{{ r.amount }}</td></tr>
+{% else %}<tr><td colspan="7">No confirmed receipts.</td></tr>{% endfor %}</tbody></table>
+{% endblock %}

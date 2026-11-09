@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}{{ invoice.number }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Supplier invoice {{ invoice.number }}</h1>
+<p><a href="/finance/supplier-invoices">Supplier invoices</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>Supplier</dt><dd>{{ invoice.supplier_name_snapshot }} ({{ invoice.supplier_ref }})</dd>
+  <dt>Supplier document</dt><dd>{{ invoice.supplier_document_number }}</dd>
+  <dt>Invoice date</dt><dd>{{ invoice.invoice_date }}</dd>
+  <dt>Received date</dt><dd>{{ invoice.received_date }}</dd>
+  <dt>Status</dt><dd>{{ invoice.status }}</dd>
+  <dt>Document total</dt><dd>{{ invoice.currency_code }} {{ invoice.total_amount }}</dd>
+  <dt>Exchange rate</dt><dd>{{ invoice.exchange_rate }}</dd>
+  {% if invoice.submitted_by %}<dt>Submitted by</dt><dd>{{ invoice.submitted_by }} at {{ invoice.submitted_at }}</dd>{% endif %}
+</dl>
+{% if invoice.status == 'DRAFT' %}
+<form method="post" action="/finance/supplier-invoices/{{ invoice.id }}/submit">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Submit for review (admin)</button>
+</form>
+{% endif %}
+<h2>Document lines</h2>
+<table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Line amount</th><th>Supplier-stated tax</th></tr></thead>
+<tbody>{% for line in lines %}<tr><td>{{ line.description }}</td><td>{{ line.quantity }}</td><td>{{ line.unit_price }}</td><td>{{ line.line_amount }}</td><td>{{ line.tax_amount }}</td></tr>{% endfor %}</tbody></table>
+<h2>Payment schedule</h2>
+<ul>{% for item in invoice.payment_schedule %}<li>{{ item.due_date }}: {{ invoice.currency_code }} {{ item.amount }}</li>{% endfor %}</ul>
+<h2>Payment obligations</h2>
+<p>Obligations appear after approval. Supplier payment execution is unavailable: this release has no outbound payment executor.</p>
+<table><thead><tr><th>Due date</th><th>Currency</th><th>Original amount</th><th>Outstanding amount</th><th>Status</th></tr></thead>
+<tbody>{% for o in obligations %}<tr><td>{{ o.due_date }}</td><td>{{ o.currency_code }}</td><td>{{ o.original_amount }}</td><td>{{ o.outstanding_amount }}</td><td>{{ o.status }}</td></tr>
+{% else %}<tr><td colspan="5">No payment obligations.</td></tr>{% endfor %}</tbody></table>
+<h2>Recorded settlement evidence</h2>
+<table><thead><tr><th>Occurred at</th><th>Source owner</th><th>Reference</th><th>Version</th><th>Currency</th><th>Amount</th></tr></thead>
+<tbody>{% for o in observations %}<tr><td>{{ o.occurred_at }}</td><td>{{ o.source_owner }}</td><td>{{ o.source_reference }}</td><td>{{ o.source_version }}</td><td>{{ o.currency_code }}</td><td>{{ o.amount }}</td></tr>
+{% else %}<tr><td colspan="6">No recorded settlement evidence.</td></tr>{% endfor %}</tbody></table>
+{% endblock %}

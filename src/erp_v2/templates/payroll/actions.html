@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Draft payroll — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Draft payroll</h1>
+<p><a href="/payroll">Payroll overview</a></p>
+<p>Create a draft run and calculate one employee using an existing effective pay assignment and published structure.
+Approval, finalization, accounting posting and payment are separate workflows.</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<h2>Create draft run</h2>
+<form method="post" action="/payroll/runs">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>Run reference <input name="run_ref" maxlength="160" required></label>
+<label>Period start <input type="date" name="period_start" required></label>
+<label>Period end <input type="date" name="period_end" required></label>
+<label>Currency code <input name="currency_code" maxlength="3" required></label>
+<label>Currency decimal places <input type="number" name="minor_units" min="0" max="6" value="2" required></label>
+<button type="submit">Create draft</button>
+</form>
+<h2>Active assignment references</h2>
+<ul>{% for a in assignments %}<li>{{ a.employee_ref }} ({{ a.effective_from }} — {{ a.effective_to or 'ongoing' }})</li>
+{% else %}<li>No active pay assignments. Configure assignments and published structures before calculating.</li>{% endfor %}</ul>
+<h2>Runs</h2>
+{% for r in runs %}
+<h3>{{ r.run_ref }} — {{ r.status }}</h3>
+<p>{{ r.period_start }} — {{ r.period_end }}, {{ r.currency_code }} ({{ r.minor_units }} decimal places)</p>
+{% if r.status == 'draft' %}
+<form method="post" action="/payroll/runs/{{ r.id }}/calculate">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>Employee assignment reference <input name="employee_ref" maxlength="240" required></label>
+<label>Proration factor (0 to 1) <input name="proration_factor" value="1" required></label>
+<label>Input components <textarea name="component_inputs" rows="4" maxlength="64000"
+ placeholder="COMPONENT-CODE | 1000.00 | compensation:source-reference"></textarea></label>
+<p>One input component per line: code | amount | evidence reference. Supply every input rule from the assigned structure.
+Fixed and percentage rules are calculated by the payroll service.</p>
+<button type="submit">Calculate employee</button>
+</form>
+{% endif %}
+{% else %}<p>No payroll runs yet.</p>{% endfor %}
+<h2>Recent employee calculations</h2>
+<table><thead><tr><th>Run</th><th>Employee</th><th>Gross</th><th>Deductions</th><th>Net</th><th>Currency</th></tr></thead>
+<tbody>{% for c, ref, currency in calculations %}<tr><td>{{ ref }}</td><td>{{ c.employee_ref }}</td>
+<td>{{ c.gross_amount }}</td><td>{{ c.deduction_amount }}</td><td>{{ c.net_amount }}</td><td>{{ currency }}</td></tr>
+{% else %}<tr><td colspan="6">No calculations yet.</td></tr>{% endfor %}</tbody></table>
+{% endblock %}

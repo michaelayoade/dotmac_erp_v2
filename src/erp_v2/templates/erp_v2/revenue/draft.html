@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Enter supplier invoice — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Enter supplier invoice</h1>
+<p><a href="/finance/supplier-invoices">Supplier invoices</a></p>
+<p>Capture one supplier document line and one due date. Saving creates a draft; submission sends it for review.</p>
+<p>Copy the supplier-stated tax amount and exchange rate from your supporting evidence. Tax is not calculated here.</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if accounts %}
+<form method="post" action="/finance/supplier-invoices">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="request_id" value="{{ values.get('request_id', '') }}">
+  {% for name, label, maxlength in [
+    ('number', 'Internal invoice number', 50), ('supplier_ref', 'Supplier reference', 255),
+    ('supplier_name', 'Supplier name', 255), ('supplier_document_number', 'Supplier document number', 120),
+    ('description', 'Line description', 2000), ('currency_code', 'Currency code', 3)
+  ] %}
+  <p><label>{{ label }} <input name="{{ name }}" value="{{ values.get(name, '') }}" maxlength="{{ maxlength }}" required></label></p>
+  {% endfor %}
+  {% for name, label in [('invoice_date', 'Invoice date'), ('received_date', 'Received date'), ('due_date', 'Due date')] %}
+  <p><label>{{ label }} <input type="date" name="{{ name }}" value="{{ values.get(name, '') }}" required></label></p>
+  {% endfor %}
+  {% for name, label in [('quantity', 'Quantity'), ('unit_price', 'Unit price'), ('tax_amount', 'Supplier-stated tax amount (enter 0 if none)'), ('exchange_rate', 'Exchange rate')] %}
+  <p><label>{{ label }} <input type="number" step="0.000001" min="0" name="{{ name }}" value="{{ values.get(name, '') }}" required></label></p>
+  {% endfor %}
+  {% for name, label, mandatory in [('posting_account_id', 'Line posting account', true), ('liability_account_id', 'Liability account', true), ('tax_account_id', 'Tax account (required when tax is positive)', false)] %}
+  <p><label>{{ label }} <select name="{{ name }}" {% if mandatory %}required{% endif %}>
+    <option value="">Select an account</option>
+    {% for a in accounts %}<option value="{{ a.id }}" {% if values.get(name) == a.id|string %}selected{% endif %}>{{ a.code }} — {{ a.name }}</option>{% endfor %}
+  </select></label></p>
+  {% endfor %}
+  <button type="submit">Save draft</button>
+</form>
+{% else %}
+<p>No active posting accounts are configured. Configure the chart of accounts before entering supplier invoices.</p>
+{% endif %}
+{% endblock %}

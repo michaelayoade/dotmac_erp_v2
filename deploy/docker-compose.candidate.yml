@@ -23,7 +23,15 @@ services:
     environment:
       DATABASE_URL: ${ERP_V2_DATABASE_URL:?runtime DSN required}
       ERP_WEB_ENABLED: "true"
-      APP_ENV: production
+      ENVIRONMENT: production
+      PLATFORM_DATABASE_URL: ${ERP_V2_DATABASE_URL:?runtime DSN required}
+      PLATFORM_ROOT_DOMAIN: ${PLATFORM_ROOT_DOMAIN:?production root domain required}
+      TRUSTED_HOSTS: "${TRUSTED_HOSTS:?explicit trusted hosts required},127.0.0.1"
+      JWT_SECRET: ${JWT_SECRET:?runtime JWT secret required}
+      SESSION_HASH_SECRET: ${SESSION_HASH_SECRET:?runtime session secret required}
+      CSRF_SECRET: ${CSRF_SECRET:?runtime CSRF secret required}
+      CSRF_ENABLED: "true"
+      SEED_ON_STARTUP: "false"
     ports:
       - "127.0.0.1:8013:8000"
     networks:

@@ -30,6 +30,7 @@ from erp_v2.web import (
     finance_queries,
     inventory_queries,
     payroll_queries,
+    payroll_routes,
     people_actions,
     people_queries,
 )
@@ -319,6 +320,9 @@ def home(
     )
 
 
+router.include_router(payroll_routes.router)
+
+
 erp_web_feature: Final = FeatureManifest(
     name="erp_web",
     web_routers=(router,),
@@ -329,6 +333,11 @@ erp_web_feature: Final = FeatureManifest(
         NavItem("Inventory", "/inventory"),
     ],
     permissions=(
+        PermissionSpec(
+            code=payroll_routes.PAYROLL_MANAGE_PERMISSION,
+            description="Create payroll drafts and calculate employee payroll.",
+            default_roles=("admin",),
+        ),
         PermissionSpec(
             code=ACCESS_PERMISSION,
             description="Enter the ERP web portal.",
