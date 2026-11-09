@@ -125,6 +125,7 @@ def _run_family(
     spec: TransformSpec,
     *,
     dry_run: bool,
+    commit: bool = False,
 ) -> TransitionOutcome:
     paths = _LIFECYCLES[spec.destination_table]
     outcome = TransitionOutcome(destination_table=spec.destination_table)
@@ -242,6 +243,13 @@ def _run_family(
                 ]
                 moved += _update_batch(dest, sql, chunk, spec, outcome, target)
             outcome.transitioned[target] = outcome.transitioned.get(target, 0) + moved
+            if commit and not dry_run:
+                # Bounded transactions per (status group, step):
+                # one mega-transaction over ~205k trigger-heavy
+                # updates bloats the heap and pins a single cached
+                # trigger plan for hours (Gate 4). Steps are
+                # status-guarded UPDATEs - idempotent and resumable.
+                dest.commit()
             # Only rows that actually moved continue down the path.
             if moved < len(moving):
                 still: list[Any] = []
@@ -283,6 +291,26 @@ def run_transitions(
     for spec in specs:
         if spec.destination_table in _LIFECYCLES:
             by_dest[spec.destination_table] = spec
+    if not dry_run and dest.dialect.name == "postgresql":
+        # Fresh planner stats BEFORE the first trigger-heavy update:
+        # autoanalyze ran while every journal was still DRAFT, so
+        # the posting trigger's EXISTS/aggregate plans cached a
+        # "POSTED is rare" estimate and scanned ~200k rows per
+        # reversal (Gate 4: 60+ minutes in one family).
+        for table in (
+            "mod_accounting.journal_entries",
+            "mod_accounting.journal_lines",
+            "mod_accounting.posted_ledger_lines",
+            "mod_accounting.fiscal_periods",
+            "mod_payables.supplier_invoices",
+        ):
+            try:
+                with dest.begin_nested():
+                    dest.execute(sa.text(f"ANALYZE {table}"))  # noqa: S608
+            except sa.exc.SQLAlchemyError:
+                pass
+        if commit:
+            dest.commit()
     outcomes: list[TransitionOutcome] = []
     for dest_table in (
         "mod_accounting.fiscal_periods",
@@ -292,7 +320,7 @@ def run_transitions(
         spec = by_dest.get(dest_table)
         if spec is None:
             continue
-        outcomes.append(_run_family(source, dest, spec, dry_run=dry_run))
+        outcomes.append(_run_family(source, dest, spec, dry_run=dry_run, commit=commit))
         if commit and not dry_run:
             dest.commit()
     return tuple(outcomes)
