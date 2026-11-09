@@ -306,7 +306,7 @@ def run_transitions(
         ):
             try:
                 with dest.begin_nested():
-                    dest.execute(sa.text(f"ANALYZE {table}"))  # noqa: S608
+                    dest.execute(sa.text(f"ANALYZE {table}"))
             except sa.exc.SQLAlchemyError:
                 pass
         if commit:
