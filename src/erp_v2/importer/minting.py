@@ -276,18 +276,25 @@ def mint_tax_rules(source: sa.Connection, dest: sa.Connection, ctx: MintContext)
 
     # Bands attach only under an explicit name -> tax_code binding.
     # Legacy deployments without a tax_band table have no bands.
-    try:
-        with source.begin_nested():
-            bands = list(
-                source.execute(
-                    sa.text(
-                        "SELECT tax_band_id, organization_id, name, min_amount, max_amount, rate, sequence "
-                        "FROM tax_band WHERE is_active"
-                    )
-                ).mappings()
-            )
-    except sa.exc.SQLAlchemyError:
-        bands = []
+    # No savepoint probe on Postgres: the shared source connection
+    # runs in psycopg server-cursor mode after executor streaming,
+    # where SAVEPOINT itself is invalid (DECLARE CURSOR FOR
+    # SAVEPOINT - found live at the Gate 5 re-rehearsal). The
+    # to_regclass existence check resolves through search_path
+    # and never errors; other dialects keep the savepoint probe.
+    band_sql = sa.text(
+        "SELECT tax_band_id, organization_id, name, min_amount, max_amount, rate, sequence "
+        "FROM tax_band WHERE is_active"
+    )
+    if source.dialect.name == "postgresql":
+        present = bool(source.execute(sa.text("SELECT to_regclass('tax_band') IS NOT NULL")).scalar_one())
+        bands = list(source.execute(band_sql).mappings()) if present else []
+    else:
+        try:
+            with source.begin_nested():
+                bands = list(source.execute(band_sql).mappings())
+        except sa.exc.SQLAlchemyError:
+            bands = []
     if bands and not ctx.tax_band_rule_binding:
         unbound = sorted({str(b["name"]) for b in bands})
         result.blockers.append(f"tax bands not minted: no tax_band_rule_binding for band names {unbound}")

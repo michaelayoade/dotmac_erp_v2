@@ -127,6 +127,51 @@ def test_tax_authorities_and_rule_policy_gate() -> None:
     assert again.created == 0 and again.existing == 2
 
 
+def test_tax_rules_mint_without_legacy_tax_band_table() -> None:
+    # Deployments without a tax_band table have no bands; the
+    # existence probe must not error (and on Postgres must not
+    # use a savepoint - the executor leaves the shared source
+    # connection in server-cursor mode where SAVEPOINT is
+    # invalid; proven in the Gate 5 re-rehearsal).
+    src = _conn(
+        (
+            "CREATE TABLE public.tax_code (tax_code_id TEXT, organization_id TEXT, tax_code TEXT, tax_type TEXT, "
+            "tax_rate REAL, effective_from TEXT, effective_to TEXT, is_inclusive INTEGER, recovery_rate REAL, "
+            "is_recoverable INTEGER, is_active INTEGER)",
+            "INSERT INTO public.tax_code VALUES ('tc1','t1','VAT','vat',0.075,'2025-01-01',NULL,0,1.0,1,1)",
+        )
+    )
+    dst = _conn(
+        (
+            "CREATE TABLE mod_tax.tax_rules (id TEXT, tenant_id TEXT, is_published INTEGER, tax_code_id TEXT, "
+            "version INTEGER, effective_from TEXT, effective_to TEXT, priority INTEGER, fact_kind TEXT, "
+            "recognition_basis_code TEXT, transaction_side TEXT, calculation_method TEXT, rate REAL, "
+            "fixed_amount REAL, inclusive INTEGER, recoverable_rate REAL, treatment_code TEXT, "
+            "calculation_sequence INTEGER, calculation_base_code TEXT, published_at TEXT)",
+            "CREATE TABLE mod_tax.tax_rule_bands (id TEXT, tenant_id TEXT, rule_id TEXT, sequence INTEGER, "
+            "lower_bound REAL, upper_bound REAL, rate REAL)",
+        )
+    )
+    ctx = MintContext(
+        tenant_id="t1",
+        actor_id="actor1",
+        occurred_at=CTX.occurred_at,
+        tax_rule_policy={
+            "vat": {
+                "fact_kind": "supply",
+                "recognition_basis_code": "accrual",
+                "transaction_side": "output",
+                "calculation_method": "percentage",
+                "treatment_code": "standard",
+                "calculation_base_code": "net_amount",
+            }
+        },
+    )
+    rules = run_mint_step("tax_rules", src, dst, ctx)
+    assert rules.created == 1 and not rules.blockers and rules.refused is None
+    assert dst.execute(sa.text("SELECT is_published FROM mod_tax.tax_rules")).scalar_one() == 1
+
+
 def test_sourcing_lines_sales_leads_and_document_types() -> None:
     src = _conn(
         (
