@@ -120,6 +120,9 @@ def test_tax_authorities_and_rule_policy_gate() -> None:
     )
     rules = run_mint_step("tax_rules", src, dst, ctx)
     assert rules.created == 2 and not rules.blockers  # 1 rule + 1 band
+    # mod_tax requires rules published by commit; insert begins
+    # unpublished (bands attach) and a publish-only UPDATE flips it.
+    assert dst.execute(sa.text("SELECT is_published FROM mod_tax.tax_rules")).scalar_one() == 1
     again = run_mint_step("tax_rules", src, dst, ctx)
     assert again.created == 0 and again.existing == 2
 
