@@ -22,6 +22,7 @@ Approval, finalization, accounting posting and payment are separate workflows.</
 <h2>Runs</h2>
 {% for r in runs %}
 <h3>{{ r.run_ref }} — {{ r.status }}</h3>
+<p><a href="/payroll/runs/{{ r.id }}/approval-readiness">Review approval readiness</a></p>
 <p>{{ r.period_start }} — {{ r.period_end }}, {{ r.currency_code }} ({{ r.minor_units }} decimal places)</p>
 {% if r.status == 'draft' %}
 <form method="post" action="/payroll/runs/{{ r.id }}/calculate">
