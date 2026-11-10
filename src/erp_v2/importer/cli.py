@@ -340,6 +340,19 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
     if len(manifest.tenant_extent) != 1:
         raise CliRefusal("billing-preflight requires a single-tenant snapshot extent")
     tenant_id = _uuid.UUID(str(manifest.tenant_extent[0]))
+    if not result.items and result.blockers:
+        _write_receipt(
+            Path(args.receipt),
+            {
+                "kind": "billing-preflight",
+                "manifest": manifest.as_dict(),
+                "importable": False,
+                "translation_blockers": [{"source_key": b.source_key, "reason": b.reason} for b in result.blockers],
+                "sub_origin_exclusions": result.exclusions.as_dict(),
+                "census": result.census,
+            },
+        )
+        return 3
     if not result.items and not result.cash_lots and not result.blockers:
         # Wholly Sub-origin (or empty) partition: a clean, explicit no-op.
         _write_receipt(

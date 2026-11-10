@@ -92,6 +92,7 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
                     "status": "posted",
                     "dotmac_sub_id": None,
                     "splynx_id": None,
+                    "customer_dotmac_sub_id": None,
                 },
                 {
                     "invoice_id": "sub-1",
@@ -103,6 +104,7 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
                     "status": "posted",
                     "dotmac_sub_id": "sub-ext-1",
                     "splynx_id": None,
+                    "customer_dotmac_sub_id": None,
                 },
             ]
         )
@@ -277,6 +279,7 @@ def test_billing_preflight_wholly_sub_origin_is_a_clean_noop(tmp_path, monkeypat
                     "status": "posted",
                     "dotmac_sub_id": "sub-ext-1",
                     "splynx_id": None,
+                    "customer_dotmac_sub_id": None,
                 }
             ]
         )

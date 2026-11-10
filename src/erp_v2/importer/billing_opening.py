@@ -105,6 +105,8 @@ SPLYNX_ERA_POLICY = "block"  # "block" | "native" (lift only after the M13 rulin
 SPLYNX_ERA_REASON = "splynx_era_pending_ruling"
 SPLYNX_FIELD = "splynx_id"
 SUB_ORIGIN_FIELD = "dotmac_sub_id"
+INVOICE_REQUIRED_FIELDS = (SUB_ORIGIN_FIELD, SPLYNX_FIELD, "customer_dotmac_sub_id")
+PAYMENT_REQUIRED_FIELDS = (SUB_ORIGIN_FIELD, SPLYNX_FIELD)
 SUB_ORIGIN_REASON = "sub_origin"
 UNDER_REVIEW_REASON = "discharged by payment under review"
 
@@ -139,6 +141,7 @@ class SubOriginExclusions:
     payments: tuple[str, ...] = ()  # Sub-tagged payments excluded whole
     mixed_payments: tuple[ExcludedPaymentSplit, ...] = ()  # ERP cash on Sub invoices (blocked)
     totals_minor: Mapping[str, int] = field(default_factory=dict)
+    inexact_keys: tuple[str, ...] = ()  # excluded rows whose amount is not exact: NOT in totals_minor
 
     def counts(self) -> dict[str, int]:
         return {
@@ -153,6 +156,7 @@ class SubOriginExclusions:
         return {
             "counts": self.counts(),
             "totals_minor": dict(sorted(self.totals_minor.items())),
+            "inexact_amount_keys": list(self.inexact_keys),
             "invoices": list(self.invoices),
             "credit_notes": list(self.credit_notes),
             "allocations": list(self.allocations),
@@ -264,10 +268,15 @@ def _classify_sub_origin(
     """Split Sub-origin rows out of the legacy AR rows and fail closed (F1)."""
 
     precision = partition.precision
-    for kind, rows, id_field in (("invoice", invoices, "invoice_id"), ("payment", payments, "payment_id")):
+    for kind, rows, id_field, required in (
+        ("invoice", invoices, "invoice_id", INVOICE_REQUIRED_FIELDS),
+        ("payment", payments, "payment_id", PAYMENT_REQUIRED_FIELDS),
+    ):
         seen: set[str] = set()
         for row in rows:
             row_key = str(row[id_field])
+            for required_field in required:  # every row, Sub-origin included, BEFORE classification
+                _tag(row, required_field, kind, row_key)
             if row_key in seen:
                 raise OpeningTranslationError(f"duplicate {kind} id {row_key} in export")
             seen.add(row_key)
@@ -280,6 +289,7 @@ def _classify_sub_origin(
     sub_invoices: list[str] = []
     sub_credit_notes: list[str] = []
     sub_invoice_minor = 0
+    inexact_keys: list[str] = []
     candidates: list[Mapping[str, object]] = []
     splynx_keys: dict[str, list[str]] = {"invoices": [], "payments": []}
     sub_customers: set[str] = set()
@@ -291,7 +301,10 @@ def _classify_sub_origin(
             sub_invoice_ids.add(key)
             invoice_outcome[key] = "excluded_sub_origin"
             minor = _minor(Decimal(str(invoice["total_amount"])), precision)
-            sub_invoice_minor += minor or 0
+            if minor is None:
+                inexact_keys.append(key)
+            else:
+                sub_invoice_minor += minor
             if str(invoice.get("invoice_type", "")).upper() == "CREDIT_NOTE":
                 sub_credit_notes.append(key)
             else:
@@ -336,12 +349,10 @@ def _classify_sub_origin(
 
         if sub_tagged and not (absent or unusable or to_native):
             excluded_payments.append(pid)  # Sub-tagged and every allocation (if any) is Sub-origin
-            excluded_payment_minor += gross_minor or 0
-            dispositions.append(
-                OpeningDispositionV1(
-                    OpeningSourceIdentityV1(kind="payment", key=pid), partition, "excluded", SUB_ORIGIN_REASON, 0
-                )
-            )
+            if gross_minor is None:
+                inexact_keys.append(pid)
+            else:
+                excluded_payment_minor += gross_minor
             continue
         reason: str | None = None
         if sub_tagged:
@@ -388,6 +399,7 @@ def _classify_sub_origin(
         payments=tuple(sorted(excluded_payments)),
         mixed_payments=tuple(sorted(splits, key=lambda m: m.payment_id)),
         totals_minor={"invoices_and_credit_notes": sub_invoice_minor, "payments": excluded_payment_minor},
+        inexact_keys=tuple(sorted(inexact_keys)),
     )
     return _Prep(
         invoices=candidates,
@@ -412,10 +424,14 @@ def translate_partition(
 ) -> OpeningTranslation:
     """Translate one partition's legacy AR rows into opening evidence.
 
-    Invoice and payment rows MUST carry `dotmac_sub_id` (None =
-    ERP-native; anything else, blank included, = Sub-origin and
-    excluded); a row without the field is refused. Optional
-    `invoice_type` identifies credit notes for the exclusion counts.
+    REQUIRED export fields (checked on every row, Sub-origin rows
+    included, before classification; a row missing any is refused, so
+    older exports must be re-exported): invoices carry `dotmac_sub_id`,
+    `splynx_id` and `customer_dotmac_sub_id`; payments carry
+    `dotmac_sub_id` and `splynx_id`. `dotmac_sub_id` None = ERP-native;
+    anything else, blank included, = Sub-origin and excluded.
+    `splynx_id` set on a native row blocks it (SPLYNX_ERA_POLICY).
+    Optional: `invoice_type` (CREDIT_NOTE) for the exclusion counts.
     Invoice rows: invoice_id, invoice_number, customer_key,
     invoice_date (datetime), due_date (date|None), currency_code,
     subtotal/tax_amount/total_amount (Decimal), status.
@@ -652,6 +668,13 @@ def translate_partition(
         invoice_outcome,
         payment_outcome,
     )
+    if cash_lots and not items:
+        result.blockers.append(
+            OpeningBlocker(
+                f"partition:{partition.source_account_key}",
+                "ERP-recorded cash with no ERP-native invoice in the partition: exceptions review",
+            )
+        )
     result.items = tuple(items)
     result.cash_lots = tuple(cash_lots)
     result.dispositions = tuple(dispositions)
@@ -846,7 +869,9 @@ def preflight_opening_import(
 
 
 __all__ = [
+    "INVOICE_REQUIRED_FIELDS",
     "MAPPING_VERSION",
+    "PAYMENT_REQUIRED_FIELDS",
     "SOURCE_SYSTEM",
     "SPLYNX_ERA_POLICY",
     "SPLYNX_ERA_REASON",

@@ -49,6 +49,7 @@ def _invoice(**overrides):
         "status": "posted",
         "dotmac_sub_id": None,
         "splynx_id": None,
+        "customer_dotmac_sub_id": None,
     }
     base.update(overrides)
     return base
@@ -287,7 +288,8 @@ def test_sub_origin_invoices_excluded_with_allocations_payments_and_credit_notes
     assert ex.mixed_payments == ()
     assert ex.totals_minor["payments"] == 30000
     excluded = {d.identity.key: d for d in result.dispositions if d.disposition == "excluded"}
-    assert set(excluded) == {"sub-1", "sub-cn", "pay-sub"}
+    assert set(excluded) == {"sub-1", "sub-cn"}  # invoices only; payments reconcile in the census
+    assert all(d.identity.kind == "invoice" for d in result.dispositions)
     assert all(d.reason == "sub_origin" for d in excluded.values())
     assert result.census["balanced"] is True
     assert result.census["invoices"] == {
@@ -368,11 +370,12 @@ def test_allocation_to_absent_void_or_blocked_invoice_blocks_payment() -> None:
 
 
 def test_row_missing_field_is_refused() -> None:
-    for field_name in ("dotmac_sub_id", "splynx_id"):
+    for field_name in ("dotmac_sub_id", "splynx_id", "customer_dotmac_sub_id"):
         bad_invoice = _invoice()
         del bad_invoice[field_name]
         with pytest.raises(OpeningTranslationError, match=field_name):
             translate_partition(context=CTX, invoices=[bad_invoice], allocations=[], payments=[])
+    for field_name in ("dotmac_sub_id", "splynx_id"):
         bad_payment = _payment("p1", "5.00")
         del bad_payment[field_name]
         with pytest.raises(OpeningTranslationError, match=field_name):
@@ -484,3 +487,83 @@ def test_census_no_receivable_item_for_any_row_with_dotmac_sub_id() -> None:
     assert set(result.exclusions.invoices) == sub_keys
     excluded = {d.identity.key for d in result.dispositions if d.disposition == "excluded"}
     assert excluded == sub_keys
+
+
+def test_required_fields_checked_on_sub_origin_rows_before_classification() -> None:
+    sub_invoice = _invoice(invoice_id="sub-1", invoice_number="S", dotmac_sub_id="x")
+    del sub_invoice["splynx_id"]
+    with pytest.raises(OpeningTranslationError, match="splynx_id"):
+        translate_partition(context=CTX, invoices=[sub_invoice], allocations=[], payments=[])
+    sub_invoice = _invoice(invoice_id="sub-1", invoice_number="S", dotmac_sub_id="x")
+    del sub_invoice["customer_dotmac_sub_id"]
+    with pytest.raises(OpeningTranslationError, match="customer_dotmac_sub_id"):
+        translate_partition(context=CTX, invoices=[sub_invoice], allocations=[], payments=[])
+    sub_payment = _payment("p-sub", "5.00", dotmac_sub_id="x")
+    del sub_payment["splynx_id"]
+    with pytest.raises(OpeningTranslationError, match="splynx_id"):
+        translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[sub_payment])
+
+
+def test_partition_with_a_later_blocked_invoice_is_wholly_not_importable() -> None:
+    from dotmac_billing import OpeningTargetV1
+    from dotmac_kernel.cache import TenantScope
+
+    from erp_v2.importer.billing_opening import preflight_opening_import
+
+    result = translate_partition(
+        context=CTX,
+        invoices=[
+            _invoice(invoice_id="over", invoice_number="O", total_amount=Decimal("100.00")),
+            _invoice(invoice_id="fine", invoice_number="F"),
+        ],
+        allocations=[_alloc("over", "pay-over", "150.00")],
+        payments=[_payment("pay-over", "150.00"), _payment("pay-free", "50.00")],
+    )
+    assert "over" in _reasons(result)
+    assert result.cash_lots  # a lot is translated beside the blocked invoice...
+    tenant_id = uuid.uuid4()
+    manifest = build_manifest(tenant_id=tenant_id, capture=_capture(), translation=result)
+    target = OpeningTargetV1(
+        scope=TenantScope(tenant_id),
+        account_id=PARTITION.account_id,
+        currency="NGN",
+        precision=2,
+        expected_position_fingerprint="fp",
+        posting_watermark="wm",
+    )
+    preflight = preflight_opening_import(
+        translation=result,
+        manifest=manifest,
+        target=target,
+        migration_authority_ref="approval:test",
+        occurred_at=datetime(2026, 11, 8, tzinfo=UTC),
+    )
+    # ...but the whole partition is not importable while any blocker exists.
+    assert preflight.importable is False
+    assert "over" in {b.source_key for b in preflight.translation_blockers}
+
+
+def test_inexact_excluded_amounts_are_listed_not_counted_as_zero() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[
+            _invoice(invoice_id="s1", invoice_number="S1", dotmac_sub_id="x", total_amount=Decimal("10.001")),
+            _invoice(invoice_id="s2", invoice_number="S2", dotmac_sub_id="x", total_amount=Decimal("5.00")),
+            _invoice(),
+        ],
+        allocations=[],
+        payments=[],
+    )
+    assert result.exclusions.totals_minor["invoices_and_credit_notes"] == 500
+    assert result.exclusions.inexact_keys == ("s1",)
+
+
+def test_erp_cash_without_native_invoice_gets_a_named_blocker() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice(dotmac_sub_id="x")],
+        allocations=[],
+        payments=[_payment("pay-free", "50.00")],
+    )
+    assert result.items == ()
+    assert "exceptions review" in _reasons(result)["partition:cust-1"]
