@@ -86,11 +86,17 @@ from dotmac_ticketing.manifest import module as ticketing_module
 from dotmac_ui import UI_CONTRACT_VERSION, static_dir
 from dotmac_workflow_runtime.manifest import module as workflow_runtime_module
 
-from erp_v2 import ui
+from erp_v2 import (
+    settings_specs,  # noqa: F401 - registers browser setting declarations
+    ui,
+)
 from erp_v2.academy_sync.routes import academy_sync_feature
+from erp_v2.banking.routes import banking_web_feature
 from erp_v2.database import build_database_runtime, database_startup_checks
 from erp_v2.migration_bindings import ASSEMBLY_MODULE_PLANES
 from erp_v2.readiness import readiness_feature
+from erp_v2.web.payroll_routes import PAYROLL_MANAGE_PERMISSION, payroll_web_feature
+from erp_v2.web.revenue_routes import WRITE_PERMISSION, revenue_web_feature
 from erp_v2.web.routes import ACCESS_PERMISSION, erp_web_feature
 
 PRODUCT_NAME: Final = "dotmac-erp"
@@ -114,6 +120,9 @@ assembly: Final = ProductAssemblySpec(
         readiness_feature,
         academy_sync_feature,
         erp_web_feature,
+        revenue_web_feature,
+        payroll_web_feature,
+        banking_web_feature,
         accounting_module,
         commercial_agreements_module,
         ai_operations_module,
@@ -173,6 +182,16 @@ assembly: Final = ProductAssemblySpec(
                 WebRouteRef("erp_web", "legacy", "payables_home"),
                 WebRouteRef("erp_web", "legacy", "payroll_home"),
                 WebRouteRef("erp_web", "legacy", "inventory_home"),
+                WebRouteRef("erp_payroll", "legacy", "payroll_actions_page"),
+                WebRouteRef("erp_payroll", "legacy", "payroll_create"),
+                WebRouteRef("erp_payroll", "legacy", "payroll_calculate"),
+                WebRouteRef("erp_revenue", "legacy", "receivables_register"),
+                WebRouteRef("erp_revenue", "legacy", "supplier_invoices"),
+                WebRouteRef("erp_revenue", "legacy", "supplier_invoice_new"),
+                WebRouteRef("erp_revenue", "legacy", "supplier_invoice_create"),
+                WebRouteRef("erp_revenue", "legacy", "supplier_invoice_detail"),
+                WebRouteRef("erp_revenue", "legacy", "supplier_invoice_submit"),
+                WebRouteRef("erp_banking", "legacy", "banking_workspace"),
             ),
             login_route=WebRouteRef("erp_web", "legacy", "login_page"),
             landing_route=WebRouteRef("erp_web", "legacy", "home"),
@@ -191,9 +210,11 @@ assembly: Final = ProductAssemblySpec(
     role_grant_profiles=(
         RoleGrantProfile(
             code="erp.web",
-            version=1,
+            version=2,
             grants=(
                 RoleGrant("admin", ACCESS_PERMISSION),
+                RoleGrant("admin", WRITE_PERMISSION),
+                RoleGrant("admin", PAYROLL_MANAGE_PERMISSION),
                 RoleGrant("staff", ACCESS_PERMISSION),
             ),
         ),

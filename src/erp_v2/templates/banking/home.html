@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Banking — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Banking</h1>
+<p>Bank observations arrive through Dotmac Integrator after account mapping and scoped credentials are provisioned. The observation HTTP receiver is awaiting trusted destination integration.</p>
+<h2>Bank accounts</h2>
+<table><thead><tr><th>Code</th><th>Account</th><th>Currency</th><th>Status</th></tr></thead><tbody>
+{% for a in accounts %}<tr><td>{{ a.account_code }}</td><td>{{ a.account_name }}</td><td>{{ a.currency_code }}</td><td>{{ a.status }}</td></tr>
+{% else %}<tr><td colspan="4">No bank accounts.</td></tr>{% endfor %}
+</tbody></table>
+<h2>Trusted provider mappings</h2>
+<table><thead><tr><th>Provider account</th><th>Installation</th><th>Write enabled</th></tr></thead><tbody>
+{% for b in bindings %}<tr><td>{{ b.provider_account_id }}</td><td>{{ b.installation_id }}</td><td>{{ b.enabled }}</td></tr>
+{% else %}<tr><td colspan="3">No account mappings provisioned.</td></tr>{% endfor %}
+</tbody></table>
+<h2>Recent statements</h2>
+<table><thead><tr><th>Reference</th><th>Date</th><th>Currency</th><th>Credits</th><th>Debits</th><th>Lines</th></tr></thead><tbody>
+{% for s in statements %}<tr><td>{{ s.statement_ref }}</td><td>{{ s.period_end | local_date }}</td><td>{{ s.currency_code }}</td><td>{{ s.total_credits }}</td><td>{{ s.total_debits }}</td><td>{{ s.total_lines }}</td></tr>
+{% else %}<tr><td colspan="6">No imported statements.</td></tr>{% endfor %}
+</tbody></table>
+<h2>Observation receipts</h2>
+<table><thead><tr><th>Transaction</th><th>Occurred</th><th>Statement</th><th>Correlation</th></tr></thead><tbody>
+{% for r in receipts %}<tr><td>{{ r.provider_transaction_id }}</td><td>{{ r.occurred_at | local_datetime }}</td><td>{{ r.statement_id }}</td><td>{{ r.correlation_id }}</td></tr>
+{% else %}<tr><td colspan="4">No accepted observations.</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}

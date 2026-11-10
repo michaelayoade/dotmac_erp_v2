@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Supplier invoices — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Supplier invoices</h1>
+<p><a href="/finance">Finance</a> · <a href="/finance/receivables">Receivables</a> · <a href="/finance/supplier-invoices/new">Enter supplier invoice (admin)</a></p>
+<p>Draft and submitted documents await review. Payment obligations and settlement evidence appear on each invoice.</p>
+<p>Supplier payment execution is unavailable: this release has no outbound payment executor.</p>
+<p>Showing up to 100 most recent documents.</p>
+<table>
+  <thead><tr><th>Number</th><th>Supplier</th><th>Supplier document</th><th>Date</th><th>Currency</th><th>Document total</th><th>Status</th></tr></thead>
+  <tbody>{% for i in invoices %}
+    <tr><td><a href="/finance/supplier-invoices/{{ i.id }}">{{ i.number }}</a></td><td>{{ i.supplier_name_snapshot }}</td><td>{{ i.supplier_document_number }}</td><td>{{ i.invoice_date }}</td><td>{{ i.currency_code }}</td><td>{{ i.total_amount }}</td><td>{{ i.status }}</td></tr>
+  {% else %}<tr><td colspan="7">No supplier invoices.</td></tr>{% endfor %}</tbody>
+</table>
+{% endblock %}

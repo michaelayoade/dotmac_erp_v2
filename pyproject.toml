@@ -60,6 +60,7 @@ dependencies = [
     # Driver is an assembly concern (kernel excludes it deliberately).
     "psycopg[binary]==3.1.19",
     "uvicorn>=0.29",
+    "python-multipart==0.0.33",  # browser forms and kernel CSRF form parsing
 ]
 
 [project.optional-dependencies]

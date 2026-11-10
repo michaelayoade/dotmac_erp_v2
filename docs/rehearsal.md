@@ -36,8 +36,10 @@ store). Exit codes: 0 ok, 2 refusal (named), 3 incomplete receipt.
    MIGRATION_DATABASE_URL=<dest> uv run python -m erp_v2.migrate upgrade heads
    ```
 
-   Expect the 32 module/kernel heads + `e2_0011_leases`
-   (`EXPECTED_HEADS`). Any head mismatch stops the rehearsal.
+   Compare the exact observed Alembic revision set with the candidate
+   `EXPECTED_STAMPED_HEADS` in `erp_v2.migrate` (current e2 lineage
+   ends at `e2_0012_academy_sync`). A matching count alone is insufficient.
+   Any revision-set mismatch stops the rehearsal.
 
 3. **Census** (no DB): `uv run python -m erp_v2.importer census --receipt <path>`
    - 426 legacy tables, one destination each.
@@ -75,7 +77,14 @@ store). Exit codes: 0 ok, 2 refusal (named), 3 incomplete receipt.
    measure for those families.
 
 6. **Apply** (same command + `--apply`, additionally
-   `ERP_IMPORT_APPLY_OK=1`). One destination transaction.
+   `ERP_IMPORT_APPLY_OK=1`). Apply commits per spec and transition;
+   it is NOT one atomic destination transaction. Failure or timeout can
+   leave a partially populated destination. Preserve the receipt and
+   logs, discard only the explicitly bound disposable destination,
+   rebuild it cleanly, and restart from the bound snapshot. Never rerun
+   apply into a partially imported destination. Exit 3 means incomplete,
+   not accepted: every exception class needs an explicit disposition
+   before a flip; see `docs/deployment.md`.
 
 7. **Billing (per partition, never executes here)**:
    `billing-plan` from read-only AR exports, then
