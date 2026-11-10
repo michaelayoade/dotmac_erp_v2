@@ -213,6 +213,7 @@ def _translate_billing_args(args: argparse.Namespace):
 
     from erp_v2.importer.billing_opening import (
         OpeningTranslationContext,
+        OpeningTranslationError,
         translate_partition,
     )
 
@@ -276,12 +277,15 @@ def _translate_billing_args(args: argparse.Namespace):
         customer_snapshot=customers.get,
         payment_instructions=PaymentInstructionsSnapshotV1(method_code="bank_transfer"),
     )
-    result = translate_partition(
-        context=context,
-        invoices=invoices,
-        allocations=_coerce(_rows(args.allocations_json)),
-        payments=_coerce(_rows(args.payments_json)),
-    )
+    try:
+        result = translate_partition(
+            context=context,
+            invoices=invoices,
+            allocations=_coerce(_rows(args.allocations_json)),
+            payments=_coerce(_rows(args.payments_json)),
+        )
+    except OpeningTranslationError as exc:
+        raise CliRefusal(str(exc)) from exc
     return manifest, context, result
 
 
@@ -300,6 +304,8 @@ def cmd_billing_plan(args: argparse.Namespace) -> int:
         "open_ar_minor": result.open_ar_minor,
         "cash_lots": len(result.cash_lots),
         "blockers": [{"source_key": b.source_key, "reason": b.reason} for b in result.blockers],
+        "sub_origin_exclusions": result.exclusions.as_dict(),
+        "census": result.census,
         "dispositions": [
             {"key": d.identity.key, "disposition": d.disposition, "residual_minor": d.residual_minor}
             for d in result.dispositions
@@ -334,6 +340,35 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
     if len(manifest.tenant_extent) != 1:
         raise CliRefusal("billing-preflight requires a single-tenant snapshot extent")
     tenant_id = _uuid.UUID(str(manifest.tenant_extent[0]))
+    if not result.items and result.blockers:
+        _write_receipt(
+            Path(args.receipt),
+            {
+                "kind": "billing-preflight",
+                "manifest": manifest.as_dict(),
+                "importable": False,
+                "translation_blockers": [{"source_key": b.source_key, "reason": b.reason} for b in result.blockers],
+                "sub_origin_exclusions": result.exclusions.as_dict(),
+                "census": result.census,
+            },
+        )
+        return 3
+    if not result.items and not result.cash_lots and not result.blockers:
+        # Wholly Sub-origin (or empty) partition: a clean, explicit no-op.
+        _write_receipt(
+            Path(args.receipt),
+            {
+                "kind": "billing-preflight",
+                "manifest": manifest.as_dict(),
+                "nothing_to_import": "sub_origin"
+                if any(result.exclusions.counts()[k] for k in ("invoices", "credit_notes", "payments"))
+                else "empty",
+                "importable": False,
+                "sub_origin_exclusions": result.exclusions.as_dict(),
+                "census": result.census,
+            },
+        )
+        return 0
     economic_cutoff = _datetime.fromisoformat(str(args.economic_cutoff))
     recorded_cutoff = _datetime.fromisoformat(str(args.recorded_cutoff))
     capture = OpeningCaptureV1(
@@ -384,6 +419,8 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
         "translation_blockers": [
             {"source_key": b.source_key, "reason": b.reason} for b in preflight.translation_blockers
         ],
+        "sub_origin_exclusions": result.exclusions.as_dict(),
+        "census": result.census,
     }
     _write_receipt(Path(args.receipt), payload)
     return 0 if preflight.importable else 3

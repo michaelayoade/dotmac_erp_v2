@@ -24,6 +24,29 @@ One translation per partition (billing account + currency):
   `collectible_receivable_minor` stays 0 in manifest controls until
   product evidence exists. Automated collection therefore cannot
   start on migrated balances — by design, not by accident.
+- **Sub-origin exclusion (F1).** ERP v2 is never the receivables
+  authority for a Sub-originated record: Sub's own Billing owns those
+  open items. Invoices (credit notes included) with
+  `dotmac_sub_id IS NOT NULL` (blank string counts) get an `excluded`
+  disposition with reason `sub_origin`, as do Sub-tagged payments whose
+  allocations (if any) are all Sub-origin. An ERP-recorded payment that
+  touches a Sub-origin invoice is a blocker for the exceptions review
+  (per-allocation evidence in minor units); it is never split or
+  re-attributed. An allocation to an invoice that is absent, void or
+  blocked blocks its payment. Splynx-era rows (`splynx_id` set,
+  `dotmac_sub_id` NULL) are blocked as `splynx_era_pending_ruling`
+  (`SPLYNX_ERA_POLICY`, pending the M13 ruling). Required export
+  fields, checked on every row (Sub-origin rows included) before
+  classification: invoices carry `dotmac_sub_id`, `splynx_id` and
+  `customer_dotmac_sub_id`; payments carry `dotmac_sub_id` and
+  `splynx_id`. A row missing any is refused, so older exports must be
+  re-exported. `customer_dotmac_sub_id` feeds a census only. Optional:
+  `invoice_type` (CREDIT_NOTE). Payments are reconciled in the receipt
+  census only; the manifest population lists invoices only. ERP cash
+  in a partition with no ERP-native invoice is a named blocker. Receipts carry
+  `sub_origin_exclusions` and a `census` that must balance per family
+  (the run is refused otherwise). A wholly Sub-origin partition makes
+  `billing-preflight` report `nothing_to_import` and exit 0.
 - Void/draft invoices are excluded dispositions, counted in the
   manifest population; nothing is dropped silently.
 
