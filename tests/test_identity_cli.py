@@ -306,3 +306,11 @@ def test_input_digests_bind_the_single_read_bytes(tmp_path, monkeypatch):
     with pytest.raises(cli.OperatorRefusal, match="operator_database_materials_required"):
         cli._run(args)
     assert counts == {args.manifest: 1, args.allowlist: 1}
+
+
+def test_source_schema_cannot_be_substituted_outside_reviewed_binding(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_run", lambda args: pytest.fail("must not run"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main([*arguments(tmp_path), "--source-schema", "alternate"])
+    assert exc.value.code == 2
+    assert not (tmp_path / "receipt.json").exists()

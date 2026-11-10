@@ -261,7 +261,7 @@ def _run(args) -> dict:
                 source_connection.execute(sa.text("SET TRANSACTION READ ONLY"))
                 if source_connection.scalar(sa.text("SELECT current_database()")) != manifest.source_database:
                     _refuse("source_database_mismatch")
-                records = _source_records(source_connection, scope, args.source_schema)
+                records = _source_records(source_connection, scope, "public")
                 with Session(destination) as db, db.begin():
                     if db.scalar(sa.text("SELECT current_database()")) != manifest.destination_database:
                         _refuse("destination_database_mismatch")
@@ -293,7 +293,6 @@ def main(argv=None) -> int:
     parser.add_argument("--snapshot-file", required=True, type=Path)
     parser.add_argument("--allowlist", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
-    parser.add_argument("--source-schema", default="public")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--approved-allowlist-sha256")
     parser.add_argument("--approved-manifest-sha256")

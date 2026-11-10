@@ -64,3 +64,6 @@ the cohort; no MFA secret is read or copied and no security flag is cleared.
 These account states need their supported source/target flow, not an automatic
 migration override. The importer is not proof of complete authentication-policy
 parity (including future lockout and MFA operations); that remains a release gate.
+
+The legacy source schema is fixed to `public`; no unreviewed schema override
+can change which credential, person or MFA tables supply a reviewed cohort.
