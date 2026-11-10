@@ -218,6 +218,9 @@ def test_sourcing_lines_sales_leads_and_document_types() -> None:
 
     leads = run_mint_step("sales_leads", src, dst, CTX)
     assert leads.created == 3  # pipeline + stage + 1 lead
+    assert leads.excluded_sub_origin == 1  # cu3 is Sub-tagged: no lead, counted
+    assert not any("cu3" in b for b in leads.blockers)
+    assert dst.execute(sa.text("SELECT count(*) FROM mod_sales.leads")).scalar() == 1
     assert any("cu2" in b for b in leads.blockers)
 
     docs = run_mint_step("document_libraries_types", src, dst, CTX)

@@ -66,6 +66,7 @@ class MintResult:
     existing: int = 0
     blockers: list[str] = field(default_factory=list)
     refused: str | None = None
+    excluded_sub_origin: int = 0  # Sub-tagged legacy rows deliberately not minted (M11 pending)
 
 
 def _norm(value: Any) -> Any:
@@ -424,6 +425,9 @@ def mint_sales_leads(source: sa.Connection, dest: sa.Connection, ctx: MintContex
                 "FROM customer WHERE dotmac_sub_id IS NULL"
             )
         ).mappings()
+    )
+    result.excluded_sub_origin = (
+        source.execute(sa.text("SELECT count(*) FROM customer WHERE dotmac_sub_id IS NOT NULL")).scalar() or 0
     )
     tenants = sorted({_norm(c["organization_id"]) for c in customers}, key=str)
     pipeline_by_tenant: dict[Any, str] = {}
