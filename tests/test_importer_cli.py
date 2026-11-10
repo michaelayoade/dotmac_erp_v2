@@ -91,6 +91,7 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
                     "total_amount": "1000.00",
                     "status": "posted",
                     "dotmac_sub_id": None,
+                    "splynx_id": None,
                 },
                 {
                     "invoice_id": "sub-1",
@@ -101,6 +102,7 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
                     "total_amount": "500.00",
                     "status": "posted",
                     "dotmac_sub_id": "sub-ext-1",
+                    "splynx_id": None,
                 },
             ]
         )
@@ -126,6 +128,7 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
     assert data["items"] == 1 and data["open_ar_minor"] == 100000
     assert data["sub_origin_exclusions"]["counts"]["invoices"] == 1
     assert data["sub_origin_exclusions"]["invoices"] == ["sub-1"]
+    assert data["census"]["balanced"] is True and data["census"]["invoices"]["source"] == 2
 
 
 def test_reflected_plan_survives_forbidden_runtime_env_names(tmp_path) -> None:
@@ -256,3 +259,59 @@ def test_execute_apply_commits_per_spec(tmp_path, monkeypatch) -> None:
     with dst.connect() as c:
         assert c.execute(sa.text("SELECT count(*) FROM widgets_out")).scalar() == 2
         assert c.execute(sa.text("SELECT count(*) FROM gadgets_out")).scalar() == 1
+
+
+def test_billing_preflight_wholly_sub_origin_is_a_clean_noop(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ERP_SELLER_LEGAL_NAME", "Dotmac Ltd")
+    invoices = tmp_path / "inv.json"
+    invoices.write_text(
+        json.dumps(
+            [
+                {
+                    "invoice_id": "sub-1",
+                    "invoice_number": "S-1",
+                    "customer_key": "cust-1",
+                    "invoice_date": "2026-01-05T00:00:00+00:00",
+                    "currency_code": "NGN",
+                    "total_amount": "500.00",
+                    "status": "posted",
+                    "dotmac_sub_id": "sub-ext-1",
+                    "splynx_id": None,
+                }
+            ]
+        )
+    )
+    receipt = tmp_path / "r.json"
+    code = main(
+        [
+            "billing-preflight",
+            "--manifest",
+            str(_manifest(tmp_path)),
+            "--invoices-json",
+            str(invoices),
+            "--source-account-key",
+            "cust-1",
+            "--account-id",
+            "22222222-2222-2222-2222-222222222222",
+            "--expected-position-fingerprint",
+            "fp",
+            "--posting-watermark",
+            "wm",
+            "--migration-authority-ref",
+            "ref",
+            "--source-authority-ref",
+            "ref",
+            "--economic-cutoff",
+            "2026-02-01T00:00:00+00:00",
+            "--recorded-cutoff",
+            "2026-02-01T00:00:00+00:00",
+            "--source-schema-heads",
+            "h1",
+            "--receipt",
+            str(receipt),
+        ]
+    )
+    assert code == 0
+    data = json.loads(receipt.read_text())
+    assert data["nothing_to_import"] == "sub_origin"
+    assert data["census"]["balanced"] is True

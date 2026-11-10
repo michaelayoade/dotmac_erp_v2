@@ -48,6 +48,7 @@ def _invoice(**overrides):
         "total_amount": Decimal("1000.00"),
         "status": "posted",
         "dotmac_sub_id": None,
+        "splynx_id": None,
     }
     base.update(overrides)
     return base
@@ -73,6 +74,7 @@ def test_open_invoice_residual_after_partial_payment() -> None:
                 "reference": "RCPT-1",
                 "status": "confirmed",
                 "dotmac_sub_id": None,
+                "splynx_id": None,
             }
         ],
     )
@@ -110,6 +112,7 @@ def test_void_overpaid_inexact_and_unallocated_cash() -> None:
                 "reference": "RCPT-9",
                 "status": "confirmed",
                 "dotmac_sub_id": None,
+                "splynx_id": None,
             },
             {
                 "payment_id": "pay-free",
@@ -118,6 +121,7 @@ def test_void_overpaid_inexact_and_unallocated_cash() -> None:
                 "reference": "RCPT-10",
                 "status": "confirmed",
                 "dotmac_sub_id": None,
+                "splynx_id": None,
             },
         ],
     )
@@ -250,9 +254,14 @@ def _payment(payment_id: str, amount: str, **overrides) -> dict:
         "reference": f"RCPT-{payment_id}",
         "status": "confirmed",
         "dotmac_sub_id": None,
+        "splynx_id": None,
     }
     row.update(overrides)
     return row
+
+
+def _reasons(result) -> dict[str, str]:
+    return {b.source_key: b.reason for b in result.blockers}
 
 
 def test_sub_origin_invoices_excluded_with_allocations_payments_and_credit_notes() -> None:
@@ -264,7 +273,7 @@ def test_sub_origin_invoices_excluded_with_allocations_payments_and_credit_notes
             _invoice(invoice_id="sub-cn", invoice_number="S-CN", dotmac_sub_id="sub-ext-2", invoice_type="CREDIT_NOTE"),
         ],
         allocations=[_alloc("sub-1", "pay-sub", "300.00"), _alloc("native-1", "pay-nat", "100.00")],
-        payments=[_payment("pay-sub", "300.00"), _payment("pay-nat", "100.00")],
+        payments=[_payment("pay-sub", "300.00", dotmac_sub_id="sx"), _payment("pay-nat", "100.00")],
     )
     assert not result.blockers
     assert [i.source_invoice_key for i in result.items] == ["native-1"]
@@ -276,10 +285,22 @@ def test_sub_origin_invoices_excluded_with_allocations_payments_and_credit_notes
     assert ex.allocations == ("pay-sub:sub-1",)
     assert ex.payments == ("pay-sub",)
     assert ex.mixed_payments == ()
-    assert ex.counts() == {"invoices": 1, "credit_notes": 1, "allocations": 1, "payments": 1, "mixed_payments": 0}
+    assert ex.totals_minor["payments"] == 30000
+    excluded = {d.identity.key: d for d in result.dispositions if d.disposition == "excluded"}
+    assert set(excluded) == {"sub-1", "sub-cn", "pay-sub"}
+    assert all(d.reason == "sub_origin" for d in excluded.values())
+    assert result.census["balanced"] is True
+    assert result.census["invoices"] == {
+        "source": 3,
+        "translated": 1,
+        "excluded_void": 0,
+        "excluded_sub_origin": 2,
+        "blocked": 0,
+    }
+    assert result.census["payments"]["excluded_sub_origin"] == 1
 
 
-def test_mixed_payment_keeps_native_allocations_and_reports_remainder() -> None:
+def test_erp_payment_on_sub_invoice_blocks_with_evidence_and_no_split() -> None:
     result = translate_partition(
         context=CTX,
         invoices=[
@@ -289,29 +310,78 @@ def test_mixed_payment_keeps_native_allocations_and_reports_remainder() -> None:
         allocations=[_alloc("native-1", "pay-mix", "100.00"), _alloc("sub-1", "pay-mix", "250.00")],
         payments=[_payment("pay-mix", "400.00")],
     )
-    assert not result.blockers
-    (item,) = result.items
-    assert item.residual_minor == 90000 and len(item.historical_discharges) == 1
+    reasons = _reasons(result)
+    assert "exceptions review" in reasons["pay-mix"] and "unapplied 5000" in reasons["pay-mix"]
+    assert reasons["native-1"] == "discharged by payment under review"
+    assert result.cash_lots == () and result.items == ()
     (split,) = result.exclusions.mixed_payments
-    assert split.payment_id == "pay-mix"
-    assert split.excluded_allocations == ("pay-mix:sub-1",)
-    assert split.excluded_amount_minor == 25000
-    assert split.kept_allocations == ("pay-mix:native-1",)
+    assert (split.gross_minor, split.sub_share_minor, split.native_share_minor, split.remainder_minor) == (
+        40000,
+        25000,
+        10000,
+        5000,
+    )
+    assert result.exclusions.payments == ()  # not "excluded whole": ERP cash is never dropped silently
+    assert result.census["payments"]["blocked"] == 1
+
+
+def test_erp_payment_wholly_on_sub_invoices_with_remainder_blocks_and_reports_amount() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice(invoice_id="sub-1", invoice_number="S-1", dotmac_sub_id="x")],
+        allocations=[_alloc("sub-1", "pay-1", "100.00")],
+        payments=[_payment("pay-1", "130.00")],
+    )
+    assert "unapplied 3000" in _reasons(result)["pay-1"]
     assert result.exclusions.payments == ()
-    # 400 gross - 250 Sub share - 100 native alloc = 50 unapplied; Sub's 250 is not re-attributed
-    (lot,) = result.cash_lots
-    assert lot.gross_minor == 15000 and lot.residual_minor == 5000
+    assert result.cash_lots == ()
+
+
+def test_allocation_to_absent_void_or_blocked_invoice_blocks_payment() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[
+            _invoice(invoice_id="void-1", invoice_number="V", status="voided"),
+            _invoice(invoice_id="bad-1", invoice_number="B", total_amount=Decimal("10.001")),
+            _invoice(invoice_id="ok-1", invoice_number="O"),
+        ],
+        allocations=[
+            _alloc("ghost", "pay-a", "10.00"),
+            _alloc("void-1", "pay-v", "10.00"),
+            _alloc("bad-1", "pay-b", "10.00"),
+            _alloc("ok-1", "pay-ok", "10.00"),
+        ],
+        payments=[
+            _payment("pay-a", "10.00"),
+            _payment("pay-v", "10.00"),
+            _payment("pay-b", "10.00"),
+            _payment("pay-ok", "10.00"),
+        ],
+    )
+    reasons = _reasons(result)
+    assert reasons["pay-a"] == "allocation targets invoice absent from export"
+    assert reasons["pay-v"] == "allocation targets void or blocked invoice"
+    assert reasons["pay-b"] == "allocation targets void or blocked invoice"
+    assert "pay-ok" not in reasons
+    assert result.census["payments"]["blocked"] == 3
+    assert result.census["payments"]["fully_allocated"] == 1
 
 
 def test_row_missing_field_is_refused() -> None:
-    bad_invoice = _invoice()
-    del bad_invoice["dotmac_sub_id"]
-    with pytest.raises(OpeningTranslationError, match="dotmac_sub_id"):
-        translate_partition(context=CTX, invoices=[bad_invoice], allocations=[], payments=[])
-    bad_payment = _payment("p1", "5.00")
-    del bad_payment["dotmac_sub_id"]
-    with pytest.raises(OpeningTranslationError, match="dotmac_sub_id"):
-        translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[bad_payment])
+    for field_name in ("dotmac_sub_id", "splynx_id"):
+        bad_invoice = _invoice()
+        del bad_invoice[field_name]
+        with pytest.raises(OpeningTranslationError, match=field_name):
+            translate_partition(context=CTX, invoices=[bad_invoice], allocations=[], payments=[])
+        bad_payment = _payment("p1", "5.00")
+        del bad_payment[field_name]
+        with pytest.raises(OpeningTranslationError, match=field_name):
+            translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[bad_payment])
+
+
+def test_duplicate_ids_refuse_so_census_cannot_mislead() -> None:
+    with pytest.raises(OpeningTranslationError, match="duplicate invoice"):
+        translate_partition(context=CTX, invoices=[_invoice(), _invoice()], allocations=[], payments=[])
 
 
 def test_native_rows_unchanged_and_blank_string_is_sub_origin() -> None:
@@ -321,13 +391,14 @@ def test_native_rows_unchanged_and_blank_string_is_sub_origin() -> None:
         allocations=[_alloc("inv-1", "pay-1", "400.00")],
         payments=[_payment("pay-1", "400.00"), _payment("pay-free", "50.00")],
     )
+    assert not result.blockers
     assert [i.source_invoice_key for i in result.items] == ["inv-1"]
     assert result.open_ar_minor == 60000
     assert [lot.source_identity.key for lot in result.cash_lots] == ["pay-free"]
     assert result.exclusions.invoices == ("blank",)  # legacy IS NOT NULL: blank counts
 
 
-def test_unallocated_sub_tagged_payment_excluded_and_contradiction_blocked() -> None:
+def test_sub_tagged_payment_unallocated_excluded_and_contradiction_blocked() -> None:
     result = translate_partition(
         context=CTX,
         invoices=[_invoice()],
@@ -335,18 +406,68 @@ def test_unallocated_sub_tagged_payment_excluded_and_contradiction_blocked() -> 
         payments=[_payment("pay-s", "20.00", dotmac_sub_id="s"), _payment("pay-c", "10.00", dotmac_sub_id="s")],
     )
     assert result.exclusions.payments == ("pay-s",)
-    # the contradictory payment is held back, so the invoice it paid blocks too
-    assert sorted(b.source_key for b in result.blockers) == ["inv-1", "pay-c"]
+    reasons = _reasons(result)
+    assert set(reasons) == {"pay-c", "inv-1"}
+    assert reasons["inv-1"] == "discharged by payment under review"
+
+
+def test_negative_cash_residual_is_a_blocker() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice(total_amount=Decimal("1000.00"))],
+        allocations=[_alloc("inv-1", "pay-1", "500.00")],
+        payments=[_payment("pay-1", "400.00")],
+    )
+    assert "negative cash residual" in _reasons(result)["pay-1"]
+    assert result.cash_lots == ()
+
+
+def test_splynx_era_rows_are_blocked_and_reported() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice(invoice_id="spl", invoice_number="SP", splynx_id="123"), _invoice()],
+        allocations=[],
+        payments=[_payment("pay-spl", "5.00", splynx_id="9"), _payment("pay-ok", "5.00")],
+    )
+    reasons = _reasons(result)
+    assert reasons["spl"] == "splynx_era_pending_ruling"
+    assert reasons["pay-spl"] == "splynx_era_pending_ruling"
+    assert [i.source_invoice_key for i in result.items] == ["inv-1"]
+    assert result.census["splynx_era"]["invoices"] == ["spl"]
+    assert result.census["splynx_era"]["payments"] == ["pay-spl"]
+
+
+def test_sub_tagged_customers_on_native_invoices_are_reported() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice(customer_dotmac_sub_id="c-sub")],
+        allocations=[],
+        payments=[],
+    )
+    assert result.census["sub_tagged_customers_on_native_invoices"] == ["cust-1"]
+    assert len(result.items) == 1  # reporting only, no exclusion
+
+
+def test_wholly_sub_origin_partition_translates_to_nothing_with_census() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice(dotmac_sub_id="x")],
+        allocations=[],
+        payments=[],
+    )
+    assert result.items == () and not result.blockers
+    assert result.census["invoices"]["excluded_sub_origin"] == 1
 
 
 def test_exclusions_are_deterministic_regardless_of_input_order() -> None:
     invoices = [_invoice(invoice_id=f"sub-{n}", invoice_number=f"S{n}", dotmac_sub_id="x") for n in (3, 1, 2)]
     allocs = [_alloc(f"sub-{n}", f"pay-{n}", "1.00") for n in (3, 1, 2)]
-    pays = [_payment(f"pay-{n}", "1.00") for n in (3, 1, 2)]
+    pays = [_payment(f"pay-{n}", "1.00", dotmac_sub_id="x") for n in (3, 1, 2)]
     a = translate_partition(context=CTX, invoices=invoices, allocations=allocs, payments=pays)
     b = translate_partition(context=CTX, invoices=invoices[::-1], allocations=allocs[::-1], payments=pays[::-1])
     assert a.exclusions == b.exclusions
     assert a.exclusions.as_dict() == b.exclusions.as_dict()
+    assert a.census == b.census
     assert a.exclusions.invoices == ("sub-1", "sub-2", "sub-3")
 
 
@@ -361,4 +482,5 @@ def test_census_no_receivable_item_for_any_row_with_dotmac_sub_id() -> None:
     assert sub_keys and not (produced & sub_keys)
     assert produced == {"n0", "n1", "n2"}
     assert set(result.exclusions.invoices) == sub_keys
-    assert not any(d.identity.key in sub_keys for d in result.dispositions)
+    excluded = {d.identity.key for d in result.dispositions if d.disposition == "excluded"}
+    assert excluded == sub_keys
