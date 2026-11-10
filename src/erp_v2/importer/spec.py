@@ -23,6 +23,8 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from erp_v2.importer.sub_origin import SUB_ORIGIN_COLUMN, SubCustomerRef, SubOriginPolicy
+
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -97,6 +99,14 @@ class TransformSpec:
     # ~39k FK errors, journal import 10x slower). Deferred columns
     # must be nullable and mapped; updates that still fail (parent
     # row itself exceptioned) become named exceptions.
+    sub_customer_ref: SubCustomerRef | None = None
+    # Child rows referencing a Sub-tagged customer become named row
+    # exceptions (M11 pending); see sub_origin.SubCustomerRef.
+    sub_origin: SubOriginPolicy | None = None
+    # Declared policy for a source carrying `dotmac_sub_id`. EXCLUDE:
+    # the executor reads only `dotmac_sub_id IS NULL` rows and counts
+    # the rest in the receipt census (F1: ERP v2 is never the
+    # authority for a Sub-originated record).
     null_fallbacks: Mapping[str, str] = field(default_factory=dict)
     # destination column -> fallback applied by the executor ONLY
     # when the mapped source value is NULL. Closed set: "row_id"
@@ -216,6 +226,8 @@ def build_spec(
     null_fallbacks: Mapping[str, str] | None = None,
     deferred: tuple[str, ...] = (),
     json_columns: tuple[str, ...] = (),
+    sub_origin: SubOriginPolicy | None = None,
+    sub_customer_ref: SubCustomerRef | None = None,
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -316,6 +328,13 @@ def build_spec(
         _check(dest_col)
         if dest_col not in column_map:
             raise ValueError(f"deferred column {dest_col!r} is not mapped from the source")
+    if sub_origin is SubOriginPolicy.EXCLUDE and SUB_ORIGIN_COLUMN not in source_set:
+        # Declared exclude but nothing to filter on: refuse, never import unfiltered.
+        missing.append(f"sub_origin_column:{SUB_ORIGIN_COLUMN}")
+    if sub_origin is SubOriginPolicy.NOT_APPLICABLE and SUB_ORIGIN_COLUMN in source_set:
+        missing.append(f"sub_origin_not_applicable_but_column_present:{SUB_ORIGIN_COLUMN}")
+    if sub_origin is None and SUB_ORIGIN_COLUMN in source_set:
+        missing.append(f"sub_origin_policy_undeclared:{SUB_ORIGIN_COLUMN}")
     consumed = set(column_map.values())
     residue = tuple(sorted(source_set - consumed))
     return TransformSpec(
@@ -333,6 +352,8 @@ def build_spec(
         null_fallbacks=null_fallbacks,
         deferred=tuple(deferred),
         json_columns=tuple(json_columns),
+        sub_origin=sub_origin,
+        sub_customer_ref=sub_customer_ref,
     )
 
 

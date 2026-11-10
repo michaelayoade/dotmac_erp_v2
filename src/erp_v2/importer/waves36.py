@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from typing import Final
 
 from erp_v2.importer.spec import TransformSpec, build_spec, destination_columns_from_table
+from erp_v2.importer.sub_origin import SubCustomerRef, SubOriginPolicy
 from erp_v2.importer.wave2 import Pairing
 
 _BILLING_TENANT_TABLES: Final = (
@@ -325,6 +326,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         },
         constants={"source": "MANUAL"},
         lookups={"intent_id": ("payment_intent_by_payment", "id", "intent_id")},
+        sub_origin=SubOriginPolicy.EXCLUDE,  # F1: Sub-origin cash is Sub Billing's, never ERP v2's
         note="source=MANUAL (ConfirmationSource): legacy rows are recorded "
         "payments, not provider callbacks. intent_id via the enrolment map "
         "built from legacy payment_intent.customer_payment_id; payments "
@@ -642,12 +644,14 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_customers.customer_accounts",
         "public.customer",
         renames={"account_number": "customer_code", "display_name": "legal_name"},
+        sub_origin=SubOriginPolicy.EXCLUDE,  # pending Michael's M11 ruling on Sub customers
         note="status from is_active/credit_hold at rehearsal; credit/tax/banking detail lands in customer_profiles",
     ),
     Pairing(
         "mod_customers.customer_profiles",
         "public.customer",
         renames={"account_id": "customer_id"},
+        sub_origin=SubOriginPolicy.EXCLUDE,  # pending Michael's M11 ruling on Sub customers
         note="second spec from the same legacy row (profile columns split); "
         "account_id is the preserved customer UUID (customer_accounts.id)",
     ),
@@ -666,6 +670,7 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "effective_date": "start_date",
             "expiry_date": "end_date",
         },
+        sub_customer_ref=SubCustomerRef("customer_id"),  # counterparty_ref may not be an FK
         lookups={"agreement_family_id": ("agreement_family", "id", "family_id")},
         note="commercial contracts only; employment/lease/performance "
         "contracts are e2. agreement_family_id: deterministic family per "
@@ -697,6 +702,7 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "authored_by_opaque_id": "created_by",
         },
         constants={"authored_by_kind": "user"},
+        sub_customer_ref=SubCustomerRef("customer_id"),
         lookups={
             "lead_id": ("quote_lead", "id", "lead_id"),
             "authored_by_label": ("user_label", "authored_by_opaque_id", "label"),
@@ -713,6 +719,7 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "public.quote_line",
         renames={"position": "line_number", "amount": "line_total"},
         computed={"gross_amount": "mul:quantity:unit_price"},
+        sub_customer_ref=SubCustomerRef("quote_id", via_table="quote", via_key="quote_id", via_customer="customer_id"),
         note="gross_amount computes as quantity x unit_price (exact "
         "Decimal); rehearsal parity-checks amount+discount against it",
     ),
@@ -1003,6 +1010,8 @@ def build_specs(
                 null_fallbacks=pairing.null_fallbacks,
                 deferred=pairing.deferred,
                 json_columns=pairing.json_columns,
+                sub_origin=pairing.sub_origin,
+                sub_customer_ref=pairing.sub_customer_ref,
             )
         )
     return tuple(specs), tuple(generated)

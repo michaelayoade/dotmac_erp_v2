@@ -192,6 +192,7 @@ RULED_LEGACY = {
         "updated_at",
     ),
     "public.customer_payment": (
+        "dotmac_sub_id",  # tagged legacy table (F1): the exclude policy needs the column
         "payment_id",
         "organization_id",
         "customer_id",
@@ -541,6 +542,7 @@ RULED_LEGACY = {
         "created_at",
     ),
     "public.customer": (
+        "dotmac_sub_id",  # tagged legacy table (F1): the exclude policy needs the column
         "customer_id",
         "organization_id",
         "customer_code",
@@ -914,6 +916,7 @@ def test_wave36_rulings_narrow_missing_to_named_decisions() -> None:
     # Spot-check the mechanisms the rulings rely on.
     assert by_dest["mod_banking.bank_statement_lines"].fk_rewrites == {"direction": "bank_direction_by_type"}
     assert by_dest["mod_payments.payment_confirmations"].constants == {"source": "MANUAL"}
+    assert by_dest["mod_payments.payment_confirmations"].sub_origin.value == "exclude"
     assert by_dest["mod_approvals.approval_requests"].lookups["policy_code"] == (
         "approval_request_policy",
         "id",

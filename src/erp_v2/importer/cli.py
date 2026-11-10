@@ -35,6 +35,15 @@ from erp_v2.importer.minting import MintContext, MintResult
 from erp_v2.importer.pipeline import order_specs, partition_parent_blocked, run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
+from erp_v2.importer.sub_origin import (
+    SUB_CUSTOMER_REFERENCE_REASON,
+    SUB_PAYMENT_INTENT_REASON,
+    SubOriginPolicy,
+    key_evidence,
+    payment_intents_on_sub_payments,
+    sub_tagged_customers_referenced_by_native,
+    write_side_file,
+)
 from erp_v2.importer.transitions import run_transitions
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
 from erp_v2.importer.wave2 import WAVE2_PAIRINGS, Pairing
@@ -171,6 +180,9 @@ def _spec_report(specs: Sequence[TransformSpec]) -> dict[str, object]:
         "residue_columns": sum(len(s.residue) for s in specs),
         "enrolment_maps_required": sorted(required_maps(specs)),
         "enrolment_maps_without_builder": sorted(unbuilt_maps(specs)),
+        "sub_origin_excluded_specs": sorted(
+            s.destination_table for s in specs if s.sub_origin is SubOriginPolicy.EXCLUDE
+        ),
     }
 
 
@@ -426,6 +438,85 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
     return 0 if preflight.importable else 3
 
 
+SIDE_FILE_SUFFIX = ".sub-origin-keys.json"
+
+
+def _sub_origin_receipt(source_engine: sa.Engine, source_schemas, reports, receipt_path: Path) -> dict[str, object]:
+    """Per-spec exclusion census, Sub-tagged customers native rows reference,
+    and payment intents on Sub-tagged payments.
+
+    Full sorted key lists go to a mode-600 side file beside the receipt; the
+    receipt carries counts, a sha256 of the newline-joined sorted keys and the
+    side-file name. `incomplete` lists named reasons the run cannot be complete.
+    """
+
+    side_path = receipt_path.with_name(receipt_path.name + SIDE_FILE_SUFFIX)
+    side: dict[str, list[str]] = {}
+    incomplete: list[str] = []
+    specs_out = []
+    for r in reports:
+        if r.census is not None:
+            side[f"excluded:{r.destination_table}"] = list(r.sub_origin_excluded_keys)
+            specs_out.append(
+                {
+                    "source_table": r.source_table,
+                    "destination_table": r.destination_table,
+                    "census": r.census,
+                    "excluded": key_evidence(list(r.sub_origin_excluded_keys), side_path.name),
+                }
+            )
+        if r.sub_customer_ref_rows:
+            side[f"customer_ref_rows:{r.destination_table}"] = list(r.sub_customer_ref_rows)
+            specs_out.append(
+                {
+                    "source_table": r.source_table,
+                    "destination_table": r.destination_table,
+                    "references_sub_tagged_customer": key_evidence(list(r.sub_customer_ref_rows), side_path.name),
+                }
+            )
+    section: dict[str, object] = {"specs": specs_out, "side_file": side_path.name}
+    if not any(r.census is not None for r in reports):
+        section["customers_referenced_by_native"] = {"skipped": "no exclude specs in this run"}
+    else:
+        try:
+            with source_engine.connect() as conn:
+                _set_search_path(conn, source_schemas)
+                customers = sub_tagged_customers_referenced_by_native(conn)
+        except sa.exc.SQLAlchemyError as exc:  # fail closed: an unrunnable census fails the run
+            section["customers_referenced_by_native"] = {"error": type(exc).__name__}
+            incomplete.append(f"sub-origin customer census could not run ({type(exc).__name__})")
+        else:
+            keys = list(customers.pop("keys"))
+            customers.pop("via_invoices"), customers.pop("via_payments")
+            side["customers_referenced_by_native"] = keys
+            section["customers_referenced_by_native"] = {**customers, **key_evidence(keys, side_path.name)}
+    # Independent of every exclude/customer_payment spec: any run that reads
+    # payment_intent must check it for intents on Sub-tagged payments.
+    if any(r.source_table.rpartition(".")[2] == "payment_intent" for r in reports):
+        try:
+            with source_engine.connect() as conn:
+                _set_search_path(conn, source_schemas)
+                intents = payment_intents_on_sub_payments(conn)
+        except sa.exc.SQLAlchemyError as exc:  # never skipped silently
+            section["payment_intents_on_sub_payments"] = {"error": type(exc).__name__}
+            incomplete.append(f"payment_intent census could not run ({type(exc).__name__})")
+        else:
+            side["payment_intents_on_sub_payments"] = intents
+            section["payment_intents_on_sub_payments"] = key_evidence(intents, side_path.name)
+            if intents:
+                incomplete.append(SUB_PAYMENT_INTENT_REASON)
+    if any(r.sub_customer_ref_rows for r in reports):
+        incomplete.append(SUB_CUSTOMER_REFERENCE_REASON)
+    if side:
+        try:
+            write_side_file(side_path, side)
+        except OSError as exc:
+            section["side_file_error"] = type(exc).__name__
+            incomplete.append(f"side file could not be written ({type(exc).__name__})")
+    section["incomplete"] = incomplete
+    return section
+
+
 def cmd_census(args: argparse.Namespace) -> int:
     _write_receipt(Path(args.receipt), _census_receipt())
     return 0
@@ -466,6 +557,7 @@ def _mint_dict(result: MintResult) -> dict[str, object]:
         "existing": result.existing,
         "blockers": list(result.blockers),
         "refused": result.refused,
+        "excluded_sub_origin": result.excluded_sub_origin,
     }
 
 
@@ -589,7 +681,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
         else:
             dest_conn.rollback()
     transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
-    complete = result.complete and not transition_exceptions
+    sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports, Path(args.receipt))
+    complete = result.complete and not transition_exceptions and not sub_origin["incomplete"]
     payload: dict[str, object] = {
         "kind": "execute",
         "manifest": manifest.as_dict(),
@@ -607,6 +700,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             }
             for e in (*result.exceptions, *transition_exceptions)
         ],
+        "sub_origin": sub_origin,
         "specs": _spec_report(specs),
         "specs_skipped_unsupplied_run_constants": unsupplied,
         "specs_skipped_parent_not_imported": [s.destination_table for s in parent_blocked],
