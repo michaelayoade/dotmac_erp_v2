@@ -11,6 +11,7 @@
     <h1>Sign in to Dotmac ERP</h1>
     {% if error %}<p role="alert">{{ error }}</p>{% endif %}
     <form method="post" action="/login">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="next" value="{{ next_url }}">
       <label>Email <input type="email" name="email" required autocomplete="username"></label>
       <label>Password <input type="password" name="password" required autocomplete="current-password"></label>

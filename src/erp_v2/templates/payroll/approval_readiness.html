@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Payroll approval readiness — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Payroll approval readiness</h1>
+<p><a href="/payroll/actions">Draft payroll</a></p>
+<h2>{{ packet.run.run_ref }}</h2>
+<p>{{ packet.run.period_start }} — {{ packet.run.period_end }}; {{ packet.run.currency_code }};
+recorded status: {{ packet.run.status }}.</p>
+<h2>Calculation evidence</h2>
+<p>{{ packet.calculation_count }} employee calculations; {{ packet.line_count }} component lines.</p>
+<table><thead><tr><th>Gross</th><th>Deductions</th><th>Net</th><th>Employer liability</th></tr></thead>
+<tbody><tr><td>{{ packet.totals.gross_amount }}</td><td>{{ packet.totals.deduction_amount }}</td>
+<td>{{ packet.totals.net_amount }}</td><td>{{ packet.totals.employer_liability_amount }}</td></tr></tbody></table>
+{% if packet.calculation_evidence_ready %}
+<p>Recorded calculations have component lines and evidence references, and gross less deductions equals net.</p>
+{% else %}<ul>{% for blocker in packet.evidence_blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>{% endif %}
+<p>These checks cover recorded evidence only. They do not validate source evidence, recalculate payroll,
+verify tax policy or establish that all expected employees were calculated.</p>
+<h2>Approval authorization: blocked</h2>
+<ul>{% for blocker in packet.approval_blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+<p>Approval rules and the approver list must be configured before this run can be approved.
+This review keeps the run unchanged. Payments require a separately authorized payment workflow.</p>
+{% endblock %}
