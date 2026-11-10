@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from typing import Final
 
 from erp_v2.importer.spec import TransformSpec, build_spec, destination_columns_from_table
+from erp_v2.importer.sub_origin import SubOriginPolicy
 from erp_v2.importer.wave2 import Pairing
 
 _BILLING_TENANT_TABLES: Final = (
@@ -325,6 +326,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         },
         constants={"source": "MANUAL"},
         lookups={"intent_id": ("payment_intent_by_payment", "id", "intent_id")},
+        sub_origin=SubOriginPolicy.EXCLUDE,  # F1: Sub-origin cash is Sub Billing's, never ERP v2's
         note="source=MANUAL (ConfirmationSource): legacy rows are recorded "
         "payments, not provider callbacks. intent_id via the enrolment map "
         "built from legacy payment_intent.customer_payment_id; payments "
@@ -642,12 +644,14 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_customers.customer_accounts",
         "public.customer",
         renames={"account_number": "customer_code", "display_name": "legal_name"},
+        sub_origin=SubOriginPolicy.EXCLUDE,  # pending Michael's M11 ruling on Sub customers
         note="status from is_active/credit_hold at rehearsal; credit/tax/banking detail lands in customer_profiles",
     ),
     Pairing(
         "mod_customers.customer_profiles",
         "public.customer",
         renames={"account_id": "customer_id"},
+        sub_origin=SubOriginPolicy.EXCLUDE,  # pending Michael's M11 ruling on Sub customers
         note="second spec from the same legacy row (profile columns split); "
         "account_id is the preserved customer UUID (customer_accounts.id)",
     ),
@@ -1003,6 +1007,7 @@ def build_specs(
                 null_fallbacks=pairing.null_fallbacks,
                 deferred=pairing.deferred,
                 json_columns=pairing.json_columns,
+                sub_origin=pairing.sub_origin,
             )
         )
     return tuple(specs), tuple(generated)

@@ -27,6 +27,7 @@ from typing import Any
 import sqlalchemy as sa
 
 from erp_v2.importer.spec import TransformSpec
+from erp_v2.importer.sub_origin import SUB_ORIGIN_COLUMN, SubOriginPolicy, capped
 
 _MISSING = object()
 
@@ -217,10 +218,35 @@ class TransformReport:
     read: int = 0
     written: int = 0
     exceptions: list[RowException] = field(default_factory=list)
+    # Sub-origin exclusion (F1); None unless the spec declares `exclude`
+    sub_origin_source: int | None = None  # all source rows, filtered or not
+    sub_origin_excluded: int = 0
+    sub_origin_excluded_keys: tuple[str, ...] = ()  # sorted, capped
+    sub_origin_keys_truncated: bool = False
+
+    @property
+    def refused(self) -> int:
+        return len({e.source_key for e in self.exceptions})
+
+    @property
+    def census(self) -> dict[str, object] | None:
+        """source = imported + excluded + refused, for `exclude` specs."""
+
+        if self.sub_origin_source is None:
+            return None
+        accounted = self.written + self.sub_origin_excluded + self.refused
+        return {
+            "source": self.sub_origin_source,
+            "imported": self.written,
+            "excluded": self.sub_origin_excluded,
+            "refused": self.refused,
+            "balanced": accounted == self.sub_origin_source,
+        }
 
     @property
     def complete(self) -> bool:
-        return not self.exceptions and self.read == self.written
+        census = self.census
+        return not self.exceptions and self.read == self.written and (census is None or bool(census["balanced"]))
 
 
 def _apply_deferred(
@@ -311,8 +337,10 @@ def execute_transform(
     id_maps = id_maps or {}
     report = TransformReport(source_table=spec.source_table, destination_table=spec.destination_table)
     source_columns = list(dict.fromkeys(spec.column_map.values()))
+    exclude_sub = spec.sub_origin is SubOriginPolicy.EXCLUDE
+    where_sub = f" WHERE {spec.source_table}.{SUB_ORIGIN_COLUMN} IS NULL" if exclude_sub else ""
     select_sql = sa.text(
-        f"SELECT {', '.join(source_columns)} FROM {spec.source_table}"  # noqa: S608
+        f"SELECT {', '.join(source_columns)} FROM {spec.source_table}{where_sub}"  # noqa: S608
     )
     dest_columns = [
         c
@@ -335,6 +363,22 @@ def execute_transform(
     # feeding the destination `id`, else the first mapped column.
     guards = _fk_guards(destination_connection, spec, dest_columns) if not dry_run else ()
     key_source = spec.column_map.get("id", source_columns[0])
+    if exclude_sub:
+        # Excluded rows are never silent: counted, with sorted keys, so
+        # the census (source = imported + excluded + refused) reconciles.
+        report.sub_origin_source = (
+            source_connection.execute(sa.text(f"SELECT count(*) FROM {spec.source_table}")).scalar() or 0  # noqa: S608
+        )
+        excluded_rows = source_connection.execute(
+            sa.text(
+                f"SELECT {key_source} FROM {spec.source_table} "  # noqa: S608
+                f"WHERE {spec.source_table}.{SUB_ORIGIN_COLUMN} IS NOT NULL"
+            )
+        )
+        excluded_keys = sorted(str(r[0]) for r in excluded_rows)
+        report.sub_origin_excluded = len(excluded_keys)
+        kept_keys, report.sub_origin_keys_truncated = capped(excluded_keys)
+        report.sub_origin_excluded_keys = tuple(kept_keys)
     batch: list[tuple[str, dict[str, Any]]] = []
     fk_retry: list[tuple[str, dict[str, Any]]] = []
     deferred_updates: list[tuple[str, Any, dict[str, Any]]] = []
@@ -515,6 +559,8 @@ def execute_transform(
             report,
         )
     _apply_deferred(destination_connection, spec, deferred_updates, report)
+    if limit is not None and report.sub_origin_source is not None:
+        report.sub_origin_source = None  # a limited run cannot reconcile a census
     if dry_run:
         # Expectation counts: rows that would have been written.
         report.written = report.read - len({e.source_key for e in report.exceptions})

@@ -35,6 +35,7 @@ from erp_v2.importer.minting import MintContext, MintResult
 from erp_v2.importer.pipeline import order_specs, partition_parent_blocked, run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
 from erp_v2.importer.spec import TransformSpec
+from erp_v2.importer.sub_origin import SubOriginPolicy, sub_tagged_customers_referenced_by_native
 from erp_v2.importer.transitions import run_transitions
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
 from erp_v2.importer.wave2 import WAVE2_PAIRINGS, Pairing
@@ -171,6 +172,9 @@ def _spec_report(specs: Sequence[TransformSpec]) -> dict[str, object]:
         "residue_columns": sum(len(s.residue) for s in specs),
         "enrolment_maps_required": sorted(required_maps(specs)),
         "enrolment_maps_without_builder": sorted(unbuilt_maps(specs)),
+        "sub_origin_excluded_specs": sorted(
+            s.destination_table for s in specs if s.sub_origin is SubOriginPolicy.EXCLUDE
+        ),
     }
 
 
@@ -389,6 +393,31 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
     return 0 if preflight.importable else 3
 
 
+def _sub_origin_receipt(source_engine: sa.Engine, source_schemas, reports) -> dict[str, object]:
+    """Per-spec exclusion census plus Sub-tagged customers native rows reference."""
+
+    specs_out = [
+        {
+            "source_table": r.source_table,
+            "destination_table": r.destination_table,
+            "census": r.census,
+            "excluded_keys": list(r.sub_origin_excluded_keys),
+            "excluded_keys_truncated": r.sub_origin_keys_truncated,
+        }
+        for r in reports
+        if r.census is not None
+    ]
+    if not specs_out:
+        return {"specs": [], "customers_referenced_by_native": {"skipped": "no exclude specs in this run"}}
+    try:
+        with source_engine.connect() as conn:
+            _set_search_path(conn, source_schemas)
+            customers: dict[str, object] = sub_tagged_customers_referenced_by_native(conn)
+    except sa.exc.SQLAlchemyError as exc:  # fail closed: an unrunnable census fails the run
+        customers = {"error": type(exc).__name__}
+    return {"specs": specs_out, "customers_referenced_by_native": customers}
+
+
 def cmd_census(args: argparse.Namespace) -> int:
     _write_receipt(Path(args.receipt), _census_receipt())
     return 0
@@ -552,7 +581,10 @@ def cmd_execute(args: argparse.Namespace) -> int:
         else:
             dest_conn.rollback()
     transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
-    complete = result.complete and not transition_exceptions
+    sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports)
+    complete = (
+        result.complete and not transition_exceptions and "error" not in sub_origin["customers_referenced_by_native"]
+    )
     payload: dict[str, object] = {
         "kind": "execute",
         "manifest": manifest.as_dict(),
@@ -570,6 +602,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             }
             for e in (*result.exceptions, *transition_exceptions)
         ],
+        "sub_origin": sub_origin,
         "specs": _spec_report(specs),
         "specs_skipped_unsupplied_run_constants": unsupplied,
         "specs_skipped_parent_not_imported": [s.destination_table for s in parent_blocked],

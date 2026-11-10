@@ -182,9 +182,10 @@ def test_sourcing_lines_sales_leads_and_document_types() -> None:
             "CREATE TABLE public.request_for_quotation (rfq_id TEXT, requisition_id TEXT)",
             "INSERT INTO public.request_for_quotation VALUES ('ev1','req1')",
             "CREATE TABLE public.customer (customer_id TEXT, organization_id TEXT, legal_name TEXT, "
-            "trading_name TEXT, currency_code TEXT)",
-            "INSERT INTO public.customer VALUES ('cu1','t1','Acme Ltd',NULL,'NGN')",
-            "INSERT INTO public.customer VALUES ('cu2','t1','No Currency Ltd',NULL,NULL)",
+            "trading_name TEXT, currency_code TEXT, dotmac_sub_id TEXT)",
+            "INSERT INTO public.customer VALUES ('cu1','t1','Acme Ltd',NULL,'NGN',NULL)",
+            "INSERT INTO public.customer VALUES ('cu2','t1','No Currency Ltd',NULL,NULL,NULL)",
+            "INSERT INTO public.customer VALUES ('cu3','t1','Sub Customer Ltd',NULL,'NGN','sub-9')",
             "CREATE TABLE public.hr_document (organization_id TEXT, category TEXT)",
             "INSERT INTO public.hr_document VALUES ('t1','Policy Documents')",
             "INSERT INTO public.hr_document VALUES ('t1',NULL)",

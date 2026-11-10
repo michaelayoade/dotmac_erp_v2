@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from erp_v2.importer.spec import TransformSpec, build_spec, destination_columns_from_table
+from erp_v2.importer.sub_origin import SubOriginPolicy
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,8 @@ class Pairing:
     null_fallbacks: Mapping[str, str] = field(default_factory=dict)
     deferred: tuple[str, ...] = ()
     json_columns: tuple[str, ...] = ()
+    # Required for any source table carrying `dotmac_sub_id` (see sub_origin.py)
+    sub_origin: SubOriginPolicy | None = None
     note: str = ""
 
 
@@ -370,6 +373,7 @@ def build_wave2_specs(
                 null_fallbacks=pairing.null_fallbacks,
                 deferred=pairing.deferred,
                 json_columns=pairing.json_columns,
+                sub_origin=pairing.sub_origin,
             )
         )
     return tuple(specs), tuple(generated)
