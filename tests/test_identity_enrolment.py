@@ -315,3 +315,126 @@ def test_missing_role_creation_requires_explicit_definition(cohort):
     assert "staff_role_missing" in dict(_plan(cohort, permissions=permissions).blockers)
     with pytest.raises(IdentityEnrolmentRefused):
         _apply(cohort, permissions=permissions)
+
+
+def test_null_email_plan_is_read_only_and_apply_replays_without_overwrite(cohort):
+    db, _, row, scope, _ = cohort
+    party = db.scalar(sa.select(Party).where(Party.id == scope.mappings[0].party_id))
+    party.email = None
+    db.flush()
+    reviewed = _plan(cohort)
+    assert reviewed.ready and reviewed.party_email_fills == 1
+    assert reviewed.sanitized_receipt()["party_email_fills"] == 1
+    assert party.email is None
+    assert db.scalar(sa.select(UserCredential)) is None
+    assert db.scalar(sa.select(PartyRoleGrant)) is None
+    _apply(cohort, plan=reviewed)
+    assert party.email == row.email.lower()
+    assert party.id == row.person_id and party.is_active
+    replay = _plan(cohort)
+    assert replay.ready and replay.party_email_fills == 0 and replay.credential_replays == 1
+    _apply(cohort, plan=replay)
+    assert party.email == row.email.lower()
+    assert len(db.scalars(sa.select(UserCredential)).all()) == 1
+    assert len(db.scalars(sa.select(PartyRoleGrant)).all()) == 1
+
+
+def test_matching_nonnull_email_is_preserved_exactly(cohort):
+    db = cohort[0]
+    party = db.scalar(sa.select(Party))
+    party.email = "Staff@Example.Test"
+    db.flush()
+    plan = _plan(cohort)
+    assert plan.ready and plan.party_email_fills == 0
+    _apply(cohort, plan=plan)
+    assert party.email == "Staff@Example.Test"
+
+
+@pytest.mark.parametrize("existing", ["different@example.test", ""])
+def test_nonnull_email_conflicts_are_never_filled(cohort, existing):
+    db = cohort[0]
+    party = db.scalar(sa.select(Party))
+    party.email = existing
+    db.flush()
+    plan = _plan(cohort)
+    assert "destination_party_mismatch" in dict(plan.blockers)
+    assert plan.party_email_fills == 0
+    with pytest.raises(IdentityEnrolmentRefused, match="identity_plan_blocked"):
+        _apply(cohort, plan=plan)
+    assert party.email == existing
+    assert db.scalar(sa.select(UserCredential)) is None
+
+
+@pytest.mark.parametrize("party_type", [PartyType.person, PartyType.organization])
+def test_null_email_fill_refuses_other_party_email_owner(cohort, party_type):
+    db, tenant, row, _, _ = cohort
+    party = db.scalar(sa.select(Party))
+    party.email = None
+    db.add(
+        Party(
+            id=uuid4(),
+            tenant_id=tenant.id,
+            party_type=party_type,
+            display_name="Other synthetic identity",
+            email=row.email.lower(),
+            is_active=True,
+        )
+    )
+    db.flush()
+    plan = _plan(cohort)
+    assert "destination_party_mismatch" in dict(plan.blockers)
+    assert plan.party_email_fills == 0
+    with pytest.raises(IdentityEnrolmentRefused, match="identity_plan_blocked"):
+        _apply(cohort, plan=plan)
+    assert party.email is None
+    assert db.scalar(sa.select(UserCredential)) is None
+    assert db.scalar(sa.select(PartyRoleGrant)) is None
+
+
+def test_null_email_observation_is_bound_to_reviewed_plan(cohort):
+    db, _, row, _, _ = cohort
+    party = db.scalar(sa.select(Party))
+    party.email = None
+    db.flush()
+    reviewed = _plan(cohort)
+    party.email = row.email.lower()
+    db.flush()
+    with pytest.raises(IdentityEnrolmentRefused, match="identity_plan_changed"):
+        _apply(cohort, plan=reviewed)
+    assert db.scalar(sa.select(UserCredential)) is None
+
+
+def test_null_email_fill_is_rolled_back_with_failed_enrolment(cohort, monkeypatch):
+    from dotmac_kernel import identity_storage
+
+    db = cohort[0]
+    party = db.scalar(sa.select(Party))
+    party.email = None
+    db.flush()
+    transaction = db.begin_nested()
+
+    def failure(*args, **kwargs):
+        raise RuntimeError("synthetic provisioning failure")
+
+    monkeypatch.setattr(identity_storage, "ensure_grant", failure)
+    with pytest.raises(IdentityEnrolmentRefused, match="identity_apply_failed_rollback_required"):
+        _apply(cohort)
+    transaction.rollback()
+    db.refresh(party)
+    assert party.email is None
+    assert db.scalar(sa.select(UserCredential)) is None
+    assert db.scalar(sa.select(PartyRoleGrant)) is None
+    assert db.scalar(sa.select(Role)) is None
+
+
+def test_ineligible_selected_source_cannot_fill_null_email(cohort):
+    db = cohort[0]
+    party = db.scalar(sa.select(Party))
+    party.email = None
+    db.flush()
+    rows = (_replace_source(cohort[2], is_active=False),)
+    plan = _plan(cohort, rows)
+    assert "inactive_source" in dict(plan.blockers) and plan.party_email_fills == 0
+    with pytest.raises(IdentityEnrolmentRefused, match="identity_plan_blocked"):
+        _apply(cohort, rows, plan=plan)
+    assert party.email is None

@@ -23,6 +23,14 @@ mapping names credential_id, person_id, party_id and employee_id. The person and
 Party UUIDs must match; destination employee, person and tenant are independently
 verified. Do not choose a winner among duplicate emails or identities.
 
+Legacy authentication reads `people.email`, while a faithfully copied
+`parties.email` may be NULL. For an eligible, explicitly mapped staff identity,
+the plan reports `party_email_fills`; apply projects the normalized source email
+only into a NULL Party email in the same transaction as credential/grant enrolment.
+Planning leaves the field unchanged. Existing non-NULL emails are preserved;
+conflicting emails, another Party using the email, or a changed reviewed target
+still refuse the cohort. This projection changes no source record.
+
 Planning (read-only source; destination rows may be locked, never changed):
 
 ```

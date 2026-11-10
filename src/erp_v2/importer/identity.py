@@ -75,6 +75,7 @@ class IdentityPlan:
     preserved_out_of_scope: int
     credential_inserts: int
     credential_replays: int
+    party_email_fills: int
     blockers: tuple[tuple[str, int], ...]
     _binding: str = field(repr=False)
 
@@ -89,6 +90,7 @@ class IdentityPlan:
             "preserved_out_of_scope": self.preserved_out_of_scope,
             "credential_inserts": self.credential_inserts,
             "credential_replays": self.credential_replays,
+            "party_email_fills": self.party_email_fills,
             "blockers": dict(self.blockers),
             "ready": self.ready,
         }
@@ -181,7 +183,7 @@ def _observe(
 ) -> IdentityPlan:
     blockers: Counter[str] = Counter()
     observations: list[object] = []
-    selected = inserts = replays = 0
+    selected = inserts = replays = email_fills = 0
     if not _permission_safe(permissions):
         blockers["unsafe_staff_permission_profile"] += 1
     tenant = db.scalar(select(Tenant).where(Tenant.id == scope.tenant_id).with_for_update())
@@ -206,6 +208,7 @@ def _observe(
     email_counts = Counter(normalize_email(row.email) for row in records)
     by_credential = {row.credential_id: row for row in records}
     for mapping in mappings:
+        previous_blockers = sum(blockers.values())
         row = by_credential.get(mapping.credential_id)
         if row is None:
             blockers["source_mapping_missing"] += 1
@@ -238,8 +241,7 @@ def _observe(
             or parties[0].id != mapping.party_id
             or parties[0].party_type != PartyType.person
             or not parties[0].is_active
-            or parties[0].email is None
-            or normalize_email(parties[0].email) != normalize_email(row.email)
+            or (parties[0].email is not None and normalize_email(parties[0].email) != normalize_email(row.email))
         ):
             blockers["destination_party_mismatch"] += 1
         person = db.scalar(
@@ -298,6 +300,8 @@ def _observe(
             replays += 1
         else:
             blockers["destination_credential_collision"] += 1
+        if sum(blockers.values()) == previous_blockers and parties[0].email is None:
+            email_fills += 1
     mapped_ids = {item.credential_id for item in mappings}
     return IdentityPlan(
         len(records),
@@ -305,6 +309,7 @@ def _observe(
         sum(row.credential_id not in mapped_ids for row in records),
         inserts,
         replays,
+        email_fills,
         tuple(sorted(blockers.items())),
         _binding(scope, records, permissions, observations),
     )
@@ -330,11 +335,12 @@ def apply_identity_enrolment(
     permissions: PermissionPlan,
     reviewed_plan: IdentityPlan,
 ) -> IdentityPlan:
-    """Revalidate, insert absent credentials and grant staff; never commit.
+    """Revalidate, fill NULL Party emails, insert credentials and grant staff; never commit.
 
     Requires an explicit caller transaction. The caller must roll back on any
     refusal and serialize migration writers (PostgreSQL SERIALIZABLE recommended).
-    No credential update occurs, including after a legitimate login rehash.
+    Only NULL Party emails may receive the eligible source person email. Existing
+    email values and credentials are never overwritten, including after login rehash.
     """
     if not db.in_transaction():
         raise IdentityEnrolmentRefused("caller_transaction_required")
@@ -362,6 +368,19 @@ def apply_identity_enrolment(
         staff = next(role for role in roles if role.slug == "staff")
         source = {row.credential_id: row for row in rows}
         for mapping in scope.mappings:
+            # The revalidated, HMAC-bound observation already locked this exact
+            # Party and ruled out normalized-email collisions across the tenant.
+            party = db.scalars(
+                select(Party)
+                .where(
+                    Party.tenant_id == scope.tenant_id,
+                    Party.id == mapping.party_id,
+                )
+                .with_for_update()
+            ).one()
+            if party.email is None:
+                party.email = normalize_email(source[mapping.credential_id].email)
+                db.flush()
             if db.scalar(select(UserCredential.id).where(UserCredential.id == mapping.credential_id)) is None:
                 db.add(
                     UserCredential(
