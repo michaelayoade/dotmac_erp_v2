@@ -213,6 +213,7 @@ def _translate_billing_args(args: argparse.Namespace):
 
     from erp_v2.importer.billing_opening import (
         OpeningTranslationContext,
+        OpeningTranslationError,
         translate_partition,
     )
 
@@ -276,12 +277,15 @@ def _translate_billing_args(args: argparse.Namespace):
         customer_snapshot=customers.get,
         payment_instructions=PaymentInstructionsSnapshotV1(method_code="bank_transfer"),
     )
-    result = translate_partition(
-        context=context,
-        invoices=invoices,
-        allocations=_coerce(_rows(args.allocations_json)),
-        payments=_coerce(_rows(args.payments_json)),
-    )
+    try:
+        result = translate_partition(
+            context=context,
+            invoices=invoices,
+            allocations=_coerce(_rows(args.allocations_json)),
+            payments=_coerce(_rows(args.payments_json)),
+        )
+    except OpeningTranslationError as exc:
+        raise CliRefusal(str(exc)) from exc
     return manifest, context, result
 
 
@@ -300,6 +304,7 @@ def cmd_billing_plan(args: argparse.Namespace) -> int:
         "open_ar_minor": result.open_ar_minor,
         "cash_lots": len(result.cash_lots),
         "blockers": [{"source_key": b.source_key, "reason": b.reason} for b in result.blockers],
+        "sub_origin_exclusions": result.exclusions.as_dict(),
         "dispositions": [
             {"key": d.identity.key, "disposition": d.disposition, "residual_minor": d.residual_minor}
             for d in result.dispositions
@@ -384,6 +389,7 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
         "translation_blockers": [
             {"source_key": b.source_key, "reason": b.reason} for b in preflight.translation_blockers
         ],
+        "sub_origin_exclusions": result.exclusions.as_dict(),
     }
     _write_receipt(Path(args.receipt), payload)
     return 0 if preflight.importable else 3

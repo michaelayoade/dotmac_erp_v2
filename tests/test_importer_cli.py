@@ -90,7 +90,18 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
                     "tax_amount": "69.77",
                     "total_amount": "1000.00",
                     "status": "posted",
-                }
+                    "dotmac_sub_id": None,
+                },
+                {
+                    "invoice_id": "sub-1",
+                    "invoice_number": "S-1",
+                    "customer_key": "cust-1",
+                    "invoice_date": "2026-01-05T00:00:00+00:00",
+                    "currency_code": "NGN",
+                    "total_amount": "500.00",
+                    "status": "posted",
+                    "dotmac_sub_id": "sub-ext-1",
+                },
             ]
         )
     )
@@ -113,6 +124,8 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
     assert code == 0
     data = json.loads(receipt.read_text())
     assert data["items"] == 1 and data["open_ar_minor"] == 100000
+    assert data["sub_origin_exclusions"]["counts"]["invoices"] == 1
+    assert data["sub_origin_exclusions"]["invoices"] == ["sub-1"]
 
 
 def test_reflected_plan_survives_forbidden_runtime_env_names(tmp_path) -> None:

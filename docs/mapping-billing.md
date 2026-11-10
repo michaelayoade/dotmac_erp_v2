@@ -24,6 +24,16 @@ One translation per partition (billing account + currency):
   `collectible_receivable_minor` stays 0 in manifest controls until
   product evidence exists. Automated collection therefore cannot
   start on migrated balances — by design, not by accident.
+- **Sub-origin exclusion (F1).** ERP v2 is never the receivables
+  authority for a Sub-originated record: Sub's own Billing owns those
+  open items. Invoices (credit notes included) with
+  `dotmac_sub_id IS NOT NULL` (blank string counts) are excluded with
+  their allocations and payments. A payment whose allocations all hit
+  Sub-origin invoices is excluded whole; a mixed payment keeps only its
+  ERP-native allocations and the Sub share is reported, never moved.
+  Exports must carry `dotmac_sub_id` on invoice and payment rows; a row
+  without it is refused. Counts and source keys are in the receipt's
+  `sub_origin_exclusions`.
 - Void/draft invoices are excluded dispositions, counted in the
   manifest population; nothing is dropped silently.
 

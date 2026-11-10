@@ -6,6 +6,7 @@ import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
+import pytest
 from dotmac_billing.contracts import (
     PartyDocumentSnapshotV1,
     PaymentInstructionsSnapshotV1,
@@ -15,6 +16,7 @@ from dotmac_billing.opening_contracts import OpeningCaptureV1, OpeningPartitionV
 
 from erp_v2.importer.billing_opening import (
     OpeningTranslationContext,
+    OpeningTranslationError,
     build_manifest,
     translate_partition,
 )
@@ -45,6 +47,7 @@ def _invoice(**overrides):
         "tax_amount": Decimal("69.77"),
         "total_amount": Decimal("1000.00"),
         "status": "posted",
+        "dotmac_sub_id": None,
     }
     base.update(overrides)
     return base
@@ -69,6 +72,7 @@ def test_open_invoice_residual_after_partial_payment() -> None:
                 "payment_date": datetime(2026, 1, 20, tzinfo=UTC),
                 "reference": "RCPT-1",
                 "status": "confirmed",
+                "dotmac_sub_id": None,
             }
         ],
     )
@@ -105,6 +109,7 @@ def test_void_overpaid_inexact_and_unallocated_cash() -> None:
                 "payment_date": datetime(2026, 1, 20, tzinfo=UTC),
                 "reference": "RCPT-9",
                 "status": "confirmed",
+                "dotmac_sub_id": None,
             },
             {
                 "payment_id": "pay-free",
@@ -112,6 +117,7 @@ def test_void_overpaid_inexact_and_unallocated_cash() -> None:
                 "payment_date": datetime(2026, 1, 21, tzinfo=UTC),
                 "reference": "RCPT-10",
                 "status": "confirmed",
+                "dotmac_sub_id": None,
             },
         ],
     )
@@ -220,3 +226,139 @@ def test_preflight_round_trip_without_verifier_is_honest() -> None:
             migration_authority_ref="approval:2026-11-08",
             occurred_at=datetime(2026, 11, 8, tzinfo=UTC),
         )
+
+
+# --- F1: Sub-origin receivables are never ERP v2's (census + exclusion) ---
+
+AT = datetime(2026, 1, 20, tzinfo=UTC)
+
+
+def _alloc(invoice_id: str, payment_id: str, amount: str) -> dict:
+    return {
+        "invoice_id": invoice_id,
+        "payment_id": payment_id,
+        "amount_allocated": Decimal(amount),
+        "allocated_at": AT,
+    }
+
+
+def _payment(payment_id: str, amount: str, **overrides) -> dict:
+    row = {
+        "payment_id": payment_id,
+        "amount": Decimal(amount),
+        "payment_date": AT,
+        "reference": f"RCPT-{payment_id}",
+        "status": "confirmed",
+        "dotmac_sub_id": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_sub_origin_invoices_excluded_with_allocations_payments_and_credit_notes() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[
+            _invoice(invoice_id="native-1", invoice_number="N-1"),
+            _invoice(invoice_id="sub-1", invoice_number="S-1", dotmac_sub_id="sub-ext-1"),
+            _invoice(invoice_id="sub-cn", invoice_number="S-CN", dotmac_sub_id="sub-ext-2", invoice_type="CREDIT_NOTE"),
+        ],
+        allocations=[_alloc("sub-1", "pay-sub", "300.00"), _alloc("native-1", "pay-nat", "100.00")],
+        payments=[_payment("pay-sub", "300.00"), _payment("pay-nat", "100.00")],
+    )
+    assert not result.blockers
+    assert [i.source_invoice_key for i in result.items] == ["native-1"]
+    assert result.items[0].residual_minor == 90000
+    assert result.cash_lots == ()
+    ex = result.exclusions
+    assert ex.invoices == ("sub-1",)
+    assert ex.credit_notes == ("sub-cn",)
+    assert ex.allocations == ("pay-sub:sub-1",)
+    assert ex.payments == ("pay-sub",)
+    assert ex.mixed_payments == ()
+    assert ex.counts() == {"invoices": 1, "credit_notes": 1, "allocations": 1, "payments": 1, "mixed_payments": 0}
+
+
+def test_mixed_payment_keeps_native_allocations_and_reports_remainder() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[
+            _invoice(invoice_id="native-1", invoice_number="N-1"),
+            _invoice(invoice_id="sub-1", invoice_number="S-1", dotmac_sub_id="x"),
+        ],
+        allocations=[_alloc("native-1", "pay-mix", "100.00"), _alloc("sub-1", "pay-mix", "250.00")],
+        payments=[_payment("pay-mix", "400.00")],
+    )
+    assert not result.blockers
+    (item,) = result.items
+    assert item.residual_minor == 90000 and len(item.historical_discharges) == 1
+    (split,) = result.exclusions.mixed_payments
+    assert split.payment_id == "pay-mix"
+    assert split.excluded_allocations == ("pay-mix:sub-1",)
+    assert split.excluded_amount_minor == 25000
+    assert split.kept_allocations == ("pay-mix:native-1",)
+    assert result.exclusions.payments == ()
+    # 400 gross - 250 Sub share - 100 native alloc = 50 unapplied; Sub's 250 is not re-attributed
+    (lot,) = result.cash_lots
+    assert lot.gross_minor == 15000 and lot.residual_minor == 5000
+
+
+def test_row_missing_field_is_refused() -> None:
+    bad_invoice = _invoice()
+    del bad_invoice["dotmac_sub_id"]
+    with pytest.raises(OpeningTranslationError, match="dotmac_sub_id"):
+        translate_partition(context=CTX, invoices=[bad_invoice], allocations=[], payments=[])
+    bad_payment = _payment("p1", "5.00")
+    del bad_payment["dotmac_sub_id"]
+    with pytest.raises(OpeningTranslationError, match="dotmac_sub_id"):
+        translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[bad_payment])
+
+
+def test_native_rows_unchanged_and_blank_string_is_sub_origin() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice(), _invoice(invoice_id="blank", invoice_number="B", dotmac_sub_id="")],
+        allocations=[_alloc("inv-1", "pay-1", "400.00")],
+        payments=[_payment("pay-1", "400.00"), _payment("pay-free", "50.00")],
+    )
+    assert [i.source_invoice_key for i in result.items] == ["inv-1"]
+    assert result.open_ar_minor == 60000
+    assert [lot.source_identity.key for lot in result.cash_lots] == ["pay-free"]
+    assert result.exclusions.invoices == ("blank",)  # legacy IS NOT NULL: blank counts
+
+
+def test_unallocated_sub_tagged_payment_excluded_and_contradiction_blocked() -> None:
+    result = translate_partition(
+        context=CTX,
+        invoices=[_invoice()],
+        allocations=[_alloc("inv-1", "pay-c", "10.00")],
+        payments=[_payment("pay-s", "20.00", dotmac_sub_id="s"), _payment("pay-c", "10.00", dotmac_sub_id="s")],
+    )
+    assert result.exclusions.payments == ("pay-s",)
+    # the contradictory payment is held back, so the invoice it paid blocks too
+    assert sorted(b.source_key for b in result.blockers) == ["inv-1", "pay-c"]
+
+
+def test_exclusions_are_deterministic_regardless_of_input_order() -> None:
+    invoices = [_invoice(invoice_id=f"sub-{n}", invoice_number=f"S{n}", dotmac_sub_id="x") for n in (3, 1, 2)]
+    allocs = [_alloc(f"sub-{n}", f"pay-{n}", "1.00") for n in (3, 1, 2)]
+    pays = [_payment(f"pay-{n}", "1.00") for n in (3, 1, 2)]
+    a = translate_partition(context=CTX, invoices=invoices, allocations=allocs, payments=pays)
+    b = translate_partition(context=CTX, invoices=invoices[::-1], allocations=allocs[::-1], payments=pays[::-1])
+    assert a.exclusions == b.exclusions
+    assert a.exclusions.as_dict() == b.exclusions.as_dict()
+    assert a.exclusions.invoices == ("sub-1", "sub-2", "sub-3")
+
+
+def test_census_no_receivable_item_for_any_row_with_dotmac_sub_id() -> None:
+    values = ["sub-ext", "0", " ", "", "NULL"]
+    invoices = [_invoice(invoice_id=f"s{n}", invoice_number=f"S{n}", dotmac_sub_id=v) for n, v in enumerate(values)] + [
+        _invoice(invoice_id=f"n{n}", invoice_number=f"N{n}") for n in range(3)
+    ]
+    result = translate_partition(context=CTX, invoices=invoices, allocations=[], payments=[])
+    produced = {i.source_invoice_key for i in result.items}
+    sub_keys = {str(r["invoice_id"]) for r in invoices if r["dotmac_sub_id"] is not None}
+    assert sub_keys and not (produced & sub_keys)
+    assert produced == {"n0", "n1", "n2"}
+    assert set(result.exclusions.invoices) == sub_keys
+    assert not any(d.identity.key in sub_keys for d in result.dispositions)

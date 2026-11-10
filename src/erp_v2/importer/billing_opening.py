@@ -18,6 +18,13 @@ Honesty rules encoded here:
 - Over-allocated invoices and payments allocated to invoices
   outside the partition are blockers/cash-review items, never
   silently netted.
+- ERP v2 is never the receivables authority for a Sub-originated
+  record (F1). Legacy ERP mirrors Sub invoices into its AR tagged
+  `dotmac_sub_id`; Sub's own Billing owns those open items. Every
+  invoice (credit notes included) whose `dotmac_sub_id` IS NOT NULL
+  is excluded with its allocations and payments, and counted in
+  `SubOriginExclusions` by family with source keys. Rows that do not
+  carry the field are refused: missing is never treated as native.
 """
 
 from __future__ import annotations
@@ -92,8 +99,82 @@ class OpeningTranslationContext:
     source_authority: str = "legacy-erp-readonly-export"
 
 
+@dataclass(frozen=True)
+class ExcludedPaymentSplit:
+    """A mixed payment: ERP-native allocations kept, Sub-origin ones named.
+
+    Money is never re-attributed: `excluded_amount_minor` stays with
+    Sub's Billing and is removed from the ERP lot's gross.
+    """
+
+    payment_id: str
+    excluded_allocations: tuple[str, ...]  # "<payment_id>:<invoice_id>"
+    excluded_amount_minor: int
+    kept_allocations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SubOriginExclusions:
+    """Sub-origin rows kept OUT of the ERP v2 opening, by family.
+
+    Every tuple is sorted, so the receipt is deterministic.
+    """
+
+    invoices: tuple[str, ...] = ()
+    credit_notes: tuple[str, ...] = ()
+    allocations: tuple[str, ...] = ()  # "<payment_id>:<invoice_id>"
+    payments: tuple[str, ...] = ()
+    mixed_payments: tuple[ExcludedPaymentSplit, ...] = ()
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "invoices": len(self.invoices),
+            "credit_notes": len(self.credit_notes),
+            "allocations": len(self.allocations),
+            "payments": len(self.payments),
+            "mixed_payments": len(self.mixed_payments),
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "counts": self.counts(),
+            "invoices": list(self.invoices),
+            "credit_notes": list(self.credit_notes),
+            "allocations": list(self.allocations),
+            "payments": list(self.payments),
+            "mixed_payments": [
+                {
+                    "payment_id": m.payment_id,
+                    "excluded_allocations": list(m.excluded_allocations),
+                    "excluded_amount_minor": m.excluded_amount_minor,
+                    "kept_allocations": list(m.kept_allocations),
+                }
+                for m in self.mixed_payments
+            ],
+        }
+
+
+SUB_ORIGIN_FIELD = "dotmac_sub_id"
+
+
+def _is_sub_origin(row: Mapping[str, object], kind: str, key: str) -> bool:
+    """Legacy semantics: Sub-origin is `dotmac_sub_id IS NOT NULL`.
+
+    Only an explicit null (None) is ERP-native; an empty or blank
+    string is NOT NULL in legacy and therefore Sub-origin. A missing
+    field is refused, never defaulted.
+    """
+
+    if SUB_ORIGIN_FIELD not in row:
+        raise OpeningTranslationError(
+            f"{kind} {key}: row lacks {SUB_ORIGIN_FIELD}; refusing (missing is not ERP-native)"
+        )
+    return row[SUB_ORIGIN_FIELD] is not None
+
+
 @dataclass
 class OpeningTranslation:
+    exclusions: SubOriginExclusions = field(default_factory=SubOriginExclusions)
     items: tuple[OpeningReceivableItemV1, ...] = ()
     cash_lots: tuple[OpeningCashLotV1, ...] = ()
     blockers: list[OpeningBlocker] = field(default_factory=list)
@@ -126,6 +207,98 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+def _exclude_sub_origin(
+    invoices: Sequence[Mapping[str, object]],
+    allocations: Sequence[Mapping[str, object]],
+    payments: Sequence[Mapping[str, object]],
+    precision: int,
+    blockers: list[OpeningBlocker],
+) -> tuple[
+    list[Mapping[str, object]],
+    list[Mapping[str, object]],
+    list[Mapping[str, object]],
+    SubOriginExclusions,
+]:
+    """Split Sub-origin rows out of the legacy AR rows (F1)."""
+
+    sub_invoice_ids: set[str] = set()
+    sub_invoices: list[str] = []
+    sub_credit_notes: list[str] = []
+    native_invoices: list[Mapping[str, object]] = []
+    for invoice in invoices:
+        key = str(invoice["invoice_id"])
+        if _is_sub_origin(invoice, "invoice", key):
+            sub_invoice_ids.add(key)
+            if str(invoice.get("invoice_type", "")).upper() == "CREDIT_NOTE":
+                sub_credit_notes.append(key)
+            else:
+                sub_invoices.append(key)
+        else:
+            native_invoices.append(invoice)
+
+    sub_payment_flag: dict[str, bool] = {}
+    for payment in payments:
+        pid = str(payment["payment_id"])
+        sub_payment_flag[pid] = _is_sub_origin(payment, "payment", pid)
+
+    kept_allocs: list[Mapping[str, object]] = []
+    sub_allocs_by_payment: dict[str, list[Mapping[str, object]]] = {}
+    kept_by_payment: dict[str, list[str]] = {}
+    for alloc in allocations:
+        pid = str(alloc["payment_id"])
+        if str(alloc["invoice_id"]) in sub_invoice_ids:
+            sub_allocs_by_payment.setdefault(pid, []).append(alloc)
+        else:
+            kept_allocs.append(alloc)
+            kept_by_payment.setdefault(pid, []).append(f"{pid}:{alloc['invoice_id']}")
+
+    excluded_payments: list[str] = []
+    mixed: list[ExcludedPaymentSplit] = []
+    native_payments: list[Mapping[str, object]] = []
+    for payment in payments:
+        pid = str(payment["payment_id"])
+        sub_allocs = sub_allocs_by_payment.get(pid, [])
+        kept = kept_by_payment.get(pid, [])
+        if sub_allocs and not kept:
+            excluded_payments.append(pid)  # every allocation targets Sub-origin invoices
+            continue
+        if not sub_allocs and not kept and sub_payment_flag[pid]:
+            excluded_payments.append(pid)  # unallocated Sub-origin cash
+            continue
+        if sub_payment_flag[pid]:
+            # Sub-tagged payment that also touches ERP-native invoices: the
+            # origin of the cash is contradictory. Do not guess: block it.
+            blockers.append(OpeningBlocker(pid, "Sub-origin payment allocated to ERP-native invoices"))
+            continue
+        if sub_allocs:
+            amount_minor = 0
+            for alloc in sub_allocs:
+                minor = _minor(Decimal(str(alloc["amount_allocated"])), precision)
+                if minor is None:
+                    blockers.append(OpeningBlocker(pid, "excluded Sub-origin allocation is inexact"))
+                else:
+                    amount_minor += minor
+            mixed.append(
+                ExcludedPaymentSplit(
+                    payment_id=pid,
+                    excluded_allocations=tuple(sorted(f"{pid}:{a['invoice_id']}" for a in sub_allocs)),
+                    excluded_amount_minor=amount_minor,
+                    kept_allocations=tuple(sorted(kept)),
+                )
+            )
+        native_payments.append(payment)
+
+    excluded_alloc_keys = sorted(f"{pid}:{a['invoice_id']}" for pid, al in sub_allocs_by_payment.items() for a in al)
+    exclusions = SubOriginExclusions(
+        invoices=tuple(sorted(sub_invoices)),
+        credit_notes=tuple(sorted(sub_credit_notes)),
+        allocations=tuple(excluded_alloc_keys),
+        payments=tuple(sorted(excluded_payments)),
+        mixed_payments=tuple(sorted(mixed, key=lambda m: m.payment_id)),
+    )
+    return native_invoices, kept_allocs, native_payments, exclusions
+
+
 def translate_partition(
     *,
     context: OpeningTranslationContext,
@@ -135,6 +308,10 @@ def translate_partition(
 ) -> OpeningTranslation:
     """Translate one partition's legacy AR rows into opening evidence.
 
+    Invoice and payment rows MUST carry `dotmac_sub_id` (None =
+    ERP-native; anything else, blank included, = Sub-origin and
+    excluded); a row without the field is refused. Optional
+    `invoice_type` identifies credit notes for the exclusion counts.
     Invoice rows: invoice_id, invoice_number, customer_key,
     invoice_date (datetime), due_date (date|None), currency_code,
     subtotal/tax_amount/total_amount (Decimal), status.
@@ -146,6 +323,10 @@ def translate_partition(
     partition = context.partition
     precision = partition.precision
     result = OpeningTranslation()
+    invoices, allocations, payments, exclusions = _exclude_sub_origin(
+        invoices, allocations, payments, precision, result.blockers
+    )
+    result.exclusions = exclusions
     dispositions: list[OpeningDispositionV1] = []
     items: list[OpeningReceivableItemV1] = []
 
@@ -292,6 +473,7 @@ def translate_partition(
             )
         )
 
+    split_excluded_minor = {m.payment_id: m.excluded_amount_minor for m in exclusions.mixed_payments}
     cash_lots: list[OpeningCashLotV1] = []
     for payment in payments:
         pid = str(payment["payment_id"])
@@ -302,6 +484,7 @@ def translate_partition(
             continue
         allocated = allocated_by_payment.get(pid, Decimal(0))
         allocated_minor = _minor(allocated, precision) or 0
+        gross_minor -= split_excluded_minor.get(pid, 0)  # Sub-origin part stays with Sub's Billing
         residual = gross_minor - allocated_minor
         if residual <= 0:
             continue  # fully allocated cash is discharge evidence, not a lot
@@ -484,11 +667,14 @@ def preflight_opening_import(
 __all__ = [
     "MAPPING_VERSION",
     "SOURCE_SYSTEM",
+    "SUB_ORIGIN_FIELD",
+    "ExcludedPaymentSplit",
     "OpeningBlocker",
     "OpeningPreflight",
     "OpeningTranslation",
     "OpeningTranslationContext",
     "OpeningTranslationError",
+    "SubOriginExclusions",
     "build_import_command",
     "build_manifest",
     "preflight_opening_import",
