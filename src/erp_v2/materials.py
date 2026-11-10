@@ -9,6 +9,8 @@ environment, once a database is bound:
 
 - JWT/SESSION/CSRF secrets present, non-sentinel, >= 32 bytes each;
 - CSRF secret distinct from the other two (kernel production rule);
+- ``MACHINE_CREDENTIAL_HMAC_KEY``, when supplied, >= 32 bytes and distinct
+  (optional: unset keeps machine-authenticated routes closed);
 - ``TRUSTED_HOSTS`` declared;
 - ``SEED_ON_STARTUP`` explicitly false (absent means the kernel default,
   which is on -- a serving process must never seed).
@@ -61,6 +63,13 @@ def runtime_materials_problems(
         secrets.get("SESSION_HASH_SECRET"),
     }:
         problems.append("CSRF_SECRET must be distinct from JWT_SECRET and SESSION_HASH_SECRET")
+    machine_key = env.get("MACHINE_CREDENTIAL_HMAC_KEY", "")
+    if machine_key:
+        # Optional (unset keeps machine routes closed), but never weak or reused.
+        if len(machine_key.encode("utf-8")) < _MIN_SECRET_BYTES:
+            problems.append("MACHINE_CREDENTIAL_HMAC_KEY must contain at least 32 bytes")
+        if machine_key in secrets.values():
+            problems.append("MACHINE_CREDENTIAL_HMAC_KEY must be distinct from the session and signing secrets")
     if not env.get("TRUSTED_HOSTS", "").strip():
         problems.append("TRUSTED_HOSTS must be declared when a database is bound")
     seed_raw = env.get("SEED_ON_STARTUP")

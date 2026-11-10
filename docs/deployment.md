@@ -81,6 +81,19 @@ role can read it (legacy RLS untouched).
   `ERP_ENROLMENT_ACTOR_ID`, `ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF`.
 - Integration secrets (SMTP/PSP/Sub/Academy) stay unset at flip
   until their v2 surfaces are wired; outbound writers off.
+- Academy completion receiver (`POST /integration/academy-sync/completions`)
+  authenticates with a kernel machine credential (`X-Api-Key`), exact scope
+  `academy_sync.completion:write`, `source_application`
+  `dotmac_academy_app`. Names only: `ACADEMY_SYNC_TENANT_ID` (non-secret
+  tenant UUID), `ACADEMY_SYNC_SOURCE_SCOPE_REF` (default `dotmac`),
+  `MACHINE_CREDENTIAL_HMAC_KEY` (the kernel's held verification secret,
+  >= 32 bytes, distinct from the session secrets; optional, and unset keeps
+  the route closed with `not_configured`). The former shared-secret
+  `ACADEMY_SYNC_WEBHOOK_SECRET` and the HMAC `X-Webhook-Signature-256` path
+  are removed. Cut-over: issue the credential (kernel `issue_credential`),
+  switch Academy's sender to `X-Api-Key`, then delete the old secret from the
+  host env file. The receiver was unconfigured at flip, so no deployed
+  caller depends on the old path.
 
 ## Flip-day sequence (ready packet + explicit flip-day go required)
 
