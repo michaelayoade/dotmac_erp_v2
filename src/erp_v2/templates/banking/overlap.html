@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Banking overlap review — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Banking overlap review</h1>
+<p><a href="/finance/banking">Banking workspace</a></p>
+<p>Review is required before feed activation. These are evidence candidates, not confirmed duplicates. This view does not match, merge or change financial records. No manual/feed authority rule has been approved.</p>
+<form method="get">
+<label for="account_id">Bank account</label>
+<select name="account_id" id="account_id" required>
+{% for a in accounts %}<option value="{{ a.id }}" {% if a.id == account_id %}selected{% endif %}>{{ a.account_code }} — {{ a.account_name }} ({{ a.currency_code }})</option>{% endfor %}
+</select><button type="submit">Review</button>
+</form>
+<p><a href="/finance/banking/overlap-review">Review all accounts</a></p>
+{% if accounts_truncated %}<p>Account list limited to 100. An account UUID can be supplied in the URL.</p>{% endif %}
+<p>Page {{ page }}. Up to 50 candidates per page. Equal date and money alone does not establish identity. Reference comparisons use exact stored text, without case or whitespace normalization.</p>
+{% for receipt, account, accepted, observed, imported, other, strong in candidates %}
+<section>
+<h2>{{ account.account_code }} — {{ account.account_name }}</h2>
+<p>{% if strong %}Reference candidate: same nonblank external reference, amount and direction.{% if observed.transaction_date != other.transaction_date %} Transaction dates differ.{% endif %}{% else %}Weak candidate: same transaction date, amount and direction; no shared nonblank external reference proves identity.{% endif %} Human review required.</p>
+<p>{{ accepted.currency_code }}, {{ accepted.minor_units }} minor units. Receipt {{ receipt.id }}; provider transaction {{ receipt.provider_transaction_id }}.</p>
+<table><thead><tr><th>Evidence</th><th>Accepted observation</th><th>Other imported/manual line</th></tr></thead><tbody>
+<tr><th>Statement</th><td>{{ accepted.statement_ref }} ({{ accepted.id }})</td><td>{{ imported.statement_ref }} ({{ imported.id }})</td></tr>
+<tr><th>Source / evidence</th><td>{{ accepted.source_ref }} / {{ accepted.evidence_ref }}</td><td>{{ imported.source_ref }} / {{ imported.evidence_ref }}</td></tr>
+<tr><th>Line</th><td>{{ observed.line_number }} ({{ observed.id }})</td><td>{{ other.line_number }} ({{ other.id }})</td></tr>
+<tr><th>Transaction date</th><td>{{ observed.transaction_date | local_date }}</td><td>{{ other.transaction_date | local_date }}</td></tr>
+<tr><th>Amount / direction</th><td>{{ observed.amount }} {{ observed.direction }}</td><td>{{ other.amount }} {{ other.direction }}</td></tr>
+<tr><th>External reference</th><td>{{ observed.external_ref or '(blank)' }}</td><td>{{ other.external_ref or '(blank)' }}</td></tr>
+<tr><th>Description</th><td>{{ observed.description }}</td><td>{{ other.description }}</td></tr>
+</tbody></table>
+</section>
+{% else %}<p>No overlap candidates on this page. This does not establish that activation is safe.</p>{% endfor %}
+{% set account_query = '&account_id=' ~ account_id if account_id else '' %}
+{% if page > 1 %}<a href="?page={{ page - 1 }}{{ account_query }}">Previous page</a>{% endif %}
+{% if has_more and page < max_page %}<a href="?page={{ page + 1 }}{{ account_query }}">Next page</a><p>Results are truncated to this page.</p>{% endif %}
+{% if has_more and page == max_page %}<p>Review limit reached; further results are truncated. Narrow the review to a bank account.</p>{% endif %}
+{% endblock %}
