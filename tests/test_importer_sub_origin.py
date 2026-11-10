@@ -15,6 +15,7 @@ from erp_v2.importer.spec import DestinationColumn, build_spec
 from erp_v2.importer.sub_origin import (
     LEGACY_SUB_ORIGIN_TABLES,
     SUB_CUSTOMER_REFERENCE_REASON,
+    SUB_PAYMENT_INTENT_REASON,
     SubCustomerRef,
     SubOriginPolicy,
     is_sub_origin_table,
@@ -222,7 +223,7 @@ def _payment_spec():
     )
 
 
-def test_payment_intents_on_sub_tagged_payments_make_the_run_incomplete(tmp_path) -> None:
+def test_payment_intents_alongside_a_payment_spec_make_the_run_incomplete(tmp_path) -> None:
     engine = _census_engine()
     with engine.begin() as c:
         c.execute(sa.text("CREATE TABLE payment_intent (intent_id TEXT, customer_payment_id TEXT)"))
@@ -232,9 +233,9 @@ def test_payment_intents_on_sub_tagged_payments_make_the_run_incomplete(tmp_path
         c.execute(sa.text("CREATE TABLE confirmations (id TEXT)"))
     with engine.connect() as s, dst.begin() as d:
         report = execute_transform(s, d, _payment_spec())
-    section = _sub_origin_receipt(engine, [], [report], tmp_path / "r.json")
+    section = _sub_origin_receipt(engine, [], [report, _intent_run(engine)], tmp_path / "r.json")
     assert section["payment_intents_on_sub_payments"]["count"] == 1  # in1 -> p2 (Sub-tagged)
-    assert "payment_intent rows reference Sub-tagged customer_payment (routing pending)" in section["incomplete"]
+    assert SUB_PAYMENT_INTENT_REASON in section["incomplete"]
     assert json.loads((tmp_path / "r.json.sub-origin-keys.json").read_text())["payment_intents_on_sub_payments"] == [
         "in1"
     ]
@@ -299,3 +300,44 @@ def test_child_pairings_declare_the_customer_reference() -> None:
     assert by_dest["mod_agreements.agreements"].sub_customer_ref == SubCustomerRef("customer_id")
     assert by_dest["mod_sales.quotes"].sub_customer_ref == SubCustomerRef("customer_id")
     assert by_dest["mod_sales.quote_lines"].sub_customer_ref.via_table == "quote"
+
+
+def _intent_spec():
+    return build_spec(
+        source_table="payment_intent",
+        destination_table="intents",
+        source_columns=("intent_id", "customer_payment_id"),
+        destination_columns=(DestinationColumn("id", nullable=False, has_default=False),),
+        renames={"id": "intent_id"},
+        sub_origin=None,
+    )
+
+
+def _intent_run(engine):
+    dst = sa.create_engine("sqlite://")
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE intents (id TEXT)"))
+    with engine.connect() as s, dst.begin() as d:
+        return execute_transform(s, d, _intent_spec())
+
+
+def test_payment_intent_only_run_without_payment_spec_is_incomplete(tmp_path) -> None:
+    engine = _census_engine()
+    with engine.begin() as c:
+        c.execute(sa.text("CREATE TABLE payment_intent (intent_id TEXT, customer_payment_id TEXT)"))
+        c.execute(sa.text("INSERT INTO payment_intent VALUES ('in1','p2'),('in2','p1')"))
+    report = _intent_run(engine)  # no customer_payment spec, no exclude spec
+    section = _sub_origin_receipt(engine, [], [report], tmp_path / "r.json")
+    assert section["payment_intents_on_sub_payments"]["count"] == 1
+    assert SUB_PAYMENT_INTENT_REASON in section["incomplete"]
+
+
+def test_payment_intent_census_that_cannot_run_is_named_not_skipped(tmp_path) -> None:
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as c:
+        c.execute(sa.text("CREATE TABLE payment_intent (intent_id TEXT, customer_payment_id TEXT)"))
+        c.execute(sa.text("INSERT INTO payment_intent VALUES ('in1','p2')"))
+    report = _intent_run(engine)  # customer_payment table is unreadable (absent)
+    section = _sub_origin_receipt(engine, [], [report], tmp_path / "r.json")
+    assert "error" in section["payment_intents_on_sub_payments"]
+    assert any("payment_intent census could not run" in r for r in section["incomplete"])

@@ -445,24 +445,29 @@ def _sub_origin_receipt(source_engine: sa.Engine, source_schemas, reports, recei
             with source_engine.connect() as conn:
                 _set_search_path(conn, source_schemas)
                 customers = sub_tagged_customers_referenced_by_native(conn)
-                intents = (
-                    payment_intents_on_sub_payments(conn)
-                    if any(r.source_table.rpartition(".")[2] == "customer_payment" for r in reports)
-                    else None
-                )
         except sa.exc.SQLAlchemyError as exc:  # fail closed: an unrunnable census fails the run
             section["customers_referenced_by_native"] = {"error": type(exc).__name__}
-            incomplete.append(f"sub-origin census could not run ({type(exc).__name__})")
+            incomplete.append(f"sub-origin customer census could not run ({type(exc).__name__})")
         else:
             keys = list(customers.pop("keys"))
             customers.pop("via_invoices"), customers.pop("via_payments")
             side["customers_referenced_by_native"] = keys
             section["customers_referenced_by_native"] = {**customers, **key_evidence(keys, side_path.name)}
-            if intents is not None:
-                side["payment_intents_on_sub_payments"] = intents
-                section["payment_intents_on_sub_payments"] = key_evidence(intents, side_path.name)
-                if intents:
-                    incomplete.append(SUB_PAYMENT_INTENT_REASON)
+    # Independent of every exclude/customer_payment spec: any run that reads
+    # payment_intent must check it for intents on Sub-tagged payments.
+    if any(r.source_table.rpartition(".")[2] == "payment_intent" for r in reports):
+        try:
+            with source_engine.connect() as conn:
+                _set_search_path(conn, source_schemas)
+                intents = payment_intents_on_sub_payments(conn)
+        except sa.exc.SQLAlchemyError as exc:  # never skipped silently
+            section["payment_intents_on_sub_payments"] = {"error": type(exc).__name__}
+            incomplete.append(f"payment_intent census could not run ({type(exc).__name__})")
+        else:
+            side["payment_intents_on_sub_payments"] = intents
+            section["payment_intents_on_sub_payments"] = key_evidence(intents, side_path.name)
+            if intents:
+                incomplete.append(SUB_PAYMENT_INTENT_REASON)
     if any(r.sub_customer_ref_rows for r in reports):
         incomplete.append(SUB_CUSTOMER_REFERENCE_REASON)
     if side:
