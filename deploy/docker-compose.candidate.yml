@@ -32,6 +32,9 @@ services:
       CSRF_SECRET: ${CSRF_SECRET:?runtime CSRF secret required}
       CSRF_ENABLED: "true"
       SEED_ON_STARTUP: "false"
+      # Optional: empty keeps the Academy machine-key route closed (503).
+      MACHINE_CREDENTIAL_HMAC_KEY: ${MACHINE_CREDENTIAL_HMAC_KEY:-}
+      ACADEMY_SYNC_TENANT_ID: ${ACADEMY_SYNC_TENANT_ID:-}
     ports:
       - "127.0.0.1:8013:8000"
     networks:

@@ -88,12 +88,24 @@ role can read it (legacy RLS untouched).
   tenant UUID), `ACADEMY_SYNC_SOURCE_SCOPE_REF` (default `dotmac`),
   `MACHINE_CREDENTIAL_HMAC_KEY` (the kernel's held verification secret,
   >= 32 bytes, distinct from the session secrets; optional, and unset keeps
-  the route closed with `not_configured`). The former shared-secret
-  `ACADEMY_SYNC_WEBHOOK_SECRET` and the HMAC `X-Webhook-Signature-256` path
-  are removed. Cut-over: issue the credential (kernel `issue_credential`),
-  switch Academy's sender to `X-Api-Key`, then delete the old secret from the
-  host env file. The receiver was unconfigured at flip, so no deployed
-  caller depends on the old path.
+  the route closed with `not_configured`; empty is treated as unset). The
+  former shared-secret `ACADEMY_SYNC_WEBHOOK_SECRET` and the HMAC
+  `X-Webhook-Signature-256` path are removed. A credential whose
+  `source_application` is not `dotmac_academy_app` is refused (403).
+  The receiver was unconfigured at flip, so no deployed caller depends on
+  the old path.
+
+  Cut-over (nothing here is done by this change):
+  1. Credential issuance needs the follow-up issuance tool. Never issue
+     credentials by hand in a container shell.
+  2. Switching Academy's sender to `X-Api-Key` is an Academy code change and
+     needs Michael's approval under the Academy freeze.
+  3. Academy's `erp_webhook_secret` also signs its webhook to the legacy ERP
+     (Academy `app/services/erp_sync.py`), so do NOT delete it with this
+     change. Retire it only after the legacy ERP webhook is retired.
+  4. Rotating `MACHINE_CREDENTIAL_HMAC_KEY` invalidates ALL machine
+     credentials (every stored digest is keyed by it); they must be
+     re-issued, so rotate only with a re-issue plan.
 
 ## Flip-day sequence (ready packet + explicit flip-day go required)
 

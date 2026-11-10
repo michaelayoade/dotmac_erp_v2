@@ -45,7 +45,7 @@ from dotmac_kernel.session_runtime import NoDatabaseRuntimeError, resolve_databa
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from erp_v2.academy_sync.contracts import OWNER_APPLICATION, build_registry
+from erp_v2.academy_sync.contracts import OWNER_APPLICATION, SOURCE_APPLICATION, build_registry
 from erp_v2.academy_sync.receiver import CompletionSyncReceiver
 
 #: The one scope that admits this route (exact match, no wildcard).
@@ -90,6 +90,9 @@ async def receive_completion(request: Request) -> JSONResponse:
     if principal.tenant_id != tenant_id:
         return _refused(401, "unauthorized")
     if not principal.has_scope(REQUIRED_SCOPE):
+        return _refused(403, "forbidden")
+    if principal.application != SOURCE_APPLICATION:
+        # Pin the peer: only the Academy application may use this route.
         return _refused(403, "forbidden")
 
     body = await request.body()

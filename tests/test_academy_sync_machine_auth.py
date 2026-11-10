@@ -213,3 +213,25 @@ def test_repo_has_no_shared_secret_reference():
             if "ACADEMY_SYNC_WEBHOOK_SECRET" in text:
                 # Only the deployment doc may name it, as a removal note.
                 assert path.name == "deployment.md", path
+
+
+def test_other_application_key_with_scope_is_refused_before_delivery(ctx, monkeypatch):
+    client, s, tenant_id = ctx
+    _, raw = _key(s, tenant_id, app="dotmac_other")
+    called = []
+    monkeypatch.setattr(routes, "deliver_authenticated", lambda *a, **k: called.append(1))
+    response = _post(client, raw, body=encode_envelope(_envelope()))
+    assert response.status_code == 403
+    assert response.json() == {"status": "forbidden"}
+    assert called == []
+
+
+def test_empty_compose_defaults_are_not_configured(ctx, monkeypatch):
+    client, s, tenant_id = ctx
+    _, raw = _key(s, tenant_id)
+    monkeypatch.setenv("ACADEMY_SYNC_TENANT_ID", "")
+    response = _post(client, raw)
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_configured"}
+    clear_secret_source()
+    assert install_machine_key_secret({MACHINE_KEY_ENV: ""}) is False
