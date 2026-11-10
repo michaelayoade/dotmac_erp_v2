@@ -4,7 +4,15 @@ Status: packet prepared 2026-11-09 after Gate 4 terminal receipt
 (candidate `4a38b05`). The traffic switch itself needs Michael's
 explicit flip-day confirmation after the readiness list below.
 
-Beside-legacy staging DONE 2026-11-09 (candidate `0721ce9`):
+Beside-legacy staging DONE 2026-11-09, restaged 2026-11-10 at
+merged main (candidate `7cc60ea`, PR #1+#2 landed; restage
+receipt `restage-receipt.json` beside the original
+`prod-receipt.json`, outcomes identical: written 1,342,827,
+exact parity). The guarded launcher now also requires the
+runtime materials in `/root/erp-v2-candidate/materials.env`
+(platform DSN via a narrow `platform_api` login, root domain,
+32-byte secrets, trusted hosts, seeding off). Original
+staging record (candidate `0721ce9`):
 `erp_v2` database and `dotmac_erp_v2_app` run on the prod host,
 loopback `127.0.0.1:8013` only, imported from snapshot
 `legacy-20261109T104205Z.dump` (sha256 `b5e75399...`, receipt
