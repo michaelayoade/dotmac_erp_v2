@@ -318,20 +318,14 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_payments.payment_confirmations",
         "public.customer_payment",
-        renames={
-            "id": "payment_id",
-            "confirmed_amount": "amount",
-            "observed_at": "payment_date",
-            "external_reference": "reference",
-            "provider_type": "payment_method",
-        },
-        constants={"source": "MANUAL"},
-        lookups={"intent_id": ("payment_intent_by_payment", "id", "intent_id")},
+        source_row_refusal=SourceRowRefusal(
+            source_key="payment_id",
+            reason="historical_customer_payment_not_confirmation_evidence",
+        ),
         sub_origin=SubOriginPolicy.EXCLUDE,  # F1: Sub-origin cash is Sub Billing's, never ERP v2's
-        note="source=MANUAL (ConfirmationSource): legacy rows are recorded "
-        "payments, not provider callbacks. intent_id via the enrolment map "
-        "built from legacy payment_intent.customer_payment_id; payments "
-        "with no intent exception to manual review (module requires one)",
+        note="Retain original customer payment evidence in the frozen source snapshot; "
+        "native rows are named refusals, never confirmed cash. Sub-tagged rows "
+        "remain excluded under the approved Sub-origin policy.",
     ),
     *_generated(
         "mod_payments",

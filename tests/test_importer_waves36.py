@@ -915,7 +915,10 @@ def test_wave36_rulings_narrow_missing_to_named_decisions() -> None:
 
     # Spot-check the mechanisms the rulings rely on.
     assert by_dest["mod_banking.bank_statement_lines"].fk_rewrites == {"direction": "bank_direction_by_type"}
-    assert by_dest["mod_payments.payment_confirmations"].constants == {"source": "MANUAL"}
+    assert by_dest["mod_payments.payment_confirmations"].constants == {}
+    assert by_dest["mod_payments.payment_confirmations"].source_row_refusal.reason == (
+        "historical_customer_payment_not_confirmation_evidence"
+    )
     assert by_dest["mod_payments.payment_confirmations"].sub_origin.value == "exclude"
     assert by_dest["mod_approvals.approval_requests"].lookups["policy_code"] == (
         "approval_request_policy",

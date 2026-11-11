@@ -70,14 +70,15 @@ def test_source_built_maps_and_conflict() -> None:
     assert maps.get("employee_party") == {"e1": "p1"}
     assert maps.get("user_party") == {"u1": "p2"}
     assert maps.get("supplier") == {"s1": {"name": "Legal Ltd"}, "s2": {"name": "Only Trading"}}
-    assert maps.get("payment_intent_by_payment") == {"cp1": {"intent_id": "i1"}}
+    with pytest.raises(KeyError, match="no enrolment builder"):
+        maps.get("payment_intent_by_payment")
     assert maps.get("project_template_task") == {"tt1": {"template_id": "tpl1"}}
     assert maps.get("bid_submission") == {"r1": {"event_id": "ev1"}}
     assert maps.get("bank_direction_by_type")["CREDIT"] == "credit"
 
-    src.execute(sa.text("INSERT INTO public.payment_intent VALUES ('i9','cp1')"))
+    src.execute(sa.text("INSERT INTO public.supplier VALUES ('s1','Conflicting Ltd','Trading')"))
     with pytest.raises(MapConflict):
-        EnrolmentMaps(src, dst).get("payment_intent_by_payment")
+        EnrolmentMaps(src, dst).get("supplier")
 
 
 def test_destination_built_maps() -> None:

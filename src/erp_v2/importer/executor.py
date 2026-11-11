@@ -337,23 +337,39 @@ def execute_transform(
     if spec.source_row_refusal is not None:
         refusal = spec.source_row_refusal
         # This path deliberately precedes insert executability, constants,
-        # enrolment, FK checks and filters. Census the complete source extent;
-        # run tenant constants must not hide historical payment evidence.
+        # enrolment and FK checks. Census the complete source extent under
+        # the declared Sub-origin policy; run constants cannot narrow it.
         for identifier in (*spec.source_table.split("."), refusal.source_key):
             if re.fullmatch(r"[a-z_][a-z0-9_]*", identifier) is None:
                 raise ValueError("unsafe SQL identifier in source-row refusal")
         report = TransformReport(source_table=spec.source_table, destination_table=spec.destination_table)
+        if any(gap.startswith("sub_origin_") for gap in spec.missing_required):
+            report.source_error = "source_row_refusal_invalid_sub_origin_policy"
+            return report
+        exclude_sub = spec.sub_origin is SubOriginPolicy.EXCLUDE
+        select_columns = f"{refusal.source_key}, {SUB_ORIGIN_COLUMN}" if exclude_sub else refusal.source_key
+        excluded_keys: list[str] = []
         try:
             # Contain a failed PostgreSQL read in a savepoint so the caller's
             # snapshot transaction remains usable for the remaining diagnostics.
             # No outer transaction commit/rollback is performed here.
             with source_connection.begin_nested():
+                if exclude_sub:
+                    # Establish the complete frozen source count before streaming:
+                    # a partial read must never masquerade as a complete census.
+                    report.sub_origin_source = source_connection.execute(
+                        sa.text(f"SELECT count(*) FROM {spec.source_table}")  # noqa: S608
+                    ).scalar_one()
                 rows = source_connection.execute(
-                    sa.text(f"SELECT {refusal.source_key} FROM {spec.source_table}"),  # noqa: S608
+                    sa.text(f"SELECT {select_columns} FROM {spec.source_table}"),  # noqa: S608
                     execution_options={"stream_results": True, "yield_per": 1000},
                 )
                 try:
                     for row in rows:
+                        if exclude_sub and row[1] is not None:
+                            excluded_keys.append(str(row[0]))
+                            report.sub_origin_excluded += 1
+                            continue
                         report.read += 1
                         report.exceptions.append(
                             RowException(spec.source_table, str(row[0]), refusal.source_key, refusal.reason)
@@ -364,6 +380,7 @@ def execute_transform(
             # Never confuse an unreadable source/key with a verified empty
             # table. Keep database error text (and possible payload) private.
             report.source_error = "source_row_refusal_census_unreadable"
+        report.sub_origin_excluded_keys = tuple(sorted(excluded_keys))
         return report
 
     if not spec.executable:

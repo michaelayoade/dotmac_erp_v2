@@ -226,6 +226,18 @@ def _systematic_candidates(dest: str, source_columns: set[str], source_table: st
     return None
 
 
+def _sub_origin_gaps(source_columns: set[str], policy: SubOriginPolicy | None) -> tuple[str, ...]:
+    """Apply the same source-policy validation to inserts and refusals."""
+
+    if policy is SubOriginPolicy.EXCLUDE and SUB_ORIGIN_COLUMN not in source_columns:
+        return (f"sub_origin_column:{SUB_ORIGIN_COLUMN}",)
+    if policy is SubOriginPolicy.NOT_APPLICABLE and SUB_ORIGIN_COLUMN in source_columns:
+        return (f"sub_origin_not_applicable_but_column_present:{SUB_ORIGIN_COLUMN}",)
+    if policy is None and SUB_ORIGIN_COLUMN in source_columns:
+        return (f"sub_origin_policy_undeclared:{SUB_ORIGIN_COLUMN}",)
+    return ()
+
+
 def build_spec(
     *,
     source_table: str,
@@ -249,13 +261,15 @@ def build_spec(
     for part in source_table.split(".") + destination_table.split("."):
         _check(part)
     if source_row_refusal is not None:
+        source_set = {_check(c) for c in source_columns}
         return TransformSpec(
             source_table=source_table,
             destination_table=destination_table,
             column_map={},
-            missing_required=(),
-            residue=tuple(sorted(_check(c) for c in source_columns)),
+            missing_required=_sub_origin_gaps(source_set, sub_origin),
+            residue=tuple(sorted(source_set)),
             source_row_refusal=source_row_refusal,
+            sub_origin=sub_origin,
         )
     renames = dict(renames or {})
     constants = dict(constants or {})
@@ -352,13 +366,7 @@ def build_spec(
         _check(dest_col)
         if dest_col not in column_map:
             raise ValueError(f"deferred column {dest_col!r} is not mapped from the source")
-    if sub_origin is SubOriginPolicy.EXCLUDE and SUB_ORIGIN_COLUMN not in source_set:
-        # Declared exclude but nothing to filter on: refuse, never import unfiltered.
-        missing.append(f"sub_origin_column:{SUB_ORIGIN_COLUMN}")
-    if sub_origin is SubOriginPolicy.NOT_APPLICABLE and SUB_ORIGIN_COLUMN in source_set:
-        missing.append(f"sub_origin_not_applicable_but_column_present:{SUB_ORIGIN_COLUMN}")
-    if sub_origin is None and SUB_ORIGIN_COLUMN in source_set:
-        missing.append(f"sub_origin_policy_undeclared:{SUB_ORIGIN_COLUMN}")
+    missing.extend(_sub_origin_gaps(source_set, sub_origin))
     consumed = set(column_map.values())
     residue = tuple(sorted(source_set - consumed))
     return TransformSpec(
