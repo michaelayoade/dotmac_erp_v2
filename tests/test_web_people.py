@@ -145,3 +145,22 @@ def test_finance_templates_render() -> None:
     )
     assert "No posted ledger lines" in home
     assert "No open supplier invoices" in env.get_template("finance/payables.html").render(invoices=[], **ctx)
+    unknown = env.get_template("finance/payables.html").render(
+        invoices=[
+            {
+                "number": "INV-HISTORICAL",
+                "supplier": "Supplier",
+                "supplier_document": "—",
+                "invoice_date": "2026-01-05",
+                "currency_code": "NGN",
+                "total": _D(100),
+                "outstanding": None,
+                "status": "APPROVED",
+                "reconciliation_required": True,
+            }
+        ],
+        **ctx,
+    )
+    assert "Invoice total" in unknown and "Outstanding" in unknown
+    assert "Not established" in unknown and "Reconciliation required" in unknown
+    assert "Invoices without obligation evidence need reconciliation." in unknown
