@@ -71,7 +71,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "im_0001_import_runs",  # imports 0.2.0a1
     "iv_0001_inventory",  # inventory 0.2.0a1
     "nu_0001_numbering",  # numbering 0.1.0a3
-    "pa_0001_payables",  # payables 0.1.0a1
+    "pa_0002_optional_supplier_doc",  # payables 0.1.0a2
     "pc_0001_procurement",  # procurement 0.1.0a1
     "pe_0001_people_directory",  # people 0.1.0a2
     "pj_0001_projects",  # projects 0.1.0a1
