@@ -75,3 +75,23 @@ parity (including future lockout and MFA operations); that remains a release gat
 
 The legacy source schema is fixed to `public`; no unreviewed schema override
 can change which credential, person or MFA tables supply a reviewed cohort.
+
+## Access scope ruling (Michael, 2026-11-11)
+
+Because v2 replaces the existing ERP, everyone gets access the way
+Academy did it — there is no hand-picked login subset. The cohort is
+every active staff member with a local credential who exactly matches
+an imported Party and Employee. Accounts the enrolment path cannot
+carry (reset-required, failed-attempt state, enabled MFA, unmatched
+identity) are named remediation groups with supported flows, not
+policy exclusions from day-one access.
+
+Dest3 cohort evidence (private operator files on the test server,
+counts only): 247 tenant credentials → 140 active person + active
+local credential → 105 exactly matched (12 no Party, 23 Party
+without Employee) → 97 source-eligible (8 blocked: 7
+password-change-required, 1 failed-attempt state) → 94
+destination-ready (2 inactive Parties and 1 DRAFT employee held out
+as data-review items). The read-only plan for the 94 ready mappings
+returns `ready: true` with 94 credential inserts, 94 Party email
+fills and zero blockers. No apply has run anywhere yet.
