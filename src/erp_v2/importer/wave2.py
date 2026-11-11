@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
-from erp_v2.importer.spec import TransformSpec, build_spec, destination_columns_from_table
+from erp_v2.importer.spec import SourceRowRefusal, TransformSpec, build_spec, destination_columns_from_table
 from erp_v2.importer.sub_origin import SubCustomerRef, SubOriginPolicy
 
 
@@ -42,6 +42,7 @@ class Pairing:
     # Child rows pointing at a Sub-tagged customer become row exceptions (M11 pending)
     sub_customer_ref: SubCustomerRef | None = None
     note: str = ""
+    source_row_refusal: SourceRowRefusal | None = None
 
 
 # Module rules/lines denormalize component identity; the enrolment
@@ -377,6 +378,7 @@ def build_wave2_specs(
                 json_columns=pairing.json_columns,
                 sub_origin=pairing.sub_origin,
                 sub_customer_ref=pairing.sub_customer_ref,
+                source_row_refusal=pairing.source_row_refusal,
             )
         )
     return tuple(specs), tuple(generated)

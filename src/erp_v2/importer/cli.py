@@ -136,13 +136,20 @@ def _resolve_sources(engine: sa.Engine, pairings: Sequence[Pairing]):
     resolution: dict[str, str | None] = {}
     ambiguous: set[str] = set()
     columns: dict[str, tuple[str, ...]] = {}
+    unreadable: set[str] = set()
     for declared in sorted({p.source for p in pairings if p.source}):
         bare = declared.rpartition(".")[2]
         holders = [s for s in schemas if bare in tables_by_schema[s]]
         if len(holders) == 1:
             actual = f"{holders[0]}.{bare}"
             resolution[declared] = actual
-            columns[actual] = tuple(c["name"] for c in inspector.get_columns(bare, schema=holders[0]))
+            try:
+                columns[actual] = tuple(c["name"] for c in inspector.get_columns(bare, schema=holders[0]))
+            except sa.exc.SQLAlchemyError:
+                if not any(p.source == declared and p.source_row_refusal is not None for p in pairings):
+                    raise
+                resolution[declared] = None
+                unreadable.add(declared)
         elif len(holders) > 1:
             resolution[declared] = None
             ambiguous.add(declared)
@@ -156,7 +163,11 @@ def _resolve_sources(engine: sa.Engine, pairings: Sequence[Pairing]):
     report = {
         "resolved": {d: a for d, a in sorted(resolution.items()) if a and a != d},
         "ambiguous": sorted(ambiguous),
-        "missing": sorted(d for d, a in resolution.items() if a is None and d not in ambiguous),
+        "missing": sorted(d for d, a in resolution.items() if a is None and d not in ambiguous | unreadable),
+        "unreadable": sorted(unreadable),
+        "refusal_sources_incomplete": sorted(
+            p.source for p in pairings if p.source_row_refusal is not None and not resolution.get(p.source)
+        ),
     }
     used_schemas = sorted({a.partition(".")[0] for a in resolution.values() if a})
     return resolved_pairings, columns, report, used_schemas
@@ -171,11 +182,14 @@ def _set_search_path(connection: sa.Connection, schemas: Sequence[str]) -> None:
 
 def _spec_report(specs: Sequence[TransformSpec]) -> dict[str, object]:
     blocked = [
-        {"destination": s.destination_table, "missing": list(s.missing_required)} for s in specs if not s.executable
+        {"destination": s.destination_table, "missing": list(s.missing_required)}
+        for s in specs
+        if not s.executable and s.source_row_refusal is None
     ]
     return {
         "specs_total": len(specs),
         "specs_executable": sum(s.executable for s in specs),
+        "specs_source_row_refusal": sum(s.source_row_refusal is not None for s in specs),
         "specs_blocked": blocked,
         "residue_columns": sum(len(s.residue) for s in specs),
         "enrolment_maps_required": sorted(required_maps(specs)),
@@ -635,7 +649,11 @@ def cmd_execute(args: argparse.Namespace) -> int:
     dest_tables = _destination_tables()
     specs, _generated = build_specs(present, source_columns, dest_tables)
     run_constants: dict[str, object] = _execute_run_constants(args, manifest)
-    supplied = tuple(s for s in specs if s.executable and set(s.run_supplied) <= set(run_constants))
+    supplied = tuple(
+        s
+        for s in specs
+        if s.source_row_refusal is not None or (s.executable and set(s.run_supplied) <= set(run_constants))
+    )
     kept, parent_blocked = partition_parent_blocked(specs, supplied, dest_tables)
     executable = order_specs(kept, dest_tables)
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
@@ -672,7 +690,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         transitions = run_transitions(
             source_conn,
             dest_conn,
-            executable,
+            tuple(s for s in executable if s.source_row_refusal is None),
             dry_run=not args.apply,
             commit=bool(args.apply),
         )
@@ -682,7 +700,12 @@ def cmd_execute(args: argparse.Namespace) -> int:
             dest_conn.rollback()
     transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
     sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports, Path(args.receipt))
-    complete = result.complete and not transition_exceptions and not sub_origin["incomplete"]
+    complete = (
+        result.complete
+        and not transition_exceptions
+        and not sub_origin["incomplete"]
+        and not resolution.get("refusal_sources_incomplete")
+    )
     payload: dict[str, object] = {
         "kind": "execute",
         "manifest": manifest.as_dict(),
@@ -705,6 +728,16 @@ def cmd_execute(args: argparse.Namespace) -> int:
         "specs_skipped_unsupplied_run_constants": unsupplied,
         "specs_skipped_parent_not_imported": [s.destination_table for s in parent_blocked],
         "source_resolution": resolution,
+        "source_row_refusals": [
+            {
+                "source_table": r.source_table,
+                "read": r.read,
+                "refused": r.refused,
+                "source_error": r.source_error,
+            }
+            for s, r in zip(executable, result.reports, strict=True)
+            if s.source_row_refusal is not None
+        ],
         "enrolment_maps_built": dict(result.enrolment_maps),
         "mints": [_mint_dict(m) for m in (*result.mints, *post_mints)],
         "transitions": [

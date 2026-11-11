@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from decimal import Decimal
 
+import pytest
 import sqlalchemy as sa
 
 from erp_v2.importer.cli import _resolve_sources
 from erp_v2.importer.enrolment import EnrolmentMaps
 from erp_v2.importer.wave2 import Pairing
+from erp_v2.importer.waves36 import ALL_WAVE_PAIRINGS
 
 _SCHEMAS = ("public", "hr", "ap", "mod_payables", "mod_sales")
 
@@ -56,6 +59,32 @@ def test_source_resolution_across_schemas() -> None:
     assert report["missing"] == ["public.absent_table"]
     assert columns["hr.employee"] == ("employee_id", "person_id")
     assert set(schemas) == {"hr", "public"}
+
+
+@pytest.mark.parametrize("shape", ["resolved", "missing", "ambiguous", "unreadable"])
+def test_payment_refusal_resolution_is_preserved_or_named_incomplete(shape, monkeypatch):
+    payment = next(p for p in ALL_WAVE_PAIRINGS if p.source == "public.supplier_payment")
+    ddl = () if shape == "missing" else ("CREATE TABLE ap.supplier_payment (payment_id TEXT)",)
+    if shape == "ambiguous":
+        ddl += ("CREATE TABLE public.supplier_payment (payment_id TEXT)",)
+    engine = _engine(ddl)
+    if shape == "unreadable":
+        inspector = sa.inspect(engine)
+
+        def unreadable(*args, **kwargs):
+            raise sa.exc.OperationalError("metadata unavailable", {}, Exception("private error"))
+
+        monkeypatch.setattr(inspector, "get_columns", unreadable)
+        monkeypatch.setattr("erp_v2.importer.cli.sa.inspect", lambda engine: inspector)
+    resolved, columns, report, _ = _resolve_sources(engine, (payment,))
+    if shape == "resolved":
+        assert resolved == (replace(payment, source="ap.supplier_payment"),)
+        assert columns["ap.supplier_payment"] == ("payment_id",)
+        assert report["refusal_sources_incomplete"] == []
+    else:
+        assert resolved == ()
+        assert report[shape] == [payment.source]
+        assert report["refusal_sources_incomplete"] == [payment.source]
 
 
 def test_unqualified_builder_sql_finds_nonpublic_schema() -> None:
@@ -126,7 +155,8 @@ def test_batch2_computations() -> None:
         assert maps.get("quote_tax_rate") == {"q1": {"tax_rate": Decimal("7.5")}}
         assert maps.get("tenant_currency") == {"t1": {"currency_code": "NGN"}}
         assert maps.get("asset_condition") == {"a1": {"condition": "fair"}}
-        assert maps.get("settlement_obligation") == {"pay1": {"obligation_id": "ob1"}}
+        with pytest.raises(KeyError, match="no enrolment builder"):
+            maps.get("settlement_obligation")
         terms = maps.get("payment_intent_terms")
         assert terms["pi1"] == {
             "payer_reference": "a@b.c",

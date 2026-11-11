@@ -88,6 +88,20 @@ This proves historical baseline restoration, not post-financial-write
 recovery, a current production snapshot or production writer fencing.
 Owned disposable resources were removed; private receipts and backup remain.
 
+## Historical supplier payment import boundary
+
+The generic importer retains every source supplier payment as the named
+`historical_ap_payment_not_settlement_evidence` refusal. Legacy payment states
+and allocations cannot insert Payables settlement observations, even when an
+invoice already has an obligation. Original payment, allocation and journal
+evidence remains in the frozen snapshot for a separate owner admission contract.
+
+The refusal census reads the complete resolved source table independently of
+destination mappings and parent filters. It writes no destination rows. Missing,
+ambiguous or unreadable sources remain incomplete; a verified empty source is
+reported separately. Refused rows count in the import receipt and keep its
+exit status at 3. No bank confirmation or liability reduction is inferred.
+
 ## Remaining gates
 
 | Area | Required evidence or next action |
