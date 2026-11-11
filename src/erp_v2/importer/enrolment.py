@@ -900,45 +900,6 @@ def _asset_condition(source: sa.Connection, dest: sa.Connection) -> dict[Any, di
     return {key: {"condition": value} for key, (_stamp, value) in latest.items()}
 
 
-def _settlement_obligation(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
-    """Single-allocation supplier payments -> the invoice's obligation.
-
-    Exact only: the payment allocates to exactly one invoice (AP
-    payment_allocation), allocations sum to the payment amount, and
-    the destination holds exactly one obligation for that invoice
-    (service-derived post-import). Anything else exceptions.
-    """
-
-    obligations: dict[Any, list[Any]] = {}
-    for invoice_id, obligation_id in dest.execute(
-        sa.text("SELECT invoice_id, id FROM mod_payables.payment_obligations")
-    ):
-        obligations.setdefault(_norm(invoice_id), []).append(_norm(obligation_id))
-    allocations: dict[Any, list[tuple[Any, Decimal]]] = {}
-    for payment_id, invoice_id, amount in source.execute(
-        sa.text("SELECT payment_id, invoice_id, allocated_amount FROM payment_allocation")
-    ):
-        try:
-            allocations.setdefault(_norm(payment_id), []).append((_norm(invoice_id), Decimal(str(amount))))
-        except InvalidOperation:
-            continue
-    mapping: dict[Any, dict[str, Any]] = {}
-    for payment_id, amount in source.execute(sa.text("SELECT payment_id, amount FROM supplier_payment")):
-        entries = allocations.get(_norm(payment_id), [])
-        if len(entries) != 1:
-            continue
-        invoice_id, allocated = entries[0]
-        try:
-            if allocated != Decimal(str(amount)):
-                continue
-        except InvalidOperation:
-            continue
-        candidates = obligations.get(invoice_id, [])
-        if len(candidates) == 1:
-            _put(mapping, "settlement_obligation", payment_id, {"obligation_id": candidates[0]})
-    return mapping
-
-
 def _payment_intent_terms(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     """payer/purpose/channel for legacy Paystack intents, derivable only.
 
@@ -1061,7 +1022,6 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "quote_lead": _quote_lead,
     "quote_tax_rate": _quote_tax_rate,
     "receipt_lines": _receipt_lines,
-    "settlement_obligation": _settlement_obligation,
     "sourcing_line_by_requisition_line": _sourcing_line_by_requisition_line,
     "structure_revision": _structure_revision,
     "supplier": _supplier,
@@ -1081,6 +1041,8 @@ def required_maps(specs: Sequence[TransformSpec]) -> frozenset[str]:
 
     names: set[str] = set()
     for spec in specs:
+        if spec.source_row_refusal is not None:
+            continue
         names.update(spec.fk_rewrites.values())
         names.update(map_name for map_name, _key, _field in spec.lookups.values())
     return frozenset(names)

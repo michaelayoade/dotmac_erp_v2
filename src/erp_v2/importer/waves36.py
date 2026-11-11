@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Final
 
-from erp_v2.importer.spec import TransformSpec, build_spec, destination_columns_from_table
+from erp_v2.importer.spec import SourceRowRefusal, TransformSpec, build_spec, destination_columns_from_table
 from erp_v2.importer.sub_origin import SubCustomerRef, SubOriginPolicy
 from erp_v2.importer.wave2 import Pairing
 
@@ -273,12 +273,13 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_payables.settlement_observations",
         "public.supplier_payment",
-        renames={"occurred_at": "payment_date", "recorded_at": "created_at"},
-        lookups={"obligation_id": ("settlement_obligation", "id", "obligation_id")},
-        note="obligation_id resolves only for exact single-allocation "
-        "payments (AP payment_allocation sums to the payment amount and "
-        "the invoice carries exactly one derived obligation); everything "
-        "else exceptions - run after payables obligations derive",
+        source_row_refusal=SourceRowRefusal(
+            source_key="payment_id",
+            reason="historical_ap_payment_not_settlement_evidence",
+        ),
+        note="Retain original supplier payment evidence in the source snapshot; "
+        "legacy payment states and allocations do not establish bank settlement. "
+        "Every source row is a named refusal, independent of destination obligations.",
     ),
     *_generated(
         "mod_payables",
@@ -1012,6 +1013,7 @@ def build_specs(
                 json_columns=pairing.json_columns,
                 sub_origin=pairing.sub_origin,
                 sub_customer_ref=pairing.sub_customer_ref,
+                source_row_refusal=pairing.source_row_refusal,
             )
         )
     return tuple(specs), tuple(generated)

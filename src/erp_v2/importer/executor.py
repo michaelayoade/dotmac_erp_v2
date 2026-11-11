@@ -224,6 +224,7 @@ class TransformReport:
     read: int = 0
     written: int = 0
     exceptions: list[RowException] = field(default_factory=list)
+    source_error: str | None = None
     # Sub-origin exclusion (F1); None unless the spec declares `exclude`
     sub_origin_source: int | None = None  # all source rows, filtered or not
     sub_origin_excluded: int = 0
@@ -252,7 +253,12 @@ class TransformReport:
     @property
     def complete(self) -> bool:
         census = self.census
-        return not self.exceptions and self.read == self.written and (census is None or bool(census["balanced"]))
+        return (
+            self.source_error is None
+            and not self.exceptions
+            and self.read == self.written
+            and (census is None or bool(census["balanced"]))
+        )
 
 
 def _apply_deferred(
@@ -327,6 +333,38 @@ def execute_transform(
     limit: int | None = None,
 ) -> TransformReport:
     """Execute one table transform. Raises if the spec is not executable."""
+
+    if spec.source_row_refusal is not None:
+        refusal = spec.source_row_refusal
+        # This path deliberately precedes insert executability, constants,
+        # enrolment, FK checks and filters. Census the complete source extent;
+        # run tenant constants must not hide historical payment evidence.
+        for identifier in (*spec.source_table.split("."), refusal.source_key):
+            if re.fullmatch(r"[a-z_][a-z0-9_]*", identifier) is None:
+                raise ValueError("unsafe SQL identifier in source-row refusal")
+        report = TransformReport(source_table=spec.source_table, destination_table=spec.destination_table)
+        try:
+            # Contain a failed PostgreSQL read in a savepoint so the caller's
+            # snapshot transaction remains usable for the remaining diagnostics.
+            # No outer transaction commit/rollback is performed here.
+            with source_connection.begin_nested():
+                rows = source_connection.execute(
+                    sa.text(f"SELECT {refusal.source_key} FROM {spec.source_table}"),  # noqa: S608
+                    execution_options={"stream_results": True, "yield_per": 1000},
+                )
+                try:
+                    for row in rows:
+                        report.read += 1
+                        report.exceptions.append(
+                            RowException(spec.source_table, str(row[0]), refusal.source_key, refusal.reason)
+                        )
+                finally:
+                    rows.close()
+        except sa.exc.SQLAlchemyError:
+            # Never confuse an unreadable source/key with a verified empty
+            # table. Keep database error text (and possible payload) private.
+            report.source_error = "source_row_refusal_census_unreadable"
+        return report
 
     if not spec.executable:
         raise ValueError(
@@ -404,7 +442,7 @@ def execute_transform(
     # Stream source rows server-side: buffered results made memory
     # (and wall time) grow superlinearly past ~70k journal rows at
     # Gate 4 - 70k rows in 30s but 160k never finished.
-    source_rows = source_connection.execution_options(stream_results=True, yield_per=1000).execute(select_sql)
+    source_rows = source_connection.execute(select_sql, execution_options={"stream_results": True, "yield_per": 1000})
     for row in source_rows.mappings():
         if limit is not None and report.read >= limit:
             break

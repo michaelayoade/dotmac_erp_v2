@@ -52,12 +52,26 @@ class DestinationColumn:
 
 
 @dataclass(frozen=True)
+class SourceRowRefusal:
+    """Audited source rows that are evidence, never destination inserts."""
+
+    source_key: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        _check(self.source_key)
+        if not self.reason:
+            raise ValueError("source-row refusal requires a named reason")
+
+
+@dataclass(frozen=True)
 class TransformSpec:
     source_table: str  # schema-qualified, e.g. public.employee
     destination_table: str  # schema-qualified, e.g. mod_people.employees
     column_map: Mapping[str, str]  # destination column -> source column
     missing_required: tuple[str, ...]
     residue: tuple[str, ...]  # source columns no destination consumes
+    source_row_refusal: SourceRowRefusal | None = None
     fk_rewrites: Mapping[str, str] = field(default_factory=dict)
     # destination FK column -> name of the id-map that rewrites its values
     constants: Mapping[str, object] = field(default_factory=dict)
@@ -132,7 +146,7 @@ class TransformSpec:
 
     @property
     def executable(self) -> bool:
-        return not self.missing_required
+        return self.source_row_refusal is None and not self.missing_required
 
 
 def _is_run_supplied(dest: str) -> bool:
@@ -228,11 +242,21 @@ def build_spec(
     json_columns: tuple[str, ...] = (),
     sub_origin: SubOriginPolicy | None = None,
     sub_customer_ref: SubCustomerRef | None = None,
+    source_row_refusal: SourceRowRefusal | None = None,
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
     for part in source_table.split(".") + destination_table.split("."):
         _check(part)
+    if source_row_refusal is not None:
+        return TransformSpec(
+            source_table=source_table,
+            destination_table=destination_table,
+            column_map={},
+            missing_required=(),
+            residue=tuple(sorted(_check(c) for c in source_columns)),
+            source_row_refusal=source_row_refusal,
+        )
     renames = dict(renames or {})
     constants = dict(constants or {})
     lookups = dict(lookups or {})
@@ -395,6 +419,7 @@ def destination_columns_from_table(table: object) -> tuple[DestinationColumn, ..
 
 __all__ = [
     "DestinationColumn",
+    "SourceRowRefusal",
     "TransformSpec",
     "build_spec",
     "destination_columns_from_table",

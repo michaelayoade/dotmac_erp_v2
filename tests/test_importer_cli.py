@@ -263,6 +263,62 @@ def test_execute_apply_commits_per_spec(tmp_path, monkeypatch) -> None:
         assert c.execute(sa.text("SELECT count(*) FROM gadgets_out")).scalar() == 1
 
 
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("shape", ["populated", "empty", "missing", "ambiguous", "unreadable"])
+def test_execute_payment_refusal_receipt_and_exit_code(tmp_path, monkeypatch, apply, shape):
+    from dataclasses import replace
+
+    import sqlalchemy as sa
+
+    from erp_v2.importer import cli
+    from erp_v2.importer.waves36 import ALL_WAVE_PAIRINGS
+
+    source_path, dest_path = tmp_path / "src.db", tmp_path / "dest.db"
+    source_url, dest_url = f"sqlite:///{source_path}", f"sqlite:///{dest_path}"
+    source = sa.create_engine(source_url)
+    with source.begin() as s:
+        if shape not in ("missing", "ambiguous"):
+            key = "wrong_key" if shape == "unreadable" else "payment_id"
+            s.execute(sa.text(f"CREATE TABLE supplier_payment ({key} TEXT)"))
+            if shape == "populated":
+                s.execute(sa.text("INSERT INTO supplier_payment VALUES ('p1'), ('p2')"))
+    payment = next(p for p in ALL_WAVE_PAIRINGS if p.source == "public.supplier_payment")
+    payment = replace(payment, destination="settlement_observations")
+    monkeypatch.setattr(cli, "_ALL_PAIRINGS", (payment,))
+    table = sa.Table("settlement_observations", sa.MetaData(), sa.Column("id", sa.String))
+    monkeypatch.setattr(cli, "_destination_tables", lambda: {payment.destination: table})
+    monkeypatch.setattr(cli, "run_transitions", lambda *args, **kwargs: ())
+    monkeypatch.setattr(cli, "_sub_origin_receipt", lambda *args: {"incomplete": []})
+    if shape == "ambiguous":
+        # Source reflection reports multiple holders, rather than choosing
+        # either. Exercise CLI completion with the actual resolver's shape.
+        monkeypatch.setattr(
+            cli,
+            "_resolve_sources",
+            lambda *args: ((), {}, {"ambiguous": [payment.source], "refusal_sources_incomplete": [payment.source]}, ()),
+        )
+    monkeypatch.setenv("ERP_IMPORT_APPROVED", "1")
+    monkeypatch.setenv("ERP_IMPORT_APPLY_OK", "1")
+    monkeypatch.setenv("LEGACY_DATABASE_URL", source_url)
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", dest_url)
+    receipt_path = tmp_path / "refusal.json"
+    argv = ["execute", "--manifest", str(_manifest(tmp_path)), "--receipt", str(receipt_path)]
+    if apply:
+        argv.append("--apply")
+    assert main(argv) == (0 if shape == "empty" else 3)
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["complete"] is (shape == "empty")
+    assert receipt["written"] == 0
+    assert receipt["read"] == (2 if shape == "populated" else 0)
+    if shape == "populated":
+        assert {e["source_key"] for e in receipt["exceptions"]} == {"p1", "p2"}
+        assert {e["reason"] for e in receipt["exceptions"]} == {"historical_ap_payment_not_settlement_evidence"}
+    if shape == "unreadable":
+        assert receipt["source_row_refusals"][0]["source_error"] == "source_row_refusal_census_unreadable"
+    if shape in ("missing", "ambiguous"):
+        assert receipt["source_resolution"]["refusal_sources_incomplete"] == [payment.source]
+
+
 def test_billing_preflight_wholly_sub_origin_is_a_clean_noop(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("ERP_SELLER_LEGAL_NAME", "Dotmac Ltd")
     invoices = tmp_path / "inv.json"

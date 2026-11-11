@@ -63,7 +63,7 @@ def partition_parent_blocked(
     """
 
     all_dests = {s.destination_table for s in all_specs}
-    runnable_dests = {s.destination_table for s in runnable}
+    runnable_dests = {s.destination_table for s in runnable if s.source_row_refusal is None}
     changed = True
     while changed:
         changed = False
@@ -72,8 +72,8 @@ def partition_parent_blocked(
             if parents - runnable_dests:
                 runnable_dests.discard(dest)
                 changed = True
-    kept = tuple(s for s in runnable if s.destination_table in runnable_dests)
-    skipped = tuple(s for s in runnable if s.destination_table not in runnable_dests)
+    kept = tuple(s for s in runnable if s.source_row_refusal is not None or s.destination_table in runnable_dests)
+    skipped = tuple(s for s in runnable if s.source_row_refusal is None and s.destination_table not in runnable_dests)
     return kept, skipped
 
 
@@ -182,7 +182,7 @@ def run_import(
     explicit = dict(id_maps or {})
     reports: list[TransformReport] = []
     for spec in specs:
-        spec_maps = enrolment.for_spec(spec) if enrolment is not None else {}
+        spec_maps = enrolment.for_spec(spec) if enrolment is not None and spec.source_row_refusal is None else {}
         reports.append(
             execute_transform(
                 source_connection,
@@ -193,7 +193,7 @@ def run_import(
                 dry_run=dry_run,
             )
         )
-        if commit_per_spec and not dry_run:
+        if commit_per_spec and not dry_run and spec.source_row_refusal is None:
             destination_connection.commit()
     return ImportReceipt(
         destination_heads=tuple(sorted(EXPECTED_HEADS)),
