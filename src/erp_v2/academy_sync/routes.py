@@ -1,27 +1,29 @@
 """Transport adapter for the Academy completion receiver.
 
-Authentication is the deployment's existing Academy webhook HMAC
-(`X-Webhook-Signature-256: sha256=<hex>` over the raw body), verified
-before any envelope trust; the authenticated peer is then handed to
-`deliver_authenticated`, which binds it to the envelope's claimed
-source. The route is a platform-context route (tenant middleware
-leaves `request.state.tenant` unset on the platform root host): the
-destination tenant comes from deployment configuration, never from
-the request, and the envelope's source scope must match the expected
-Academy tenant slug before any session opens.
+Authentication is the kernel's machine credential: the caller presents an
+`X-Api-Key` that resolves (inside the configured tenant's RLS scope) to a
+non-revoked, unexpired, attributed credential holding exactly the scope
+`academy_sync.completion:write`. Scope matching is exact set membership; there
+is no wildcard and no shared secret. Every refusal is a fixed, opaque body.
+The credential's `source_application` becomes the authenticated peer handed
+to `deliver_authenticated`, which binds it to the envelope's claimed source.
+
+The route is a platform-context route (tenant middleware leaves
+`request.state.tenant` unset on the platform root host). Machine credentials
+live behind tenant RLS, so the tenant scope is established from deployment
+configuration, never from the request, before the key is looked up.
 
 Configuration (environment, read per request; unset = not configured):
-- `ACADEMY_SYNC_WEBHOOK_SECRET` — HMAC key shared with Academy.
-- `ACADEMY_SYNC_TENANT_ID` — UUID of the ERP tenant that owns the
-  Academy boundary in this deployment.
-- `ACADEMY_SYNC_SOURCE_SCOPE_REF` — expected Academy tenant slug
+- `ACADEMY_SYNC_TENANT_ID` -- UUID of the ERP tenant that owns the
+  Academy boundary in this deployment (not a secret).
+- `ACADEMY_SYNC_SOURCE_SCOPE_REF` -- expected Academy tenant slug
   (default `dotmac`).
+- `MACHINE_CREDENTIAL_HMAC_KEY` -- the kernel's dedicated verification
+  secret, installed at startup by `erp_v2.machine_keys`.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 from typing import Final
@@ -36,7 +38,9 @@ from dotmac_app_sync import (
     UnknownContract,
     deliver_authenticated,
 )
+from dotmac_kernel.exceptions import UnauthorizedError
 from dotmac_kernel.features import FeatureManifest
+from dotmac_kernel.machine_auth import API_KEY_HEADER, MachineKeyUnavailableError, authenticate_machine
 from dotmac_kernel.session_runtime import NoDatabaseRuntimeError, resolve_database_runtime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -44,7 +48,8 @@ from fastapi.responses import JSONResponse
 from erp_v2.academy_sync.contracts import OWNER_APPLICATION, SOURCE_APPLICATION, build_registry
 from erp_v2.academy_sync.receiver import CompletionSyncReceiver
 
-_SIGNATURE_HEADER: Final = "x-webhook-signature-256"
+#: The one scope that admits this route (exact match, no wildcard).
+REQUIRED_SCOPE: Final = "academy_sync.completion:write"
 _MAX_BODY_BYTES: Final = 64 * 1024
 
 router = APIRouter(tags=["integrations"])
@@ -54,31 +59,45 @@ def _refused(status_code: int, status: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"status": status})
 
 
-def _expected_signature(secret: str, body: bytes) -> str:
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-
-
 @router.post("/integration/academy-sync/completions", include_in_schema=False)
 async def receive_completion(request: Request) -> JSONResponse:
     if getattr(request.state, "tenant", None) is not None:
         # Platform-context route by construction; a tenant-resolved host
         # is not the integration surface.
         return _refused(404, "tenant_context_refused")
-    secret = os.environ.get("ACADEMY_SYNC_WEBHOOK_SECRET", "")
     tenant_raw = os.environ.get("ACADEMY_SYNC_TENANT_ID", "")
-    if not secret or not tenant_raw:
+    if not tenant_raw:
         return _refused(503, "not_configured")
     try:
         tenant_id = UUID(tenant_raw)
     except ValueError:
         return _refused(503, "not_configured")
 
+    raw_key = request.headers.get(API_KEY_HEADER, "")
+    if not raw_key:
+        return _refused(401, "unauthorized")
+    try:
+        runtime = resolve_database_runtime()
+    except NoDatabaseRuntimeError:
+        return _refused(503, "database_unbound")
+    try:
+        with runtime.tenant_session(tenant_id) as auth_db:
+            principal = authenticate_machine(auth_db, raw_key)
+    except MachineKeyUnavailableError:
+        return _refused(503, "not_configured")
+    except UnauthorizedError:
+        return _refused(401, "unauthorized")
+    if principal.tenant_id != tenant_id:
+        return _refused(401, "unauthorized")
+    if not principal.has_scope(REQUIRED_SCOPE):
+        return _refused(403, "forbidden")
+    if principal.application != SOURCE_APPLICATION:
+        # Pin the peer: only the Academy application may use this route.
+        return _refused(403, "forbidden")
+
     body = await request.body()
     if len(body) > _MAX_BODY_BYTES:
         return _refused(413, "body_too_large")
-    supplied = request.headers.get(_SIGNATURE_HEADER, "")
-    if not hmac.compare_digest(supplied, _expected_signature(secret, body)):
-        return _refused(401, "bad_signature")
 
     # Scope pre-check only (selects configuration; the envelope itself is
     # validated by deliver_authenticated below).
@@ -91,14 +110,13 @@ async def receive_completion(request: Request) -> JSONResponse:
         return _refused(422, "source_scope_refused")
 
     try:
-        runtime = resolve_database_runtime()
-    except NoDatabaseRuntimeError:
-        return _refused(503, "database_unbound")
-    try:
         with runtime.tenant_session(tenant_id) as db:
             receipt = deliver_authenticated(
                 body,
-                peer=AuthenticatedPeer(application=SOURCE_APPLICATION, transport_subject="hmac:academy-sync"),
+                peer=AuthenticatedPeer(
+                    application=principal.application,
+                    transport_subject=f"machine:{principal.credential_id}",
+                ),
                 expected_owner=OWNER_APPLICATION,
                 registry=build_registry(),
                 receiver=CompletionSyncReceiver(db, tenant_id=tenant_id),
@@ -125,4 +143,4 @@ academy_sync_feature: Final = FeatureManifest(
     routers=(router,),
 )
 
-__all__ = ["academy_sync_feature", "router"]
+__all__ = ["REQUIRED_SCOPE", "academy_sync_feature", "router"]
