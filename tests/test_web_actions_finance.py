@@ -40,6 +40,7 @@ def session():
         acct.JournalEntry.__table__,
         acct.PostedLedgerLine.__table__,
         pay.SupplierInvoice.__table__,
+        pay.PaymentObligation.__table__,
     ] + [Base.metadata.tables[n] for n in hr.HR_TABLES]
     Base.metadata.create_all(engine, tables=tables)
     s = Session(engine)
@@ -152,3 +153,94 @@ def test_finance_queries(session) -> None:
     assert tb["total_debit"] == Decimal(500) and tb["lines"][0]["balance"] == Decimal(500)
     assert fq.chart_of_accounts(s, tenant_id=tenant.id)[0]["code"] == "1000"
     assert fq.open_payables(s, tenant_id=tenant.id) == []
+
+
+def test_open_payables_uses_tenant_obligations_without_flushing(session) -> None:
+    s, tenant, _party, _emp = session
+    other_tenant = Tenant(id=uuid.uuid4(), slug="other", name="Other")
+    s.add(other_tenant)
+
+    def invoice(number, *, tenant_id=tenant.id, status="APPROVED"):
+        row = pay.SupplierInvoice(
+            tenant_id=tenant_id,
+            number=number,
+            supplier_ref=number,
+            supplier_name_snapshot="Supplier",
+            supplier_document_number=None,
+            invoice_date=date(2026, 1, 5),
+            received_date=date(2026, 1, 5),
+            currency_code="NGN",
+            exchange_rate=Decimal(1),
+            liability_account_ref="AP",
+            subtotal=Decimal(100),
+            tax_amount=Decimal(0),
+            total_amount=Decimal(100),
+            payment_schedule=[],
+            request_fingerprint=number,
+            status=status,
+        )
+        s.add(row)
+        s.flush()
+        return row
+
+    def obligation(row, sequence, outstanding, *, currency="NGN", tenant_id=None):
+        s.add(
+            pay.PaymentObligation(
+                tenant_id=tenant_id or row.tenant_id,
+                invoice_id=row.id,
+                sequence=sequence,
+                due_date=date(2026, 2, 5),
+                currency_code=currency,
+                original_amount=Decimal(100),
+                outstanding_amount=Decimal(outstanding),
+                status="SETTLED" if outstanding == 0 else "OPEN",
+            )
+        )
+
+    settled = invoice("paid")
+    obligation(settled, 1, 0)
+    partial = invoice("partial")
+    obligation(partial, 1, 10)
+    obligation(partial, 2, 15)
+    full = invoice("full")
+    obligation(full, 1, 100)
+    invoice("missing")
+    currency_mismatch = invoice("currency-mismatch")
+    obligation(currency_mismatch, 1, 0, currency="USD")
+    mixed_currency = invoice("mixed-currency")
+    obligation(mixed_currency, 1, 20)
+    obligation(mixed_currency, 2, 30, currency="USD")
+    cross_tenant = invoice("cross-tenant-evidence")
+    # SQLite permits this deliberately inconsistent imported structure; the
+    # presentation must never use another tenant's evidence for this invoice.
+    obligation(cross_tenant, 1, 0, tenant_id=other_tenant.id)
+    hidden = invoice("other-tenant", tenant_id=other_tenant.id)
+    obligation(hidden, 1, 100)
+    for status in ("VOID", "DRAFT", "SUBMITTED"):
+        row = invoice(status, status=status)
+        obligation(row, 1, 100)
+    s.flush()
+
+    # A read must not flush pending writes or present unflushed ORM values.
+    full.total_amount = Decimal(999)
+    statements = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    sa.event.listen(s.bind, "before_cursor_execute", record_statement)
+    try:
+        result = {row["number"]: row for row in fq.open_payables(s, tenant_id=tenant.id)}
+    finally:
+        sa.event.remove(s.bind, "before_cursor_execute", record_statement)
+    assert set(result) == {"partial", "full", "missing", "currency-mismatch", "mixed-currency", "cross-tenant-evidence"}
+    assert result["partial"]["outstanding"] == Decimal(25)
+    assert result["full"]["outstanding"] == Decimal(100)
+    assert result["full"]["total"] == Decimal(100)
+    assert result["full"]["reconciliation_required"] is False
+    for number in ("missing", "currency-mismatch", "mixed-currency", "cross-tenant-evidence"):
+        assert result[number]["outstanding"] is None
+        assert result[number]["reconciliation_required"] is True
+        assert result[number]["supplier_document"] == "—"
+    assert full in s.dirty
+    assert statements and all(statement.lstrip().upper().startswith("SELECT") for statement in statements)

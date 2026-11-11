@@ -3,12 +3,13 @@
 {% block content %}
 <h1>Open payables</h1>
 <p><a href="/finance">Back to finance</a></p>
+<p>Invoices without obligation evidence need reconciliation.</p>
 {% if invoices %}
 <table>
-  <thead><tr><th>Number</th><th>Supplier</th><th>Supplier doc</th><th>Date</th><th>Currency</th><th>Total</th><th>Status</th></tr></thead>
+  <thead><tr><th>Number</th><th>Supplier</th><th>Supplier doc</th><th>Date</th><th>Currency</th><th>Invoice total</th><th>Outstanding</th><th>Status</th><th>Reconciliation</th></tr></thead>
   <tbody>
   {% for i in invoices %}
-    <tr><td>{{ i.number }}</td><td>{{ i.supplier }}</td><td>{{ i.supplier_document }}</td><td>{{ i.invoice_date }}</td><td>{{ i.currency_code }}</td><td>{{ i.total }}</td><td>{{ i.status }}</td></tr>
+    <tr><td>{{ i.number }}</td><td>{{ i.supplier }}</td><td>{{ i.supplier_document }}</td><td>{{ i.invoice_date }}</td><td>{{ i.currency_code }}</td><td>{{ i.total }}</td><td>{{ 'Not established' if i.outstanding is none else i.outstanding }}</td><td>{{ i.status }}</td><td>{{ 'Reconciliation required' if i.reconciliation_required else '—' }}</td></tr>
   {% endfor %}
   </tbody>
 </table>

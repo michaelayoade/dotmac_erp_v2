@@ -11,8 +11,9 @@ from decimal import Decimal
 from uuid import UUID
 
 from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
-from dotmac_payables.models import SupplierInvoice
-from sqlalchemy import func, select
+from dotmac_payables.contracts import InvoiceStatus
+from dotmac_payables.models import PaymentObligation, SupplierInvoice
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 
@@ -88,27 +89,61 @@ def trial_balance(db: Session, *, tenant_id: UUID) -> dict[str, object]:
 
 
 def open_payables(db: Session, *, tenant_id: UUID, limit: int = 50) -> list[dict[str, object]]:
-    rows = db.scalars(
-        select(SupplierInvoice)
+    # A missing owner structure is unknown, never evidence of a zero balance.
+    obligations = (
+        select(
+            PaymentObligation.tenant_id,
+            PaymentObligation.invoice_id,
+            func.count(PaymentObligation.id).label("obligation_count"),
+            func.min(PaymentObligation.currency_code).label("min_currency"),
+            func.max(PaymentObligation.currency_code).label("max_currency"),
+            func.sum(PaymentObligation.outstanding_amount).label("outstanding"),
+        )
+        .where(PaymentObligation.tenant_id == tenant_id)
+        .group_by(PaymentObligation.tenant_id, PaymentObligation.invoice_id)
+        .subquery()
+    )
+    outstanding = case(
+        (
+            (obligations.c.obligation_count > 0)
+            & (obligations.c.min_currency == SupplierInvoice.currency_code)
+            & (obligations.c.max_currency == SupplierInvoice.currency_code),
+            obligations.c.outstanding,
+        ),
+        else_=None,
+    )
+    query = (
+        select(
+            SupplierInvoice.number,
+            SupplierInvoice.supplier_name_snapshot.label("supplier"),
+            SupplierInvoice.supplier_document_number.label("supplier_document"),
+            SupplierInvoice.invoice_date,
+            SupplierInvoice.currency_code,
+            SupplierInvoice.total_amount.label("total"),
+            SupplierInvoice.status,
+            outstanding.label("outstanding"),
+        )
+        .outerjoin(
+            obligations,
+            (obligations.c.tenant_id == SupplierInvoice.tenant_id) & (obligations.c.invoice_id == SupplierInvoice.id),
+        )
         .where(
             SupplierInvoice.tenant_id == tenant_id,
-            SupplierInvoice.status.not_in(("voided", "paid")),
+            SupplierInvoice.status == InvoiceStatus.APPROVED,
+            outstanding.is_(None) | (outstanding > 0),
         )
-        .order_by(SupplierInvoice.invoice_date.desc())
+        .order_by(SupplierInvoice.invoice_date.desc(), SupplierInvoice.id)
         .limit(limit)
     )
-    return [
-        {
-            "number": i.number,
-            "supplier": i.supplier_name_snapshot,
-            "supplier_document": i.supplier_document_number or "—",
-            "invoice_date": i.invoice_date,
-            "currency_code": i.currency_code,
-            "total": i.total_amount,
-            "status": i.status,
-        }
-        for i in rows
-    ]
+    with db.no_autoflush:
+        return [
+            {
+                **row,
+                "supplier_document": row["supplier_document"] or "—",
+                "reconciliation_required": row["outstanding"] is None,
+            }
+            for row in db.execute(query).mappings()
+        ]
 
 
 __all__ = ["chart_of_accounts", "open_payables", "recent_journals", "trial_balance"]
