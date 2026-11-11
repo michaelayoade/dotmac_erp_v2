@@ -194,3 +194,63 @@ publish-only `UPDATE` flips `is_published` (a deferred trigger
 requires published by commit). Validated live: 6 rules
 created+published. PAYE bands (NTA 2025) stay an explicit
 blocker — legacy has no PAYE `tax_code` to bind bands to.
+
+## Dest3 rehearsal — payables 0.1.0a2 candidate (2026-11-11)
+
+Candidate `7e3da63` (image `sha-7e3da63`, digest
+`sha256:5489105d...`) pins Starter `dotmac-payables 0.1.0a2`
+(Starter PR #1032, tag `dotmac-payables-v0.1.0a2`). Michael
+ruled that a supplier-issued invoice number that was never
+captured stays empty: `pa_0002_optional_supplier_doc` makes
+`supplier_document_number` nullable for historical/imported
+rows, while new documents created through the Payables
+contracts still require it. The frozen importer needed no
+code change — it already maps the source NULL straight
+through.
+
+Fresh genesis into `erp_v2_dest3` from the exact image
+stamped 30/30 `EXPECTED_STAMPED_HEADS` including
+`pa_0002_optional_supplier_doc`, both columns nullable, with
+the cutover ledger index created before `execute`. Full
+execute (same approvals/materials as dest2) completed with
+the by-design exit 3, `complete=False`
+(`dest3-receipt.json` on the test server).
+
+Supplier-document result, accounted row-for-row
+(`ap_reconcile.py` + cohort script):
+
+- Source supplier invoices with NULL `supplier_invoice_number`:
+  1,208. Landed in `mod_payables.supplier_invoices` with
+  `supplier_document_number` NULL: **1,151**. Landed with an
+  invented document number: **0**.
+- The remaining 57 are all named header exceptions in a
+  pre-existing finance family: 56 × `ck_supplier_invoices_total`,
+  1 × `ck_supplier_invoices_amounts` (50 PAID, 4 APPROVED,
+  2 DRAFT, 1 SUBMITTED). Nothing was adjusted to force them in.
+- `supplier_document_number` exceptions in the receipt: **0**
+  (dest2: 1,208 NotNullViolation).
+- Captured-document cohort is byte-identical to dest2
+  (732 landed, 264 missing: 199 supplier-document duplicates,
+  totals checks and REJECTED statuses), so the delta is
+  isolated to the ruling. Landed-row mismatches across
+  document presence/value, totals, currency and status
+  mapping: 0.
+
+Everything else matches dest2 except the deliberate F1
+Sub-origin exclusion, which first takes effect in this
+candidate: read 1,382,524 (dest2 1,401,472), written 1,336,803
+(dest2 1,342,544), customer accounts 456 (dest2 5,380;
+4,924 Sub-origin excluded with hashed side-file keys),
+journal entries 217,600 and posted ledger 445,950 unchanged,
+account-level GL reconciliation exact (108 accounts,
+0 mismatches). AP lines rose 1,867 → 4,823 with the newly
+landed invoices.
+
+Runtime proof on dest3: the candidate image served with
+dedicated `erp_v2_runtime`/`erp_v2_platform` logins
+(NOBYPASSRLS) reported `payables@0.1.0a2` in its startup
+order, `/health/ready` returned database mode, the tenant
+host redirected to login and an unknown host returned 400.
+Guarded startup also refused sub-32-byte secrets before
+serving. The rehearsal app container was stopped; `erp_v2_dest`,
+`erp_v2_dest2` and `erp_v2_dest3` all remain for comparison.
