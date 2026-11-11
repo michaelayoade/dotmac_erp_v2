@@ -657,6 +657,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
     kept, parent_blocked = partition_parent_blocked(specs, supplied, dest_tables)
     executable = order_specs(kept, dest_tables)
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
+    non_executable = [s.destination_table for s in specs if s.source_row_refusal is None and not s.executable]
     mint_context = _mint_context(args, run_constants) if args.mint else None
     post_mints: tuple[MintResult, ...] = ()
     # connect(), not begin(): --apply commits per spec, and a commit
@@ -702,6 +703,11 @@ def cmd_execute(args: argparse.Namespace) -> int:
     sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports, Path(args.receipt))
     complete = (
         result.complete
+        # Every source-backed spec in this batch must run. Generated/command
+        # destinations are a separate stage, not members of `specs`.
+        and not non_executable
+        and not unsupplied
+        and not parent_blocked
         and not transition_exceptions
         and not sub_origin["incomplete"]
         and not resolution.get("refusal_sources_incomplete")
@@ -725,6 +731,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         ],
         "sub_origin": sub_origin,
         "specs": _spec_report(specs),
+        "specs_skipped_non_executable": non_executable,
         "specs_skipped_unsupplied_run_constants": unsupplied,
         "specs_skipped_parent_not_imported": [s.destination_table for s in parent_blocked],
         "source_resolution": resolution,
