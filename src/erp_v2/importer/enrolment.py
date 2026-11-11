@@ -238,16 +238,6 @@ def _supplier(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str,
     return _lookup(rows, "supplier", ("name",))
 
 
-def _payment_intent_by_payment(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
-    rows = source.execute(
-        sa.text(
-            "SELECT customer_payment_id AS key, intent_id AS intent_id "
-            "FROM payment_intent WHERE customer_payment_id IS NOT NULL"
-        )
-    ).mappings()
-    return _lookup(rows, "payment_intent_by_payment", ("intent_id",))
-
-
 def _project_template_task(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     rows = source.execute(
         sa.text("SELECT template_task_id AS key, template_id AS template_id FROM project_template_task")
@@ -1013,7 +1003,6 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "inventory_item": _inventory_item,
     "lot_status": _lot_status,
     "pay_component": _pay_component,
-    "payment_intent_by_payment": _payment_intent_by_payment,
     "payroll_calculation": _payroll_calculation,
     "payroll_line_method": _payroll_line_method,
     "payment_intent_terms": _payment_intent_terms,
