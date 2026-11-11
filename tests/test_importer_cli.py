@@ -374,3 +374,88 @@ def test_billing_preflight_wholly_sub_origin_is_a_clean_noop(tmp_path, monkeypat
     data = json.loads(receipt.read_text())
     assert data["nothing_to_import"] == "sub_origin"
     assert data["census"]["balanced"] is True
+
+
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("include_consumer", [False, True])
+@pytest.mark.parametrize("producer_skip", ["unsupplied", "non_executable", "generated_stage_only"])
+def test_execute_required_skips_cannot_hide_behind_successful_reports(
+    tmp_path, monkeypatch, apply, include_consumer, producer_skip
+):
+    """A blocked item map must not erase PO exceptions into a green receipt.
+
+    Without the consumer, the producer's own skip still makes the run
+    incomplete. Generated/command pairings remain outside this batch.
+    """
+    import sqlalchemy as sa
+
+    from erp_v2.importer import cli
+    from erp_v2.importer.spec import TransformSpec
+    from erp_v2.importer.wave2 import Pairing
+
+    source_path, dest_path = tmp_path / "source.db", tmp_path / "destination.db"
+    source_url, dest_url = f"sqlite:///{source_path}", f"sqlite:///{dest_path}"
+    source_engine, dest_engine = sa.create_engine(source_url), sa.create_engine(dest_url)
+    with source_engine.begin() as source:
+        source.execute(sa.text("CREATE TABLE widgets (id TEXT)"))
+        source.execute(sa.text("INSERT INTO widgets VALUES ('widget-1')"))
+    with dest_engine.begin() as destination:
+        destination.execute(sa.text("CREATE TABLE widgets_out (id TEXT)"))
+    success = TransformSpec("widgets", "widgets_out", {"id": "id"}, (), ())
+    producer = TransformSpec(
+        "item",
+        "mod_inventory.items",
+        {"id": "id"},
+        ("base_uom",) if producer_skip == "non_executable" else (),
+        (),
+        run_supplied=("created_by_id",) if producer_skip == "unsupplied" else (),
+    )
+    consumer = TransformSpec(
+        "purchase_order_line",
+        "mod_procurement.purchase_order_lines",
+        {"id": "id", "item_ref": "item_ref"},
+        (),
+        (),
+        lookups={"unit": ("inventory_item", "item_ref", "base_uom")},
+    )
+    specs = (success,)
+    if producer_skip != "generated_stage_only":
+        specs = ((consumer,) if include_consumer else ()) + (producer, success)
+    generated = (Pairing("mod_example.command_owned", None),)
+    monkeypatch.setattr(cli, "_resolve_sources", lambda *args: ((), {}, {}, ()))
+    monkeypatch.setattr(cli, "_destination_tables", lambda: {})
+    monkeypatch.setattr(cli, "build_specs", lambda *args: (specs, generated))
+    monkeypatch.setattr(cli, "_sub_origin_receipt", lambda *args: {"incomplete": []})
+
+    def transitions(source, destination, executed, **kwargs):
+        assert executed == (success,)  # no financial/lifecycle mutations from skipped specs
+        return ()
+
+    monkeypatch.setattr(cli, "run_transitions", transitions)
+    monkeypatch.delenv("ERP_ENROLMENT_ACTOR_ID", raising=False)
+    monkeypatch.setenv("ERP_IMPORT_APPROVED", "1")
+    monkeypatch.setenv("ERP_IMPORT_APPLY_OK", "1")
+    monkeypatch.setenv("LEGACY_DATABASE_URL", source_url)
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", dest_url)
+    receipt_path = tmp_path / "skipped.json"
+    argv = ["execute", "--manifest", str(_manifest(tmp_path)), "--receipt", str(receipt_path)]
+    if apply:
+        argv.append("--apply")
+    complete = producer_skip == "generated_stage_only"
+    assert main(argv) == (0 if complete else 3)
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["complete"] is complete
+    assert receipt["read"] == 1 and receipt["written"] == 1
+    assert not receipt["exceptions"] and not receipt["enrolment_maps_built"]
+    assert receipt["specs_skipped_non_executable"] == (
+        [producer.destination_table] if producer_skip == "non_executable" else []
+    )
+    assert receipt["specs_skipped_unsupplied_run_constants"] == (
+        [producer.destination_table] if producer_skip == "unsupplied" else []
+    )
+    assert receipt["specs_skipped_parent_not_imported"] == (
+        [consumer.destination_table] if include_consumer and not complete else []
+    )
+    with dest_engine.connect() as destination:
+        assert destination.execute(sa.text("SELECT count(*) FROM widgets_out")).scalar_one() == int(apply)
+        assert sa.inspect(destination).get_table_names() == ["widgets_out"]

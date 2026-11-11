@@ -21,7 +21,7 @@ from typing import Any
 
 import sqlalchemy as sa
 
-from erp_v2.importer.enrolment import EnrolmentMaps
+from erp_v2.importer.enrolment import EnrolmentMaps, destination_dependencies
 from erp_v2.importer.executor import RowException, TransformReport, execute_transform
 from erp_v2.importer.minting import MintResult
 from erp_v2.importer.spec import TransformSpec
@@ -50,7 +50,7 @@ def partition_parent_blocked(
     runnable: Sequence[TransformSpec],
     destination_tables: Mapping[str, Any],
 ) -> tuple[tuple[TransformSpec, ...], tuple[TransformSpec, ...]]:
-    """Split off specs whose FK parent has a spec that is not running.
+    """Split off specs whose FK or map parent has a spec that is not running.
 
     Gate 4 live finding: bank_statements was skipped for an
     unsupplied run constant, and its 59k statement lines then
@@ -64,11 +64,14 @@ def partition_parent_blocked(
 
     all_dests = {s.destination_table for s in all_specs}
     runnable_dests = {s.destination_table for s in runnable if s.source_row_refusal is None}
+    map_parents: dict[str, set[str]] = {}
+    for spec in runnable:
+        map_parents.setdefault(spec.destination_table, set()).update(destination_dependencies((spec,)) & all_dests)
     changed = True
     while changed:
         changed = False
         for dest in sorted(runnable_dests):
-            parents = _fk_parents(dest, destination_tables, all_dests)
+            parents = _fk_parents(dest, destination_tables, all_dests) | map_parents[dest]
             if parents - runnable_dests:
                 runnable_dests.discard(dest)
                 changed = True
@@ -81,39 +84,32 @@ def order_specs(
     specs: Sequence[TransformSpec],
     destination_tables: Mapping[str, Any],
 ) -> tuple[TransformSpec, ...]:
-    """Topologically order specs so FK parents land before children.
+    """Order physical FK parents and declared destination-map producers first.
 
-    Gate 4 live finding: wave declaration order put employees
-    before their party parents - every row FK-rejected. The
-    destination metadata FK graph is the authority for execution
-    order; declaration order only breaks ties (stable). Specs
-    sharing a destination stay together in declaration order.
-    Cycles (mutual FKs) keep declaration order for the remainder;
-    the executor's FK retry pass covers intra-run ordering.
+    Declaration order breaks ties; specs sharing a destination stay together.
+    FK-only cycles retain the existing declaration-order fallback. A stalled
+    graph with unmet map dependencies fails before a lazy map can cache rows
+    from a producer that has not run. Source-refusal specs consume no maps.
     """
-
-    def _key(table: Any) -> str:
-        return f"{table.schema}.{table.name}" if table.schema else table.name
 
     groups: dict[str, list[TransformSpec]] = {}
     for spec in specs:
         groups.setdefault(spec.destination_table, []).append(spec)
-    parents: dict[str, set[str]] = {}
-    for dest in groups:
-        table = destination_tables.get(dest)
-        deps: set[str] = set()
-        if table is not None:
-            for fk in table.foreign_keys:
-                parent_key = _key(fk.column.table)
-                if parent_key in groups and parent_key != dest:
-                    deps.add(parent_key)
-        parents[dest] = deps
+    known_dests = set(groups)
+    map_parents = {dest: set(destination_dependencies(group)) & known_dests for dest, group in groups.items()}
+    parents = {dest: _fk_parents(dest, destination_tables, known_dests) | map_parents[dest] for dest in groups}
     ordered_dests: list[str] = []
     emitted: set[str] = set()
     remaining = list(groups)
     while remaining:
         ready = [d for d in remaining if parents[d] <= emitted]
-        if not ready:  # cycle: declaration order for the rest
+        if not ready:
+            unmet_maps = {
+                dest: sorted(map_parents[dest] - emitted) for dest in remaining if map_parents[dest] - emitted
+            }
+            if unmet_maps:
+                raise ValueError(f"cannot order import destination-map dependencies: {unmet_maps}")
+            # FK-only cycle: preserve the existing declaration-order fallback.
             ordered_dests.extend(remaining)
             break
         for dest in ready:
