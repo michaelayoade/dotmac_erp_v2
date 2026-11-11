@@ -136,6 +136,13 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (13): amendment_reason, amendment_version, approval_request_id, approved_by_user_id, budget_id, commitment_journal_entry_id, correlation_id, created_by_user_id, exchange_rate, is_amendment, original_po_id, shipping_address, variation_id
 
 ## public.purchase_order_line -> mod_procurement.purchase_order_lines
+
+Execution also depends on `mod_inventory.items`: the `inventory_item` enrolment
+map reads imported `base_uom` and caches it on first use. The importer orders this
+producer before purchase-order lines even though `item_ref` has no physical FK.
+If the item producer is blocked, consumers are parent-blocked; an absent item
+reference remains a named `unit` lookup exception, with no invented unit.
+
 - executable: True; mapped: 12; missing: none
 - residue (7): asset_account_id, delivery_date, expense_account_id, project_id, quantity_invoiced, segment_id, tax_code_id
 

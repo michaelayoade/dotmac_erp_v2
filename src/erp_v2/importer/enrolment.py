@@ -1025,6 +1025,13 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
 }
 
 
+# Destination rows that must land before the first cached read of a map.
+# Parents without an import spec are pre-existing/enrolment-owned, not blockers.
+MAP_DESTINATION_DEPENDENCIES: Final[Mapping[str, frozenset[str]]] = {
+    "inventory_item": frozenset({"mod_inventory.items"}),
+}
+
+
 def required_maps(specs: Sequence[TransformSpec]) -> frozenset[str]:
     """Every map name the given specs declare (rewrites + lookups)."""
 
@@ -1035,6 +1042,12 @@ def required_maps(specs: Sequence[TransformSpec]) -> frozenset[str]:
         names.update(spec.fk_rewrites.values())
         names.update(map_name for map_name, _key, _field in spec.lookups.values())
     return frozenset(names)
+
+
+def destination_dependencies(specs: Sequence[TransformSpec]) -> frozenset[str]:
+    """Destination tables read by declared maps; source refusals consume none."""
+
+    return frozenset(table for name in required_maps(specs) for table in MAP_DESTINATION_DEPENDENCIES.get(name, ()))
 
 
 def unbuilt_maps(specs: Sequence[TransformSpec]) -> frozenset[str]:
@@ -1102,8 +1115,10 @@ class EnrolmentMaps:
 
 __all__ = [
     "MAP_BUILDERS",
+    "MAP_DESTINATION_DEPENDENCIES",
     "EnrolmentMaps",
     "MapConflict",
+    "destination_dependencies",
     "required_maps",
     "unbuilt_maps",
 ]
