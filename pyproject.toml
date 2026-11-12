@@ -32,7 +32,7 @@ dependencies = [
     "dotmac-banking==0.1.0a1",  # wave 3
     "dotmac-expenses==0.1.0a1",  # wave 3
     "dotmac-finance==0.2.0a1",  # wave 3
-    "dotmac-payables==0.1.0a2",  # wave 3
+    "dotmac-payables==0.1.0a3",  # wave 3
     "dotmac-payments==0.1.0a3",  # wave 3
     "dotmac-procurement==0.1.0a1",  # wave 3
     "dotmac-commercial-agreements==0.1.0a4",  # wave 4

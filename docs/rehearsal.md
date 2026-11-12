@@ -254,3 +254,97 @@ host redirected to login and an unknown host returned 400.
 Guarded startup also refused sub-32-byte secrets before
 serving. The rehearsal app container was stopped; `erp_v2_dest`,
 `erp_v2_dest2` and `erp_v2_dest3` all remain for comparison.
+
+## Verified historical unpaid AP admission
+
+The separate historical admission operation requires the released Payables
+version containing `admit_historical_unpaid_invoice` and its forward
+`pa_0003_historical_invoice` migration. Payables `0.1.0a3` was published by
+the PR #1044 integration train: tag `dotmac-payables-v0.1.0a3`, source commit
+`ec7af09897c8123067344b57216ff643fafb09d1`, release run `43237641857`.
+This assembly adopts that exact version. Retain the publication and subsequent
+ERP image qualification receipts; source adoption alone does not qualify data.
+
+This operation covers only STANDARD invoices already posted in the source,
+wholly unpaid, with a genuine due date, no payment allocations, withholding,
+prepayment or unsupported adjustments, and exact source/destination invoice
+and posted-ledger evidence. It preserves missing supplier document numbers and
+approval facts. It creates no modern approval, cash settlement or GL posting.
+Other historical positions remain in the exception register.
+
+Use a held, read-only restored source and a clean disposable destination on the
+dedicated server. Retain the independent restore/role-closure receipt: hashing
+a dump and naming a database does not prove that database came from the dump.
+The manifest's candidate revision must match the imported rows' recorded
+`source_version`. For an upgraded prior rehearsal, retain its original import
+manifest and separately record the newer operator image/revision. Do not relabel
+old imported data as a fresh run of a newer image.
+
+Create a private cohort JSON with exactly `version` (integer 1), `tenant_id`,
+`snapshot_sha256`, `candidate_revision`, and `invoice_ids`. The cohort must name
+one manifest tenant and 1–1,000 unique canonical invoice UUIDs. Keep the cohort,
+full plan, commands, row-level refusals and receipts outside Git; use private
+directories. Each receipt path must be new and have an existing real parent.
+
+Plan with operator materials supplied only to that command:
+
+```sh
+python -m erp_v2.importer.payables_history_cli \
+  --manifest /private/manifest.json \
+  --snapshot-file /private/source.dump \
+  --cohort /private/cohort.json \
+  --receipt /private/ap-plan.json
+```
+
+The command consumes `LEGACY_DATABASE_URL` and `MIGRATION_DATABASE_URL`, removes
+them before loading owner code, and rejects serving database materials. Both
+connections are bound to the manifest identities. The source transaction and
+the plan destination transaction are read-only; source reads refuse RLS
+filtering and bind the evidenced AP/GL namespaces explicitly. Execution uses SERIALIZABLE
+isolation. Admission uses a separate nonprivileged destination login, with no
+superuser, BYPASSRLS, role-management or ownership authority, including through
+role membership. Schema upgrades use their own offline migration credentials.
+The operator checks the exact released owner version and stamped schema heads,
+then binds and verifies the cohort tenant transaction-locally before evidence
+reads. Console output contains counts only. Full evidence stays in the private
+receipt.
+
+Review every refusal and compare the exact planned commands with the bound
+source evidence. Every member of an apply cohort must qualify. If a narrower
+cohort is justified, retain the original refused plan, record the exclusions,
+and generate a new explicit cohort and plan. Never edit the old plan into an
+acceptance result.
+
+Apply the exact reviewed bytes using a new receipt path:
+
+```sh
+ERP_IMPORT_APPROVED=1 ERP_IMPORT_APPLY_OK=1 \
+python -m erp_v2.importer.payables_history_cli \
+  --manifest /private/manifest.json \
+  --snapshot-file /private/source.dump \
+  --cohort /private/cohort.json \
+  --reviewed-plan /private/ap-plan.json \
+  --reviewed-plan-sha256 <sha256-of-the-reviewed-plan-bytes> \
+  --apply --receipt /private/ap-apply.json
+```
+
+The fixed ERP verifier rechecks actual source/destination facts; the plan hash
+does not replace verification or migration authorization. Admission takes the
+invoice lock and creates the obligation, historical recognition event and
+permanent receipt in one owner transaction. A later cohort failure rolls the
+whole transaction back. Preserve the destination and inspect its durable
+receipts before retrying after any uncertain process/output failure.
+
+Repeat the same command and reviewed plan with another new receipt path to
+prove exact replay. Existing receipts must return without recreating objects or
+resetting an obligation subsequently settled through legitimate operations.
+Do not fabricate payments to exercise replay against historical business data;
+the hosted synthetic canaries cover settlement-after-admission behavior.
+
+Reconcile admitted invoice identities, full-face amounts, due dates, outstanding
+amounts, original recognition timestamps and permanent receipts. Verify that
+invoice fields and complete GL row fingerprints are unchanged. Back up and
+restore the admitted result, comparing its AP evidence and ledger fingerprints.
+Once historical receipts exist, schema downgrade is refused; use a forward
+correction. A successful bounded cohort does not establish full AP parity or
+authorize a production switch.
