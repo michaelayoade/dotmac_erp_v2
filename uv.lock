@@ -301,7 +301,7 @@ wheels = [
 
 [[package]]
 name = "dotmac-billing"
-version = "0.1.0a10"
+version = "0.1.0a11"
 source = { registry = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" }
 dependencies = [
     { name = "alembic" },
@@ -309,9 +309,9 @@ dependencies = [
     { name = "dotmac-kernel" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-billing/0.1.0a10/dotmac_billing-0.1.0a10.tar.gz", hash = "sha256:a9208ebaa8d9a5937fb52e2a240977bd2bfaf0c0dfd5d1625bb73c649d31618f" }
+sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-billing/0.1.0a11/dotmac_billing-0.1.0a11.tar.gz", hash = "sha256:5d14695e306c904cd11c44cfedd6bb149e52e8bc086ae7fda553660413073d98" }
 wheels = [
-    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-billing/0.1.0a10/dotmac_billing-0.1.0a10-py3-none-any.whl", hash = "sha256:1015392d43a8828ea463bb252ba0fa63cbe50fe036b532097b48612c5a609bde" },
+    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-billing/0.1.0a11/dotmac_billing-0.1.0a11-py3-none-any.whl", hash = "sha256:c5f6ec2871b83be0d2bfa1a35f084229134e038bd4a186dc8b16a053384d692b" },
 ]
 
 [[package]]
@@ -441,7 +441,7 @@ requires-dist = [
     { name = "dotmac-approvals", specifier = "==0.1.0a8", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-assets", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-banking", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
-    { name = "dotmac-billing", specifier = "==0.1.0a10", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
+    { name = "dotmac-billing", specifier = "==0.1.0a11", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-collections", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-commercial-agreements", specifier = "==0.1.0a4", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-customers", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },

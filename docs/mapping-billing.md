@@ -68,5 +68,16 @@ One translation per partition (billing account + currency):
    fingerprint locally, and runs `preview_opening_account_import_v2`.
    With no signed-grant verifier injected the module itself reports
    `verifier_unavailable` and nothing is importable - execution
-   still waits on the M1 verifier (Sub-first) plus rehearsal/flip
+   still waits on ERP's trusted verifier composition (Sub-first) plus rehearsal/flip
    approvals. Preflight never executes.
+
+Billing `0.1.0a11` publishes the Starter-native M1 verifier factory and
+profile contracts (tag `dotmac-billing-v0.1.0a11`, commit
+`8be175cc8bc470753e7edbc359f8415564c9f39f`). This assembly adopts its
+`bi_0014_opening_variance_ledger` head with the existing tenant plane and
+prerequisite bindings; kernel `0.1.0a107` satisfies its `>=0.1.0a105` floor.
+ERP's trusted source, custody, grant, window, authorization, time,
+revocation and target readers remain unwired. The default preview still
+reports `verifier_unavailable` and `importable=False`; adoption alone
+does not qualify rehearsal or activate imports. The 2026-10-12 Billing
+freeze and no repair/backfill rule remain in force.

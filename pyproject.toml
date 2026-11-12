@@ -36,7 +36,7 @@ dependencies = [
     "dotmac-payments==0.1.0a3",  # wave 3
     "dotmac-procurement==0.1.0a1",  # wave 3
     "dotmac-commercial-agreements==0.1.0a4",  # wave 4
-    "dotmac-billing==0.1.0a10",  # wave 4
+    "dotmac-billing==0.1.0a11",  # wave 4
     "dotmac-collections==0.1.0a1",  # wave 4
     "dotmac-customers==0.1.0a1",  # wave 4
     "dotmac-party==0.1.0a1",  # wave 4

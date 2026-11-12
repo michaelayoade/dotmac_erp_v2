@@ -7,10 +7,9 @@ from dotmac_kernel.planes import ModulePlane
 from erp_v2 import readiness
 from erp_v2.assembly import assembly
 
-# Latest RELEASED version per mounted module (waves 1-6). A pin bump
-# updates this dict, pyproject.toml and EXPECTED_HEADS together; never
-# bump to a version whose changelog says UNRELEASED (numbering a4,
-# accounting a2, billing a11, payments a4, ...).
+# Selected released versions per mounted module (waves 1-6). A pin bump
+# updates this dict, pyproject.toml, uv.lock and EXPECTED_HEADS together.
+# Verify publication using release/tag evidence; changelog headings can lag.
 EXPECTED_MODULE_VERSIONS = {
     "erp_shell.readiness": None,
     "erp_academy_sync": None,
@@ -24,7 +23,7 @@ EXPECTED_MODULE_VERSIONS = {
     "approvals": "0.1.0a8",
     "assets": "0.1.0a1",
     "banking": "0.1.0a1",
-    "billing": "0.1.0a10",
+    "billing": "0.1.0a11",
     "collections": "0.1.0a1",
     "commercial_agreements": "0.1.0a4",
     "customers": "0.1.0a1",
