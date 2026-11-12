@@ -378,8 +378,12 @@ def test_operator_plan_no_owner_calls_and_only_read_queries(operator):
     plan = cli._run(args)
     assert plan["counts"]["eligible"] == 1
     assert not state["calls"] and not state["pending"]
-    assert all(sql.startswith(("SET TRANSACTION READ ONLY", "SELECT", "WITH RECURSIVE")) for sql in state["sql"])
+    assert all(
+        sql.startswith(("SET TRANSACTION READ ONLY", "SET LOCAL row_security = off", "SELECT", "WITH RECURSIVE"))
+        for sql in state["sql"]
+    )
     assert state["transaction_tenant"] == TENANT and state["planned"] == 1
+    assert "SET LOCAL row_security = off" in state["sql"]
     posture = next(sql for sql in state["sql"] if sql.startswith("WITH RECURSIVE"))
     assert "current_user, session_user" in posture and "pg_catalog.pg_auth_members" in posture
     assert all(flag in posture for flag in ("rolsuper", "rolbypassrls", "rolcreaterole", "rolreplication"))
@@ -639,6 +643,16 @@ def hosted_postgres():
             connection.exec_driver_sql(
                 f'ALTER FUNCTION public.ap_history_owned_fn() OWNER TO "{names["routine_owner"]}"'
             )
+        with engines["owner"].begin() as connection:
+            for schema in ("ap", "ar"):
+                connection.exec_driver_sql(f"CREATE SCHEMA {schema}")
+                connection.exec_driver_sql(f"CREATE TABLE {schema}.payment_allocation (invoice_id uuid NOT NULL)")
+                connection.exec_driver_sql(f"GRANT USAGE ON SCHEMA {schema} TO app_user")
+                connection.exec_driver_sql(f"GRANT SELECT ON {schema}.payment_allocation TO app_user")
+            connection.execute(sa.text("INSERT INTO ap.payment_allocation VALUES (:invoice)"), {"invoice": INVOICE})
+            connection.execute(
+                sa.text("INSERT INTO ar.payment_allocation VALUES (:invoice)"), {"invoice": str(UUID(int=999))}
+            )
         yield engines, names
     finally:
         for engine in engines.values():
@@ -727,3 +741,26 @@ def test_hosted_postgres_refuses_unqualified_schema_heads(hosted_postgres, chang
                     sa.text("INSERT INTO public.alembic_version (version_num) VALUES (:head)"),
                     [{"head": head} for head in original],
                 )
+
+
+def test_hosted_postgres_ap_allocation_contract_ignores_ar_namesake(hosted_postgres):
+    from erp_v2.importer.payables_history import _read
+
+    engines, _names = hosted_postgres
+    with engines["operator"].connect() as connection, connection.begin():
+        connection.execute(sa.text("SET TRANSACTION READ ONLY"))
+        connection.execute(sa.text("SET LOCAL row_security = off"))
+        rows = _read(connection, "payment_allocation", key="invoice_id", value=INVOICE)
+        assert len(rows) == 1 and str(rows[0]["invoice_id"]) == INVOICE
+        assert _read(connection, "payment_allocation", key="invoice_id", value=str(UUID(int=999))) == []
+
+
+def test_hosted_postgres_source_refuses_rls_filtering_instead_of_partial_rows(hosted_postgres):
+    engines, _names = hosted_postgres
+    with engines["operator"].connect() as connection, connection.begin() as transaction:
+        connection.execute(sa.text("SET TRANSACTION READ ONLY"))
+        connection.execute(sa.text("SET LOCAL row_security = off"))
+        with pytest.raises(sa.exc.ProgrammingError) as refused:
+            connection.execute(sa.text("SELECT tenant_id FROM public.ap_history_rls_probe")).all()
+        assert refused.value.orig.sqlstate == "42501"
+        transaction.rollback()

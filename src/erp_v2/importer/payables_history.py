@@ -115,6 +115,20 @@ entry_date posting_date description debit credit original_debit original_credit 
 source_document_kind source_document_id source_version source_fingerprint posted_by posted_at""".split()
 
 
+# The held legacy PostgreSQL snapshot contains AP and AR tables with the same
+# allocation name. Bind the source contract to its evidenced namespaces.
+SOURCE_SCHEMAS = {
+    "organization": "core_org",
+    "supplier": "ap",
+    "supplier_invoice": "ap",
+    "supplier_invoice_line": "ap",
+    "payment_allocation": "ap",
+    "journal_entry": "gl",
+    "journal_entry_line": "gl",
+    "posted_ledger_line": "gl",
+}
+
+
 READ_FIELDS = {
     "supplier_invoice": SOURCE_HEADER,
     "supplier": SOURCE_SUPPLIER,
@@ -247,6 +261,9 @@ def _readonly(connection: sa.Connection) -> bool:
 def _read(
     connection: sa.Connection, name: str, *, schema: str | None = None, key: str | None = None, value: object = None
 ) -> list[dict]:
+    if schema is None and connection.dialect.name == "postgresql":
+        _require(name in SOURCE_SCHEMAS, "unknown_source_table_contract")
+        schema = SOURCE_SCHEMAS[name]
     table = _reflect(connection, name, schema)
     columns = []
     for field in READ_FIELDS[name]:

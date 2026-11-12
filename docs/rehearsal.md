@@ -299,7 +299,8 @@ python -m erp_v2.importer.payables_history_cli \
 The command consumes `LEGACY_DATABASE_URL` and `MIGRATION_DATABASE_URL`, removes
 them before loading owner code, and rejects serving database materials. Both
 connections are bound to the manifest identities. The source transaction and
-the plan destination transaction are read-only; execution uses SERIALIZABLE
+the plan destination transaction are read-only; source reads refuse RLS
+filtering and bind the evidenced AP/GL namespaces explicitly. Execution uses SERIALIZABLE
 isolation. Admission uses a separate nonprivileged destination login, with no
 superuser, BYPASSRLS, role-management or ownership authority, including through
 role membership. Schema upgrades use their own offline migration credentials.

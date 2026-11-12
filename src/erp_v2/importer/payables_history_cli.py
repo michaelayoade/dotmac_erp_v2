@@ -281,6 +281,8 @@ def _run(args) -> dict:
         try:
             with source_engine.connect() as source, source.begin():
                 source.execute(sa.text("SET TRANSACTION READ ONLY"))
+                # Refuse any source RLS filtering instead of accepting partial evidence.
+                source.execute(sa.text("SET LOCAL row_security = off"))
                 _require(
                     source.scalar(sa.text("SELECT current_database()")) == manifest.source_database,
                     "source_database_mismatch",
