@@ -259,9 +259,11 @@ serving. The rehearsal app container was stopped; `erp_v2_dest`,
 
 The separate historical admission operation requires the released Payables
 version containing `admit_historical_unpaid_invoice` and its forward
-`pa_0003_historical_invoice` migration. Starter PR #1040 introduces the a3
-candidate; a candidate declaration alone does not permit an ERP pin or prove
-publication. Retain the exact publication and ERP image qualification receipts.
+`pa_0003_historical_invoice` migration. Payables `0.1.0a3` was published by
+the PR #1044 integration train: tag `dotmac-payables-v0.1.0a3`, source commit
+`ec7af09897c8123067344b57216ff643fafb09d1`, release run `43237641857`.
+This assembly adopts that exact version. Retain the publication and subsequent
+ERP image qualification receipts; source adoption alone does not qualify data.
 
 This operation covers only STANDARD invoices already posted in the source,
 wholly unpaid, with a genuine due date, no payment allocations, withholding,
@@ -298,8 +300,13 @@ The command consumes `LEGACY_DATABASE_URL` and `MIGRATION_DATABASE_URL`, removes
 them before loading owner code, and rejects serving database materials. Both
 connections are bound to the manifest identities. The source transaction and
 the plan destination transaction are read-only; execution uses SERIALIZABLE
-isolation. Console output contains counts only. Full evidence stays in the
-private receipt.
+isolation. Admission uses a separate nonprivileged destination login, with no
+superuser, BYPASSRLS, role-management or ownership authority, including through
+role membership. Schema upgrades use their own offline migration credentials.
+The operator checks the exact released owner version and stamped schema heads,
+then binds and verifies the cohort tenant transaction-locally before evidence
+reads. Console output contains counts only. Full evidence stays in the private
+receipt.
 
 Review every refusal and compare the exact planned commands with the bound
 source evidence. Every member of an apply cohort must qualify. If a narrower

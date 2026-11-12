@@ -14,6 +14,7 @@ import json
 import os
 import re
 from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from uuid import UUID
 
@@ -161,6 +162,74 @@ def _dependencies():
     return TenantScope, HistoricalPayablesVerifier, admit_historical_unpaid_invoice, HistoricalUnpaidInvoiceCommand
 
 
+def _installed_payables_version() -> str:
+    return version("dotmac-payables")
+
+
+def _expected_schema_heads() -> set[str]:
+    from erp_v2.migrate import EXPECTED_STAMPED_HEADS
+
+    return set(EXPECTED_STAMPED_HEADS)
+
+
+def _destination_preflight(session, tenant: UUID) -> None:
+    """Check the actual admission connection, then bind its transaction to scope."""
+    posture = (
+        session.execute(
+            sa.text(
+                "WITH RECURSIVE role_closure(roleid) AS ("
+                " SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN (current_user, session_user)"
+                " UNION SELECT am.roleid FROM pg_catalog.pg_auth_members am"
+                " JOIN role_closure c ON am.member=c.roleid)"
+                " SELECT current_user AS current_role_name, session_user AS session_role_name,"
+                " (SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname IN (current_user, session_user))"
+                " AS identities_found,"
+                " (SELECT count(*) FROM pg_catalog.pg_roles r JOIN role_closure c ON r.oid=c.roleid"
+                " WHERE r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolreplication OR r.rolcreatedb"
+                " OR r.rolname IN ('pg_execute_server_program','pg_read_server_files','pg_write_server_files'))"
+                " AS privileged_roles,"
+                " (SELECT count(*) FROM pg_catalog.pg_class r JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace"
+                " WHERE n.nspname IN ('public','mod_payables','mod_accounting')"
+                " AND r.relowner IN (SELECT roleid FROM role_closure))"
+                " + (SELECT count(*) FROM pg_catalog.pg_namespace n"
+                " WHERE n.nspname IN ('public','mod_payables','mod_accounting')"
+                " AND n.nspowner IN (SELECT roleid FROM role_closure))"
+                " + (SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace"
+                " WHERE n.nspname IN ('public','mod_payables','mod_accounting')"
+                " AND p.proowner IN (SELECT roleid FROM role_closure))"
+                " + (SELECT count(*) FROM pg_catalog.pg_database d WHERE d.datname=current_database()"
+                " AND d.datdba IN (SELECT roleid FROM role_closure)) AS owned_objects"
+            )
+        )
+        .mappings()
+        .one()
+    )
+    _require(
+        isinstance(posture["current_role_name"], str)
+        and bool(posture["current_role_name"])
+        and posture["current_role_name"] == posture["session_role_name"]
+        and posture["identities_found"] == 1
+        and posture["privileged_roles"] == 0
+        and posture["owned_objects"] == 0,
+        "destination_role_not_nonprivileged",
+    )
+    expected = _expected_schema_heads()
+    _require(
+        session.scalar(sa.text("SELECT to_regclass('public.alembic_version') IS NOT NULL")) is True,
+        "destination_schema_heads_mismatch",
+    )
+    actual = list(session.scalars(sa.text("SELECT version_num FROM public.alembic_version")))
+    _require(
+        "pa_0003_historical_invoice" in expected and len(actual) == len(set(actual)) and set(actual) == expected,
+        "destination_schema_heads_mismatch",
+    )
+    selected = session.scalar(
+        sa.text("SELECT set_config('app.current_tenant', :tenant, true)"), {"tenant": str(tenant)}
+    )
+    observed = session.scalar(sa.text("SELECT public.app_current_tenant_id()"))
+    _require(selected == str(tenant) and str(observed) == str(tenant), "destination_tenant_binding_mismatch")
+
+
 def _authorized(args) -> bool:
     return not args.apply or (
         os.environ.get("ERP_IMPORT_APPROVED") == "1" and os.environ.get("ERP_IMPORT_APPLY_OK") == "1"
@@ -203,6 +272,7 @@ def _run(args) -> dict:
         destination_database=manifest.destination_database,
         source_owner="legacy-erp",
     )
+    _require(_installed_payables_version() == "0.1.0a3", "released_payables_version_required")
     scope_type, verifier_type, admit, command_type = _dependencies()
     scope = scope_type(tenant)
     source_engine = _safe_engine(source_url)
@@ -223,6 +293,7 @@ def _run(args) -> dict:
                         session.scalar(sa.text("SELECT current_database()")) == manifest.destination_database,
                         "destination_database_mismatch",
                     )
+                    _destination_preflight(session, tenant)
                     plan = _plan(verifier, scope, ids, session, bindings)
                     if args.apply:
                         _apply(session, scope, verifier, plan, reviewed, admit, command_type=command_type)

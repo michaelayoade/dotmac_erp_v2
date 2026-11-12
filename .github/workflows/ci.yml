@@ -14,6 +14,18 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -31,4 +43,6 @@ jobs:
           uv run ruff format --check src tests
 
       - name: Test
+        env:
+          ERP_TEST_POSTGRES_URL: postgresql+psycopg://postgres@127.0.0.1:5432/postgres
         run: uv run pytest -q
