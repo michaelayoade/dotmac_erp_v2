@@ -7,15 +7,15 @@ an ERP fully composable from the reusable Starter modules: this spec
 is that composition. Classification: `docs/classification.md`.
 
 Composition posture:
-- 31 Starter modules mounted at their latest RELEASED pins (waves
+- 31 Starter modules mounted at their selected released pins (waves
   1-6 in one composition; data waves still land in wave order — see
   `docs/cutover.md`). Mounting is not a flip: no consumer reads a
   module through this app, and no ERP-unique slice has ported yet,
   until that module's transform mapping rehearses. Only unreleased
   or non-mountable Starter surfaces stay out: `dotmac-workforce`
   (no release), connectors (libraries for product adapters, no
-  module manifest), and later unreleased bumps of pinned modules
-  (e.g. numbering a4, accounting a2, billing a11, payments a4).
+  module manifest). Pin changes require verified release/tag evidence
+  and matching lockfile and migration heads.
 - `tenancy="multi"`: ERP is a multi-tenant product (legacy
   `product_assembly.py` declares the same), declared explicitly rather
   than inherited from the kernel default.
