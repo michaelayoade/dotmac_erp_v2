@@ -348,3 +348,34 @@ restore the admitted result, comparing its AP evidence and ledger fingerprints.
 Once historical receipts exist, schema downgrade is refused; use a forward
 correction. A successful bounded cohort does not establish full AP parity or
 authorize a production switch.
+
+## Dest4 rehearsal — freeze candidate e82c89b, fresh snapshot (2026-11-13)
+
+Freeze candidate is ERP `main` `e82c89b` (Payables a3, Billing a11),
+image `sha-e82c89b` digest `sha256:2b9f806e...`. A fresh production
+dump taken the same morning (`legacy-fresh-20261113T074551Z.dump`,
+sha256 `9fc8fb1e...`) was restored on the test server as
+`erp_legacy_fresh` and rehearsed into `erp_v2_dest4`:
+
+- Genesis 33s, stamped 30/30 heads (`pa_0003_historical_invoice`,
+  `bi_0014_opening_variance_ledger` included). Execute 14m49s,
+  exit 3 by design, `complete=False`.
+- Account-level GL reconciliation exact (108 accounts, 0 mismatches)
+  against the fresh source. Entries 217,892; ledger 446,679.
+- AP: 1,896 invoices landed. Uncaptured cohort: 1,155 of 1,212 landed
+  with `supplier_document_number` NULL, 0 invented, 57 accounted
+  totals-check exceptions — the same 57 as dest3. Supplier-document
+  exceptions: 0.
+- Identity (everyone-access ruling): fresh cohort 143 → 106 matched →
+  98 eligible → 94 ready. Ready plan zero blockers; apply on dest4
+  inserted 94 credentials. The dest4 app serves on the test server
+  (host port 18015) for the designated real-login proof.
+- Prod loopback staging was restaged to the same image from the same
+  fresh snapshot: total restage 14m36s, counts identical to dest4
+  (entries 217,892; ledger 446,679; AP 1,896 / 1,155 null), readiness
+  database mode, tenant host 302, unknown host 400, legacy untouched.
+  Staging credentials remain 0 — identity apply is a flip-window step.
+- Timings for the flip window proposal: dump ~3m, restore ~4m,
+  genesis <1m, execute ~15m, boot + smoke ~2m. Reconciliation and
+  identity apply measured in minutes. A 2-hour window with abort if
+  reconciliation is not green by T+75m is the working proposal.
