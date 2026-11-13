@@ -384,3 +384,14 @@ no re-import. Freeze image is now
 (login 200, unknown host 400) and on the prod loopback
 (ready 200, tenant root 302). The staff login is owed on this
 image. Any further code landing on main re-opens the freeze.
+
+Freeze moved again the same day to main `92578cc` for PR #26
+(tax seed CLI, see the tax seed rehearsal in `docs/rehearsal.md`).
+Importer tree still byte-identical (`d9030ae4...`); freeze image
+`sha-92578cc` (digest `sha256:c041f623...`) boot-verified on
+dest5 and prod loopback. The PAYE legacy-code finance item is
+closed by the seed ruling: flip step 9 now also runs
+`erp_v2.tax_seed` apply with the reviewed PAYE spec after
+identity enrolment. Still owed: payroll `2040` confirmation, HR
+department canonicals, staff login on `sha-92578cc`, flip
+go/no-go + window.
