@@ -379,3 +379,31 @@ sha256 `9fc8fb1e...`) was restored on the test server as
   genesis <1m, execute ~15m, boot + smoke ~2m. Reconciliation and
   identity apply measured in minutes. A 2-hour window with abort if
   reconciliation is not green by T+75m is the working proposal.
+
+
+## Historical AP qualification checkpoint — 2026-11-13
+
+The retained source snapshot `327c22df...` was separately restored and qualified
+with operator `e82c89b`; this is distinct from the newer Dest4 snapshot above.
+The source audit verified 2,204 total invoice headers and 1,913 recognized
+STANDARD invoices. Exact application/package bytes, schema heads, all ten AP
+owner-table fingerprints and the 445,950-row ledger fingerprint passed. Source
+RLS visibility was qualified through a restricted, read-only offline audit role;
+destination admission retained its nonprivileged tenant-bound role.
+
+The private historical AP plan requested 23 preliminary invoices and qualified
+zero: 22 refused unsupported procurement evidence and one refused source amount
+scale. No admission ran. Read-only diagnosis found NULL procurement references
+and 64-character receipt fingerprints on those 22 imported headers, with no
+source PO/receipt-line links. The source invoice table has no corresponding
+receipt-fingerprint column; the generic mapper selected `sha256_row` for that
+missing field. A row hash cannot supply the missing business evidence binding.
+
+Row-hash derivations now require reviewed mapping declarations. Unsourced
+business proof remains omitted when nullable or an explicit missing requirement
+when mandatory. Existing source hash values, including NULL, are preserved.
+The retained rehearsal and refused plan remain unchanged. The amount exception
+keeps its original precision for separate review. The next historical AP attempt
+requires a fresh isolated import using the corrected mapping, a newly reviewed
+eligible plan, unchanged financial evidence, exact replay and recovery parity.
+Full AP open-position reconciliation remains a cutover gate.

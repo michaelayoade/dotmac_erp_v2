@@ -249,6 +249,7 @@ def build_spec(
     constants: Mapping[str, object] | None = None,
     lookups: Mapping[str, tuple[str, str, str]] | None = None,
     computed: Mapping[str, str] | None = None,
+    row_hash_columns: tuple[str, ...] = (),
     null_fallbacks: Mapping[str, str] | None = None,
     deferred: tuple[str, ...] = (),
     json_columns: tuple[str, ...] = (),
@@ -260,6 +261,15 @@ def build_spec(
 
     for part in source_table.split(".") + destination_table.split("."):
         _check(part)
+    # Row hashes are explicit source-content fallbacks, never evidence
+    # inferred from a destination column's name. Validate even refused specs.
+    destination_names = {dest.name for dest in destination_columns}
+    for dest_col in row_hash_columns:
+        _check(dest_col)
+        if dest_col not in destination_names:
+            raise ValueError(f"row hash column {dest_col!r} is absent from destination")
+    if len(set(row_hash_columns)) != len(row_hash_columns):
+        raise ValueError("duplicate row hash columns")
     if source_row_refusal is not None:
         source_set = {_check(c) for c in source_columns}
         return TransformSpec(
@@ -335,7 +345,7 @@ def build_spec(
             if found is None:
                 # No source at all: computed and run-supplied conventions
                 # apply before declaring the column missing.
-                if "fingerprint" in dest.name or dest.name.endswith("_sha256") or dest.name.endswith("_digest"):
+                if dest.name in row_hash_columns:
                     computed[dest.name] = "sha256_row"
                 elif dest.name in ("evidence_ref", "source_ref", "source_reference"):
                     computed[dest.name] = "source_key"

@@ -349,7 +349,10 @@ flip-day sequence and rollback boundary still apply verbatim.
   `127.0.0.1:8013`). A maintenance page/snippet is prepared but
   NOT enabled (`/var/www/erp-maintenance/`,
   `sites-available/erp-maintenance.snippet`).
-- Still owed before flip: finance PAYE legacy code + policy fields
-  and payroll `2040` confirmation, HR department canonical
-  confirmation, a real staff login on this frozen candidate, and
-  Michael's explicit flip-day go with a chosen window.
+- Still owed before flip: historical AP qualification and full open-position
+  reconciliation, including a fresh import after the receipt-hash mapping
+  correction (see the historical AP checkpoint in `docs/rehearsal.md`);
+  finance PAYE legacy code + policy fields and payroll `2040` confirmation;
+  HR department canonical confirmation; a real staff login on this frozen
+  candidate; and Michael's explicit flip-day go with a chosen window. The
+  full reconciliation gates in the flip-day sequence remain required.
