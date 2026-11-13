@@ -143,6 +143,13 @@ class TransformSpec:
     # calculation lines; the enrolment step builds the map from the
     # imported parent rows). A key with no map entry is an exception,
     # never a default.
+    source_order: tuple[tuple[str, bool], ...] = ()
+    # (source column, descending) pairs rendered as a deterministic
+    # ORDER BY on the executor source scan. Declared only where
+    # landing order decides a destination unique-key winner
+    # (departments: legacy duplicate codes — the active/oldest row
+    # must land first so employee FKs resolve to it; later
+    # duplicates still exception by name, never silently dropped).
 
     @property
     def executable(self) -> bool:
@@ -256,6 +263,7 @@ def build_spec(
     sub_origin: SubOriginPolicy | None = None,
     sub_customer_ref: SubCustomerRef | None = None,
     source_row_refusal: SourceRowRefusal | None = None,
+    source_order: tuple[str, ...] = (),
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -270,6 +278,18 @@ def build_spec(
             raise ValueError(f"row hash column {dest_col!r} is absent from destination")
     if len(set(row_hash_columns)) != len(row_hash_columns):
         raise ValueError("duplicate row hash columns")
+    observed_columns = set(source_columns)
+    parsed_order: list[tuple[str, bool]] = []
+    seen_order: set[str] = set()
+    for entry in source_order:
+        column, sep, direction = entry.partition(":")
+        _check(column)
+        if (sep and direction not in ("asc", "desc")) or column not in observed_columns:
+            raise ValueError(f"invalid source order entry {entry!r}")
+        if column in seen_order:
+            raise ValueError(f"duplicate source order column {column!r}")
+        seen_order.add(column)
+        parsed_order.append((column, direction == "desc"))
     if source_row_refusal is not None:
         source_set = {_check(c) for c in source_columns}
         return TransformSpec(
@@ -396,6 +416,7 @@ def build_spec(
         json_columns=tuple(json_columns),
         sub_origin=sub_origin,
         sub_customer_ref=sub_customer_ref,
+        source_order=tuple(parsed_order),
     )
 
 
