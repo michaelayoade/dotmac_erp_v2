@@ -825,3 +825,62 @@ def test_explicit_computed_still_overrides_source_and_fallback() -> None:
     )
     assert spec.column_map == {}
     assert spec.computed == {"request_fingerprint": "source_key"}
+
+
+def test_spec_source_order_is_validated_against_observed_columns() -> None:
+    spec = _spec(source_order=("department_code:desc", "department_id"))
+    assert spec.source_order == (("department_code", True), ("department_id", False))
+    with pytest.raises(ValueError, match="invalid source order"):
+        _spec(source_order=("missing_column:desc",))
+    with pytest.raises(ValueError, match="invalid source order"):
+        _spec(source_order=("department_code:sideways",))
+    with pytest.raises(ValueError, match="duplicate source order"):
+        _spec(source_order=("department_code", "department_code:desc"))
+
+
+def test_executor_source_order_lands_canonical_duplicate_first() -> None:
+    src = sa.create_engine("sqlite://")
+    dst = sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE department (department_id TEXT, organization_id TEXT,"
+                " department_code TEXT, department_name TEXT, head_id TEXT,"
+                " is_active INTEGER, created_at TEXT)"
+            )
+        )
+        # Heap order puts the inactive duplicate first; without a
+        # declared order it would win the unique code and strand
+        # employees referencing the active canonical row.
+        c.execute(
+            sa.text(
+                "INSERT INTO department VALUES"
+                " ('d-inactive','t1','ADMIN','Admin',NULL,0,'2025-06-01'),"
+                " ('d-active','t1','ADMIN','Admin',NULL,1,'2025-01-01')"
+            )
+        )
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE departments (id TEXT, tenant_id TEXT, code TEXT, name TEXT, UNIQUE (tenant_id, code))"
+            )
+        )
+    spec = _spec(
+        source_columns=(
+            "department_id",
+            "organization_id",
+            "department_code",
+            "department_name",
+            "head_id",
+            "is_active",
+            "created_at",
+        ),
+        source_order=("is_active:desc", "created_at:asc", "department_id:asc"),
+    )
+    with src.connect() as s, dst.begin() as d:
+        report = execute_transform(s, d, spec)
+        assert report.written == 1
+        assert len(report.exceptions) == 1
+        assert report.exceptions[0].source_key == "d-inactive"
+        row = d.execute(sa.text("SELECT id, code FROM departments")).one()
+        assert tuple(row) == ("d-active", "ADMIN")

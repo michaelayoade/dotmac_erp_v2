@@ -40,6 +40,7 @@ class Pairing:
     null_fallbacks: Mapping[str, str] = field(default_factory=dict)
     deferred: tuple[str, ...] = ()
     json_columns: tuple[str, ...] = ()
+    source_order: tuple[str, ...] = ()
     # Required for any source table carrying `dotmac_sub_id` (see sub_origin.py)
     sub_origin: SubOriginPolicy | None = None
     # Child rows pointing at a Sub-tagged customer become row exceptions (M11 pending)
@@ -78,6 +79,10 @@ WAVE2_PAIRINGS: Final[tuple[Pairing, ...]] = (
             "parent_id": "parent_department_id",
         },
         deferred=("parent_id",),
+        # Legacy carries duplicate department_codes (62 dup groups);
+        # the active/oldest row is the canonical winner employees
+        # reference, so it must land first under uq_departments code.
+        source_order=("is_active:desc", "created_at:asc", "department_id:asc"),
         note="residue: head_id/cost_center_id are e2/reporting facts",
     ),
     Pairing(
@@ -383,6 +388,7 @@ def build_wave2_specs(
                 sub_origin=pairing.sub_origin,
                 sub_customer_ref=pairing.sub_customer_ref,
                 source_row_refusal=pairing.source_row_refusal,
+                source_order=pairing.source_order,
             )
         )
     return tuple(specs), tuple(generated)
