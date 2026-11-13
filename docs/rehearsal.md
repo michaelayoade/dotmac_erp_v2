@@ -468,3 +468,31 @@ rates/bounds/dates copy exactly from legacy `payroll.tax_band`.
   remain finance-ratifiable via rule supersession; the bands
   themselves are pure legacy evidence. Payroll `2040`
   confirmation is still owed (unchanged).
+
+## Dest6 department-order rehearsal — 2026-11-13 (candidate `41173a3`)
+
+Legacy carries 62 duplicate department codes. Heap-order import
+landed an inactive duplicate for 9 codes, stranding 53 employees
+whose canonical department then failed the FK (dest5: 513/590
+employees). PR #28 adds a declared source order to the
+departments pairing (active, then oldest); PR #29 forwards it
+through the generic spec builder the CLI actually uses (the
+first dest6 attempt proved the gap and was stopped).
+
+Dest6 (same snapshot, image `sha-41173a3`):
+
+- All 62 canonical departments match the HR proposal exactly.
+- Employees 513 → 564 (51 of the 53 recovered; 2 exception for
+  other named reasons). Written 1,344,782 (+5,292 downstream HR
+  rows); exceptions 65,118 (was 70,594). One knock-on +1
+  disciplinary check exception now reaches its check named.
+- GL exact (108 accounts, ledger 446,679); AP reconciliation
+  byte-identical to dest5 (1,896 landed, fingerprints 0).
+- Identity cohort grew with the recovered employees:
+  143 → 125 matched → 117 eligible → 113 ready, plan 0
+  blockers, applied on dest6 only. Same 8 source-state holds
+  (7 password-change + 1 MFA), same 4 destination mismatches.
+- Tax seed re-applied (PAYE + 6 bands). Login surface live
+  (200 tenant host / 400 unknown), sessions 0.
+- HR ask is now only the four surviving department names;
+  finance ask only payroll `2040` (evidence pack on hosts).

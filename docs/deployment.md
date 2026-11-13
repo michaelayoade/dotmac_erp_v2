@@ -395,3 +395,13 @@ closed by the seed ruling: flip step 9 now also runs
 identity enrolment. Still owed: payroll `2040` confirmation, HR
 department canonicals, staff login on `sha-92578cc`, flip
 go/no-go + window.
+
+Freeze moved the same day to main `41173a3` for PR #28/#29
+(deterministic department source order; see the dest6 rehearsal
+in `docs/rehearsal.md`). Freeze image `sha-41173a3` is
+boot-verified on dest6 and restaged on the prod loopback with
+counts matching dest6 (written 1,344,782). The HR department
+item is reduced to confirming four surviving names (any change
+is a post-flip rename). Still owed: payroll `2040`
+confirmation, staff login on `sha-41173a3`, flip go/no-go +
+window.
