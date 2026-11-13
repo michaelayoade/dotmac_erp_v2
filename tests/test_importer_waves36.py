@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+from decimal import Decimal
+
+import pytest
 import sqlalchemy as sa
 
 from erp_v2.importer.pipeline import run_import
@@ -906,6 +910,7 @@ def test_wave36_rulings_narrow_missing_to_named_decisions() -> None:
 
     expected_missing = {
         "mod_expenses.expense_lifecycle_events": ("actor_reference",),
+        "mod_procurement.bid_evaluations": ("content_sha256",),
         "mod_expenses.expense_requests": ("needed_by",),
         "mod_inventory.stock_movements": ("value_after",),
         "mod_documents.documents": ("sensitivity", "handling_instructions"),
@@ -942,3 +947,121 @@ def test_generated_reclassifications_are_not_row_copies() -> None:
         "mod_agreements.agreement_events",
     ):
         assert dest in generated, dest
+
+
+def test_released_payables_mapping_omits_absent_receipt_proof() -> None:
+    from erp_v2.importer.waves36 import build_specs
+
+    pairing = next(p for p in WAVE3_PAIRINGS if p.destination == "mod_payables.supplier_invoices")
+    specs, _ = build_specs((pairing,), RULED_LEGACY, _dest_tables())
+    spec = specs[0]
+    assert pairing.row_hash_columns == ("request_fingerprint",)
+    assert "receipt_evidence_fingerprint" not in spec.column_map
+    assert "receipt_evidence_fingerprint" not in spec.computed
+    assert "receipt_evidence_fingerprint" not in spec.constants
+    assert "receipt_evidence_fingerprint" not in spec.defaults
+    assert "receipt_evidence_fingerprint" not in spec.missing_required
+    assert spec.computed["request_fingerprint"] == "sha256_row"
+
+
+def test_released_payables_absent_proof_lands_sql_null_with_exact_amounts() -> None:
+    from erp_v2.importer.executor import execute_transform
+    from erp_v2.importer.spec import destination_columns_from_table
+
+    pairing = next(p for p in WAVE3_PAIRINGS if p.destination == "mod_payables.supplier_invoices")
+    columns = destination_columns_from_table(_dest_tables()[pairing.destination])
+    assert next(c for c in columns if c.name == "receipt_evidence_fingerprint").nullable
+    # Use the released columns and the real pairing's fallback in a minimal
+    # source/target fixture, retaining exact source text (no float affinity).
+    selected = {"id", "subtotal", "tax_amount", "total_amount", "receipt_evidence_fingerprint", "request_fingerprint"}
+    spec = build_spec(
+        source_table="supplier_invoice",
+        destination_table="supplier_invoices",
+        source_columns=("invoice_id", "subtotal", "tax_amount", "total_amount"),
+        destination_columns=tuple(c for c in columns if c.name in selected),
+        row_hash_columns=pairing.row_hash_columns,
+    )
+    src, dst = sa.create_engine("sqlite://"), sa.create_engine("sqlite://")
+    amounts = {"subtotal": "12345678901234567890.1200", "tax": "0.0000", "total": "12345678901234567890.1200"}
+    with src.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE supplier_invoice (invoice_id TEXT, subtotal TEXT, tax_amount TEXT, total_amount TEXT)"
+            )
+        )
+        c.execute(sa.text("INSERT INTO supplier_invoice VALUES ('inv1', :subtotal, :tax, :total)"), amounts)
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE supplier_invoices (id TEXT, subtotal TEXT, tax_amount TEXT, total_amount TEXT, "
+                "receipt_evidence_fingerprint TEXT, request_fingerprint TEXT)"
+            )
+        )
+    with src.connect() as source, dst.begin() as target:
+        assert execute_transform(source, target, spec).complete
+        row = target.execute(sa.text("SELECT * FROM supplier_invoices")).mappings().one()
+        assert row["receipt_evidence_fingerprint"] is None
+        assert len(row["request_fingerprint"]) == 64
+        assert (row["subtotal"], row["tax_amount"], row["total_amount"]) == (
+            amounts["subtotal"],
+            amounts["tax"],
+            amounts["total"],
+        )
+
+
+def test_hosted_payables_absent_proof_preserves_native_decimal() -> None:
+    from erp_v2.importer.executor import execute_transform
+    from erp_v2.importer.spec import destination_columns_from_table
+
+    raw_url = os.environ.get("ERP_TEST_POSTGRES_URL")
+    if not raw_url:
+        pytest.skip("ERP_TEST_POSTGRES_URL is required for hosted PostgreSQL qualification")
+    admin_url = sa.make_url(raw_url)
+    assert os.environ.get("GITHUB_ACTIONS") == "true"
+    assert admin_url.get_backend_name() == "postgresql"
+    assert admin_url.host in {"localhost", "127.0.0.1", "::1"} and not admin_url.query
+    assert admin_url.username == "postgres" and admin_url.database == "postgres"
+    pairing = next(p for p in WAVE3_PAIRINGS if p.destination == "mod_payables.supplier_invoices")
+    columns = destination_columns_from_table(_dest_tables()[pairing.destination])
+    selected = {"id", "subtotal", "tax_amount", "total_amount", "receipt_evidence_fingerprint", "request_fingerprint"}
+    spec = build_spec(
+        source_table="proof_hash_source",
+        destination_table="proof_hash_target",
+        source_columns=("invoice_id", "subtotal", "tax_amount", "total_amount"),
+        destination_columns=tuple(c for c in columns if c.name in selected),
+        renames={"id": "invoice_id"},
+        row_hash_columns=pairing.row_hash_columns,
+    )
+    amounts = {
+        "subtotal": Decimal("12345678901234567890.1200"),
+        "tax": Decimal("0.0000"),
+        "total": Decimal("12345678901234567890.1200"),
+    }
+    engine = sa.create_engine(admin_url, hide_parameters=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    "CREATE TEMP TABLE proof_hash_source (invoice_id TEXT, subtotal NUMERIC(30,4), "
+                    "tax_amount NUMERIC(30,4), total_amount NUMERIC(30,4)) ON COMMIT DROP"
+                )
+            )
+            connection.execute(
+                sa.text(
+                    "CREATE TEMP TABLE proof_hash_target (id TEXT, subtotal NUMERIC(30,4), "
+                    "tax_amount NUMERIC(30,4), total_amount NUMERIC(30,4), receipt_evidence_fingerprint TEXT, "
+                    "request_fingerprint TEXT) ON COMMIT DROP"
+                )
+            )
+            connection.execute(
+                sa.text("INSERT INTO proof_hash_source VALUES ('inv1', :subtotal, :tax, :total)"), amounts
+            )
+            assert execute_transform(connection, connection, spec).complete
+            row = connection.execute(sa.text("SELECT * FROM proof_hash_target")).mappings().one()
+            assert row["receipt_evidence_fingerprint"] is None
+            assert len(row["request_fingerprint"]) == 64
+            for field, key in (("subtotal", "subtotal"), ("tax_amount", "tax"), ("total_amount", "total")):
+                assert isinstance(row[field], Decimal)
+                assert row[field].as_tuple() == amounts[key].as_tuple()
+    finally:
+        engine.dispose()

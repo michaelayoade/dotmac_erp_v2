@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+from decimal import Decimal
+
 import pytest
 import sqlalchemy as sa
 
@@ -115,6 +118,7 @@ def test_run_supplied_and_computed_columns() -> None:
             DestinationColumn("evidence_ref", nullable=False, has_default=False),
         ),
         renames={"id": "line_id", "journal_id": "entry_id"},
+        row_hash_columns=("request_fingerprint",),
     )
     assert spec.executable
     assert spec.run_supplied == ("tenant_id",)
@@ -194,7 +198,7 @@ def test_lookup_key_must_be_mapped() -> None:
         )
 
 
-def test_slug_computed_and_digest_convention() -> None:
+def test_slug_computed_and_declared_digest() -> None:
     spec = build_spec(
         source_table="project_template",
         destination_table="project_templates",
@@ -207,6 +211,7 @@ def test_slug_computed_and_digest_convention() -> None:
         ),
         renames={"id": "template_id"},
         computed={"code": "slug:name"},
+        row_hash_columns=("document_digest",),
     )
     assert spec.executable
     assert spec.computed == {"code": "slug:name", "document_digest": "sha256_row"}
@@ -685,3 +690,138 @@ def test_json_columns_encode_scalar_answers() -> None:
     with dst.connect() as d_:
         rows = d_.execute(sa.text("SELECT id, value_json FROM answers_out ORDER BY id")).all()
     assert rows == [("a1", '"plain text"'), ("a2", '"42"'), ("a3", None)]
+
+
+@pytest.mark.parametrize("column", ("receipt_evidence_fingerprint", "content_sha256", "evidence_digest"))
+@pytest.mark.parametrize("nullable", (False, True))
+def test_unsourced_hash_names_do_not_manufacture_proof(column: str, nullable: bool) -> None:
+    spec = build_spec(
+        source_table="legacy_item",
+        destination_table="items",
+        source_columns=("id",),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn(column, nullable=nullable, has_default=False),
+        ),
+    )
+    assert column not in spec.column_map
+    assert column not in spec.computed
+    assert column not in spec.defaults
+    assert spec.missing_required == (() if nullable else (column,))
+    assert spec.executable is nullable
+
+
+@pytest.mark.parametrize("source_name", ("request_fingerprint", "recorded_hash"))
+@pytest.mark.parametrize("value", (None, "source-recorded-fingerprint"))
+def test_declared_row_hash_preserves_source_value_including_null(source_name: str, value: str | None) -> None:
+    spec = build_spec(
+        source_table="legacy_item",
+        destination_table="items",
+        source_columns=("id", source_name),
+        destination_columns=(
+            DestinationColumn("id", nullable=False, has_default=False),
+            DestinationColumn("request_fingerprint", nullable=True, has_default=False),
+        ),
+        renames={"request_fingerprint": source_name} if source_name != "request_fingerprint" else {},
+        row_hash_columns=("request_fingerprint",),
+    )
+    assert spec.column_map["request_fingerprint"] == source_name
+    assert spec.computed == {}
+    src, dst = sa.create_engine("sqlite://"), sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text(f"CREATE TABLE legacy_item (id TEXT, {source_name} TEXT)"))
+        c.execute(sa.text("INSERT INTO legacy_item VALUES ('r1', :value)"), {"value": value})
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE items (id TEXT, request_fingerprint TEXT)"))
+    with src.connect() as source, dst.begin() as target:
+        assert execute_transform(source, target, spec).complete
+        assert target.execute(sa.text("SELECT request_fingerprint FROM items")).scalar_one() == value
+
+
+@pytest.mark.parametrize(
+    ("declaration", "message"),
+    (
+        (("unsafe;column",), "unsafe SQL identifier"),
+        (("absent",), "absent from destination"),
+        (("request_fingerprint", "request_fingerprint"), "duplicate row hash"),
+    ),
+)
+def test_row_hash_declarations_are_validated(declaration: tuple[str, ...], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_spec(
+            source_table="legacy_item",
+            destination_table="items",
+            source_columns=("id",),
+            destination_columns=(DestinationColumn("request_fingerprint", nullable=False, has_default=False),),
+            row_hash_columns=declaration,
+        )
+
+
+def test_declared_hashes_keep_exact_bytes_and_computed_order() -> None:
+    spec = build_spec(
+        source_table="legacy_item",
+        destination_table="items",
+        source_columns=("id", "name", "amount"),
+        destination_columns=tuple(
+            DestinationColumn(name, nullable=False, has_default=False)
+            for name in (
+                "id",
+                "name",
+                "amount",
+                "source_fingerprint",
+                "evidence_ref",
+                "request_fingerprint",
+                "code",
+                "submission_key",
+            )
+        ),
+        # Declaration order must not reorder the destination-column walk.
+        row_hash_columns=("request_fingerprint", "source_fingerprint"),
+        computed={"code": "slug:name", "submission_key": "source_key"},
+    )
+    assert list(spec.computed.items()) == [
+        ("source_fingerprint", "sha256_row"),
+        ("evidence_ref", "source_key"),
+        ("request_fingerprint", "sha256_row"),
+        ("code", "slug:name"),
+        ("submission_key", "source_key"),
+    ]
+    src, dst = sa.create_engine("sqlite://"), sa.create_engine("sqlite://")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE legacy_item (id TEXT, name TEXT, amount TEXT)"))
+        c.execute(sa.text("INSERT INTO legacy_item VALUES ('r1', 'Site Rollout', '12345678901234567890.1200')"))
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE items (id TEXT, name TEXT, amount TEXT, source_fingerprint TEXT, "
+                "evidence_ref TEXT, request_fingerprint TEXT, code TEXT, submission_key TEXT)"
+            )
+        )
+    first_bytes = b"[('amount', '12345678901234567890.1200'), ('id', 'r1'), ('name', 'Site Rollout')]"
+    first_hash = hashlib.sha256(first_bytes).hexdigest()
+    second_bytes = (
+        "[('amount', '12345678901234567890.1200'), ('evidence_ref', 'legacy:legacy_item:r1'), "
+        "('id', 'r1'), ('name', 'Site Rollout'), ('source_fingerprint', '" + first_hash + "')]"
+    ).encode()
+    with src.connect() as source, dst.begin() as target:
+        assert execute_transform(source, target, spec).complete
+        row = target.execute(sa.text("SELECT * FROM items")).mappings().one()
+        assert row["source_fingerprint"] == first_hash
+        assert row["request_fingerprint"] == hashlib.sha256(second_bytes).hexdigest()
+        assert row["code"] == "site-rollout"
+        assert row["submission_key"] == row["evidence_ref"] == "legacy:legacy_item:r1"
+        assert row["amount"] == "12345678901234567890.1200"
+        assert Decimal(row["amount"]).as_tuple() == Decimal("12345678901234567890.1200").as_tuple()
+
+
+def test_explicit_computed_still_overrides_source_and_fallback() -> None:
+    spec = build_spec(
+        source_table="legacy_item",
+        destination_table="items",
+        source_columns=("id", "request_fingerprint"),
+        destination_columns=(DestinationColumn("request_fingerprint", nullable=False, has_default=False),),
+        row_hash_columns=("request_fingerprint",),
+        computed={"request_fingerprint": "source_key"},
+    )
+    assert spec.column_map == {}
+    assert spec.computed == {"request_fingerprint": "source_key"}

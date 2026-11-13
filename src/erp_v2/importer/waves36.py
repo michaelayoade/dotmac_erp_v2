@@ -102,6 +102,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_accounting.journal_entries",
         "public.journal_entry",
+        row_hash_columns=("source_fingerprint", "request_fingerprint"),
         renames={
             "number": "journal_number",
             "kind": "journal_type",
@@ -140,6 +141,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_accounting.posted_ledger_lines",
         "public.posted_ledger_line",
+        row_hash_columns=("source_fingerprint",),
         renames={
             "journal_id": "journal_entry_id",
             "currency_code": "original_currency_code",
@@ -244,6 +246,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_payables.supplier_invoices",
         "public.supplier_invoice",
+        row_hash_columns=("request_fingerprint",),
         renames={
             "number": "invoice_number",
             "supplier_document_number": "supplier_invoice_number",
@@ -429,6 +432,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_procurement.bid_submissions",
         "public.quotation_response",
+        row_hash_columns=("content_sha256",),
         renames={"event_id": "rfq_id", "source_event_id": "response_id"},
         note="source_event_id is the legacy response's own id in the source "
         "system; content_sha256 computes over the imported row",
@@ -485,6 +489,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_procurement.receipt_observations",
         "public.goods_receipt",
+        row_hash_columns=("payload_sha256",),
         renames={
             "order_id": "po_id",
             "source_event_id": "receipt_id",
@@ -504,6 +509,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_approvals.approval_requests",
         "public.approval_request",
+        row_hash_columns=("content_digest",),
         renames={
             "subject_type": "document_type",
             "subject_id": "document_id",
@@ -529,6 +535,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_approvals.approval_policies",
         "public.approval_workflow",
+        row_hash_columns=("document_digest",),
         renames={"policy_code": "workflow_code", "levels": "approval_levels"},
         constants={"version": 1},
         note="enrols as policy v1 (re-published through the approvals "
@@ -936,6 +943,7 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_forms.form_submissions",
         "public.form_submission",
+        row_hash_columns=("request_fingerprint",),
         computed={"submission_key": "source_key"},
         note="submission_key is the stable legacy source key; request_fingerprint computes over the imported row",
     ),
@@ -958,6 +966,7 @@ WAVE56_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_workflow.workflow_executions",
         "public.workflow_execution",
+        row_hash_columns=("definition_digest", "request_fingerprint"),
         renames={
             "definition_version_ref": "rule_id",
             "subject_ref": "entity_id",
@@ -1002,6 +1011,7 @@ def build_specs(
                 fk_rewrites=pairing.fk_rewrites,
                 lookups=pairing.lookups,
                 computed=pairing.computed,
+                row_hash_columns=pairing.row_hash_columns,
                 null_fallbacks=pairing.null_fallbacks,
                 deferred=pairing.deferred,
                 json_columns=pairing.json_columns,

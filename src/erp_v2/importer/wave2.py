@@ -34,6 +34,9 @@ class Pairing:
     fk_rewrites: Mapping[str, str] = field(default_factory=dict)
     lookups: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
     computed: Mapping[str, str] = field(default_factory=dict)
+    # Hash imported row content only when this destination has no source.
+    # Source values (including NULL) and explicit computed strategies win.
+    row_hash_columns: tuple[str, ...] = ()
     null_fallbacks: Mapping[str, str] = field(default_factory=dict)
     deferred: tuple[str, ...] = ()
     json_columns: tuple[str, ...] = ()
@@ -373,6 +376,7 @@ def build_wave2_specs(
                 fk_rewrites=pairing.fk_rewrites,
                 lookups=pairing.lookups,
                 computed=pairing.computed,
+                row_hash_columns=pairing.row_hash_columns,
                 null_fallbacks=pairing.null_fallbacks,
                 deferred=pairing.deferred,
                 json_columns=pairing.json_columns,

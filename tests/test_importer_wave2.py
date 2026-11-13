@@ -446,3 +446,29 @@ def test_wave2_payroll_tax_rulings_narrow_missing_to_named_decisions() -> None:
 
     # Bands are GENERATED with rule re-publication, never row-copied.
     assert "mod_tax.tax_rule_bands" in {p.destination for p in generated}
+
+
+def test_wave2_forwards_explicit_row_hash_fallback(monkeypatch) -> None:
+    import sqlalchemy as sa
+
+    from erp_v2.importer import wave2
+
+    pairing = wave2.Pairing(
+        "mod_people.import_fixture",
+        "public.legacy_fixture",
+        row_hash_columns=("request_fingerprint",),
+    )
+    monkeypatch.setattr(wave2, "WAVE2_PAIRINGS", (pairing,))
+    table = sa.Table(
+        "import_fixture",
+        sa.MetaData(),
+        sa.Column("id", sa.String, nullable=False),
+        sa.Column("request_fingerprint", sa.String, nullable=False),
+        sa.Column("evidence_digest", sa.String, nullable=True),
+        schema="mod_people",
+    )
+    specs, generated = wave2.build_wave2_specs({"public.legacy_fixture": ("id",)}, {pairing.destination: table})
+    assert generated == ()
+    assert specs[0].executable
+    assert specs[0].computed == {"request_fingerprint": "sha256_row"}
+    assert "evidence_digest" not in specs[0].column_map
