@@ -15,6 +15,9 @@ environment, once a database is bound:
   declared and the store is not memory (default postgres; checked even
   without a bound DATABASE_URL): present, non-sentinel, >= 32 bytes and
   distinct from the other secrets (the kernel checks it in production only);
+- every lookup uses a canonical-name view of the env (matched with
+  ``str.lower()`` like the kernel, whose settings are
+  case-insensitive); two spellings of one gate key are refused;
 - ``TRUSTED_HOSTS`` declared;
 - ``SEED_ON_STARTUP`` explicitly false (absent means the kernel default,
   which is on -- a serving process must never seed).
@@ -36,6 +39,44 @@ _SECRET_NAMES: Final = ("JWT_SECRET", "SESSION_HASH_SECRET", "CSRF_SECRET")
 _ANON_KEY_NAME: Final = "ANONYMOUS_RATE_LIMIT_KEY_SECRET"
 _TRUTHY: Final = frozenset({"1", "true", "yes", "on"})
 _FALSY: Final = frozenset({"0", "false", "no", "off"})
+
+
+_GATE_KEYS: Final = frozenset(
+    (
+        "JWT_SECRET",
+        "SESSION_HASH_SECRET",
+        "CSRF_SECRET",
+        "ANONYMOUS_RATE_LIMIT_ROUTES",
+        "ANONYMOUS_RATE_LIMIT_STORE",
+        "ANONYMOUS_RATE_LIMIT_KEY_SECRET",
+        "DATABASE_URL",
+        "TRUSTED_HOSTS",
+        "SEED_ON_STARTUP",
+        "MACHINE_CREDENTIAL_HMAC_KEY",
+    )
+)
+
+
+_GATE_LOWER: Final = {name.lower(): name for name in _GATE_KEYS}
+
+
+def _gate_view(env: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Canonical-name view of the gate keys, plus keys set under >1 spelling.
+
+    The kernel (pydantic-settings) matches a name when ``key.lower()`` equals
+    the lower-case field name, so match the same way: ``str.upper()`` disagrees
+    with ``str.lower()`` on some non-ASCII characters.
+    """
+
+    view: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for key, value in env.items():
+        canonical = _GATE_LOWER.get(key.lower())
+        if canonical is None:
+            continue
+        view[canonical] = value
+        counts[canonical] = counts.get(canonical, 0) + 1
+    return view, sorted(name for name, count in counts.items() if count > 1)
 
 
 class RuntimeMaterialsError(RuntimeError):
@@ -70,7 +111,14 @@ def runtime_materials_problems(
 ) -> list[str]:
     """List material defects for a DB-bound runtime process (empty = fit)."""
 
-    env = os.environ if environ is None else environ
+    raw = os.environ if environ is None else environ
+    # The kernel's BaseSettings is case-insensitive, so a lower-case name
+    # configures it while an exact-name lookup sees nothing. Read through a
+    # lower-case canonical-name view (see _gate_view); two spellings of one
+    # gate key are ambiguous: refuse.
+    env, collisions = _gate_view(raw)
+    if collisions:
+        return [f"{name} is set under more than one letter case; supply exactly one spelling" for name in collisions]
     if not env.get("DATABASE_URL", "").strip():
         # The anonymous store counts through PLATFORM_DATABASE_URL, so its key
         # rule holds even without a bound DATABASE_URL.
