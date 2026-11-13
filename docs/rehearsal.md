@@ -407,3 +407,38 @@ keeps its original precision for separate review. The next historical AP attempt
 requires a fresh isolated import using the corrected mapping, a newly reviewed
 eligible plan, unchanged financial evidence, exact replay and recovery parity.
 Full AP open-position reconciliation remains a cutover gate.
+
+## Dest5 re-freeze rehearsal — 2026-11-13 (candidate `241b1ad`)
+
+PR #22 invalidated the `e82c89b` freeze for AP history: the frozen
+importer generated `receipt_evidence_fingerprint` values with no
+source column, which the historical verifier refuses. Dest5 reran
+the full import from the identical fresh snapshot
+(`legacy-fresh-20261113T074551Z.dump`) with the corrected importer
+(image `sha-241b1ad`, digest `sha256:2e3fabfe...`), so PR #21/#22
+are the only variables against dest4.
+
+- Genesis clean: 30/30 stamped heads match the image, cutover
+  index created before execute, 344 tables.
+- Execute: exit 3 by design (`complete=False`); read 1,384,806,
+  written 1,339,490 — written identical to dest4. Exceptions
+  70,594 (dest4: 71,253); the 659 delta is the procurement chain
+  (128 purchase orders + 7 lines + 524 receipt observations) now
+  named `specs_skipped_parent_not_imported` because
+  `mod_procurement.bid_evaluations` is blocked on missing source
+  `content_sha256`, instead of 659 per-row failures. Blocked
+  specs 5 → 7 (adds bid_evaluations `content_sha256` and
+  expense_policy_evaluations `fingerprint`); every unlanded row
+  remains named.
+- AP: 1,896 landed (741 captured document + 1,155 NULL), zero
+  field mismatches, reconciliation byte-identical to dest4.
+  Generated receipt fingerprints: 1,896 (dest4) → **0** (dest5).
+- GL: exact — 108 accounts, 0 mismatches (ledger 446,679 lines).
+- Identity re-derived on dest5 only: cohort 143 → 106 matched →
+  98 source-eligible (7 password-change + 1 MFA held) → 94 ready
+  (2 party + 2 employee destination mismatches held); plan 0
+  blockers; 94 credentials applied on the rehearsal database.
+- Runtime: dest5 app serves login 200 on the tenant host,
+  unknown host 400; sessions 0 until a real staff login.
+- Tax mint blocker unchanged: NTA 2025 bands unminted — legacy
+  has no PAYE tax code (SD/VAT/WHT only); Track B finance item.
