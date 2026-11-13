@@ -442,3 +442,29 @@ are the only variables against dest4.
   unknown host 400; sessions 0 until a real staff login.
 - Tax mint blocker unchanged: NTA 2025 bands unminted — legacy
   has no PAYE tax code (SD/VAT/WHT only); Track B finance item.
+
+## Tax seed rehearsal — 2026-11-13 (candidate `92578cc`)
+
+Ruling (Michael): tax code creation is composable in v2, so seed
+from legacy taxes instead of editing legacy or the importer.
+`erp_v2.tax_seed` (PR #26) creates destination codes through the
+dotmac_tax ensure-service from a reviewed seed spec; band
+rates/bounds/dates copy exactly from legacy `payroll.tax_band`.
+
+- Dest5: plan clean (rolled back), apply created `PAYE`
+  (INCOME_TAX, fact `income_tax`, basis `payroll`, side
+  `withholding`) with a published progressive rule v1 effective
+  2026-01-01 and all six NTA 2025 bands; replay from the built
+  image returned the identical code/rule ids.
+- Determination proof: module preview on NGN 5,000,000 gave
+  NGN 690,000 (330,000 at 15% + 360,000 at 18%) with exact band
+  lines.
+- Prod loopback staging: same plan/apply green from image
+  `sha-92578cc`; staging now carries 7 active tax codes.
+- The importer execute receipt still lists the band mint
+  blocker; its disposition is this post-execute seed step, which
+  joins the flip sequence after identity apply.
+- Policy labels are explicit in the reviewed seed spec and
+  remain finance-ratifiable via rule supersession; the bands
+  themselves are pure legacy evidence. Payroll `2040`
+  confirmation is still owed (unchanged).
