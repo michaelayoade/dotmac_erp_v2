@@ -371,3 +371,16 @@ rehearsal database only. The still-owed list above is unchanged,
 with the staff login now owed on `241b1ad` and the fresh-import
 half of the AP qualification item satisfied by dest5 (full
 open-position reconciliation still owed).
+
+Freeze moved to main `3c751a5` later the same day: PR #23
+(materials-gate case-insensitive hardening, `9088cc8`) and docs
+PR #24 landed after `241b1ad`. The importer package tree is
+byte-identical between images `sha-241b1ad` and `sha-3c751a5`
+(tree sha256 `d9030ae4...`; only `materials.py` differs), so the
+dest5 rehearsal and prod restage data evidence carries over with
+no re-import. Freeze image is now
+`ghcr.io/michaelayoade/dotmac_erp_v2:sha-3c751a5`
+(digest `sha256:73cf6657...`): boot-verified against dest5
+(login 200, unknown host 400) and on the prod loopback
+(ready 200, tenant root 302). The staff login is owed on this
+image. Any further code landing on main re-opens the freeze.
