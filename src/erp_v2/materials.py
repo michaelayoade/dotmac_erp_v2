@@ -11,8 +11,9 @@ environment, once a database is bound:
 - CSRF secret distinct from the other two (kernel production rule);
 - ``MACHINE_CREDENTIAL_HMAC_KEY``, when supplied, >= 32 bytes and distinct
   (optional: unset keeps machine-authenticated routes closed);
-- ``ANONYMOUS_RATE_LIMIT_KEY_SECRET``, only when anonymous routes are
-  declared on the postgres store: present, non-sentinel, >= 32 bytes and
+- ``ANONYMOUS_RATE_LIMIT_KEY_SECRET``, whenever anonymous routes are
+  declared and the store is not memory (default postgres; checked even
+  without a bound DATABASE_URL): present, non-sentinel, >= 32 bytes and
   distinct from the other secrets (the kernel checks it in production only);
 - ``TRUSTED_HOSTS`` declared;
 - ``SEED_ON_STARTUP`` explicitly false (absent means the kernel default,
@@ -41,6 +42,29 @@ class RuntimeMaterialsError(RuntimeError):
     """Declared runtime materials are unfit to serve. Sanitized: no values."""
 
 
+def _anonymous_key_problems(env: Mapping[str, str]) -> list[str]:
+    """Key rule for declared anonymous routes (kernel: production only)."""
+
+    if not env.get("ANONYMOUS_RATE_LIMIT_ROUTES", "").strip():
+        return []
+    # Kernel default store is postgres; any other non-memory value is refused
+    # by the kernel at startup, so failing closed here is consistent.
+    store = env.get("ANONYMOUS_RATE_LIMIT_STORE", "postgres").strip().lower()
+    if store == "memory":
+        return []
+    anon_key = env.get(_ANON_KEY_NAME, "")
+    if not anon_key:
+        return [f"{_ANON_KEY_NAME} must be supplied when anonymous routes use the postgres store"]
+    problems: list[str] = []
+    if anon_key == _KERNEL_DEV_SENTINEL:
+        problems.append(f"{_ANON_KEY_NAME} is the kernel's published dev sentinel; supply a deployment secret")
+    elif len(anon_key.encode("utf-8")) < _MIN_SECRET_BYTES:
+        problems.append(f"{_ANON_KEY_NAME} must contain at least 32 bytes")
+    if anon_key in {env.get(name, "") for name in (*_SECRET_NAMES, "MACHINE_CREDENTIAL_HMAC_KEY")}:
+        problems.append(f"{_ANON_KEY_NAME} must be distinct from the other secrets")
+    return problems
+
+
 def runtime_materials_problems(
     environ: Mapping[str, str] | None = None,
 ) -> list[str]:
@@ -48,7 +72,9 @@ def runtime_materials_problems(
 
     env = os.environ if environ is None else environ
     if not env.get("DATABASE_URL", "").strip():
-        return []
+        # The anonymous store counts through PLATFORM_DATABASE_URL, so its key
+        # rule holds even without a bound DATABASE_URL.
+        return _anonymous_key_problems(env)
     problems: list[str] = []
     secrets: dict[str, str] = {}
     for name in _SECRET_NAMES:
@@ -74,20 +100,7 @@ def runtime_materials_problems(
             problems.append("MACHINE_CREDENTIAL_HMAC_KEY must contain at least 32 bytes")
         if machine_key in secrets.values():
             problems.append("MACHINE_CREDENTIAL_HMAC_KEY must be distinct from the session and signing secrets")
-    if (
-        env.get("ANONYMOUS_RATE_LIMIT_ROUTES", "").strip()
-        and env.get("ANONYMOUS_RATE_LIMIT_STORE", "").strip().lower() == "postgres"
-    ):
-        anon_key = env.get(_ANON_KEY_NAME, "")
-        if not anon_key:
-            problems.append(f"{_ANON_KEY_NAME} must be supplied when anonymous routes use the postgres store")
-        else:
-            if anon_key == _KERNEL_DEV_SENTINEL:
-                problems.append(f"{_ANON_KEY_NAME} is the kernel's published dev sentinel; supply a deployment secret")
-            elif len(anon_key.encode("utf-8")) < _MIN_SECRET_BYTES:
-                problems.append(f"{_ANON_KEY_NAME} must contain at least 32 bytes")
-            if anon_key in {*secrets.values(), machine_key}:
-                problems.append(f"{_ANON_KEY_NAME} must be distinct from the other secrets")
+    problems.extend(_anonymous_key_problems(env))
     if not env.get("TRUSTED_HOSTS", "").strip():
         problems.append("TRUSTED_HOSTS must be declared when a database is bound")
     seed_raw = env.get("SEED_ON_STARTUP")
