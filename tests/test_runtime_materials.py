@@ -161,3 +161,46 @@ def test_case_collision_refuses_without_disclosure():
         enforce_runtime_materials(env)
     assert other not in str(exc.value)
     assert env["JWT_SECRET"] not in str(exc.value)
+
+
+def test_lowercase_weak_signing_secret_reports_exact_weak_message():
+    env = valid_env()
+    del env["JWT_SECRET"]
+    env["jwt_secret"] = "short"
+    with pytest.raises(RuntimeMaterialsError) as exc:
+        enforce_runtime_materials(env)
+    assert str(exc.value) == "JWT_SECRET must contain at least 32 bytes"
+
+
+def test_case_collision_message_is_exact():
+    env = valid_env()
+    env["jwt_secret"] = "fixture-other-" + "q" * 32
+    with pytest.raises(RuntimeMaterialsError) as exc:
+        enforce_runtime_materials(env)
+    assert str(exc.value) == "JWT_SECRET is set under more than one letter case; supply exactly one spelling"
+
+
+def test_only_lowercase_spellings_with_strong_distinct_values_pass():
+    env = {key.lower(): value for key, value in valid_env().items()}
+    env["anonymous_rate_limit_routes"] = "/login"
+    env["anonymous_rate_limit_store"] = "postgres"
+    env["anonymous_rate_limit_key_secret"] = "fixture-anon-" + "a" * 32
+    env["machine_credential_hmac_key"] = "fixture-machine-" + "m" * 32
+    enforce_runtime_materials(env)
+
+
+def test_non_ascii_fold_lookalike_does_not_satisfy_gate_key():
+    env = valid_env()
+    del env["JWT_SECRET"]
+    env["JWT_ſECRET"] = "fixture-jwt-" + "x" * 32
+    with pytest.raises(RuntimeMaterialsError) as exc:
+        enforce_runtime_materials(env)
+    assert str(exc.value) == "JWT_SECRET must be supplied when a database is bound"
+
+
+def test_kelvin_sign_name_is_treated_as_the_gate_key_like_the_kernel():
+    env = anon_env()
+    del env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"]
+    enforce_runtime_materials({**env, "ANONYMOUS_RATE_LIMIT_KEY_SECRET": "fixture-anon-" + "a" * 32})
+    with pytest.raises(RuntimeMaterialsError, match="ANONYMOUS_RATE_LIMIT_KEY_SECRET"):
+        enforce_runtime_materials({**env, "ANONYMOUS_RATE_LIMIT_KEY_SECRET": "short"})
