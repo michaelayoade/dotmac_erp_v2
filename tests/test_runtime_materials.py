@@ -54,3 +54,54 @@ def test_csrf_cannot_reuse_session_secret():
     env["CSRF_SECRET"] = env["SESSION_HASH_SECRET"]
     with pytest.raises(RuntimeMaterialsError, match="distinct"):
         enforce_runtime_materials(env)
+
+
+def anon_env(**extra):
+    env = valid_env()
+    env.update(
+        {
+            "ANONYMOUS_RATE_LIMIT_ROUTES": "/login",
+            "ANONYMOUS_RATE_LIMIT_STORE": "postgres",
+            "ANONYMOUS_RATE_LIMIT_KEY_SECRET": "fixture-anon-" + "a" * 32,
+        }
+    )
+    env.update(extra)
+    return env
+
+
+def test_anonymous_key_ignored_when_routes_undeclared():
+    env = valid_env()
+    env["ANONYMOUS_RATE_LIMIT_STORE"] = "postgres"
+    env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"] = "dev-insecure-change-me"  # noqa: S105
+    enforce_runtime_materials(env)
+
+
+def test_anonymous_key_ignored_on_memory_store():
+    env = anon_env(ANONYMOUS_RATE_LIMIT_STORE="memory")
+    del env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"]
+    enforce_runtime_materials(env)
+
+
+def test_valid_anonymous_key_allows_startup():
+    enforce_runtime_materials(anon_env())
+
+
+@pytest.mark.parametrize("value", [None, "dev-insecure-change-me", "short", "JWT", "SESSION", "CSRF", "MACHINE"])
+def test_unsafe_anonymous_key_refuses_without_disclosure(value):
+    env = anon_env(MACHINE_CREDENTIAL_HMAC_KEY="fixture-machine-" + "m" * 32)
+    reuse = {
+        "JWT": "JWT_SECRET",
+        "SESSION": "SESSION_HASH_SECRET",
+        "CSRF": "CSRF_SECRET",
+        "MACHINE": "MACHINE_CREDENTIAL_HMAC_KEY",
+    }
+    if value is None:
+        del env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"]
+    elif value in reuse:
+        env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"] = env[reuse[value]]
+    else:
+        env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"] = value
+    with pytest.raises(RuntimeMaterialsError, match="ANONYMOUS_RATE_LIMIT_KEY_SECRET") as exc:
+        enforce_runtime_materials(env)
+    if value:
+        assert env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"] not in str(exc.value)

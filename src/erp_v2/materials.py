@@ -11,6 +11,9 @@ environment, once a database is bound:
 - CSRF secret distinct from the other two (kernel production rule);
 - ``MACHINE_CREDENTIAL_HMAC_KEY``, when supplied, >= 32 bytes and distinct
   (optional: unset keeps machine-authenticated routes closed);
+- ``ANONYMOUS_RATE_LIMIT_KEY_SECRET``, only when anonymous routes are
+  declared on the postgres store: present, non-sentinel, >= 32 bytes and
+  distinct from the other secrets (the kernel checks it in production only);
 - ``TRUSTED_HOSTS`` declared;
 - ``SEED_ON_STARTUP`` explicitly false (absent means the kernel default,
   which is on -- a serving process must never seed).
@@ -29,6 +32,7 @@ from typing import Final
 _KERNEL_DEV_SENTINEL: Final = "dev-insecure-change-me"
 _MIN_SECRET_BYTES: Final = 32
 _SECRET_NAMES: Final = ("JWT_SECRET", "SESSION_HASH_SECRET", "CSRF_SECRET")
+_ANON_KEY_NAME: Final = "ANONYMOUS_RATE_LIMIT_KEY_SECRET"
 _TRUTHY: Final = frozenset({"1", "true", "yes", "on"})
 _FALSY: Final = frozenset({"0", "false", "no", "off"})
 
@@ -70,6 +74,20 @@ def runtime_materials_problems(
             problems.append("MACHINE_CREDENTIAL_HMAC_KEY must contain at least 32 bytes")
         if machine_key in secrets.values():
             problems.append("MACHINE_CREDENTIAL_HMAC_KEY must be distinct from the session and signing secrets")
+    if (
+        env.get("ANONYMOUS_RATE_LIMIT_ROUTES", "").strip()
+        and env.get("ANONYMOUS_RATE_LIMIT_STORE", "").strip().lower() == "postgres"
+    ):
+        anon_key = env.get(_ANON_KEY_NAME, "")
+        if not anon_key:
+            problems.append(f"{_ANON_KEY_NAME} must be supplied when anonymous routes use the postgres store")
+        else:
+            if anon_key == _KERNEL_DEV_SENTINEL:
+                problems.append(f"{_ANON_KEY_NAME} is the kernel's published dev sentinel; supply a deployment secret")
+            elif len(anon_key.encode("utf-8")) < _MIN_SECRET_BYTES:
+                problems.append(f"{_ANON_KEY_NAME} must contain at least 32 bytes")
+            if anon_key in {*secrets.values(), machine_key}:
+                problems.append(f"{_ANON_KEY_NAME} must be distinct from the other secrets")
     if not env.get("TRUSTED_HOSTS", "").strip():
         problems.append("TRUSTED_HOSTS must be declared when a database is bound")
     seed_raw = env.get("SEED_ON_STARTUP")
