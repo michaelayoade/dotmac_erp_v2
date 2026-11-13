@@ -15,6 +15,8 @@ environment, once a database is bound:
   declared and the store is not memory (default postgres; checked even
   without a bound DATABASE_URL): present, non-sentinel, >= 32 bytes and
   distinct from the other secrets (the kernel checks it in production only);
+- every lookup uses an upper-cased view of the env (the kernel's settings are
+  case-insensitive); two spellings of one gate key are refused;
 - ``TRUSTED_HOSTS`` declared;
 - ``SEED_ON_STARTUP`` explicitly false (absent means the kernel default,
   which is on -- a serving process must never seed).
@@ -36,6 +38,33 @@ _SECRET_NAMES: Final = ("JWT_SECRET", "SESSION_HASH_SECRET", "CSRF_SECRET")
 _ANON_KEY_NAME: Final = "ANONYMOUS_RATE_LIMIT_KEY_SECRET"
 _TRUTHY: Final = frozenset({"1", "true", "yes", "on"})
 _FALSY: Final = frozenset({"0", "false", "no", "off"})
+
+
+_GATE_KEYS: Final = frozenset(
+    (
+    "JWT_SECRET", "SESSION_HASH_SECRET", "CSRF_SECRET",
+    "ANONYMOUS_RATE_LIMIT_ROUTES", "ANONYMOUS_RATE_LIMIT_STORE", "ANONYMOUS_RATE_LIMIT_KEY_SECRET",
+    "DATABASE_URL", "TRUSTED_HOSTS", "SEED_ON_STARTUP",
+    "MACHINE_CREDENTIAL_HMAC_KEY",
+    )
+)
+
+
+def _case_collisions(env: Mapping[str, str]) -> list[str]:
+    """Upper-cased gate key names present under more than one spelling."""
+
+    seen: dict[str, int] = {}
+    for key in env:
+        upper = key.upper()
+        if upper in _GATE_KEYS:
+            seen[upper] = seen.get(upper, 0) + 1
+    return sorted(name for name, count in seen.items() if count > 1)
+
+
+def _upper_view(env: Mapping[str, str]) -> dict[str, str]:
+    """Upper-cased copy of the env: the kernel's settings are case-insensitive."""
+
+    return {key.upper(): value for key, value in env.items()}
 
 
 class RuntimeMaterialsError(RuntimeError):
@@ -70,7 +99,17 @@ def runtime_materials_problems(
 ) -> list[str]:
     """List material defects for a DB-bound runtime process (empty = fit)."""
 
-    env = os.environ if environ is None else environ
+    raw = os.environ if environ is None else environ
+    # The kernel's BaseSettings is case-insensitive, so a lower-case name
+    # configures it while an exact-name lookup sees nothing. Read through an
+    # upper-cased view; two spellings of one gate key are ambiguous: refuse.
+    collisions = _case_collisions(raw)
+    if collisions:
+        return [
+            f"{name} is set under more than one letter case; supply exactly one spelling"
+            for name in collisions
+        ]
+    env = _upper_view(raw)
     if not env.get("DATABASE_URL", "").strip():
         # The anonymous store counts through PLATFORM_DATABASE_URL, so its key
         # rule holds even without a bound DATABASE_URL.

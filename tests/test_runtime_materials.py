@@ -134,3 +134,30 @@ def test_anonymous_key_rule_applies_without_database_url():
         enforce_runtime_materials(env)
     env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"] = "fixture-anon-" + "a" * 32
     enforce_runtime_materials(env)
+
+
+def test_lowercase_anonymous_routes_with_missing_key_refuses():
+    env = valid_env()
+    env["anonymous_rate_limit_routes"] = "/login"
+    with pytest.raises(RuntimeMaterialsError, match="ANONYMOUS_RATE_LIMIT_KEY_SECRET"):
+        enforce_runtime_materials(env)
+
+
+@pytest.mark.parametrize("value", ["short", "dev-insecure-change-me"])
+def test_lowercase_signing_secret_is_refused_like_uppercase(value):
+    env = valid_env()
+    del env["JWT_SECRET"]
+    env["jwt_secret"] = value
+    with pytest.raises(RuntimeMaterialsError, match="JWT_SECRET") as exc:
+        enforce_runtime_materials(env)
+    assert value not in str(exc.value)
+
+
+def test_case_collision_refuses_without_disclosure():
+    env = valid_env()
+    other = "fixture-other-" + "q" * 32
+    env["jwt_secret"] = other
+    with pytest.raises(RuntimeMaterialsError, match="JWT_SECRET") as exc:
+        enforce_runtime_materials(env)
+    assert other not in str(exc.value)
+    assert env["JWT_SECRET"] not in str(exc.value)
