@@ -356,3 +356,18 @@ flip-day sequence and rollback boundary still apply verbatim.
   HR department canonical confirmation; a real staff login on this frozen
   candidate; and Michael's explicit flip-day go with a chosen window. The
   full reconciliation gates in the flip-day sequence remain required.
+
+Re-freeze 2026-11-13 (later same day): PR #21 (materials gate) and
+PR #22 (no generated proof hashes) landed on main after `e82c89b`.
+PR #22 invalidated the `e82c89b` freeze for AP history, so the
+freeze candidate is now main `241b1ad`, image
+`ghcr.io/michaelayoade/dotmac_erp_v2:sha-241b1ad`
+(digest `sha256:2e3fabfe...`), fully rehearsed as dest5 (see
+`docs/rehearsal.md`: GL exact, written identical to dest4,
+generated AP receipt fingerprints 0, procurement chain named
+skipped under a blocked parent). The prod loopback staging is
+restaged to this image; identity (94) is applied on the dest5
+rehearsal database only. The still-owed list above is unchanged,
+with the staff login now owed on `241b1ad` and the fresh-import
+half of the AP qualification item satisfied by dest5 (full
+open-position reconciliation still owed).
