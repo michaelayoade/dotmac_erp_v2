@@ -166,7 +166,8 @@ def test_case_collision_refuses_without_disclosure():
 def test_lowercase_weak_signing_secret_reports_exact_weak_message():
     env = valid_env()
     del env["JWT_SECRET"]
-    env["jwt_secret"] = "short"
+    weak = "short"
+    env["jwt_secret"] = weak
     with pytest.raises(RuntimeMaterialsError) as exc:
         enforce_runtime_materials(env)
     assert str(exc.value) == "JWT_SECRET must contain at least 32 bytes"
@@ -192,7 +193,7 @@ def test_only_lowercase_spellings_with_strong_distinct_values_pass():
 def test_non_ascii_fold_lookalike_does_not_satisfy_gate_key():
     env = valid_env()
     del env["JWT_SECRET"]
-    env["JWT_ſECRET"] = "fixture-jwt-" + "x" * 32
+    env["JWT_\u017fECRET"] = "fixture-jwt-" + "x" * 32
     with pytest.raises(RuntimeMaterialsError) as exc:
         enforce_runtime_materials(env)
     assert str(exc.value) == "JWT_SECRET must be supplied when a database is bound"
@@ -201,6 +202,6 @@ def test_non_ascii_fold_lookalike_does_not_satisfy_gate_key():
 def test_kelvin_sign_name_is_treated_as_the_gate_key_like_the_kernel():
     env = anon_env()
     del env["ANONYMOUS_RATE_LIMIT_KEY_SECRET"]
-    enforce_runtime_materials({**env, "ANONYMOUS_RATE_LIMIT_KEY_SECRET": "fixture-anon-" + "a" * 32})
+    enforce_runtime_materials({**env, "ANONYMOUS_RATE_LIMIT_\u212aEY_SECRET": "fixture-anon-" + "a" * 32})
     with pytest.raises(RuntimeMaterialsError, match="ANONYMOUS_RATE_LIMIT_KEY_SECRET"):
-        enforce_runtime_materials({**env, "ANONYMOUS_RATE_LIMIT_KEY_SECRET": "short"})
+        enforce_runtime_materials({**env, "ANONYMOUS_RATE_LIMIT_\u212aEY_SECRET": "short"})
