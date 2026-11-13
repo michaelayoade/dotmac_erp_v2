@@ -262,8 +262,7 @@ def _run(args) -> dict:
                     jurisdictions = list(
                         db.execute(
                             sa.text(
-                                "SELECT id FROM mod_tax.tax_jurisdictions "
-                                "WHERE tenant_id = :t AND status = 'active'"
+                                "SELECT id FROM mod_tax.tax_jurisdictions WHERE tenant_id = :t AND status = 'active'"
                             ),
                             {"t": str(tenant_id)},
                         ).scalars()

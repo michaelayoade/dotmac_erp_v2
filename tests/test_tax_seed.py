@@ -92,6 +92,6 @@ def test_select_bands_refuses_gaps_and_missing():
     rows = [_band("NTA 2025 - 0%", 1, "0", "800000", "0")]
     with pytest.raises(OperatorRefusal, match="legacy_band_missing"):
         select_bands(rows, ("NTA 2025 - 15%",))
-    gapped = rows + [_band("NTA 2025 - 15%", 2, "900000", None, "0.15")]
+    gapped = [*rows, _band("NTA 2025 - 15%", 2, "900000", None, "0.15")]
     with pytest.raises(OperatorRefusal, match="legacy_band_not_contiguous"):
         select_bands(gapped, ("NTA 2025 - 0%", "NTA 2025 - 15%"))
