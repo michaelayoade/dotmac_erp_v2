@@ -1018,6 +1018,7 @@ def build_specs(
                 sub_origin=pairing.sub_origin,
                 sub_customer_ref=pairing.sub_customer_ref,
                 source_row_refusal=pairing.source_row_refusal,
+                source_order=pairing.source_order,
             )
         )
     return tuple(specs), tuple(generated)
