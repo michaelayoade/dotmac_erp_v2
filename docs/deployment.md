@@ -318,3 +318,38 @@ principal tenant/credential matching remains mandatory in the banking
 service, and bank-account/statement relationships retain composite tenant
 FKs. Explicit app_user SELECT plus UPDATE(updated_at) (binding lock), and SELECT/INSERT
 (receipt append) grants are part of genesis; runtime cannot create bindings.
+
+## Freeze addendum — 2026-11-13
+
+Supersedes the candidate/readiness state above where they differ; the
+flip-day sequence and rollback boundary still apply verbatim.
+
+- Freeze candidate: ERP `main` `e82c89b`, image
+  `ghcr.io/michaelayoade/dotmac_erp_v2:sha-e82c89b`
+  (digest `sha256:2b9f806e...`, Payables a3, Billing a11).
+  Rehearsed on a fresh same-day prod snapshot (dest4, see
+  `docs/rehearsal.md`) with exact GL parity, and restaged onto the
+  prod loopback (`127.0.0.1:8013`) from the same snapshot with
+  counts identical to dest4. Legacy and nginx untouched.
+- Supplier-document ruling is landed (Payables a2/a3): uncaptured
+  numbers persist NULL, 1,155/1,212 on the fresh snapshot, 57 named
+  totals exceptions, zero invented numbers.
+- Identity: everyone-access ruling (2026-11-11). The 94-person ready
+  cohort is applied on the dest4 rehearsal database only; prod
+  staging still has zero credentials. Identity apply on the flip
+  destination is a flip-window step with reviewed digests.
+- Measured timings (prod hardware): dump ~3m, restore ~4m,
+  genesis <1m, execute ~15m, full restage 14m36s. Working window
+  proposal: 2 hours; abort if reconciliation is not green by T+75m.
+- Fencing mechanics verified read-only on prod: writers are
+  compose services `app`/`worker`/`beat` with
+  `restart=unless-stopped` (manual `docker compose stop` holds);
+  `nginx -t` clean; the traffic switch is one line in
+  `sites-enabled/erp.dotmac.io` (upstream `127.0.0.1:8003` ->
+  `127.0.0.1:8013`). A maintenance page/snippet is prepared but
+  NOT enabled (`/var/www/erp-maintenance/`,
+  `sites-available/erp-maintenance.snippet`).
+- Still owed before flip: finance PAYE legacy code + policy fields
+  and payroll `2040` confirmation, HR department canonical
+  confirmation, a real staff login on this frozen candidate, and
+  Michael's explicit flip-day go with a chosen window.
