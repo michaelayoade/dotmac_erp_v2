@@ -472,3 +472,22 @@ def test_wave2_forwards_explicit_row_hash_fallback(monkeypatch) -> None:
     assert specs[0].executable
     assert specs[0].computed == {"request_fingerprint": "sha256_row"}
     assert "evidence_digest" not in specs[0].column_map
+
+
+def test_departments_source_order_survives_both_spec_builders() -> None:
+    # The CLI executes through waves36.build_specs, not
+    # build_wave2_specs; the canonical-department ordering must
+    # reach the executor through the builder that actually runs.
+    from erp_v2.importer.waves36 import build_specs
+
+    expected = (("is_active", True), ("created_at", False), ("department_id", False))
+    people = tuple(p for p in WAVE2_PAIRINGS if p.destination == "mod_people.departments")
+    generic_specs, _ = build_specs(people, LEGACY, _people_dest())
+    assert generic_specs[0].source_order == expected
+    from unittest.mock import patch
+
+    import erp_v2.importer.wave2 as wave2
+
+    with patch.object(wave2, "WAVE2_PAIRINGS", people):
+        wave2_specs, _ = wave2.build_wave2_specs(LEGACY, _people_dest())
+    assert wave2_specs[0].source_order == expected
