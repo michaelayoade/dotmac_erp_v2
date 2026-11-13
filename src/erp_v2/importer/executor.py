@@ -404,8 +404,14 @@ def execute_transform(
     select_columns = list(source_columns)
     if ref is not None and ref.column not in select_columns:
         select_columns.append(ref.column)
+    order_sql = ""
+    if spec.source_order:
+        # Identifiers and directions are closed-set validated in spec.py.
+        order_sql = " ORDER BY " + ", ".join(
+            f"{column} DESC" if descending else f"{column} ASC" for column, descending in spec.source_order
+        )
     select_sql = sa.text(
-        f"SELECT {', '.join(select_columns)} FROM {spec.source_table}{where_sub}"  # noqa: S608
+        f"SELECT {', '.join(select_columns)} FROM {spec.source_table}{where_sub}{order_sql}"  # noqa: S608
     )
     dest_columns = [
         c
