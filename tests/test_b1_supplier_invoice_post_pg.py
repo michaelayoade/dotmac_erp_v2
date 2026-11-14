@@ -128,7 +128,12 @@ def approve(engine, env, invoice_id, party_index=1, *, commit=True, caller_write
         tenant, party = db.get(Tenant, env.tenant_id), db.get(Party, env.party_ids[party_index])
         if caller_write:
             db.add(
-                AccountCategory(tenant_id=env.tenant_id, code="CALLER", name="c", account_class=AccountClass.EXPENSE)
+                AccountCategory(
+                    tenant_id=env.tenant_id,
+                    code=f"CALLER-{invoice_id.hex[:12]}",
+                    name="c",
+                    account_class=AccountClass.EXPENSE,
+                )
             )
             db.flush()
         try:
@@ -147,7 +152,7 @@ def refusal(engine, env, invoice_id, code, party_index=1):
     with Session(engine) as db:  # the caller's earlier write survives
         assert db.scalar(
             sa.select(AccountCategory.id).where(
-                AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "CALLER"
+                AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == f"CALLER-{invoice_id.hex[:12]}"
             )
         )
     assert any(
