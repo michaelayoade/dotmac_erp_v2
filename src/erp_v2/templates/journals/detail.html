@@ -17,6 +17,7 @@
   {% if manual.reversal_requested_by_party_id %}<dt>Reversal requested by</dt><dd>{{ names.get(manual.reversal_requested_by_party_id, manual.reversal_requested_by_party_id) }} for {{ manual.reversal_posting_date }}: {{ manual.reversal_reason }}</dd>{% endif %}
   {% if manual.reversal_approved_by_party_id %}<dt>Reversal approved by</dt><dd>{{ names.get(manual.reversal_approved_by_party_id, manual.reversal_approved_by_party_id) }}</dd>{% endif %}
 </dl>
+{% if control_accounts %}<p role="alert"><strong>Control account:</strong> this journal posts to subledger control account(s) {{ control_accounts|join(', ') }}. It breaks subledger-to-GL parity unless deliberate; the evidence reference must name the reconciliation item.</p>{% endif %}
 {% include "journals/_lines.html" %}
 
 {% if not approver %}

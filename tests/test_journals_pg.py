@@ -81,7 +81,11 @@ def seed(engine, *, currency: str | None = "USD", adjustment: bool = False) -> S
         db.flush()
         categories = {
             code: AccountCategory(tenant_id=tenant_id, code=code, name=code, account_class=klass)
-            for code, klass in (("AST", AccountClass.ASSET), ("REV", AccountClass.REVENUE))
+            for code, klass in (
+                ("AST", AccountClass.ASSET),
+                ("REV", AccountClass.REVENUE),
+                ("LIA", AccountClass.LIABILITY),
+            )
         }
         db.add_all(categories.values())
         db.flush()
@@ -90,6 +94,7 @@ def seed(engine, *, currency: str | None = "USD", adjustment: bool = False) -> S
             ("1000", "AST", NormalBalance.DEBIT),
             ("1400", "AST", NormalBalance.DEBIT),
             ("4000", "REV", NormalBalance.CREDIT),
+            ("2000", "LIA", NormalBalance.CREDIT),
         ):
             row = Account(
                 tenant_id=tenant_id,
@@ -650,7 +655,7 @@ def test_withdrawn_reversal_returns_to_posted(engine):
 # --- held legacy journals --------------------------------------------------
 
 
-def legacy_draft(engine, env, *, document="legacy-1", amount="75") -> SimpleNamespace:
+def legacy_draft(engine, env, *, document="legacy-1", amount="75", owner="legacy-erp") -> SimpleNamespace:
     with Session(engine) as db:
         journal = accounting.create_journal(
             db,
@@ -663,7 +668,7 @@ def legacy_draft(engine, env, *, document="legacy-1", amount="75") -> SimpleName
                 currency_code="USD",
                 exchange_rate=Decimal(1),
                 description="Imported legacy journal",
-                source=SourceIdentity("legacy-erp", "journal", document, "1", "b" * 64),
+                source=SourceIdentity(owner, "journal", document, "1", "b" * 64),
                 lines=(
                     JournalLineInput(env.accounts["1000"], debit=Decimal(amount)),
                     JournalLineInput(env.accounts["4000"], credit=Decimal(amount)),
@@ -832,3 +837,177 @@ def test_service_never_exposes_period_reopen_or_account_creation():
     assert "reopen_period" not in names
     assert not {n for n in names if n.startswith("create_")}
     assert InvalidPeriod  # accounting's own refusal type is what period commands map from
+
+
+# --- review changes (B2-1 .. B2-6) ------------------------------------------
+
+
+def test_another_modules_draft_is_not_held_and_cannot_be_requested(engine):
+    env = seed(engine)
+    foreign = legacy_draft(engine, env, document="dep-1", owner="finance")
+    ours = legacy_draft(engine, env, document="leg-1")
+    with Session(engine) as db:
+        page = queries.held_journals(db, tenant_id=env.tenant_id, page=1)
+        assert [j.id for j in page["journals"]] == [ours.id] and page["total"] == 1
+    before = counts(engine, env)
+    with pytest.raises(JournalRefused) as exc:
+        run(
+            engine,
+            env,
+            service.request_legacy_post,
+            journal_id=foreign.id,
+            actor=env.parties["preparer"],
+            review_ref="R",
+        )
+    assert exc.value.code == "not_legacy_held"
+    assert counts(engine, env) == before
+
+
+def test_rejected_held_journal_can_be_re_requested_with_sod_and_audit_history(engine):
+    env = seed(engine)
+    held = legacy_draft(engine, env)
+    first = run(
+        engine, env, service.request_legacy_post, journal_id=held.id, actor=env.parties["preparer"], review_ref="R-1"
+    )
+    run(engine, env, service.reject, manual_id=first.manual_id, actor=env.parties["approver"], reason="missing support")
+    with Session(engine) as db:
+        assert queries.held_journals(db, tenant_id=env.tenant_id, page=1)["total"] == 1  # held again
+    again = run(
+        engine, env, service.request_legacy_post, journal_id=held.id, actor=env.parties["requester"], review_ref="R-2"
+    )
+    assert again.manual_id == first.manual_id and again.state == m.STATE_POST_REQUESTED
+    with pytest.raises(JournalRefused) as exc:
+        approve(engine, env, again, who="requester")
+    assert exc.value.code == "sod_preparer_cannot_approve"
+    approve(engine, env, again, who="approver")
+    with Session(engine) as db:
+        row = db.scalar(sa.select(ManualJournal).where(ManualJournal.id == first.manual_id))
+        assert (row.state, row.evidence_ref, row.prepared_by_party_id) == (
+            m.STATE_POSTED,
+            "R-2",
+            env.parties["requester"],
+        )
+        assert row.rejection_reason is None
+        details = list(
+            db.scalars(
+                sa.select(AuditEvent.details).where(
+                    AuditEvent.tenant_id == env.tenant_id, AuditEvent.action == "erp.journal.post_requested"
+                )
+            )
+        )
+        assert any(d.get("prior_reason") == "missing support" and d.get("re_request") for d in details)
+    assert "erp.journal.rejected" in actions(engine, env)
+
+
+def test_rejected_manual_journal_stays_terminal(engine):
+    env = seed(engine)
+    outcome = prepare(engine, env)
+    request(engine, env, outcome)
+    run(engine, env, service.reject, manual_id=outcome.manual_id, actor=env.parties["approver"], reason="no")
+    with pytest.raises(JournalRefused):
+        request(engine, env, outcome, who="requester")
+    journal_id = outcome.journal_id
+    with pytest.raises(JournalRefused) as exc:
+        run(
+            engine,
+            env,
+            service.request_legacy_post,
+            journal_id=journal_id,
+            actor=env.parties["requester"],
+            review_ref="R",
+        )
+    assert exc.value.code == "not_legacy_held"
+
+
+def _raw_update(engine, manual_id, **values):
+    with Session(engine) as db:
+        try:
+            db.execute(sa.update(ManualJournal).where(ManualJournal.id == manual_id).values(**values))
+            db.flush()
+        finally:
+            db.rollback()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"prepared_by_party_id": "requester"},
+        {"requested_by_party_id": "approver2"},
+        {"approved_by_party_id": "approver2"},
+        {"evidence_ref": "TAMPERED"},
+    ],
+)
+def test_trigger_freezes_recorded_actors_and_evidence(engine, change):
+    env = seed(engine)
+    outcome = posted_flow(engine, env)
+    values = {k: (env.parties[v] if k.endswith("party_id") else v) for k, v in change.items()}
+    with pytest.raises(IntegrityError):
+        _raw_update(engine, outcome.manual_id, **values)
+
+
+def test_trigger_refuses_undeclared_state_transitions(engine):
+    env = seed(engine)
+    outcome = prepare(engine, env)  # PREPARED
+    with pytest.raises(IntegrityError):
+        _raw_update(
+            engine,
+            outcome.manual_id,
+            state=m.STATE_POSTED,
+            requested_by_party_id=env.parties["requester"],
+            requested_at=NOW,
+            approved_by_party_id=env.parties["approver"],
+            approved_at=NOW,
+        )
+
+
+def test_downgrade_refuses_while_the_table_holds_evidence(engine):
+    import importlib
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    env = seed(engine)
+    prepare(engine, env)
+    module = importlib.import_module("erp_v2.migrations.versions.e2_0014_manual_journals")
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        with Operations.context(MigrationContext.configure(connection)):
+            with pytest.raises(RuntimeError, match="maker-checker evidence"):
+                module.downgrade()
+        transaction.rollback()
+    with Session(engine) as db:
+        assert (
+            db.scalar(
+                sa.select(sa.func.count()).select_from(ManualJournal).where(ManualJournal.tenant_id == env.tenant_id)
+            )
+            == 1
+        )
+
+
+def test_control_account_journal_is_flagged_not_blocked(engine):
+    env = seed(engine)
+    cmd = PrepareJournal(
+        uuid4(),
+        DAY,
+        JournalKind.STANDARD,
+        "AP correction",
+        "RECON-ITEM-9",
+        (LineInput(env.accounts["2000"], debit=Decimal(10)), LineInput(env.accounts["1000"], credit=Decimal(10))),
+    )
+    outcome = run(engine, env, service.prepare_journal, actor=env.parties["preparer"], command=cmd)
+    with Session(engine) as db:
+        assert queries.detail(db, tenant_id=env.tenant_id, manual_id=outcome.manual_id)["control_accounts"] == ["2000"]
+    request(engine, env, outcome)
+    approve(engine, env, outcome)  # warning only: it still posts
+    plain = prepare(engine, env)
+    with Session(engine) as db:
+        assert queries.detail(db, tenant_id=env.tenant_id, manual_id=plain.manual_id)["control_accounts"] == []
+
+
+def test_held_drafts_are_counted_per_period_for_the_soft_close_screen(engine):
+    env = seed(engine)
+    legacy_draft(engine, env, document="a")
+    legacy_draft(engine, env, document="b")
+    legacy_draft(engine, env, document="c", owner="finance")
+    with Session(engine) as db:
+        assert queries.held_counts_by_period(db, tenant_id=env.tenant_id) == {env.periods[1]: 2}

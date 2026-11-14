@@ -227,6 +227,7 @@ def browser(monkeypatch):
                 ]
             ),
             "posting_accounts": Mock(return_value=[account]),
+            "held_counts_by_period": Mock(return_value={ID: 3}),
         }
         for name, spy in queries.items():
             monkeypatch.setattr(routes.queries, name, spy)
@@ -438,4 +439,5 @@ def test_register_queue_held_and_period_pages_render(browser):
     assert "Request posting of this journal" in browser.client.get(f"/finance/journals/held/{ID}").text
     browser.sign_in("approver")
     assert "MJ-1" in browser.client.get("/finance/journal-approvals").text
-    assert "Soft-close" in browser.client.get("/finance/periods").text
+    periods = browser.client.get("/finance/periods").text
+    assert "Soft-close" in periods and "3 held legacy draft" in periods

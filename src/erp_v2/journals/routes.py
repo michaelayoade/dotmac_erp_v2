@@ -342,6 +342,7 @@ def _periods_page(
             request,
             party,
             periods=queries.periods(db, tenant_id=tenant.id),
+            held_counts=queries.held_counts_by_period(db, tenant_id=tenant.id),
             currency=currency,
             currency_error=currency_error,
             error=error,

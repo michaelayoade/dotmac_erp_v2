@@ -13,8 +13,11 @@ from sqlalchemy.orm import Session
 
 from erp_v2.journals import models as m
 from erp_v2.journals.models import ManualJournal
-from erp_v2.journals.service import MANUAL_OWNER
+from erp_v2.journals.service import LEGACY_OWNER
 
+# Subledger control accounts (AP control, payroll payable): a manual posting here is allowed but
+# breaks subledger-to-GL parity unless deliberate, so approval screens warn (never block).
+CONTROL_ACCOUNT_CODES = frozenset({"2000", "2040"})
 PAGE_SIZE = 50
 MAX_PAGE = 1000
 REGISTER_LIMIT = 200
@@ -88,11 +91,13 @@ def detail(db: Session, *, tenant_id: UUID, manual_id: UUID) -> dict[str, Any] |
     )
     if journal is None:
         return None
+    lines = _lines(db, tenant_id, journal.id)
     return {
         "manual": manual,
         "journal": journal,
-        "lines": _lines(db, tenant_id, journal.id),
+        "lines": lines,
         "names": _names(db, tenant_id, [manual]),
+        "control_accounts": sorted({a.code for _, a in lines if a.code in CONTROL_ACCOUNT_CODES}),
     }
 
 
@@ -113,9 +118,14 @@ def _held_filter(tenant_id: UUID):
     return (
         JournalEntry.tenant_id == tenant_id,
         JournalEntry.status == JournalStatus.DRAFT,
-        JournalEntry.source_owner != MANUAL_OWNER,
+        JournalEntry.source_owner == LEGACY_OWNER,
+        # A rejected held request may be re-requested, so it counts as held again.
         ~select(ManualJournal.id)
-        .where(ManualJournal.tenant_id == JournalEntry.tenant_id, ManualJournal.journal_id == JournalEntry.id)
+        .where(
+            ManualJournal.tenant_id == JournalEntry.tenant_id,
+            ManualJournal.journal_id == JournalEntry.id,
+            ManualJournal.state != m.STATE_REJECTED,
+        )
         .exists(),
     )
 
@@ -144,6 +154,18 @@ def held_detail(db: Session, *, tenant_id: UUID, journal_id: UUID) -> dict[str, 
         select(ManualJournal).where(ManualJournal.tenant_id == tenant_id, ManualJournal.journal_id == journal_id)
     )
     return {"journal": journal, "lines": _lines(db, tenant_id, journal.id), "workflow": workflow}
+
+
+def held_counts_by_period(db: Session, *, tenant_id: UUID) -> dict[UUID, int]:
+    """Held legacy DRAFTs per fiscal period, so Finance decides before a period is soft-closed."""
+    return {
+        period_id: count
+        for period_id, count in db.execute(
+            select(JournalEntry.fiscal_period_id, func.count())
+            .where(*_held_filter(tenant_id))
+            .group_by(JournalEntry.fiscal_period_id)
+        )
+    }
 
 
 def periods(db: Session, *, tenant_id: UUID) -> list[FiscalPeriod]:

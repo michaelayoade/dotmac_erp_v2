@@ -60,6 +60,9 @@ from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
 
 MANUAL_OWNER: Final = "erp.manual"
 MANUAL_KIND: Final = "manual_journal"
+# The one declared legacy import owner (the import run's source_owner constant). Only its
+# DRAFT journals may enter the held-journal path; another module's draft is never ours to post.
+LEGACY_OWNER: Final = "legacy-erp"
 SOURCE_APPLICATION: Final = "dotmac_erp"
 ALLOWED_KINDS: Final = (JournalKind.STANDARD, JournalKind.ADJUSTMENT)
 MAX_LINES: Final = 200
@@ -388,7 +391,11 @@ def request_post(db: Session, *, tenant_id: UUID, manual_id: UUID, actor: UUID, 
 def request_legacy_post(
     db: Session, *, tenant_id: UUID, journal_id: UUID, actor: UUID, review_ref: str, now: datetime | None = None
 ) -> Outcome:
-    """Open the maker-checker path for ONE held legacy DRAFT journal (Finance review reference)."""
+    """Open the maker-checker path for ONE held legacy DRAFT journal (Finance review reference).
+
+    A previously REJECTED held journal may be re-requested with a new review reference and
+    requester (SoD re-checked at approval); the prior rejection stays in the audit trail.
+    """
     moment = _now(now)
     evidence = _text(review_ref, "Finance review reference", 255)
     try:
@@ -396,39 +403,61 @@ def request_legacy_post(
         with db.begin_nested():
             journal = _journal(db, tenant_id, journal_id)
             existing = db.scalar(
-                select(ManualJournal).where(
-                    ManualJournal.tenant_id == tenant_id, ManualJournal.journal_id == journal_id
-                )
+                select(ManualJournal)
+                .where(ManualJournal.tenant_id == tenant_id, ManualJournal.journal_id == journal_id)
+                .with_for_update()
             )
+            if journal.source_owner != LEGACY_OWNER:
+                raise JournalRefused("not_legacy_held", "only journals from the legacy import can be reviewed here")
             if existing is not None:
                 if existing.origin == m.ORIGIN_LEGACY_HELD and existing.requested_by_party_id == actor:
-                    return _outcome(existing, replayed=True)
-                raise JournalRefused("already_requested", "this journal already has a posting workflow")
+                    if existing.state == m.STATE_POST_REQUESTED and existing.evidence_ref == evidence:
+                        return _outcome(existing, replayed=True)
+                if existing.origin != m.ORIGIN_LEGACY_HELD or existing.state != m.STATE_REJECTED:
+                    raise JournalRefused("already_requested", "this journal already has a posting workflow")
             if journal.status != JournalStatus.DRAFT:
                 raise JournalRefused("journal_state_refused", journal.status.value.lower())
-            if journal.source_owner == MANUAL_OWNER:
-                raise JournalRefused("not_legacy_held", "manual journals follow the prepare path")
             _require_open_period(db, tenant_id, journal.posting_date, journal.kind)
-            row = ManualJournal(
-                tenant_id=tenant_id,
-                journal_id=journal.id,
-                origin=m.ORIGIN_LEGACY_HELD,
-                state=m.STATE_POST_REQUESTED,
-                evidence_ref=evidence,
-                legacy_source_key=":".join(
-                    (
-                        journal.source_owner or "",
-                        journal.source_document_kind or "",
-                        journal.source_document_id or "",
-                        journal.source_version or "",
-                    )
-                )[:480],
-                prepared_by_party_id=actor,
-                prepared_at=moment,
-                requested_by_party_id=actor,
-                requested_at=moment,
-            )
-            db.add(row)
+            if existing is not None:  # re-request after rejection
+                prior = (existing.rejected_by_party_id, existing.rejection_reason, existing.evidence_ref)
+                existing.state = m.STATE_POST_REQUESTED
+                existing.evidence_ref = evidence
+                existing.prepared_by_party_id = actor
+                existing.prepared_at = moment
+                existing.requested_by_party_id = actor
+                existing.requested_at = moment
+                existing.rejected_by_party_id = None
+                existing.rejected_at = None
+                existing.rejection_reason = None
+                row = existing
+                extra = {
+                    "re_request": True,
+                    "prior_rejected_by": prior[0],
+                    "prior_reason": prior[1],
+                    "prior_review_ref": prior[2],
+                }
+            else:
+                row = ManualJournal(
+                    tenant_id=tenant_id,
+                    journal_id=journal.id,
+                    origin=m.ORIGIN_LEGACY_HELD,
+                    state=m.STATE_POST_REQUESTED,
+                    evidence_ref=evidence,
+                    legacy_source_key=":".join(
+                        (
+                            journal.source_owner or "",
+                            journal.source_document_kind or "",
+                            journal.source_document_id or "",
+                            journal.source_version or "",
+                        )
+                    )[:480],
+                    prepared_by_party_id=actor,
+                    prepared_at=moment,
+                    requested_by_party_id=actor,
+                    requested_at=moment,
+                )
+                db.add(row)
+                extra = {}
             db.flush()
             _audit(
                 db,
@@ -441,6 +470,7 @@ def request_legacy_post(
                 origin=row.origin,
                 number=journal.number,
                 review_ref=evidence,
+                **extra,
             )
             return _outcome(row)
     except _REFUSABLE as exc:

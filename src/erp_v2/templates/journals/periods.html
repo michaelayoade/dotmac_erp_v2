@@ -16,6 +16,7 @@
         <form method="post" action="/finance/periods/{{ p.id }}/open"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Open</button></form>
       {% elif p.status.value == 'OPEN' %}
         <form method="post" action="/finance/periods/{{ p.id }}/soft-close"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          {% if held_counts.get(p.id) %}<p role="alert">{{ held_counts[p.id] }} held legacy draft journal(s) are dated in this period. They cannot be posted once it is closed.</p>{% endif %}
           <label>Finance review reference <input name="review_ref" maxlength="255" required></label><button type="submit">Soft-close</button></form>
       {% elif p.status.value == 'SOFT_CLOSED' %}
         <form method="post" action="/finance/periods/{{ p.id }}/lock"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Lock (cannot be undone)</button></form>

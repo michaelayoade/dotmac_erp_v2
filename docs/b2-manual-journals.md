@@ -23,7 +23,7 @@ period (an adjustment period takes ADJUSTMENT journals). REOPENED periods are ne
 Imported DRAFT journals appear on `/finance/journals/held` (read-only, paged, no actions). Each is
 opened individually, needs a Finance review reference, and then follows the same request/approve+post
 path. There is no bulk route or command. Their source identity stays on the journal and is snapshotted
-on the workflow row. A rejected request is terminal for that journal.
+on the workflow row. Only journals whose source owner is the declared legacy import owner (`legacy-erp`) qualify; another module's DRAFT is refused. A rejected held request can be re-requested with a new review reference and requester (SoD re-checked; the prior rejection stays in the audit trail); a rejected manual journal is terminal. The soft-close screen shows the count of held drafts in the period. Approval screens warn (never block) when a journal touches subledger control accounts 2000/2040. A DB trigger freezes recorded preparer/requester/approver evidence and allows only declared state transitions; the e2_0014 downgrade refuses when rows exist.
 
 ## Periods
 
