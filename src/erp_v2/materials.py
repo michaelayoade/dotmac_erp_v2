@@ -106,11 +106,26 @@ def _anonymous_key_problems(env: Mapping[str, str]) -> list[str]:
     return problems
 
 
+_DOTENV_PROBLEM: Final = (
+    ".env file present in the working directory; runtime settings must come only from the process environment"
+)
+
+
 def runtime_materials_problems(
     environ: Mapping[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
 ) -> list[str]:
     """List material defects for a DB-bound runtime process (empty = fit)."""
 
+    # The kernel's Settings reads ./.env relative to the working directory,
+    # a source this gate cannot see. lexists: a dangling symlink or a
+    # directory named .env also counts. Never opened, never read.
+    if os.path.lexists(os.path.join(os.getcwd() if cwd is None else cwd, ".env")):
+        return [_DOTENV_PROBLEM]
+    return _environ_problems(environ)
+
+
+def _environ_problems(environ: Mapping[str, str] | None) -> list[str]:
     raw = os.environ if environ is None else environ
     # The kernel's BaseSettings is case-insensitive, so a lower-case name
     # configures it while an exact-name lookup sees nothing. Read through a
