@@ -46,9 +46,10 @@ def values(env, *, legacy=None, number="L-1", **extra):
 def enter(engine, env, vals):
     with Session(engine) as db:
         try:
-            return service.create_legacy_reentry_draft(
+            invoice = service.create_legacy_reentry_draft(
                 db, tenant=db.get(Tenant, env.tenant_id), party=db.get(Party, env.party_ids[0]), values=vals
             )
+            return invoice.id
         finally:
             db.commit()
 
@@ -80,14 +81,14 @@ def refused(engine, env, vals, code):
 def test_reentry_creates_a_draft_and_its_legacy_reference(engine):
     env = world(engine)
     legacy = uuid4()
-    invoice = enter(engine, env, values(env, legacy=legacy))
+    invoice_id = enter(engine, env, values(env, legacy=legacy))
     assert counts(engine, env)[1] == 1
     with Session(engine) as db:
         ref = db.scalar(sa.select(LegacyInvoiceReference).where(LegacyInvoiceReference.tenant_id == env.tenant_id))
-        assert ref.legacy_invoice_id == legacy and ref.invoice_id == invoice.id
+        assert ref.legacy_invoice_id == legacy and ref.invoice_id == invoice_id
         assert ref.legacy_posting_state == "never_posted" and ref.evidence_ref == "census-R6-7"
         assert ref.entered_by == str(env.party_ids[0])
-        assert db.get(SupplierInvoice, invoice.id).status.value == "DRAFT"
+        assert db.get(SupplierInvoice, invoice_id).status.value == "DRAFT"
 
 
 def test_same_legacy_invoice_cannot_be_entered_twice(engine):
@@ -99,14 +100,14 @@ def test_same_legacy_invoice_cannot_be_entered_twice(engine):
 
 def test_legacy_id_already_landed_by_the_importer_is_refused(engine):
     env = world(engine)
-    landed = enter(engine, env, values(env)).id  # stands in for an importer-landed invoice with that id
+    landed = enter(engine, env, values(env))  # stands in for an importer-landed invoice with that id
     refused(engine, env, values(env, legacy=landed, number="L-2"), "legacy_already_landed")
 
 
 def test_legacy_id_already_admitted_historically_is_refused(engine):
     env = world(engine)
     legacy = uuid4()
-    other = enter(engine, env, values(env)).id
+    other = enter(engine, env, values(env))
     with Session(engine) as db:
         payables.approve_invoice(
             db,
