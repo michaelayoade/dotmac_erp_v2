@@ -129,6 +129,12 @@ SOURCE_SCHEMAS = {
 }
 
 
+# The importer stamps the resolved, schema-qualified source table (for example
+# ``legacy:gl.journal_entry:<id>``), so derive the expected prefix from the same
+# source contract the verifier reads the journal with. Never accept other schemas.
+SOURCE_JOURNAL_REFERENCE = f"legacy:{SOURCE_SCHEMAS['journal_entry']}.journal_entry:"
+
+
 READ_FIELDS = {
     "supplier_invoice": SOURCE_HEADER,
     "supplier": SOURCE_SUPPLIER,
@@ -624,11 +630,11 @@ class HistoricalPayablesVerifier:
         # waves36 deliberately uses the legacy journal row as destination document
         # identity, retaining the AP invoice link in source provenance.
         _require(
-            target["source_document_id"] == f"legacy:public.journal_entry:{journal['journal_entry_id']}",
+            target["source_document_id"] == f"{SOURCE_JOURNAL_REFERENCE}{journal['journal_entry_id']}",
             "journal_source_document_id",
         )
         expected_posting_stamp = (
-            f"legacy:public.journal_entry:{target['id']}@"
+            f"{SOURCE_JOURNAL_REFERENCE}{target['id']}@"
             f"{_day(journal['posting_date'], 'source_journal_posting_date').isoformat()}"
         )
         _require(target["approval_reference"] == expected_posting_stamp, "journal_posting_stamp")
