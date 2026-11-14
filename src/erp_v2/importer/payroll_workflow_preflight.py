@@ -130,9 +130,10 @@ def eligible(employee: Employee, run: Run) -> bool:
 
 
 def source_access(identity: Identity) -> bool:
+    roles = {role.strip().lower() for role in identity.source_roles if role and role.strip()}
     return identity.active_member and bool(
-        "admin" in identity.source_roles
-        or HR_ROLES.intersection(identity.source_roles)
+        "admin" in roles
+        or HR_ROLES.intersection(roles)
         or "hr:access" in identity.source_scopes
         or any(scope.startswith("hr:schedule:") for scope in identity.source_scopes)
     )
@@ -200,9 +201,9 @@ def evaluate(observed: Observations, *, candidate_revision: str) -> dict:
         authority_reasons.append("source_target_access_difference")
     effects = []
     if observed.auto_post_gl is True:
-        effects.append("released_payroll_gl_handoff_hook_absent")
+        effects.append("payroll_gl_handoff_not_qualified")
     if observed.loan_links:
-        effects.append("released_payroll_loan_repayment_hook_absent")
+        effects.append("payroll_loan_repayment_handoff_not_qualified")
     if observed.auto_post_gl is None:
         effects.append("effective_auto_post_gl_unresolved")
     sod = "indeterminate"
@@ -271,6 +272,31 @@ def _id(value) -> str | None:
         return str(UUID(str(value)))
     except ValueError:
         raise PreflightRefusal("invalid_observed_uuid") from None
+
+
+def resolve_auto_post_gl(settings, tenant: str) -> tuple[bool | None, str]:
+    """Mirror the registered legacy boolean spec, never read secret values."""
+    require(all(_id(row["organization_id"]) in {tenant, None} for row in settings), "setting_tenant_mismatch")
+    local = [row for row in settings if _id(row["organization_id"]) == tenant]
+    selected = local or [row for row in settings if row["organization_id"] is None]
+    require(len(selected) <= 1, "ambiguous_auto_post_gl_setting")
+    if not selected:
+        return True, "source_policy_default_true"
+    row = selected[0]
+    if row["is_secret"] is not False:
+        return None, "unreadable_secret_setting"
+    provenance = "organization" if local else "global"
+    raw = row["value_text"] if row["value_text"] is not None else row["value_json"]
+    # The registered payroll spec controls coercion, not row.value_type.
+    if isinstance(raw, bool):
+        return raw, provenance
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True, provenance
+        if normalized in {"0", "false", "no", "off"}:
+            return False, provenance
+    return True, provenance + "_registered_default_true"
 
 
 def collect(source: Reader, destination: Reader, tenant: str, run_id: str) -> Observations:
@@ -411,19 +437,7 @@ def collect(source: Reader, destination: Reader, tenant: str, run_id: str) -> Ob
         "AND (organization_id=:tenant OR organization_id IS NULL)",
         tenant=tenant,
     )
-    local = [row for row in settings if _id(row["organization_id"]) == tenant]
-    selected = local or settings
-    require(len(selected) <= 1, "ambiguous_auto_post_gl_setting")
-    gl, provenance = True, "source_policy_default_true"
-    if selected:
-        row = selected[0]
-        provenance = "organization" if local else "global"
-        raw = row["value_text"] if row["value_text"] is not None else row["value_json"]
-        gl = raw if type(raw) is bool else {"true": True, "false": False}.get(str(raw).lower())
-        if row["is_secret"] is not False:
-            gl, provenance = None, "unreadable_secret_setting"
-        elif str(row["value_type"]).lower() != "boolean":
-            gl = None
+    gl, provenance = resolve_auto_post_gl(settings, tenant)
     return Observations(
         run,
         employees,

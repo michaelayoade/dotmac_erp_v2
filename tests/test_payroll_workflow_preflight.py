@@ -171,9 +171,9 @@ def test_per_slip_separation(creators, expected):
 @pytest.mark.parametrize(
     "changes,reason",
     [
-        ({"auto_post_gl": True}, "released_payroll_gl_handoff_hook_absent"),
+        ({"auto_post_gl": True}, "payroll_gl_handoff_not_qualified"),
         ({"auto_post_gl": None}, "effective_auto_post_gl_unresolved"),
-        ({"loan_links": 1, "repayment_refs": 1}, "released_payroll_loan_repayment_hook_absent"),
+        ({"loan_links": 1, "repayment_refs": 1}, "payroll_loan_repayment_handoff_not_qualified"),
     ],
 )
 def test_conditional_approval_effects(changes, reason):
@@ -240,3 +240,221 @@ def test_cli_diagnostic_has_no_apply_option():
     )
     assert args.func is preflight.command
     assert not hasattr(args, "apply")
+
+
+@pytest.mark.parametrize("role", [" HR_MANAGER ", "Payroll_Approver", " ADMIN "])
+def test_legacy_role_normalization_prevents_false_equivalence(role):
+    value = complete()
+    identity = replace(value.identities[0], source_roles=(role,), target_roles=("staff",))
+    assert preflight.source_access(identity)
+    assert evaluate(replace(value, identities=(identity,)))["authority_equivalence"] == "mismatch"
+
+
+def test_scope_tokens_remain_case_sensitive_like_legacy():
+    assert not preflight.source_access(preflight.Identity(PERSON, PERSON, True, True, source_scopes=("HR:ACCESS",)))
+
+
+def setting(text=None, json_value=None, tenant=TENANT, secret=False, value_type="string"):
+    return {
+        "organization_id": UUID(tenant) if tenant else None,
+        "value_type": value_type,
+        "value_text": text,
+        "value_json": json_value,
+        "is_secret": secret,
+    }
+
+
+class Facts:
+    """Typed source/target fixture responses, with no ORM or business actions."""
+
+    def __init__(self, *, target=False, settings=(), matched=True):
+        self.target, self.settings, self.matched = target, settings, matched
+        self.queries = []
+
+    def rows(self, sql, **parameters):
+        assert sql.startswith("SELECT ") and ";" not in sql
+        assert parameters.get("tenant") == TENANT
+        self.queries.append(sql)
+        if self.target:
+            if "FROM public.parties " in sql:
+                return [{"id": UUID(PERSON), "is_active": True}]
+            if "FROM mod_people.employees " in sql:
+                return [{"id": UUID(EMPLOYEE).hex, "party_id": UUID(PERSON).hex, "status": "ACTIVE"}]
+            if "FROM public.party_role_grants " in sql:
+                return [{"party_id": UUID(PERSON).hex, "slug": "staff"}]
+            if "FROM mod_payroll.payroll_runs " in sql:
+                return (
+                    [
+                        {
+                            "id": UUID(RUN_ID).hex,
+                            "period_start": START,
+                            "period_end": END,
+                            "created_by_id": UUID(PERSON).hex,
+                            "status": "DRAFT",
+                        }
+                    ]
+                    if self.matched
+                    else []
+                )
+            if "FROM mod_payroll.payroll_calculations " in sql:
+                return [{"employee_ref": UUID(EMPLOYEE).hex}]
+        else:
+            if "FROM payroll.payroll_entry " in sql:
+                return [
+                    {
+                        "entry_id": UUID(RUN_ID),
+                        "start_date": START,
+                        "end_date": END,
+                        "created_by_id": UUID(PERSON),
+                        "department_id": None,
+                        "designation_id": None,
+                        "employment_type_id": None,
+                        "status": "DRAFT",
+                        "journal_entry_id": None,
+                    }
+                ]
+            if "FROM hr.employee " in sql:
+                return [
+                    {
+                        "employee_id": UUID(EMPLOYEE),
+                        "status": "ACTIVE",
+                        "date_of_leaving": None,
+                        "eligible_for_final_payroll": False,
+                        "final_payroll_processed_at": None,
+                        "final_payroll_cutoff_date": None,
+                        "department_id": None,
+                        "designation_id": None,
+                        "employment_type_id": None,
+                    }
+                ]
+            if "FROM payroll.salary_structure_assignment " in sql:
+                return [{"employee_id": UUID(EMPLOYEE), "from_date": START, "to_date": None}]
+            if "JOIN public.permissions " in sql:
+                return [{"person": UUID(PERSON), "key": "hr:access"}]
+            if "FROM public.people p JOIN " in sql:
+                return [{"person": UUID(PERSON), "name": " HR_MANAGER "}]
+            if "FROM public.people " in sql:
+                return [{"id": UUID(PERSON), "is_active": True, "status": "active"}]
+            if "FROM payroll.salary_slip_loan_deduction " in sql:
+                return []
+            if "FROM payroll.salary_slip " in sql:
+                return [{"slip_id": UUID(OTHER), "created_by_id": UUID(PERSON)}]
+            if "FROM public.domain_settings " in sql:
+                assert "CASE WHEN is_secret IS FALSE" in sql
+                return list(self.settings)
+        raise AssertionError("unexpected diagnostic relation: " + sql)
+
+
+@pytest.mark.parametrize(
+    "text,json_value,expected",
+    [
+        (" off ", None, False),
+        (" NO ", None, False),
+        ("0", None, False),
+        (" on ", None, True),
+        (" YES ", None, True),
+        ("1", None, True),
+        (None, False, False),
+        (None, " off ", False),
+        (None, True, True),
+        ("false", True, False),
+        (None, None, True),
+        ("invalid", None, True),
+        (None, 0, True),
+    ],
+)
+def test_collector_registered_boolean_coercion(text, json_value, expected):
+    source, target = Facts(settings=(setting(text, json_value),)), Facts(target=True)
+    observed = preflight.collect(source, target, TENANT, RUN_ID)
+    assert observed.auto_post_gl is expected
+    assert observed.destination_employees == (EMPLOYEE,)
+    assert observed.source_creator_party == observed.destination_creator == PERSON
+    assert observed.identities[0].party == PERSON
+    assert observed.identities[0].target_roles == ("staff",)
+    assert preflight.source_access(observed.identities[0])
+
+
+@pytest.mark.parametrize(
+    "rows,expected,origin",
+    [
+        ((), True, "source_policy_default_true"),
+        ((setting("off", tenant=None),), False, "global"),
+        ((setting("off", tenant=None), setting("on")), True, "organization"),
+        ((setting("on", tenant=None), setting("off")), False, "organization"),
+        ((setting("off", tenant=None), setting()), True, "organization_registered_default_true"),
+    ],
+)
+def test_collector_setting_precedence(rows, expected, origin):
+    observed = preflight.collect(Facts(settings=rows), Facts(target=True), TENANT, RUN_ID)
+    assert (observed.auto_post_gl, observed.gl_provenance) == (expected, origin)
+
+
+def test_secret_setting_is_not_read_or_defaulted():
+    class Protected(dict):
+        def __getitem__(self, key):
+            if key in {"value_text", "value_json"}:
+                raise AssertionError("secret value read")
+            return super().__getitem__(key)
+
+    row = Protected(setting(secret=True))
+    observed = preflight.collect(Facts(settings=(row,)), Facts(target=True), TENANT, RUN_ID)
+    assert observed.auto_post_gl is None
+    assert observed.gl_provenance == "unreadable_secret_setting"
+
+
+def test_ambiguous_settings_and_foreign_tenant_refuse():
+    for rows, reason in (
+        ((setting("on"), setting("off")), "ambiguous_auto_post_gl_setting"),
+        ((setting("off", tenant=OTHER),), "setting_tenant_mismatch"),
+    ):
+        with pytest.raises(preflight.PreflightRefusal, match=reason):
+            preflight.resolve_auto_post_gl(rows, TENANT)
+
+
+def test_collector_unmatched_destination_is_not_a_new_run():
+    observed = preflight.collect(Facts(), Facts(target=True, matched=False), TENANT, RUN_ID)
+    assert observed.imported_run is None
+    assert observed.destination_employees is None
+
+
+class Connection:
+    def __init__(self, *, scope=TENANT, readonly="on", isolation="serializable"):
+        self.scope, self.readonly, self.isolation = scope, readonly, isolation
+        self.calls = []
+
+    @property
+    def autoflush(self):
+        raise AssertionError("ORM/autoflush must not be used")
+
+    def execute(self, statement, parameters=None):
+        sql = str(statement)
+        self.calls.append((sql, parameters))
+        value = self.scope if "current_setting" in sql else None
+        if sql == "SHOW transaction_read_only":
+            value = self.readonly
+        elif sql == "SHOW transaction_isolation":
+            value = self.isolation
+        return SimpleNamespace(scalar_one=lambda: value)
+
+
+def test_transaction_uses_kernel_tenant_key_and_checks_read_only():
+    connection = Connection()
+    assert preflight._transaction(connection, tenant=TENANT).connection is connection
+    sql = [call[0] for call in connection.calls]
+    assert "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY" in sql
+    assert "SELECT set_config('app.current_tenant', :tenant, true)" in sql
+    assert "SELECT current_setting('app.current_tenant', true)" in sql
+    assert all(text.startswith(("SET ", "SELECT ", "SHOW ")) for text in sql)
+
+
+@pytest.mark.parametrize(
+    "options,reason",
+    [
+        ({"scope": OTHER}, "destination_tenant_binding_mismatch"),
+        ({"readonly": "off"}, "read_only_required"),
+        ({"isolation": "read committed"}, "serializable_required"),
+    ],
+)
+def test_transaction_rejects_missing_guarantees(options, reason):
+    with pytest.raises(preflight.PreflightRefusal, match=reason):
+        preflight._transaction(Connection(**options), tenant=TENANT)
