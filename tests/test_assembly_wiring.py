@@ -15,6 +15,7 @@ EXPECTED_MODULE_VERSIONS = {
     "erp_academy_sync": None,
     "erp_web": None,
     "erp_revenue": None,
+    "erp_revenue_approval": None,
     "erp_banking": None,
     "erp_banking_statements": None,
     "erp_access": None,
