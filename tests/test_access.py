@@ -60,6 +60,14 @@ def test_profile_roles_equal_spec_default_roles_for_every_new_code():
         assert granted == set(spec.default_roles), spec.code
 
 
+def test_every_new_code_in_the_profile_is_a_declared_spec_with_matching_roles():
+    specs = {s.code: set(s.default_roles) for s in access.PERMISSION_SPECS}
+    legacy = {ACCESS_PERMISSION, WRITE_PERMISSION, PAYROLL_MANAGE_PERMISSION}
+    for code in {g.permission_code for g in profile().grants} - legacy:
+        assert code in specs, code
+        assert {g.role_code for g in profile().grants if g.permission_code == code} == specs[code]
+
+
 def test_sod_pairs_reference_only_new_roles_and_audit_action_is_declared():
     for pair in access.SOD_CONFLICT_PAIRS:
         assert len(pair) == 2 and pair <= set(access.NEW_ROLES)

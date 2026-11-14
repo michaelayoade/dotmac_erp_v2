@@ -329,3 +329,38 @@ def test_two_concurrent_posts_of_one_source_yield_one_journal(engine):
     assert not thread.is_alive() and "error" not in outcome, outcome
     assert outcome["result"].journal_id == winner.journal_id and outcome["result"].replayed is True
     assert counts(engine, env)["journals"] == 1
+
+
+def test_post_failure_after_a_real_create_rolls_back_the_draft_and_keeps_the_callers_write(engine, monkeypatch):
+    from dotmac_accounting.contracts import InvalidPeriod
+
+    env = seed(engine)
+    seen = {}
+
+    def failing_post(db, **kwargs):
+        # The real create_journal has already written the draft, lines and its idempotency row.
+        seen["drafts"] = db.scalar(
+            sa.select(sa.func.count()).select_from(JournalEntry).where(JournalEntry.tenant_id == env.tenant_id)
+        )
+        raise InvalidPeriod("period closed between create and post")
+
+    monkeypatch.setattr(bridge.accounting, "post_journal", failing_post)
+    with Session(engine) as db:
+        db.add(
+            AccountCategory(tenant_id=env.tenant_id, code="CALLER", name="Caller", account_class=AccountClass.EXPENSE)
+        )
+        db.flush()
+        with pytest.raises(PostingRefused) as exc:
+            bridge.post_consequence(
+                db, scope=env.scope, consequence=consequence(env), approval_ref="appr-1", actor="p-1", now=NOW
+            )
+        assert exc.value.code == "accounting_refused"
+        db.commit()
+    assert seen["drafts"] == 1
+    assert counts(engine, env) == EMPTY
+    with Session(engine) as db:
+        assert db.scalar(
+            sa.select(AccountCategory.id).where(
+                AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "CALLER"
+            )
+        )

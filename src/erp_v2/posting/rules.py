@@ -70,10 +70,10 @@ class RefPolicy:
 
 # One declared form per owner field; each new kind is one reviewed entry plus a
 # test in the PR that adds it. Read-only mapping.
-# The payroll kinds take the Starter payroll a3 consequence, which mirrors the
-# payables AccountingConsequence shape (source owner "payroll", version "1");
-# there is no separate adapter. The imported net-payable account ref is the
-# account CODE "2040" (minting.py); component refs are Account UUIDs.
+# The payroll kinds take the Starter payroll a3 consequence via
+# erp_v2.posting.payroll, which refuses non-functional currencies and supplies
+# exchange_rate 1 (payroll carries none). Net payable account ref is the account
+# CODE "2040" (minting.py); component refs are Account UUIDs.
 POLICIES: Final = MappingProxyType(
     {
         ("payables", "supplier_invoice"): RefPolicy(),
