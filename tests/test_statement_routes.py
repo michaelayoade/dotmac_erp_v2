@@ -33,7 +33,16 @@ from erp_v2.banking import statement_import as si
 from erp_v2.banking import statement_routes as routes
 from erp_v2.banking.statement_file import MAX_FILE_BYTES, parse_statement
 
-ROLES = ("admin", "staff", "bank_reconciler", "treasury", "unprivileged")
+# Portal admission (erp.web.access) belongs to staff/admin; the P0 access CLI only grants
+# new roles to such parties, so a real holder is staff plus the named role.
+ROLE_SETS = {
+    "admin": ("admin",),
+    "staff": ("staff",),
+    "reconciler": ("staff", "bank_reconciler"),
+    "treasury": ("staff", "treasury"),
+    "portalless": ("bank_reconciler",),
+    "unprivileged": (),
+}
 CSV = b"date,type,amount,description,reference\n2026-01-15,credit,10.00,<script>alert(1)</script>,R1\n"
 XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ACCOUNT_ID = uuid4()
@@ -100,7 +109,11 @@ def browser(monkeypatch):
         db.add(tenant)
         db.flush()
         tokens, parties = {}, {}
-        for role_name in ROLES:
+        slugs = {slug for held in ROLE_SETS.values() for slug in held}
+        roles = {slug: Role(tenant_id=tenant.id, slug=slug, name=slug) for slug in sorted(slugs)}
+        db.add_all(roles.values())
+        db.flush()
+        for role_name, held in ROLE_SETS.items():
             party = Party(
                 id=uuid4(),
                 tenant_id=tenant.id,
@@ -111,11 +124,8 @@ def browser(monkeypatch):
             db.add(party)
             db.flush()
             parties[role_name] = party
-            if role_name != "unprivileged":
-                role = Role(tenant_id=tenant.id, slug=role_name, name=role_name)
-                db.add(role)
-                db.flush()
-                db.add(PartyRoleGrant(tenant_id=tenant.id, party_id=party.id, role_id=role.id))
+            for slug in held:
+                db.add(PartyRoleGrant(tenant_id=tenant.id, party_id=party.id, role_id=roles[slug].id))
             token, expires_at = issue_access_token(party.id, tenant.id)
             db.add(
                 AuthSession(tenant_id=tenant.id, party_id=party.id, token_hash=hash_token(token), expires_at=expires_at)
@@ -151,8 +161,11 @@ PREVIEW, IMPORT = "/finance/banking/statements/preview", "/finance/banking/state
 
 
 @pytest.mark.parametrize("path", [PREVIEW, IMPORT])
-@pytest.mark.parametrize("role,expected", [(None, 302), ("admin", 403), ("staff", 403), ("treasury", 403)])
-def test_only_the_bank_reconciler_role_is_admitted(browser: Browser, path, role, expected):
+@pytest.mark.parametrize(
+    "role,expected",
+    [(None, 302), ("admin", 403), ("staff", 403), ("treasury", 403), ("portalless", 403), ("unprivileged", 403)],
+)
+def test_only_staff_holding_the_bank_reconciler_role_is_admitted(browser: Browser, path, role, expected):
     token = browser.sign_in(role)
     response = browser.post(path, token=token)
     assert response.status_code == expected
@@ -163,7 +176,7 @@ def test_only_the_bank_reconciler_role_is_admitted(browser: Browser, path, role,
 def test_form_page_is_dormant_for_admin_and_open_to_bank_reconciler(browser: Browser):
     browser.sign_in("admin")
     assert browser.client.get(IMPORT).status_code == 403
-    browser.sign_in("bank_reconciler")
+    browser.sign_in("reconciler")
     response = browser.client.get(IMPORT)
     assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
 
@@ -171,7 +184,7 @@ def test_form_page_is_dormant_for_admin_and_open_to_bank_reconciler(browser: Bro
 @pytest.mark.parametrize("proof", ["missing", "mismatch", "forged", "foreign-origin"])
 @pytest.mark.parametrize("path", [PREVIEW, IMPORT])
 def test_multipart_upload_refuses_invalid_csrf_before_the_service(browser: Browser, path, proof):
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     headers = {}
     form_token = token
     if proof == "missing":
@@ -190,7 +203,7 @@ def test_multipart_upload_refuses_invalid_csrf_before_the_service(browser: Brows
 
 
 def test_preview_renders_escaped_content_and_import_form_with_hash(browser: Browser):
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     response = browser.post(PREVIEW, token=token)
     assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
     assert "<script>alert(1)</script>" not in response.text and "&lt;script&gt;" in response.text
@@ -203,19 +216,19 @@ def test_preview_renders_escaped_content_and_import_form_with_hash(browser: Brow
 
 def test_preview_with_blockers_offers_no_import(browser: Browser):
     browser.preview.side_effect = lambda **kw: make_plan(kw["data"], blockers=("1 line(s) already exist",))
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     response = browser.post(PREVIEW, token=token)
     assert response.status_code == 200 and "already exist" in response.text
     assert 'action="/finance/banking/statements/import"' not in response.text
 
 
 def test_import_passes_tenant_actor_hash_and_bytes_then_redirects(browser: Browser):
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     response = browser.post(IMPORT, token=token, extra={"expected_sha256": "b" * 64, "date_format": "dmy"})
     assert response.status_code == 303 and response.headers["location"] == "/finance/banking"
     kwargs = browser.do_import.call_args.kwargs
     assert kwargs["tenant_id"] == browser.tenant.id
-    assert kwargs["actor_party_id"] == browser.parties["bank_reconciler"].id
+    assert kwargs["actor_party_id"] == browser.parties["reconciler"].id
     assert kwargs["expected_sha256"] == "b" * 64 and kwargs["data"] == CSV
     assert kwargs["options"].account_id == ACCOUNT_ID and kwargs["options"].date_format == "dmy"
     assert kwargs["now"].tzinfo is not None and abs((datetime.now(UTC) - kwargs["now"]).total_seconds()) < 60
@@ -223,7 +236,7 @@ def test_import_passes_tenant_actor_hash_and_bytes_then_redirects(browser: Brows
 
 def test_service_refusal_is_shown_not_raised(browser: Browser):
     browser.do_import.side_effect = si.StatementImportRefused(["This exact file has already been imported"])
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     response = browser.post(IMPORT, token=token)
     assert response.status_code == 400 and "already been imported" in response.text
 
@@ -240,7 +253,7 @@ def test_service_refusal_is_shown_not_raised(browser: Browser):
 )
 @pytest.mark.parametrize("path", [PREVIEW, IMPORT])
 def test_upload_validation_refuses_before_the_service(browser: Browser, path, kwargs):
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     response = browser.post(path, token=token, **kwargs)
     assert response.status_code in (400, 413)
     browser.preview.assert_not_called()
@@ -248,13 +261,13 @@ def test_upload_validation_refuses_before_the_service(browser: Browser, path, kw
 
 
 def test_bad_account_id_and_amount_inputs_are_refused(browser: Browser):
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     assert browser.post(PREVIEW, token=token, extra={"account_id": "nope"}).status_code == 400
     assert browser.post(PREVIEW, token=token, extra={"opening_balance": "1e9"}).status_code == 400
     browser.preview.assert_not_called()
 
 
 def test_xlsx_content_type_is_accepted_for_xlsx_only(browser: Browser):
-    token = browser.sign_in("bank_reconciler")
+    token = browser.sign_in("reconciler")
     browser.post(PREVIEW, token=token, name="s.xlsx", content=b"PK\x03\x04", ctype=XLSX_TYPE)
     assert browser.preview.call_args.kwargs["file_format"] == "xlsx"
