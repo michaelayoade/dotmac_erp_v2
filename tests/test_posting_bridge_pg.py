@@ -13,6 +13,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
+import dotmac_kernel.db  # noqa: F401 - import at collection, before other tests mutate DATABASE_URL
 import pytest
 import sqlalchemy as sa
 from dotmac_accounting import service as accounting
