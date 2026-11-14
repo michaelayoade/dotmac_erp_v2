@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Fiscal periods — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Fiscal periods</h1>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<p>Functional currency: {% if currency %}<strong>{{ currency }}</strong> (read-only){% else %}not configured{% endif %}. Periods are not created or reopened here.</p>
+{% if periods %}
+<table>
+  <thead><tr><th>Period</th><th>From</th><th>To</th><th>Status</th><th></th></tr></thead>
+  <tbody>
+  {% for p in periods %}
+    <tr>
+      <td>{{ p.name }}{% if p.is_adjustment %} (adjustment){% endif %}</td><td>{{ p.start_date }}</td><td>{{ p.end_date }}</td><td>{{ p.status.value }}</td>
+      <td>
+      {% if p.status.value == 'FUTURE' %}
+        <form method="post" action="/finance/periods/{{ p.id }}/open"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Open</button></form>
+      {% elif p.status.value == 'OPEN' %}
+        <form method="post" action="/finance/periods/{{ p.id }}/soft-close"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>Finance review reference <input name="review_ref" maxlength="255" required></label><button type="submit">Soft-close</button></form>
+      {% elif p.status.value == 'SOFT_CLOSED' %}
+        <form method="post" action="/finance/periods/{{ p.id }}/lock"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Lock (cannot be undone)</button></form>
+      {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>No fiscal periods exist.</p>{% endif %}
+{% endblock %}

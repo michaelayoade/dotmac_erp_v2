@@ -1,0 +1,776 @@
+"""Manual-journal commands: prepare, request post, approve+post, reject, reverse; period commands.
+
+Accounting a1 stays the authority: every journal is created, posted and reversed
+through ``create_journal`` / ``post_journal`` / ``reverse_journal`` (and periods through
+``open_period`` / ``soft_close_period`` / ``lock_period``), so balance, active-account,
+period and ledger rules are accounting's own. This module adds only what accounting does
+not record: who prepared, requested and approved (maker-checker, preparer != approver,
+enforced here and by CHECK constraints), a mandatory evidence reference, and audit events.
+
+The caller owns the transaction (kernel request boundary); nothing here commits. Each
+command runs inside one SAVEPOINT, so a refusal leaves zero rows even if the caller
+catches it and continues. Approvals are recorded in ``erp_manual_journals`` (the approvals
+module is not consulted: no tenant approval policy is published for this workflow).
+
+Legacy DRAFT-held journals have no preparer. They enter the same approve+post path one at
+a time through ``request_legacy_post``, which needs a Finance review reference; there is
+no bulk command. Their source identity stays on the journal; the workflow row snapshots it.
+
+No account, fiscal year, fiscal period or dimension is created here (accounting a1's
+create_* helpers carry the known _flush_unique defect).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from typing import Final
+from uuid import UUID
+
+from dotmac_accounting import service as accounting
+from dotmac_accounting.contracts import (
+    AccountingError,
+    CloseCheck,
+    CreateJournal,
+    JournalKind,
+    JournalLineInput,
+    JournalStatus,
+    PeriodCloseEvidence,
+    PeriodStatus,
+    ReverseJournal,
+    SourceIdentity,
+)
+from dotmac_accounting.models import FiscalPeriod, JournalEntry
+from dotmac_kernel.audit import write_audit_event
+from dotmac_kernel.cache import TenantScope
+from dotmac_kernel.exceptions import BadRequestError
+from dotmac_kernel.idempotency import IdempotencyConflict
+from dotmac_kernel.models import Party
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from erp_v2.journals import models as m
+from erp_v2.journals.models import ManualJournal
+from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
+
+MANUAL_OWNER: Final = "erp.manual"
+MANUAL_KIND: Final = "manual_journal"
+SOURCE_APPLICATION: Final = "dotmac_erp"
+ALLOWED_KINDS: Final = (JournalKind.STANDARD, JournalKind.ADJUSTMENT)
+MAX_LINES: Final = 200
+QUANTUM: Final = Decimal("0.000001")
+MAXIMUM: Final = Decimal("99999999999999.999999")
+
+AUDIT_PREPARED: Final = "erp.journal.prepared"
+AUDIT_POST_REQUESTED: Final = "erp.journal.post_requested"
+AUDIT_POSTED: Final = "erp.journal.posted"
+AUDIT_REJECTED: Final = "erp.journal.rejected"
+AUDIT_REVERSAL_REQUESTED: Final = "erp.journal.reversal_requested"
+AUDIT_REVERSED: Final = "erp.journal.reversed"
+AUDIT_REVERSAL_REJECTED: Final = "erp.journal.reversal_rejected"
+AUDIT_PERIOD_OPENED: Final = "erp.period.opened"
+AUDIT_PERIOD_SOFT_CLOSED: Final = "erp.period.soft_closed"
+AUDIT_PERIOD_LOCKED: Final = "erp.period.locked"
+AUDIT_ACTIONS: Final = (
+    AUDIT_PREPARED,
+    AUDIT_POST_REQUESTED,
+    AUDIT_POSTED,
+    AUDIT_REJECTED,
+    AUDIT_REVERSAL_REQUESTED,
+    AUDIT_REVERSED,
+    AUDIT_REVERSAL_REJECTED,
+    AUDIT_PERIOD_OPENED,
+    AUDIT_PERIOD_SOFT_CLOSED,
+    AUDIT_PERIOD_LOCKED,
+)
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+class JournalRefused(ValueError):
+    """Fail-closed refusal with a stable ``code``; nothing was written."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
+
+
+@dataclass(frozen=True, slots=True)
+class LineInput:
+    account_id: UUID
+    debit: Decimal = Decimal(0)
+    credit: Decimal = Decimal(0)
+    description: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PrepareJournal:
+    request_id: UUID
+    posting_date: date
+    kind: JournalKind
+    description: str
+    evidence_ref: str
+    lines: tuple[LineInput, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    manual_id: UUID
+    journal_id: UUID
+    state: str
+    replayed: bool = False
+
+
+# --- helpers ---------------------------------------------------------------
+
+
+def _text(value: object, label: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise JournalRefused("invalid_input", f"{label} is required")
+    text = value.strip()
+    if not text:
+        raise JournalRefused("invalid_input", f"{label} is required")
+    if len(text) > maximum or _CONTROL.search(text):
+        raise JournalRefused("invalid_input", f"{label} is too long or contains control characters")
+    return text
+
+
+def _amount(value: object, label: str) -> Decimal:
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0 or value > MAXIMUM:
+        raise JournalRefused("invalid_amount", f"{label} must be a finite non-negative amount")
+    if value != value.quantize(QUANTUM):
+        raise JournalRefused("invalid_amount", f"{label} has more than six decimals")
+    return value
+
+
+def _now(now: datetime | None) -> datetime:
+    return now or datetime.now(UTC)
+
+
+def _scope(tenant_id: UUID) -> TenantScope:
+    return TenantScope(tenant_id)
+
+
+def _actor(db: Session, tenant_id: UUID, party_id: UUID) -> UUID:
+    found = db.scalar(
+        select(Party.id).where(Party.id == party_id, Party.tenant_id == tenant_id, Party.is_active.is_(True))
+    )
+    if found is None:
+        raise JournalRefused("actor_invalid", "the acting party is not an active party of this tenant")
+    return found
+
+
+def _audit(db: Session, *, tenant_id: UUID, actor: UUID, action: str, entity_type: str, entity_id: str, **details):
+    write_audit_event(
+        db,
+        tenant_id=tenant_id,
+        actor_party_id=actor,
+        actor_type="user",
+        actor_id=str(actor),
+        source_application=SOURCE_APPLICATION,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        is_success=True,
+        details={key: (str(value) if isinstance(value, UUID | date) else value) for key, value in details.items()},
+    )
+
+
+def _map(exc: Exception) -> JournalRefused:
+    if isinstance(exc, JournalRefused):
+        return exc
+    if isinstance(exc, FunctionalCurrencyError):
+        return JournalRefused(exc.code, str(exc))
+    if isinstance(exc, IntegrityError):
+        return JournalRefused("conflict", "a conflicting record already exists")
+    return JournalRefused("accounting_refused", str(exc))
+
+
+_REFUSABLE = (AccountingError, IdempotencyConflict, BadRequestError, ValueError, IntegrityError)
+
+
+def _periods_for(db: Session, tenant_id: UUID, day: date) -> list[FiscalPeriod]:
+    return list(
+        db.scalars(
+            select(FiscalPeriod).where(
+                FiscalPeriod.tenant_id == tenant_id, FiscalPeriod.start_date <= day, FiscalPeriod.end_date >= day
+            )
+        )
+    )
+
+
+def _require_open_period(db: Session, tenant_id: UUID, day: date, kind: JournalKind) -> FiscalPeriod:
+    """Only an OPEN period accepts a manual posting (REOPENED is never offered)."""
+    periods = _periods_for(db, tenant_id, day)
+    if len(periods) != 1:
+        raise JournalRefused("period_missing", "the date is not in exactly one fiscal period")
+    period = periods[0]
+    if period.status != PeriodStatus.OPEN:
+        raise JournalRefused("period_closed", f"the fiscal period is {period.status.value.lower()}")
+    if period.is_adjustment and kind not in (JournalKind.ADJUSTMENT, JournalKind.CLOSING):
+        raise JournalRefused("period_adjustment_only", "the period accepts adjustment journals only")
+    return period
+
+
+def _lock_row(db: Session, tenant_id: UUID, manual_id: UUID) -> ManualJournal:
+    row = db.scalar(
+        select(ManualJournal)
+        .where(ManualJournal.tenant_id == tenant_id, ManualJournal.id == manual_id)
+        .with_for_update()
+    )
+    if row is None:
+        raise JournalRefused("not_found", "manual journal was not found")
+    return row
+
+
+def _journal(db: Session, tenant_id: UUID, journal_id: UUID) -> JournalEntry:
+    journal = db.scalar(select(JournalEntry).where(JournalEntry.tenant_id == tenant_id, JournalEntry.id == journal_id))
+    if journal is None:
+        raise JournalRefused("not_found", "journal was not found")
+    return journal
+
+
+def _fingerprint(payload: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _outcome(row: ManualJournal, *, replayed: bool = False) -> Outcome:
+    return Outcome(row.id, row.journal_id, row.state, replayed)
+
+
+# --- prepare ---------------------------------------------------------------
+
+
+def prepare_journal(
+    db: Session, *, tenant_id: UUID, actor: UUID, command: PrepareJournal, now: datetime | None = None
+) -> Outcome:
+    """Create a DRAFT manual journal in the tenant functional currency (preparer step)."""
+    moment = _now(now)
+    evidence = _text(command.evidence_ref, "evidence reference", 255)
+    description = _text(command.description, "description", 2000)
+    if command.kind not in ALLOWED_KINDS:
+        raise JournalRefused("invalid_input", "journal kind must be STANDARD or ADJUSTMENT")
+    if not 2 <= len(command.lines) <= MAX_LINES:
+        raise JournalRefused("invalid_input", f"a journal needs between 2 and {MAX_LINES} lines")
+    debit = credit = Decimal(0)
+    lines: list[JournalLineInput] = []
+    for number, line in enumerate(command.lines, start=1):
+        amount_debit = _amount(line.debit, f"line {number} debit")
+        amount_credit = _amount(line.credit, f"line {number} credit")
+        if (amount_debit > 0) == (amount_credit > 0):
+            raise JournalRefused("invalid_amount", f"line {number} must carry an amount on exactly one side")
+        line_text = None if line.description is None else _text(line.description, f"line {number} description", 2000)
+        debit += amount_debit
+        credit += amount_credit
+        lines.append(JournalLineInput(line.account_id, amount_debit, amount_credit, line_text))
+    if debit != credit or debit <= 0:
+        raise JournalRefused("unbalanced", "total debit must equal total credit and be positive")
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            currency = functional_currency(db, tenant_id)
+            _require_open_period(db, tenant_id, command.posting_date, command.kind)
+            fingerprint = _fingerprint(
+                {
+                    "request_id": str(command.request_id),
+                    "kind": command.kind.value,
+                    "posting_date": command.posting_date.isoformat(),
+                    "description": description,
+                    "evidence_ref": evidence,
+                    "currency": currency,
+                    "lines": [[str(x.account_id), str(x.debit), str(x.credit), x.description] for x in lines],
+                }
+            )
+            journal = accounting.create_journal(
+                db,
+                scope=_scope(tenant_id),
+                command=CreateJournal(
+                    number="MJ-" + command.request_id.hex[:24].upper(),
+                    kind=command.kind,
+                    entry_date=command.posting_date,
+                    posting_date=command.posting_date,
+                    currency_code=currency,
+                    exchange_rate=Decimal(1),
+                    description=description,
+                    reference=evidence,
+                    source=SourceIdentity(
+                        owner=MANUAL_OWNER,
+                        document_kind=MANUAL_KIND,
+                        document_id=str(command.request_id),
+                        version="1",
+                        fingerprint=fingerprint,
+                    ),
+                    lines=tuple(lines),
+                ),
+                idempotency_key=f"erp.manual:{command.request_id}:create",
+                idempotency_expires_at=None,
+                recorded_at=moment,
+            )
+            existing = db.scalar(
+                select(ManualJournal).where(
+                    ManualJournal.tenant_id == tenant_id, ManualJournal.journal_id == journal.id
+                )
+            )
+            if existing is not None:
+                return _outcome(existing, replayed=True)
+            if journal.status != JournalStatus.DRAFT:
+                raise JournalRefused("journal_state_refused", journal.status.value.lower())
+            row = ManualJournal(
+                tenant_id=tenant_id,
+                journal_id=journal.id,
+                origin=m.ORIGIN_MANUAL,
+                state=m.STATE_PREPARED,
+                evidence_ref=evidence,
+                prepared_by_party_id=actor,
+                prepared_at=moment,
+            )
+            db.add(row)
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_PREPARED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=journal.id,
+                number=journal.number,
+                evidence_ref=evidence,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+# --- request post ----------------------------------------------------------
+
+
+def request_post(db: Session, *, tenant_id: UUID, manual_id: UUID, actor: UUID, now: datetime | None = None) -> Outcome:
+    """PREPARED -> POST_REQUESTED. Replays when already requested by the same actor."""
+    moment = _now(now)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            row = _lock_row(db, tenant_id, manual_id)
+            if row.state == m.STATE_POST_REQUESTED and row.requested_by_party_id == actor:
+                return _outcome(row, replayed=True)
+            if row.state != m.STATE_PREPARED:
+                raise JournalRefused("state_refused", f"cannot request posting from state {row.state}")
+            journal = _journal(db, tenant_id, row.journal_id)
+            if journal.status != JournalStatus.DRAFT:
+                raise JournalRefused("journal_state_refused", journal.status.value.lower())
+            _require_open_period(db, tenant_id, journal.posting_date, journal.kind)
+            row.state = m.STATE_POST_REQUESTED
+            row.requested_by_party_id = actor
+            row.requested_at = moment
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_POST_REQUESTED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=row.journal_id,
+                origin=row.origin,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+def request_legacy_post(
+    db: Session, *, tenant_id: UUID, journal_id: UUID, actor: UUID, review_ref: str, now: datetime | None = None
+) -> Outcome:
+    """Open the maker-checker path for ONE held legacy DRAFT journal (Finance review reference)."""
+    moment = _now(now)
+    evidence = _text(review_ref, "Finance review reference", 255)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            journal = _journal(db, tenant_id, journal_id)
+            existing = db.scalar(
+                select(ManualJournal).where(
+                    ManualJournal.tenant_id == tenant_id, ManualJournal.journal_id == journal_id
+                )
+            )
+            if existing is not None:
+                if existing.origin == m.ORIGIN_LEGACY_HELD and existing.requested_by_party_id == actor:
+                    return _outcome(existing, replayed=True)
+                raise JournalRefused("already_requested", "this journal already has a posting workflow")
+            if journal.status != JournalStatus.DRAFT:
+                raise JournalRefused("journal_state_refused", journal.status.value.lower())
+            if journal.source_owner == MANUAL_OWNER:
+                raise JournalRefused("not_legacy_held", "manual journals follow the prepare path")
+            _require_open_period(db, tenant_id, journal.posting_date, journal.kind)
+            row = ManualJournal(
+                tenant_id=tenant_id,
+                journal_id=journal.id,
+                origin=m.ORIGIN_LEGACY_HELD,
+                state=m.STATE_POST_REQUESTED,
+                evidence_ref=evidence,
+                legacy_source_key=":".join(
+                    (
+                        journal.source_owner or "",
+                        journal.source_document_kind or "",
+                        journal.source_document_id or "",
+                        journal.source_version or "",
+                    )
+                )[:480],
+                prepared_by_party_id=actor,
+                prepared_at=moment,
+                requested_by_party_id=actor,
+                requested_at=moment,
+            )
+            db.add(row)
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_POST_REQUESTED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=journal.id,
+                origin=row.origin,
+                number=journal.number,
+                review_ref=evidence,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+# --- approve + post / reject -----------------------------------------------
+
+
+def approve_and_post(
+    db: Session, *, tenant_id: UUID, manual_id: UUID, approver: UUID, now: datetime | None = None
+) -> Outcome:
+    """POST_REQUESTED -> POSTED through accounting.post_journal. Approver != preparer and != requester."""
+    moment = _now(now)
+    try:
+        _actor(db, tenant_id, approver)
+        with db.begin_nested():
+            row = _lock_row(db, tenant_id, manual_id)
+            if row.state == m.STATE_POSTED and row.approved_by_party_id == approver:
+                return _outcome(row, replayed=True)
+            if row.state != m.STATE_POST_REQUESTED:
+                raise JournalRefused("state_refused", f"cannot approve from state {row.state}")
+            if approver == row.prepared_by_party_id:
+                raise JournalRefused("sod_preparer_cannot_approve", "the preparer cannot approve their own journal")
+            if approver == row.requested_by_party_id:
+                raise JournalRefused("sod_requester_cannot_approve", "the requester cannot approve their own request")
+            journal = _journal(db, tenant_id, row.journal_id)
+            if journal.status != JournalStatus.DRAFT:
+                raise JournalRefused("journal_state_refused", journal.status.value.lower())
+            _require_open_period(db, tenant_id, journal.posting_date, journal.kind)
+            posted = accounting.post_journal(
+                db,
+                scope=_scope(tenant_id),
+                journal_id=journal.id,
+                approval_reference=f"erp.manual:{row.id}:post",
+                posted_by=str(approver),
+                idempotency_key=f"erp.manual:{row.id}:post",
+                idempotency_expires_at=None,
+                posted_at=moment,
+            )
+            if posted.status != JournalStatus.POSTED:
+                raise JournalRefused("journal_state_refused", posted.status.value.lower())
+            row.state = m.STATE_POSTED
+            row.approved_by_party_id = approver
+            row.approved_at = moment
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=approver,
+                action=AUDIT_POSTED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=row.journal_id,
+                number=posted.number,
+                origin=row.origin,
+                prepared_by=row.prepared_by_party_id,
+                requested_by=row.requested_by_party_id,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+def reject(
+    db: Session, *, tenant_id: UUID, manual_id: UUID, actor: UUID, reason: str, now: datetime | None = None
+) -> Outcome:
+    """POST_REQUESTED -> REJECTED (terminal; the DRAFT journal stays unposted), or
+    REVERSAL_REQUESTED -> POSTED (the reversal request is withdrawn)."""
+    moment = _now(now)
+    why = _text(reason, "reason", 2000)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            row = _lock_row(db, tenant_id, manual_id)
+            if row.state == m.STATE_POST_REQUESTED:
+                row.state = m.STATE_REJECTED
+                row.rejected_by_party_id = actor
+                row.rejected_at = moment
+                row.rejection_reason = why
+                action = AUDIT_REJECTED
+            elif row.state == m.STATE_REVERSAL_REQUESTED:
+                row.state = m.STATE_POSTED
+                row.reversal_requested_by_party_id = None
+                row.reversal_requested_at = None
+                row.reversal_reason = None
+                row.reversal_posting_date = None
+                action = AUDIT_REVERSAL_REJECTED
+            else:
+                raise JournalRefused("state_refused", f"nothing to reject in state {row.state}")
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=action,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=row.journal_id,
+                reason=why,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+# --- reversal --------------------------------------------------------------
+
+
+def request_reversal(
+    db: Session,
+    *,
+    tenant_id: UUID,
+    manual_id: UUID,
+    actor: UUID,
+    reason: str,
+    posting_date: date,
+    now: datetime | None = None,
+) -> Outcome:
+    moment = _now(now)
+    why = _text(reason, "reversal reason", 2000)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            row = _lock_row(db, tenant_id, manual_id)
+            if (
+                row.state == m.STATE_REVERSAL_REQUESTED
+                and row.reversal_requested_by_party_id == actor
+                and row.reversal_posting_date == posting_date
+                and row.reversal_reason == why
+            ):
+                return _outcome(row, replayed=True)
+            if row.state != m.STATE_POSTED:
+                raise JournalRefused("state_refused", f"cannot request reversal from state {row.state}")
+            _require_open_period(db, tenant_id, posting_date, JournalKind.REVERSAL)
+            row.state = m.STATE_REVERSAL_REQUESTED
+            row.reversal_requested_by_party_id = actor
+            row.reversal_requested_at = moment
+            row.reversal_reason = why
+            row.reversal_posting_date = posting_date
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_REVERSAL_REQUESTED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=row.journal_id,
+                reason=why,
+                posting_date=posting_date,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+def approve_reversal(
+    db: Session, *, tenant_id: UUID, manual_id: UUID, approver: UUID, now: datetime | None = None
+) -> Outcome:
+    """REVERSAL_REQUESTED -> REVERSED through accounting.reverse_journal. Approver != requester and != preparer."""
+    moment = _now(now)
+    try:
+        _actor(db, tenant_id, approver)
+        with db.begin_nested():
+            row = _lock_row(db, tenant_id, manual_id)
+            if row.state == m.STATE_REVERSED and row.reversal_approved_by_party_id == approver:
+                return _outcome(row, replayed=True)
+            if row.state != m.STATE_REVERSAL_REQUESTED:
+                raise JournalRefused("state_refused", f"cannot approve a reversal from state {row.state}")
+            if approver == row.reversal_requested_by_party_id:
+                raise JournalRefused("sod_requester_cannot_approve", "the requester cannot approve their own reversal")
+            if approver == row.prepared_by_party_id:
+                raise JournalRefused("sod_preparer_cannot_approve", "the preparer cannot approve the reversal")
+            if row.reversal_posting_date is None or row.reversal_reason is None:
+                raise JournalRefused("state_refused", "the reversal request is incomplete")
+            _require_open_period(db, tenant_id, row.reversal_posting_date, JournalKind.REVERSAL)
+            original = _journal(db, tenant_id, row.journal_id)
+            reversal = accounting.reverse_journal(
+                db,
+                scope=_scope(tenant_id),
+                command=ReverseJournal(
+                    journal_id=original.id,
+                    number="RV-" + row.id.hex[:24].upper(),
+                    posting_date=row.reversal_posting_date,
+                    reason=row.reversal_reason,
+                    approval_reference=f"erp.manual:{row.id}:reverse",
+                    reversed_by=str(approver),
+                ),
+                idempotency_key=f"erp.manual:{row.id}:reverse",
+                idempotency_expires_at=None,
+                reversed_at=moment,
+            )
+            row.state = m.STATE_REVERSED
+            row.reversal_approved_by_party_id = approver
+            row.reversal_approved_at = moment
+            row.reversal_journal_id = reversal.id
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=approver,
+                action=AUDIT_REVERSED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=row.journal_id,
+                reversal_journal_id=reversal.id,
+                requested_by=row.reversal_requested_by_party_id,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+# --- periods ---------------------------------------------------------------
+
+
+def _period(db: Session, tenant_id: UUID, period_id: UUID) -> FiscalPeriod:
+    period = db.scalar(select(FiscalPeriod).where(FiscalPeriod.tenant_id == tenant_id, FiscalPeriod.id == period_id))
+    if period is None:
+        raise JournalRefused("not_found", "fiscal period was not found")
+    return period
+
+
+def open_period(db: Session, *, tenant_id: UUID, period_id: UUID, actor: UUID, now: datetime | None = None) -> str:
+    moment = _now(now)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            _period(db, tenant_id, period_id)
+            period = accounting.open_period(
+                db, scope=_scope(tenant_id), period_id=period_id, actor_ref=str(actor), occurred_at=moment
+            )
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_PERIOD_OPENED,
+                entity_type="fiscal_period",
+                entity_id=str(period_id),
+                name=period.name,
+            )
+            return period.status.value
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+def pending_manual_journals(db: Session, tenant_id: UUID, period_id: UUID) -> int:
+    return (
+        db.scalar(
+            select(func.count())
+            .select_from(ManualJournal)
+            .join(
+                JournalEntry,
+                (JournalEntry.tenant_id == ManualJournal.tenant_id) & (JournalEntry.id == ManualJournal.journal_id),
+            )
+            .where(
+                ManualJournal.tenant_id == tenant_id,
+                JournalEntry.fiscal_period_id == period_id,
+                ManualJournal.state.in_((m.STATE_PREPARED, m.STATE_POST_REQUESTED, m.STATE_REVERSAL_REQUESTED)),
+            )
+        )
+        or 0
+    )
+
+
+def soft_close_period(
+    db: Session, *, tenant_id: UUID, period_id: UUID, actor: UUID, review_ref: str, now: datetime | None = None
+) -> str:
+    """OPEN -> SOFT_CLOSED with accounting's close evidence: no pending manual journals + a Finance review reference."""
+    moment = _now(now)
+    review = _text(review_ref, "Finance review reference", 255)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            _period(db, tenant_id, period_id)
+            pending = pending_manual_journals(db, tenant_id, period_id)
+            if pending:
+                raise JournalRefused("pending_manual_journals", f"{pending} manual journal(s) are still unresolved")
+            auto = f"erp.manual.pending=0:{period_id}"
+            period = accounting.soft_close_period(
+                db,
+                scope=_scope(tenant_id),
+                period_id=period_id,
+                evidence=PeriodCloseEvidence(
+                    checks=(
+                        CloseCheck("NO_PENDING_MANUAL_JOURNALS", True, auto, hashlib.sha256(auto.encode()).hexdigest()),
+                        CloseCheck("FINANCE_REVIEW", True, review, hashlib.sha256(review.encode()).hexdigest()),
+                    )
+                ),
+                actor_ref=str(actor),
+                approval_reference=f"erp.period:{period_id}:soft_close",
+                occurred_at=moment,
+            )
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_PERIOD_SOFT_CLOSED,
+                entity_type="fiscal_period",
+                entity_id=str(period_id),
+                review_ref=review,
+            )
+            return period.status.value
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+def lock_period(db: Session, *, tenant_id: UUID, period_id: UUID, actor: UUID, now: datetime | None = None) -> str:
+    moment = _now(now)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            _period(db, tenant_id, period_id)
+            period = accounting.lock_period(
+                db,
+                scope=_scope(tenant_id),
+                period_id=period_id,
+                actor_ref=str(actor),
+                approval_reference=f"erp.period:{period_id}:lock",
+                occurred_at=moment,
+            )
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_PERIOD_LOCKED,
+                entity_type="fiscal_period",
+                entity_id=str(period_id),
+            )
+            return period.status.value
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc

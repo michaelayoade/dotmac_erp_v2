@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Journal {{ journal.number }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Journal {{ journal.number }}</h1>
+<p>{% if approver %}<a href="/finance/journal-approvals">Approval queue</a>{% else %}<a href="/finance/journals">Manual journals</a>{% endif %}</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>State</dt><dd>{{ manual.state }} ({{ manual.origin }}); accounting status {{ journal.status.value }}</dd>
+  <dt>Posting date</dt><dd>{{ journal.posting_date }}</dd>
+  <dt>Description</dt><dd>{{ journal.description }}</dd>
+  <dt>Evidence reference</dt><dd>{{ manual.evidence_ref }}</dd>
+  {% if manual.legacy_source_key %}<dt>Legacy source</dt><dd>{{ manual.legacy_source_key }}</dd>{% endif %}
+  <dt>Prepared by</dt><dd>{{ names.get(manual.prepared_by_party_id, manual.prepared_by_party_id) }} at {{ manual.prepared_at }}</dd>
+  {% if manual.requested_by_party_id %}<dt>Posting requested by</dt><dd>{{ names.get(manual.requested_by_party_id, manual.requested_by_party_id) }} at {{ manual.requested_at }}</dd>{% endif %}
+  {% if manual.approved_by_party_id %}<dt>Approved and posted by</dt><dd>{{ names.get(manual.approved_by_party_id, manual.approved_by_party_id) }} at {{ manual.approved_at }}</dd>{% endif %}
+  {% if manual.rejected_by_party_id %}<dt>Rejected by</dt><dd>{{ names.get(manual.rejected_by_party_id, manual.rejected_by_party_id) }}: {{ manual.rejection_reason }}</dd>{% endif %}
+  {% if manual.reversal_requested_by_party_id %}<dt>Reversal requested by</dt><dd>{{ names.get(manual.reversal_requested_by_party_id, manual.reversal_requested_by_party_id) }} for {{ manual.reversal_posting_date }}: {{ manual.reversal_reason }}</dd>{% endif %}
+  {% if manual.reversal_approved_by_party_id %}<dt>Reversal approved by</dt><dd>{{ names.get(manual.reversal_approved_by_party_id, manual.reversal_approved_by_party_id) }}</dd>{% endif %}
+</dl>
+{% include "journals/_lines.html" %}
+
+{% if not approver %}
+  {% if manual.state == 'PREPARED' %}
+  <form method="post" action="/finance/journals/{{ manual.id }}/request-post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Request posting</button>
+  </form>
+  {% elif manual.state == 'POSTED' %}
+  <form method="post" action="/finance/journals/{{ manual.id }}/request-reversal">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Reversal date <input type="date" name="posting_date" value="{{ reversal_default }}" required></label></p>
+    <p><label>Reason <input name="reason" maxlength="2000" required></label></p>
+    <button type="submit">Request reversal</button>
+  </form>
+  {% endif %}
+{% else %}
+  {% if manual.state == 'POST_REQUESTED' %}
+  <form method="post" action="/finance/journal-approvals/{{ manual.id }}/approve">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Approve and post</button>
+  </form>
+  {% elif manual.state == 'REVERSAL_REQUESTED' %}
+  <form method="post" action="/finance/journal-approvals/{{ manual.id }}/approve-reversal">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Approve reversal</button>
+  </form>
+  {% endif %}
+  {% if manual.state in ('POST_REQUESTED', 'REVERSAL_REQUESTED') %}
+  <form method="post" action="/finance/journal-approvals/{{ manual.id }}/reject">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Reason <input name="reason" maxlength="2000" required></label></p>
+    <button type="submit">Reject</button>
+  </form>
+  {% endif %}
+{% endif %}
+{% endblock %}
