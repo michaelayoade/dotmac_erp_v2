@@ -109,6 +109,7 @@ def test_legacy_id_already_admitted_historically_is_refused(engine):
     legacy = uuid4()
     other = enter(engine, env, values(env))
     with Session(engine) as db:
+        payables.submit_invoice(db, scope=env.scope, invoice_id=other, submitted_by="importer", submitted_at=NOW)
         payables.approve_invoice(
             db,
             scope=env.scope,
