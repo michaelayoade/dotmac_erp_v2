@@ -16,6 +16,7 @@ EXPECTED_MODULE_VERSIONS = {
     "erp_web": None,
     "erp_revenue": None,
     "erp_revenue_approval": None,
+    "erp_legacy_reentry": None,
     "erp_banking": None,
     "erp_access": None,
     "erp_payroll": None,

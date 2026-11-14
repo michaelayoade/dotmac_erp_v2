@@ -293,6 +293,8 @@ def operator(monkeypatch, tmp_path):
 
         def scalars(self, statement):
             state["sql"].append(str(statement))
+            if str(statement) == "SELECT legacy_invoice_id FROM public.legacy_invoice_references":
+                return iter(state.get("referenced", []))
             assert str(statement) == "SELECT version_num FROM public.alembic_version"
             return iter(state["schema_heads"])
 
@@ -764,3 +766,10 @@ def test_hosted_postgres_source_refuses_rls_filtering_instead_of_partial_rows(ho
             connection.execute(sa.text("SELECT tenant_id FROM public.ap_history_rls_probe")).all()
         assert refused.value.orig.sqlstate == "42501"
         transaction.rollback()
+
+
+def test_plan_refuses_invoices_already_reentered_with_a_legacy_reference():
+    scope = SimpleNamespace(tenant_id=UUID(TENANT))
+    plan = cli._plan(Verifier(), scope, (UUID(INVOICE),), object(), {}, frozenset({INVOICE}))
+    assert plan["commands"] == [] and plan["refusals"] == [dict(invoice_id=INVOICE, reason="legacy_reference_entered")]
+    assert plan["counts"] == dict(requested=1, eligible=0, refused=1)

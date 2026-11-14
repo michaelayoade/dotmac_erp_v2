@@ -7,8 +7,14 @@
 <p>Copy the supplier-stated tax amount and exchange rate from your supporting evidence. Tax is not calculated here.</p>
 {% if error %}<p role="alert">{{ error }}</p>{% endif %}
 {% if accounts %}
-<form method="post" action="/finance/supplier-invoices">
+<form method="post" action="{{ form_action|default('/finance/supplier-invoices') }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  {% if legacy %}
+  <p>Legacy open invoice that legacy NEVER posted to the ledger. Invoices legacy already posted are admitted historically, not entered here.</p>
+  <p><label>Legacy invoice id (UUID) <input name="legacy_invoice_id" value="{{ values.get('legacy_invoice_id', '') }}" maxlength="36" required></label></p>
+  <p><label>Census / review evidence reference <input name="evidence_ref" value="{{ values.get('evidence_ref', '') }}" maxlength="255" required></label></p>
+  <p><label><input type="checkbox" name="legacy_posting_state" value="never_posted" required> Legacy never posted this invoice to the ledger</label></p>
+  {% endif %}
   <input type="hidden" name="request_id" value="{{ values.get('request_id', '') }}">
   {% for name, label, maxlength in [
     ('number', 'Internal invoice number', 50), ('supplier_ref', 'Supplier reference', 255),

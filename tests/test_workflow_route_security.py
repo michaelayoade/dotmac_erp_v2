@@ -263,3 +263,25 @@ def test_approve_refuses_invalid_csrf(browser: Browser) -> None:
     response = browser.client.post(APPROVE_PATH, data={}, headers={"origin": "https://other.example"})
     assert response.status_code == 403
     browser.approve.assert_not_called()
+
+
+REENTRY_PATH = "/finance/supplier-invoices/legacy-reentry"
+
+
+def test_legacy_reentry_is_admin_write_only_with_csrf(browser: Browser, monkeypatch) -> None:
+    from erp_v2.web import legacy_reentry_routes
+
+    create = Mock(return_value=SimpleNamespace(id=DOCUMENT_ID))
+    monkeypatch.setattr(legacy_reentry_routes.service, "create_legacy_reentry_draft", create)
+    for role, expected in ((None, 302), ("staff", 403), ("approver", 403)):
+        token = browser.sign_in(role)
+        assert browser.client.post(REENTRY_PATH, data={"csrf_token": token}).status_code == expected
+    create.assert_not_called()
+    browser.sign_in("admin")
+    assert browser.client.post(REENTRY_PATH, data={}, headers={"origin": "https://other.example"}).status_code == 403
+    create.assert_not_called()
+    token = browser.sign_in("admin")
+    response = browser.client.post(REENTRY_PATH, data={"csrf_token": token, "legacy_invoice_id": "x"})
+    assert response.status_code == 303
+    create.assert_called_once()
+    assert "csrf_token" not in create.call_args.kwargs["values"]
