@@ -113,6 +113,14 @@ def invoice(engine, env, *, number="AP-1", submit=True, tax="15", period_date="2
         return created.id
 
 
+def submit(engine, env, invoice_id):
+    with Session(engine) as db:
+        drafts.submit_supplier_draft(
+            db, tenant=db.get(Tenant, env.tenant_id), party=db.get(Party, env.party_ids[0]), invoice_id=invoice_id
+        )
+        db.commit()
+
+
 def approve(engine, env, invoice_id, party_index=1, *, commit=True, caller_write=False):
     with Session(engine) as db:
         tenant, party = db.get(Tenant, env.tenant_id), db.get(Party, env.party_ids[party_index])
@@ -220,7 +228,7 @@ def test_inactive_liability_account_refuses_without_partial_state(engine):
 
 def test_non_canonical_account_ref_refuses(engine):
     env = world(engine)
-    iid = invoice(engine, env)
+    iid = invoice(engine, env, submit=False)  # submitted documents are immutable (DB trigger)
     with Session(engine) as db:
         db.execute(
             sa.update(SupplierInvoice)
@@ -228,12 +236,13 @@ def test_non_canonical_account_ref_refuses(engine):
             .values(liability_account_ref=env.accounts["2000"].hex)
         )
         db.commit()
+    submit(engine, env, iid)
     refusal(engine, env, iid, "posting_account_ref_form_refused")
 
 
 def test_dimensioned_lines_are_refused_not_dropped(engine):
     env = world(engine)
-    iid = invoice(engine, env)
+    iid = invoice(engine, env, submit=False)  # submitted documents are immutable (DB trigger)
     with Session(engine) as db:
         db.execute(
             sa.update(SupplierInvoiceLine)
@@ -241,6 +250,7 @@ def test_dimensioned_lines_are_refused_not_dropped(engine):
             .values(dimension_refs=[["COST_CENTER", str(uuid4())]])
         )
         db.commit()
+    submit(engine, env, iid)
     refusal(engine, env, iid, "dimensions_unsupported")
 
 
