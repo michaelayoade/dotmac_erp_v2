@@ -13,7 +13,6 @@ from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
-import dotmac_kernel.db  # noqa: F401 - import at collection, before other tests mutate DATABASE_URL
 import pytest
 import sqlalchemy as sa
 from dotmac_accounting import service as accounting
@@ -21,14 +20,19 @@ from dotmac_accounting.contracts import (
     AccountClass,
     AccountKind,
     CloseCheck,
-    CreateAccount,
-    CreateAccountCategory,
-    CreateFiscalPeriod,
-    CreateFiscalYear,
     NormalBalance,
     PeriodCloseEvidence,
+    PeriodStatus,
 )
-from dotmac_accounting.models import Account, AccountCategory, JournalEntry, JournalLine, PostedLedgerLine
+from dotmac_accounting.models import (
+    Account,
+    AccountCategory,
+    FiscalPeriod,
+    FiscalYear,
+    JournalEntry,
+    JournalLine,
+    PostedLedgerLine,
+)
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.idempotency_models import IdempotencyRecord
 from dotmac_kernel.models import Tenant
@@ -98,30 +102,46 @@ def seed(engine) -> SimpleNamespace:
     with Session(engine) as db:
         db.add(Tenant(id=tenant_id, slug=f"t{tenant_id.hex[:24]}", name="Bridge"))
         db.flush()
-        expense = accounting.create_account_category(
-            db, scope=scope, command=CreateAccountCategory("EXP", "Expense", AccountClass.EXPENSE)
-        )
-        liability = accounting.create_account_category(
-            db, scope=scope, command=CreateAccountCategory("LIA", "Liability", AccountClass.LIABILITY)
-        )
-        accounts = {}
-        for code, category, kind_balance in (
-            ("5000", expense, NormalBalance.DEBIT),
-            ("2000", liability, NormalBalance.CREDIT),
-            ("2040", liability, NormalBalance.CREDIT),
+        # Direct owner rows: accounting a1's create_* helpers import the kernel's reference
+        # runtime (dotmac_kernel.db), which a composed ERP process must not construct.
+        categories = {
+            code: AccountCategory(tenant_id=tenant_id, code=code, name=code, account_class=klass)
+            for code, klass in (("EXP", AccountClass.EXPENSE), ("LIA", AccountClass.LIABILITY))
+        }
+        db.add_all(categories.values())
+        db.flush()
+        rows = {}
+        for code, category, balance in (
+            ("5000", "EXP", NormalBalance.DEBIT),
+            ("2000", "LIA", NormalBalance.CREDIT),
+            ("2040", "LIA", NormalBalance.CREDIT),
         ):
-            accounts[code] = accounting.create_account(
-                db,
-                scope=scope,
-                command=CreateAccount(code, f"Account {code}", category.id, AccountKind.POSTING, kind_balance),
-            ).id
-        year = accounting.create_fiscal_year(
-            db, scope=scope, command=CreateFiscalYear("FY26", "FY 2026", date(2026, 1, 1), date(2026, 12, 31))
+            rows[code] = Account(
+                tenant_id=tenant_id,
+                category_id=categories[category].id,
+                code=code,
+                name=f"Account {code}",
+                kind=AccountKind.POSTING,
+                normal_balance=balance,
+            )
+        db.add_all(rows.values())
+        year = FiscalYear(
+            tenant_id=tenant_id, code="FY26", name="FY 2026", start_date=date(2026, 1, 1), end_date=date(2026, 12, 31)
         )
-        period = accounting.create_fiscal_period(
-            db, scope=scope, command=CreateFiscalPeriod(year.id, 1, "Jan", date(2026, 1, 1), date(2026, 1, 31))
+        db.add(year)
+        db.flush()
+        period = FiscalPeriod(
+            tenant_id=tenant_id,
+            fiscal_year_id=year.id,
+            period_number=1,
+            name="Jan",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status=PeriodStatus.OPEN,
         )
-        accounting.open_period(db, scope=scope, period_id=period.id, actor_ref="test", occurred_at=NOW)
+        db.add(period)
+        db.flush()
+        accounts = {code: row.id for code, row in rows.items()}
         db.commit()
         return SimpleNamespace(tenant_id=tenant_id, scope=scope, accounts=accounts, period_id=period.id)
 
@@ -257,9 +277,12 @@ def test_refusal_leaves_no_bridge_rows_and_the_callers_prior_write_survives(engi
     env = seed(engine)
     c, code = scenario(engine, env)
     with Session(engine) as db:
-        accounting.create_account_category(
-            db, scope=env.scope, command=CreateAccountCategory("CALLER", "Caller write", AccountClass.EXPENSE)
+        db.add(
+            AccountCategory(
+                tenant_id=env.tenant_id, code="CALLER", name="Caller write", account_class=AccountClass.EXPENSE
+            )
         )
+        db.flush()
         with pytest.raises(PostingRefused) as exc:
             bridge.post_consequence(db, scope=env.scope, consequence=c, approval_ref="appr-1", actor="p-1", now=NOW)
         assert exc.value.code == code
