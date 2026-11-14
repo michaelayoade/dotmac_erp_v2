@@ -70,6 +70,15 @@ def test_existing_receipt_blocks(tmp_path, monkeypatch):
     assert receipt.read_text() == "old"
 
 
+def test_apply_without_operator_ref_refuses_before_database(tmp_path, monkeypatch):
+    allow, receipt = tmp_path / "a.json", tmp_path / "r.json"
+    allow.write_bytes(doc())
+    monkeypatch.setenv("ERP_ACCESS_APPLY", "1")
+    sha = hashlib.sha256(allow.read_bytes()).hexdigest()
+    rc = cli.main(["apply", "--allowlist", str(allow), "--receipt", str(receipt), "--approved-allowlist-sha256", sha])
+    assert rc == 2 and "operator_ref_required" in receipt.read_text()
+
+
 def test_apply_without_matching_sha_refuses_and_receipt_is_0600(tmp_path, monkeypatch):
     allow, receipt = tmp_path / "a.json", tmp_path / "r.json"
     allow.write_bytes(doc())
@@ -98,11 +107,21 @@ def test_sha_binding_matches_allowlist_bytes():
     assert hashlib.sha256(raw).hexdigest() == hashlib.sha256(doc()).hexdigest()
 
 
-class Store:
-    """Scripted kernel identity_storage + session."""
+STAFF = SimpleNamespace(id=uuid4(), slug="staff")
 
-    def __init__(self, monkeypatch, parties, roles=(), grants=()):
-        self.parties, self.roles, self.existing = parties, list(roles), list(grants)
+
+def staff_grant(pid):
+    return SimpleNamespace(party_id=pid, role_id=STAFF.id)
+
+
+class Store:
+    """Scripted kernel identity_storage + session (parties default to staff holders)."""
+
+    def __init__(self, monkeypatch, parties, roles=(), grants=(), staff=True):
+        self.parties, self.roles, self.existing = parties, [STAFF, *roles], list(grants)
+        if staff:
+            self.existing += [staff_grant(p.id) for p in parties]
+        self.audited = []
         self.ensured, self.provisioned = [], []
         from dotmac_kernel import identity_storage as s
 
@@ -125,21 +144,93 @@ def party(pid, active=True, kind="person"):
     return SimpleNamespace(id=pid, is_active=active, party_type=kind)
 
 
-def test_plan_writes_nothing_and_apply_is_additive(monkeypatch):
+def apply(store, allow, **over):
+    args = dict(allowlist_sha256="d" * 64, operator_ref="ops-1", audit=lambda db, **kw: store.audited.append(kw))
+    args.update(over)
+    return cli.apply_grants(store.db(), allow, **args)
+
+
+def test_plan_writes_nothing_and_apply_is_additive_and_audited(monkeypatch):
     store = Store(monkeypatch, [party(P1)])
     allow = cli.parse_allowlist(doc())
     plan = cli.plan_grants(store.db(), allow)
     assert plan.ready and plan.role_inserts == 1 and plan.grant_inserts == 1
-    assert store.ensured == [] and store.provisioned == []
-    applied = cli.apply_grants(store.db(), allow)
+    assert store.ensured == [] and store.provisioned == [] and store.audited == []
+    applied = apply(store, allow)
     assert applied.ready and store.provisioned == ["treasury"] and len(store.ensured) == 1
+    assert [(a["party_id"], a["role"], a["operator_ref"]) for a in store.audited] == [(P1, "treasury", "ops-1")]
+
+
+def test_apply_requires_operator_ref(monkeypatch):
+    store = Store(monkeypatch, [party(P1)])
+    with pytest.raises(cli.AccessRefusal, match="operator_ref_required"):
+        apply(store, cli.parse_allowlist(doc()), operator_ref=" ")
+    assert store.ensured == []
+
+
+def test_party_without_portal_access_refuses(monkeypatch):
+    store = Store(monkeypatch, [party(P1)], staff=False)
+    plan = apply(store, cli.parse_allowlist(doc()))
+    assert dict(plan.blockers) == {"party_lacks_portal_access": 1}
+    assert store.ensured == [] and store.audited == []
+
+
+def role(slug):
+    return SimpleNamespace(id=uuid4(), slug=slug)
+
+
+def test_sod_pair_in_one_request_refuses_unless_excepted(monkeypatch):
+    pair = [{"party_id": str(P1), "role": "finance_approver"}, {"party_id": str(P1), "role": "treasury"}]
+    store = Store(monkeypatch, [party(P1)])
+    plan = apply(store, cli.parse_allowlist(doc(pair)))
+    assert dict(plan.blockers) == {"sod_conflict": 1} and store.ensured == []
+    allowed = doc(pair, sod_exceptions=[{"party_id": str(P1), "roles": ["treasury", "finance_approver"]}])
+    store2 = Store(monkeypatch, [party(P1)])
+    assert apply(store2, cli.parse_allowlist(allowed)).ready and len(store2.ensured) == 2
+
+
+def test_sod_pair_against_existing_role_refuses(monkeypatch):
+    existing = role("payroll_approver")
+    store = Store(
+        monkeypatch,
+        [party(P1)],
+        roles=[existing],
+        grants=[SimpleNamespace(party_id=P1, role_id=existing.id)],
+    )
+    plan = apply(store, cli.parse_allowlist(doc([{"party_id": str(P1), "role": "payroll_finalizer"}])))
+    assert dict(plan.blockers) == {"sod_conflict": 1}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"sod_exceptions": [{"party_id": str(P1), "roles": ["treasury", "staff"]}]},
+        {"sod_exceptions": [{"party_id": str(P1), "roles": ["treasury"]}]},
+        {"sod_exceptions": [{"party_id": str(P1)}]},
+    ],
+)
+def test_invalid_sod_exceptions_refuse(extra):
+    with pytest.raises(cli.AccessRefusal, match="invalid_sod_exception"):
+        cli.parse_allowlist(doc(**extra))
+
+
+def test_boolean_version_and_noncanonical_uuids_refuse():
+    with pytest.raises(cli.AccessRefusal, match="invalid_allowlist_schema"):
+        cli.parse_allowlist(doc(version=True))
+    with pytest.raises(cli.AccessRefusal, match="invalid_party_id"):
+        cli.parse_allowlist(doc([{"party_id": str(P1).upper(), "role": "treasury"}]))
+    with pytest.raises(cli.AccessRefusal, match="invalid_party_id"):
+        cli.parse_allowlist(doc([{"party_id": P1.hex, "role": "treasury"}]))
+    with pytest.raises(cli.AccessRefusal, match="invalid_tenant_id"):
+        cli.parse_allowlist(doc(tenant_id=str(TENANT).upper()))
 
 
 def test_replay_counts_existing_grant(monkeypatch):
-    role = SimpleNamespace(id=uuid4(), slug="treasury")
-    store = Store(monkeypatch, [party(P1)], roles=[role], grants=[SimpleNamespace(party_id=P1, role_id=role.id)])
-    plan = cli.plan_grants(store.db(), cli.parse_allowlist(doc()))
+    held = role("treasury")
+    store = Store(monkeypatch, [party(P1)], roles=[held], grants=[SimpleNamespace(party_id=P1, role_id=held.id)])
+    plan = apply(store, cli.parse_allowlist(doc()))
     assert (plan.grant_replays, plan.grant_inserts, plan.role_inserts) == (1, 0, 0)
+    assert store.audited == []  # a replay writes no new audit event
 
 
 @pytest.mark.parametrize(
@@ -152,12 +243,14 @@ def test_replay_counts_existing_grant(monkeypatch):
 )
 def test_party_blockers_refuse_apply_and_write_nothing(monkeypatch, parties, blocker):
     store = Store(monkeypatch, parties)
-    plan = cli.apply_grants(store.db(), cli.parse_allowlist(doc()))
+    plan = apply(store, cli.parse_allowlist(doc()))
     assert not plan.ready and dict(plan.blockers) == {blocker: 1}
     assert store.ensured == [] and store.provisioned == []
 
 
 def test_inactive_tenant_refuses(monkeypatch):
     store = Store(monkeypatch, [party(P1)])
-    plan = cli.apply_grants(store.db(active=False), cli.parse_allowlist(doc()))
+    plan = cli.apply_grants(
+        store.db(active=False), cli.parse_allowlist(doc()), allowlist_sha256="d" * 64, operator_ref="ops"
+    )
     assert dict(plan.blockers) == {"tenant_missing_or_inactive": 1} and store.ensured == []

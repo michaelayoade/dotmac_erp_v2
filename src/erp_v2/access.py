@@ -75,8 +75,10 @@ _LEGACY_GRANTS: Final = (
     RoleGrant("staff", ACCESS_PERMISSION),
 )
 _NEW_GRANTS: Final = (
-    # Every new role may sign in; only the listed powers are added.
-    *(RoleGrant(role, ACCESS_PERMISSION) for role in NEW_ROLES),
+    # Portal entry (erp.web.access) is NOT granted to the new roles: holders
+    # must already be staff/admin (access_cli refuses otherwise), so no access
+    # is widened. The profile therefore matches runtime authorization, which
+    # uses each PermissionSpec.default_roles.
     *(RoleGrant(role, code) for code, (_, role) in _NEW_PERMISSIONS.items()),
 )
 
@@ -84,4 +86,21 @@ ROLE_GRANT_PROFILES: Final = (
     RoleGrantProfile(code=PROFILE_CODE, version=PROFILE_VERSION, grants=_LEGACY_GRANTS + _NEW_GRANTS),
 )
 
-access_feature: Final = FeatureManifest(name="erp_access", permissions=PERMISSION_SPECS)
+# Role pairs one person must not hold together (approve-and-pay, pay-and-reconcile,
+# prepare-and-approve, approve-and-finalize). Overridable only by an explicit
+# ``sod_exceptions`` entry inside the sha-bound allowlist (access_cli).
+SOD_CONFLICT_PAIRS: Final = frozenset(
+    frozenset(pair)
+    for pair in (
+        ("finance_preparer", "finance_approver"),
+        ("payroll_approver", "payroll_finalizer"),
+        ("finance_approver", "treasury"),
+        ("treasury", "bank_reconciler"),
+    )
+)
+
+AUDIT_ROLE_GRANTED: Final = "erp.access.role_granted"
+
+access_feature: Final = FeatureManifest(
+    name="erp_access", permissions=PERMISSION_SPECS, audit_actions=(AUDIT_ROLE_GRANTED,)
+)

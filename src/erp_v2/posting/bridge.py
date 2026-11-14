@@ -4,6 +4,9 @@ The caller owns the transaction (kernel request boundary); this function never
 commits. Everything it writes happens inside one SAVEPOINT, so any refusal
 leaves zero rows even if the caller catches the exception and continues.
 
+``approval_ref`` and ``actor`` are caller-asserted strings (the approvals module
+is deliberately not consulted here); callers pass a real approval id.
+
 Fail-closed: unknown consequence kind, unbalanced or malformed consequence,
 account reference in an undeclared form, unknown/inactive/non-postable
 account, and missing/closed/locked/adjustment/reopened period all refuse with
@@ -31,6 +34,7 @@ from dotmac_accounting.contracts import (
 )
 from dotmac_accounting.models import Account, FiscalPeriod, JournalEntry
 from dotmac_kernel.cache import TenantScope
+from dotmac_kernel.exceptions import BadRequestError
 from dotmac_kernel.idempotency import IdempotencyConflict
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -45,6 +49,9 @@ class PostingResult:
     journal_id: UUID
     journal_number: str
     replayed: bool
+    # Journal request fingerprint: the accounting evidence fingerprint callers
+    # (B1) record against the owner document.
+    evidence_fingerprint: str
 
 
 def _resolve_accounts(
@@ -114,9 +121,25 @@ def post_consequence(
                     JournalEntry.source_version == source.version,
                 )
             )
-            if existing is not None and existing.status not in (JournalStatus.POSTED, JournalStatus.DRAFT):
+            if existing is not None and existing.status != JournalStatus.POSTED:
+                # create+post is atomic here, so a DRAFT can only be another writer's.
                 raise PostingRefused("journal_state_refused", existing.status.value.lower())
-            replay = existing is not None and existing.status == JournalStatus.POSTED
+            replay = existing is not None
+            if not replay:
+                superseded = db.scalar(
+                    select(JournalEntry.id)
+                    .where(
+                        JournalEntry.tenant_id == tenant_id,
+                        JournalEntry.source_owner == source.owner,
+                        JournalEntry.source_document_kind == source.document_kind,
+                        JournalEntry.source_document_id == source.document_id,
+                        JournalEntry.source_version != source.version,
+                        JournalEntry.status != JournalStatus.REVERSED,
+                    )
+                    .limit(1)
+                )
+                if superseded is not None:
+                    raise PostingRefused("version_conflict", "another version of this document is already posted")
             accounts = _resolve_accounts(
                 db, tenant_id, policy, [e.account_ref for e in consequence.entries], require_open=not replay
             )
@@ -159,7 +182,7 @@ def post_consequence(
                 recorded_at=moment,
             )
             if journal.status == JournalStatus.POSTED:
-                return PostingResult(journal.id, journal.number, True)
+                return PostingResult(journal.id, journal.number, True, journal.request_fingerprint)
             if journal.status != JournalStatus.DRAFT:
                 raise PostingRefused("journal_state_refused", journal.status.value.lower())
             posted = accounting.post_journal(
@@ -172,10 +195,10 @@ def post_consequence(
                 idempotency_expires_at=None,
                 posted_at=moment,
             )
-            return PostingResult(posted.id, posted.number, False)
+            return PostingResult(posted.id, posted.number, False, posted.request_fingerprint)
     except PostingRefused:
         raise
-    except (AccountingError, IdempotencyConflict) as exc:
+    except (AccountingError, IdempotencyConflict, BadRequestError, ValueError) as exc:
         raise PostingRefused("accounting_refused", str(exc)) from exc
     except IntegrityError as exc:
         raise PostingRefused("accounting_conflict", "journal number or source identity conflict") from exc

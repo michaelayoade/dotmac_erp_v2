@@ -43,14 +43,27 @@ def test_each_new_permission_is_granted_to_exactly_its_role_and_declared_once():
         assert declared.count(spec.code) == 1
 
 
-def test_new_roles_defined_empty_and_sign_in_only_plus_their_powers():
+def test_new_roles_defined_empty_and_hold_only_their_declared_powers():
     codes = {r.code for r in assembly.role_definitions}
     assert codes == {"admin", "staff", *access.NEW_ROLES}
     for role in access.NEW_ROLES:
-        assert ACCESS_PERMISSION in grants(role)
-        assert grants(role) - {ACCESS_PERMISSION} <= access.NEW_PERMISSION_CODES
+        # No portal entry grant: runtime authorization would ignore it (default_roles).
+        assert ACCESS_PERMISSION not in grants(role)
+        assert grants(role) <= access.NEW_PERMISSION_CODES
     for role in ("admin", "staff"):
         assert not next(r for r in assembly.role_definitions if r.code == role).create_if_missing
+
+
+def test_profile_roles_equal_spec_default_roles_for_every_new_code():
+    for spec in access.PERMISSION_SPECS:
+        granted = {g.role_code for g in profile().grants if g.permission_code == spec.code}
+        assert granted == set(spec.default_roles), spec.code
+
+
+def test_sod_pairs_reference_only_new_roles_and_audit_action_is_declared():
+    for pair in access.SOD_CONFLICT_PAIRS:
+        assert len(pair) == 2 and pair <= set(access.NEW_ROLES)
+    assert access.AUDIT_ROLE_GRANTED in access.access_feature.audit_actions
 
 
 def test_segregation_roles_do_not_overlap_on_the_critical_pairs():

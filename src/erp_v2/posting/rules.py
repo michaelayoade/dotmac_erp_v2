@@ -12,11 +12,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Final, Protocol
 from uuid import UUID
 
 QUANTUM: Final = Decimal("0.000001")
-MAX_KEY_LENGTH: Final = 240
+# Kernel idempotency MAX_KEY_LENGTH (a107) is 200; a test asserts we never exceed it.
+MAX_KEY_LENGTH: Final = 200
 _FINGERPRINT: Final = re.compile(r"[0-9a-f]{64}")
 
 
@@ -66,14 +68,20 @@ class RefPolicy:
     code_refs: frozenset[str] = frozenset()
 
 
-# One declared form per owner field; later PRs append entries (reviewed).
-POLICIES: Final[dict[tuple[str, str], RefPolicy]] = {
-    ("payables", "supplier_invoice"): RefPolicy(),
-    ("payables", "credit_note"): RefPolicy(),
-    # payroll revision net_payable_account_ref is the account CODE (minting.py).
-    ("payroll", "payroll_run"): RefPolicy(frozenset({"2040"})),
-    ("payroll", "liability_settlement"): RefPolicy(frozenset({"2040"})),
-}
+# One declared form per owner field; each new kind is one reviewed entry plus a
+# test in the PR that adds it. Read-only mapping.
+# The payroll kinds take the Starter payroll a3 consequence, which mirrors the
+# payables AccountingConsequence shape (source owner "payroll", version "1");
+# there is no separate adapter. The imported net-payable account ref is the
+# account CODE "2040" (minting.py); component refs are Account UUIDs.
+POLICIES: Final = MappingProxyType(
+    {
+        ("payables", "supplier_invoice"): RefPolicy(),
+        ("payables", "credit_note"): RefPolicy(),
+        ("payroll", "payroll_run"): RefPolicy(frozenset({"2040"})),
+        ("payroll", "payroll_liability_settlement"): RefPolicy(frozenset({"2040"})),
+    }
+)
 
 
 def policy_for(owner: str, kind: str) -> RefPolicy:
@@ -104,7 +112,18 @@ def _text(value: object, label: str, maximum: int) -> str:
 
 
 def validate(consequence: ConsequenceLike) -> RefPolicy:
-    """Shape + balance checks; returns the owner's ref policy. No database."""
+    """Shape + balance checks; returns the owner's ref policy. No database.
+
+    An object that is not shaped like an AccountingConsequence refuses
+    (``invalid_consequence``) rather than raising AttributeError.
+    """
+    try:
+        return _validate(consequence)
+    except (AttributeError, TypeError, KeyError) as exc:
+        raise PostingRefused("invalid_consequence", "not an accounting consequence") from exc
+
+
+def _validate(consequence: ConsequenceLike) -> RefPolicy:
     source = consequence.source
     owner = _text(source.owner, "source owner", 120)
     kind = _text(source.document_kind, "source document kind", 80)

@@ -9,7 +9,13 @@ created exclusively before any write) carries counts/codes, never identities.
 
     python -m erp_v2.access_cli plan  --allowlist A.json --receipt R.json
     ERP_ACCESS_APPLY=1 python -m erp_v2.access_cli apply --allowlist A.json \
-        --receipt R.json --approved-allowlist-sha256 <sha256 of A.json>
+        --receipt R.json --approved-allowlist-sha256 <sha256 of A.json> --operator-ref <who>
+
+No access is widened: a party must already hold ``staff`` or ``admin`` (portal
+entry) and must not end up with a conflicting role pair (``SOD_CONFLICT_PAIRS``)
+unless the sha-bound allowlist lists that pair under ``sod_exceptions``. Every
+inserted grant writes a DB audit event (``erp.access.role_granted``) in the same
+transaction. There is no revoke path yet (required before the flip).
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from erp_v2.access import NEW_ROLES
+from erp_v2.access import AUDIT_ROLE_GRANTED, NEW_ROLES, SOD_CONFLICT_PAIRS
 
 MAX_GRANTS = 200
 
@@ -41,6 +47,18 @@ def _refuse(code: str):
 class Allowlist:
     tenant_id: UUID = field(repr=False)
     grants: tuple[tuple[UUID, str], ...] = field(repr=False)
+    sod_exceptions: frozenset[tuple[UUID, frozenset[str]]] = field(default=frozenset(), repr=False)
+
+
+def _uuid(value: object, code: str) -> UUID:
+    # Canonical dashed lowercase only: no alternate spellings of one identity.
+    try:
+        parsed = UUID(str(value))
+    except ValueError:
+        _refuse(code)
+    if str(parsed) != value:
+        _refuse(code)
+    return parsed
 
 
 def parse_allowlist(raw_bytes: bytes) -> Allowlist:
@@ -48,12 +66,15 @@ def parse_allowlist(raw_bytes: bytes) -> Allowlist:
         raw = json.loads(raw_bytes)
     except ValueError:
         _refuse("invalid_allowlist_json")
-    if not isinstance(raw, dict) or set(raw) != {"version", "tenant_id", "grants"} or raw["version"] != 1:
+    if (
+        not isinstance(raw, dict)
+        or not {"version", "tenant_id", "grants"} <= set(raw)
+        or set(raw) - {"version", "tenant_id", "grants", "sod_exceptions"}
+        or type(raw["version"]) is not int
+        or raw["version"] != 1
+    ):
         _refuse("invalid_allowlist_schema")
-    try:
-        tenant = UUID(str(raw["tenant_id"]))
-    except ValueError:
-        _refuse("invalid_tenant_id")
+    tenant = _uuid(raw["tenant_id"], "invalid_tenant_id")
     rows = raw["grants"]
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_GRANTS:
         _refuse("explicit_bounded_grants_required")
@@ -66,14 +87,18 @@ def parse_allowlist(raw_bytes: bytes) -> Allowlist:
             _refuse("role_not_grantable")
         if role not in NEW_ROLES:
             _refuse("unknown_role")
-        try:
-            party = UUID(str(row["party_id"]))
-        except ValueError:
-            _refuse("invalid_party_id")
-        grants.append((party, role))
+        grants.append((_uuid(row["party_id"], "invalid_party_id"), role))
     if len(set(grants)) != len(grants):
         _refuse("duplicate_grant")
-    return Allowlist(tenant, tuple(sorted(grants, key=lambda g: (str(g[0]), g[1]))))
+    exceptions = set()
+    for row in raw.get("sod_exceptions", []):
+        if not isinstance(row, dict) or set(row) != {"party_id", "roles"} or not isinstance(row["roles"], list):
+            _refuse("invalid_sod_exception")
+        pair = frozenset(row["roles"])
+        if pair not in SOD_CONFLICT_PAIRS or len(row["roles"]) != 2:
+            _refuse("invalid_sod_exception")
+        exceptions.add((_uuid(row["party_id"], "invalid_party_id"), pair))
+    return Allowlist(tenant, tuple(sorted(grants, key=lambda g: (str(g[0]), g[1]))), frozenset(exceptions))
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +124,27 @@ class AccessPlan:
         }
 
 
-def _observe(db, allow: Allowlist, *, write: bool) -> AccessPlan:
+def _write_audit(db, *, tenant_id, party_id, role, allowlist_sha256, operator_ref) -> None:
+    from dotmac_kernel.audit import write_audit_event
+
+    write_audit_event(
+        db,
+        tenant_id=tenant_id,
+        actor_type="service",
+        actor_id=operator_ref,
+        actor_label="erp_v2.access_cli",
+        source_application="dotmac_erp",
+        action=AUDIT_ROLE_GRANTED,
+        entity_type="party_role_grant",
+        entity_id=str(party_id),
+        is_success=True,
+        details={"role": role, "allowlist_sha256": allowlist_sha256},
+    )
+
+
+def _observe(
+    db, allow: Allowlist, *, write: bool, audit=None, allowlist_sha256: str = "", operator_ref: str = ""
+) -> AccessPlan:
     from dotmac_kernel import identity_storage
     from dotmac_kernel.models import Tenant
     from sqlalchemy import select
@@ -122,10 +167,24 @@ def _observe(db, allow: Allowlist, *, write: bool) -> AccessPlan:
     roles = {r.slug: r for r in identity_storage.lock_roles(db, tenant_id=allow.tenant_id)}
     needed = sorted({role for _, role in allow.grants})
     missing = [slug for slug in needed if slug not in roles]
-    existing = {
-        (g.party_id, g.role_id)
-        for g in identity_storage.lock_grants(db, tenant_id=allow.tenant_id, party_ids=tuple(parties))
-    }
+    grant_rows = identity_storage.lock_grants(db, tenant_id=allow.tenant_id, party_ids=tuple(parties))
+    existing = {(g.party_id, g.role_id) for g in grant_rows}
+    slug_by_id = {r.id: r.slug for r in roles.values()}
+    held: dict[UUID, set[str]] = {party_id: set() for party_id in party_ids}
+    for g in grant_rows:
+        held.setdefault(g.party_id, set()).add(slug_by_id.get(g.role_id, ""))
+    requested: dict[UUID, set[str]] = {}
+    for party_id, role in allow.grants:
+        requested.setdefault(party_id, set()).add(role)
+    for party_id in party_ids:
+        if party_id not in parties:
+            continue
+        if not held[party_id] & {"staff", "admin"}:
+            blockers["party_lacks_portal_access"] += 1
+        final = held[party_id] | requested[party_id]
+        for pair in SOD_CONFLICT_PAIRS:
+            if pair <= final and (party_id, pair) not in allow.sod_exceptions:
+                blockers["sod_conflict"] += 1
     replays = sum(1 for party, role in allow.grants if role in roles and (party, roles[role].id) in existing)
     inserts = len(allow.grants) - replays
     if write and not blockers:
@@ -145,6 +204,7 @@ def _observe(db, allow: Allowlist, *, write: bool) -> AccessPlan:
             }
         )
         for party, role in allow.grants:
+            already = (party, roles[role].id) in existing
             identity_storage.ensure_grant(
                 db,
                 tenant_id=allow.tenant_id,
@@ -154,6 +214,15 @@ def _observe(db, allow: Allowlist, *, write: bool) -> AccessPlan:
                 created_at=now,
                 updated_at=now,
             )
+            if not already:
+                (audit or _write_audit)(
+                    db,
+                    tenant_id=allow.tenant_id,
+                    party_id=party,
+                    role=role,
+                    allowlist_sha256=allowlist_sha256,
+                    operator_ref=operator_ref,
+                )
     return AccessPlan(len(allow.grants), inserts, replays, len(missing), tuple(sorted(blockers.items())))
 
 
@@ -161,9 +230,13 @@ def plan_grants(db, allow: Allowlist) -> AccessPlan:
     return _observe(db, allow, write=False)
 
 
-def apply_grants(db, allow: Allowlist) -> AccessPlan:
-    """Caller owns the transaction. Refused plans write nothing."""
-    return _observe(db, allow, write=True)
+def apply_grants(db, allow: Allowlist, *, allowlist_sha256: str, operator_ref: str, audit=None) -> AccessPlan:
+    """Caller owns the transaction. Refused plans write nothing; each new grant is audited."""
+    if not operator_ref or not operator_ref.strip() or len(operator_ref) > 120:
+        _refuse("operator_ref_required")
+    return _observe(
+        db, allow, write=True, audit=audit, allowlist_sha256=allowlist_sha256, operator_ref=operator_ref.strip()
+    )
 
 
 def _run(args) -> dict:
@@ -172,20 +245,31 @@ def _run(args) -> dict:
     allow = parse_allowlist(raw)
     if args.mode == "apply" and args.approved_allowlist_sha256 != sha:
         _refuse("allowlist_review_binding_required")
+    if args.mode == "apply" and not (args.operator_ref or "").strip():
+        _refuse("operator_ref_required")
     url = os.environ.pop("MIGRATION_DATABASE_URL", "")
     if not url:
         _refuse("operator_database_materials_required")
     if "DATABASE_URL" in os.environ:
         _refuse("serving_database_materials_forbidden")
     import sqlalchemy as sa
+    from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
     from sqlalchemy.orm import Session
+
+    from erp_v2.assembly import assembly
+
+    install_audit_actions(AuditActionRegistry.from_manifests(assembly.modules))
 
     engine = sa.create_engine(url, echo=False, hide_parameters=True)
     try:
         if engine.dialect.name != "postgresql":
             _refuse("postgresql_required")
         with Session(engine) as db, db.begin():
-            plan = apply_grants(db, allow) if args.mode == "apply" else plan_grants(db, allow)
+            plan = (
+                apply_grants(db, allow, allowlist_sha256=sha, operator_ref=args.operator_ref or "")
+                if args.mode == "apply"
+                else plan_grants(db, allow)
+            )
             if args.mode == "plan" or not plan.ready:
                 db.rollback()
             return {"mode": args.mode, "allowlist_sha256": sha, "access": plan.receipt()}
@@ -199,6 +283,7 @@ def main(argv=None) -> int:
     parser.add_argument("--allowlist", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--approved-allowlist-sha256")
+    parser.add_argument("--operator-ref", help="who is applying (recorded in the audit event)")
     args = parser.parse_args(argv)
     try:
         if args.mode == "apply" and os.environ.get("ERP_ACCESS_APPLY") != "1":

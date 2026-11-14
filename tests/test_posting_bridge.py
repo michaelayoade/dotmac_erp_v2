@@ -21,6 +21,7 @@ from dotmac_accounting.contracts import (
 )
 from dotmac_accounting.models import Account, FiscalPeriod
 from dotmac_kernel.cache import TenantScope
+from dotmac_kernel.exceptions import BadRequestError
 from dotmac_kernel.idempotency import IdempotencyConflict
 from sqlalchemy.exc import IntegrityError
 
@@ -44,8 +45,8 @@ def period(status=PeriodStatus.OPEN, adjustment=False):
 
 
 class FakeDB:
-    def __init__(self, accounts, periods=None, existing=None):
-        self.accounts, self.existing = list(accounts), existing
+    def __init__(self, accounts, periods=None, existing=None, other_version=None):
+        self.accounts, self.existing, self.other_version = list(accounts), existing, other_version
         self.periods = [period()] if periods is None else list(periods)
         self.savepoints = []
 
@@ -60,6 +61,8 @@ class FakeDB:
             raise
 
     def scalar(self, stmt):
+        if stmt.column_descriptions[0]["name"] == "id":
+            return self.other_version
         return self.existing
 
     def scalars(self, stmt):
@@ -84,13 +87,17 @@ class Accounting:
         self.calls.append(("create", kw))
         if self.create_error:
             raise self.create_error
-        return SimpleNamespace(id=uuid4(), number=kw["command"].number, status=self.created_status)
+        return SimpleNamespace(
+            id=uuid4(), number=kw["command"].number, status=self.created_status, request_fingerprint="c" * 64
+        )
 
     def post(self, db, **kw):
         self.calls.append(("post", kw))
         if self.post_error:
             raise self.post_error
-        return SimpleNamespace(id=kw["journal_id"], number="N", status=JournalStatus.POSTED)
+        return SimpleNamespace(
+            id=kw["journal_id"], number="N", status=JournalStatus.POSTED, request_fingerprint="c" * 64
+        )
 
     @property
     def names(self):
@@ -168,10 +175,47 @@ def test_idempotency_key_conflict_refuses(monkeypatch):
     assert exc.value.code == "accounting_refused"
 
 
-def test_existing_draft_is_posted_not_duplicated(monkeypatch):
+def test_existing_draft_under_bridge_identity_refuses(monkeypatch):
     acc = Accounting(monkeypatch)
-    run(FakeDB(two_accounts(), existing=SimpleNamespace(status=JournalStatus.DRAFT)))
-    assert acc.names == ["create", "post"]
+    with pytest.raises(PostingRefused) as exc:
+        run(FakeDB(two_accounts(), existing=SimpleNamespace(status=JournalStatus.DRAFT)))
+    assert exc.value.code == "journal_state_refused" and acc.calls == []
+
+
+def test_other_posted_version_of_same_document_refuses(monkeypatch):
+    acc = Accounting(monkeypatch)
+    with pytest.raises(PostingRefused) as exc:
+        run(FakeDB(two_accounts(), other_version=uuid4()))
+    assert exc.value.code == "version_conflict" and acc.calls == []
+
+
+def test_result_carries_evidence_fingerprint(monkeypatch):
+    Accounting(monkeypatch)
+    assert run(FakeDB(two_accounts())).evidence_fingerprint == "c" * 64
+
+
+@pytest.mark.parametrize("error", [ValueError("journal number is required"), BadRequestError("key too long")])
+def test_plain_value_and_bad_request_errors_are_mapped(monkeypatch, error):
+    Accounting(monkeypatch, create_error=error)
+    with pytest.raises(PostingRefused) as exc:
+        run(FakeDB(two_accounts()))
+    assert exc.value.code == "accounting_refused"
+
+
+def test_idempotency_key_never_exceeds_kernel_limit():
+    from dotmac_kernel.idempotency import MAX_KEY_LENGTH
+
+    assert rules.MAX_KEY_LENGTH <= MAX_KEY_LENGTH
+
+
+def test_payroll_shaped_consequence_posts_with_declared_code(monkeypatch):
+    # Shape of Starter payroll a3 (mirrors payables AccountingConsequence).
+    acc = Accounting(monkeypatch)
+    c = consequence(
+        (entry(A1, debit="100"), entry("2040", credit="100")), owner="payroll", kind="payroll_liability_settlement"
+    )
+    run(FakeDB([account(A1), account(A3, "2040")]), c)
+    assert acc.calls[0][1]["command"].source.owner == "payroll"
 
 
 @pytest.mark.parametrize("state", [JournalStatus.REVERSED, JournalStatus.VOID])

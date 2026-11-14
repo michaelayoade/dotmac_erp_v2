@@ -64,6 +64,7 @@ def test_both_sides_negative_and_scale_refuse():
 def test_unknown_owner_kind_refuses():
     assert refusal(consequence(owner="mystery")) == "unknown_consequence_kind"
     assert refusal(consequence(kind="supplier_payment")) == "unknown_consequence_kind"
+    assert refusal(consequence(owner="payroll", kind="liability_settlement")) == "unknown_consequence_kind"
 
 
 def test_account_ref_forms_one_declared_form_only():
@@ -104,11 +105,39 @@ def test_malformed_header_refuses(over):
     assert refusal(consequence(**over)) == "invalid_consequence"
 
 
+def test_s2_native_shape_is_refused_not_crashed():
+    # The pre-fix-up Starter payroll shape (source_type/lines/content_sha256) is not a consequence.
+    raw = SimpleNamespace(
+        tenant_id="t",
+        source_type="payroll.run.finalized",
+        source_ref="r",
+        effective_date=date(2026, 1, 1),
+        lines=(),
+        content_sha256=FP,
+    )
+    assert refusal(raw) == "invalid_consequence"
+
+
+def test_payroll_consequence_shape_validates_with_declared_code_form():
+    c = consequence((entry(A1, debit="100"), entry("2040", credit="100")), owner="payroll", kind="payroll_run")
+    assert rules.validate(c).code_refs == frozenset({"2040"})
+    settle = consequence(
+        (entry("2040", debit="40"), entry(A2, credit="40")), owner="payroll", kind="payroll_liability_settlement"
+    )
+    rules.validate(settle)
+
+
+def test_policies_are_read_only():
+    with pytest.raises(TypeError):
+        rules.POLICIES[("x", "y")] = rules.RefPolicy()  # type: ignore[index]
+
+
 def test_identity_is_deterministic_and_bounded():
     c = consequence()
     assert rules.idempotency_key(c.source, "post") == "erp.post:payables:supplier_invoice:doc-1:1:post"
     assert rules.journal_number(c.source) == rules.journal_number(consequence().source)
     assert len(rules.journal_number(c.source)) <= 50
+    assert rules.MAX_KEY_LENGTH == 200
     c.source.document_id = "x" * 300
     with pytest.raises(PostingRefused) as exc:
         rules.idempotency_key(c.source, "create")
