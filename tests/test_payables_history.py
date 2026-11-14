@@ -9,8 +9,12 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from erp_v2.importer.cli import _resolve_sources
+from erp_v2.importer.executor import execute_transform
 from erp_v2.importer.payables_history import HistoricalEvidenceError, HistoricalPayablesVerifier
 from erp_v2.importer.snapshot import SnapshotManifest
+from erp_v2.importer.transitions import run_transitions
+from erp_v2.importer.waves36 import ALL_WAVE_PAIRINGS, build_specs
 
 T, INVOICE, S, J, AP, EXP, PERIOD = (str(UUID(int=n)) for n in range(1, 8))
 STAMP = "2025-01-02T10:00:00+00:00"
@@ -381,6 +385,67 @@ def test_complete_evidence_preserves_null_and_inclusive_line(db):
             command=replace(command, evidence_fingerprint="cv1:" + "f" * 64),
             destination=db[2],
         )
+
+
+def test_resolved_journal_producer_references_verify_and_reject_public_namespace(db):
+    source, target, session, verifier, tables = db
+    # Use the complete accounting evidence fixture, but produce the journal
+    # header through the same resolved pairing and lifecycle as the importer.
+    # Attached SQLite schemas exercise qualified SQL without a mocked resolver.
+    source.exec_driver_sql("ATTACH DATABASE ':memory:' AS gl")
+    original = tables[True, "journal_entry"]
+    journal = original.to_metadata(sa.MetaData(), schema="gl")
+    journal.create(source)
+    journal_rows = [dict(row) for row in source.execute(sa.select(original)).mappings()]
+    source.execute(journal.insert(), journal_rows)
+    original.drop(source)
+    source.commit()
+
+    destination = tables[False, "journal_entries"]
+    target.execute(destination.delete())
+    target.exec_driver_sql("ALTER TABLE mod_accounting.journal_entries ADD COLUMN updated_at TEXT")
+    destination.append_column(sa.Column("updated_at", sa.Text))
+    # Released accounting requires these per-run provenance values. All other
+    # header facts, including UUIDs, exact money text and dates, come from SQL.
+    for name in ("source_owner", "source_version"):
+        destination.c[name].nullable = False
+    pairing = next(p for p in ALL_WAVE_PAIRINGS if p.destination == destination.fullname)
+    assert pairing.source == "public.journal_entry"
+    # Attached schemas belong to this connection, so reflect that connection.
+    resolved, columns, resolution, _schemas = _resolve_sources(source, (pairing,))
+    assert resolution["resolved"] == {pairing.source: "gl.journal_entry"}
+    assert not resolution["missing"] and not resolution["ambiguous"]
+    (spec,), generated = build_specs(resolved, columns, {destination.fullname: destination})
+    assert not generated and spec.executable
+    report = execute_transform(
+        source, target, spec, run_constants={"source_owner": "legacy-erp", "source_version": "candidate"}
+    )
+    assert report.complete and report.read == report.written == 1
+    draft = target.execute(sa.select(destination)).mappings().one()
+    assert draft["status"] == "DRAFT" and draft["approval_reference"] is None
+    (outcome,) = run_transitions(source, target, (spec,))
+    assert not outcome.exceptions and outcome.transitioned == {"POSTED": 1}
+    assert outcome.stamped_approval_refs == 1
+    produced = target.execute(sa.select(destination)).mappings().one()
+    assert produced["source_document_id"].startswith("legacy:gl.journal_entry:")
+    assert produced["approval_reference"].startswith("legacy:gl.journal_entry:")
+
+    item = evidence(db)
+    command = verifier.command(item)
+    scope = SimpleNamespace(tenant_id=UUID(T))
+    assert verifier.verify(scope=scope, command=command, destination=session) == item
+    # Mutate each actual producer output independently; a document failure must
+    # not hide a posting-stamp regression or vice versa.
+    for column, reason in (
+        ("source_document_id", "journal_source_document_id"),
+        ("approval_reference", "journal_posting_stamp"),
+    ):
+        wrong_namespace = produced[column].replace("legacy:gl.", "legacy:public.", 1)
+        target.execute(destination.update().values(**{column: wrong_namespace}))
+        with pytest.raises(HistoricalEvidenceError, match=reason):
+            verifier.verify(scope=scope, command=command, destination=session)
+        target.execute(destination.update().values(**{column: produced[column]}))
+    assert verifier.verify(scope=scope, command=command, destination=session) == item
 
 
 @pytest.mark.parametrize(
