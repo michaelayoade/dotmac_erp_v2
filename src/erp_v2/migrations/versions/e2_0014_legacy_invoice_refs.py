@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "e2_0014_legacy_invoice_references"
+revision = "e2_0014_legacy_invoice_refs"
 down_revision = "e2_0013_banking_observations"
 branch_labels = None
 depends_on = None
