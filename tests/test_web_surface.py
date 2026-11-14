@@ -57,7 +57,10 @@ def test_facet_declared_with_kernel_cookie_auth() -> None:
         ("erp_banking", "legacy", "banking_workspace"),
     }
     assert assembly.authentication_profiles[0].code == "erp_tenant_session"
-    assert {d.code for d in assembly.role_definitions} == {"admin", "staff"}
+    from erp_v2.access import NEW_ROLES
+
+    assert {d.code for d in assembly.role_definitions} == {"admin", "staff", *NEW_ROLES}
+    assert not any(d.create_if_missing for d in assembly.role_definitions if d.code in {"admin", "staff"})
 
 
 def test_web_mounts_only_with_bound_database() -> None:
