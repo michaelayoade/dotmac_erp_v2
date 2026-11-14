@@ -32,7 +32,7 @@ from sqlalchemy.pool import StaticPool
 
 from erp_v2.assembly import assembly
 from erp_v2.banking import routes as banking_routes
-from erp_v2.web import payroll_actions, revenue_routes
+from erp_v2.web import payroll_actions, revenue_approval_routes, revenue_routes
 
 DOCUMENT_ID = uuid4()
 WRITE_PATHS = (
@@ -52,6 +52,7 @@ class Browser:
     actions: tuple[Mock, ...]
     banking_read: Mock
     supplier_read: Mock
+    approve: Mock
 
     def sign_in(self, role: str | None) -> str:
         self.client.cookies.clear()
@@ -84,7 +85,8 @@ def browser(monkeypatch):
         db.flush()
         tokens = {}
         parties = {}
-        for role_name in ("admin", "staff", "unprivileged"):
+        roles: dict[str, Role] = {}
+        for role_name in ("admin", "staff", "unprivileged", "approver", "admin_approver"):
             party = Party(
                 id=uuid4(),
                 tenant_id=tenant.id,
@@ -95,11 +97,17 @@ def browser(monkeypatch):
             db.add(party)
             db.flush()
             parties[role_name] = party
-            if role_name != "unprivileged":
-                role = Role(tenant_id=tenant.id, slug=role_name, name=role_name)
-                db.add(role)
-                db.flush()
-                db.add(PartyRoleGrant(tenant_id=tenant.id, party_id=party.id, role_id=role.id))
+            slugs = {
+                "unprivileged": (),
+                "approver": ("staff", "finance_approver"),  # portal entry needs staff/admin (F4)
+                "admin_approver": ("admin", "staff"),  # admin must gain nothing (W14)
+            }.get(role_name, (role_name,))
+            for slug in slugs:
+                if slug not in roles:
+                    roles[slug] = Role(tenant_id=tenant.id, slug=slug, name=slug)
+                    db.add(roles[slug])
+                    db.flush()
+                db.add(PartyRoleGrant(tenant_id=tenant.id, party_id=party.id, role_id=roles[slug].id))
             token, expires_at = issue_access_token(party.id, tenant.id)
             db.add(
                 AuthSession(tenant_id=tenant.id, party_id=party.id, token_hash=hash_token(token), expires_at=expires_at)
@@ -123,13 +131,15 @@ def browser(monkeypatch):
         monkeypatch.setattr(revenue_routes.services, "submit_supplier_draft", actions[1])
         monkeypatch.setattr(payroll_actions, "create_draft", actions[2])
         monkeypatch.setattr(payroll_actions, "calculate_employee", actions[3])
+        approve = Mock(return_value=SimpleNamespace(invoice_id=DOCUMENT_ID, accounting_reference="j", replayed=False))
+        monkeypatch.setattr(revenue_approval_routes.services, "approve_and_post", approve)
         banking_read = Mock(return_value={"accounts": [], "statements": [], "bindings": [], "receipts": []})
         supplier_read = Mock(return_value=[])
         monkeypatch.setattr(banking_routes.queries, "workspace", banking_read)
         monkeypatch.setattr(revenue_routes.queries, "posting_accounts", supplier_read)
         client = TestClient(app, base_url="http://acme.erp.test", follow_redirects=False)
         try:
-            yield Browser(client, tenant, parties["admin"], tokens, actions, banking_read, supplier_read)
+            yield Browser(client, tenant, parties["admin"], tokens, actions, banking_read, supplier_read, approve)
         finally:
             client.close()
             app.dependency_overrides.clear()
@@ -225,3 +235,31 @@ def test_assembly_registers_browser_display_settings(key: str, default: str) -> 
     # Cookie authentication resolves display settings before route dispatch.
     # Specs must come from production assembly imports, not fixture bootstrap.
     assert get_spec(SettingDomain.display, key).default == default
+
+
+APPROVE_PATH = f"/finance/supplier-invoices/{DOCUMENT_ID}/approve"
+
+
+def test_only_finance_approver_reaches_approve_and_post(browser: Browser) -> None:
+    token = browser.sign_in("approver")
+    response = browser.client.post(APPROVE_PATH, data={"csrf_token": token})
+    assert response.status_code == 303
+    browser.approve.assert_called_once()
+    kwargs = browser.approve.call_args.kwargs
+    assert kwargs["tenant"].id == browser.tenant.id and kwargs["invoice_id"] == DOCUMENT_ID
+    assert str(kwargs["party"].id) != str(browser.party.id)
+
+
+@pytest.mark.parametrize("role,expected", [(None, 302), ("admin", 403), ("staff", 403), ("admin_approver", 403)])
+def test_approve_refused_for_admin_staff_and_anonymous(browser: Browser, role, expected) -> None:
+    token = browser.sign_in(role)
+    response = browser.client.post(APPROVE_PATH, data={"csrf_token": token})
+    assert response.status_code == expected
+    browser.approve.assert_not_called()
+
+
+def test_approve_refuses_invalid_csrf(browser: Browser) -> None:
+    browser.sign_in("approver")
+    response = browser.client.post(APPROVE_PATH, data={}, headers={"origin": "https://other.example"})
+    assert response.status_code == 403
+    browser.approve.assert_not_called()
