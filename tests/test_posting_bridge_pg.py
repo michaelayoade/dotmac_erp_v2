@@ -137,11 +137,12 @@ def seed(engine) -> SimpleNamespace:
             name="Jan",
             start_date=date(2026, 1, 1),
             end_date=date(2026, 1, 31),
-            status=PeriodStatus.OPEN,
+            status=PeriodStatus.FUTURE,
         )
         db.add(period)
         db.flush()
         accounts = {code: row.id for code, row in rows.items()}
+        accounting.open_period(db, scope=scope, period_id=period.id, actor_ref="test", occurred_at=NOW)
         db.commit()
         return SimpleNamespace(tenant_id=tenant_id, scope=scope, accounts=accounts, period_id=period.id)
 
