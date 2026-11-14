@@ -41,6 +41,7 @@ ALLOWED_TYPES = {
 }
 PREVIEW_ROWS = 50
 _DECIMAL = re.compile(r"^-?[0-9]{1,14}(\.[0-9]{1,6})?$")
+_GROUPED = re.compile(r"^-?[0-9]{1,3}(,[0-9]{3})+(\.[0-9]{1,6})?$")
 
 router = APIRouter(tags=["banking-statements-web"])
 
@@ -77,7 +78,7 @@ def _optional_decimal(value: object, label: str) -> Decimal | None:
     text = value.strip() if isinstance(value, str) else ""
     if not text:
         return None
-    if not _DECIMAL.match(text.replace(",", "")):
+    if not (_DECIMAL.match(text) or _GROUPED.match(text)):
         raise service.StatementImportRefused([f"{label} is not a valid amount"])
     return Decimal(text.replace(",", ""))
 

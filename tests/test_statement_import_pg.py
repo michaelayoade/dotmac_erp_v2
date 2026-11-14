@@ -217,3 +217,12 @@ def test_concurrent_identical_and_overlapping_imports_land_exactly_once(engine):
             sa.select(BankStatementLine.external_ref).where(BankStatementLine.tenant_id == env.tenant_id)
         ).all()
         assert len(refs) == len(set(refs)) == 2
+
+
+def test_period_overlap_with_an_existing_statement_is_refused_even_with_different_references(engine):
+    env = seed(engine)
+    run(engine, env, FILE_A)  # covers 2026-01-15..2026-01-16
+    other = b"date,type,amount,description,reference\n2026-01-15,credit,999.00,Other export,ZZ-9\n"
+    with pytest.raises(si.StatementImportRefused, match="overlaps existing statement"):
+        run(engine, env, other)
+    assert n(engine, BankStatement, env.tenant_id) == 1

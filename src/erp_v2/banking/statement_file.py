@@ -28,13 +28,14 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Final
 from xml.etree import ElementTree as ET
+from xml.parsers import expat
 
 MAX_FILE_BYTES: Final = 2 * 1024 * 1024
 MAX_ROWS: Final = 5000
 MAX_COLUMNS: Final = 100
 MAX_ERRORS: Final = 50
 MAX_XLSX_MEMBERS: Final = 200
-MAX_XLSX_UNCOMPRESSED: Final = 20 * 1024 * 1024
+MAX_XLSX_UNCOMPRESSED: Final = 8 * 1024 * 1024
 MAX_AMOUNT: Final = Decimal("100000000000000")  # banking stores Numeric(20, 6)
 
 DATE_FORMATS: Final = {
@@ -114,6 +115,7 @@ def sha256_hex(data: bytes) -> str:
 # ---------------------------------------------------------------- field parsing
 
 _AMOUNT = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+_GROUPED_AMOUNT = re.compile(r"^[0-9]{1,3}(,[0-9]{3})+(\.[0-9]+)?$")
 
 
 def _text(value: object | None) -> str:
@@ -132,9 +134,12 @@ def parse_amount(value: object | None, field: str, row: int) -> Decimal | None:
     if isinstance(value, Decimal):
         amount = value
     else:
-        text = _text(value).replace(",", "").replace(" ", "")
+        text = _text(value).replace(" ", "")
         if not text:
             return None
+        # Commas are thousands separators only (valid grouping); "1500,50" is ambiguous.
+        if _GROUPED_AMOUNT.match(text):
+            text = text.replace(",", "")
         if not _AMOUNT.match(text):
             raise ValueError(f"Row {row}: {field} is not a plain positive decimal number")
         amount = Decimal(text)
@@ -145,7 +150,9 @@ def parse_amount(value: object | None, field: str, row: int) -> Decimal | None:
     return amount
 
 
-def parse_date(value: object | None, field: str, row: int, date_format: str) -> date:
+def parse_date(
+    value: object | None, field: str, row: int, date_format: str, seen: list[tuple[int, int]] | None = None
+) -> date:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -164,9 +171,13 @@ def parse_date(value: object | None, field: str, row: int, date_format: str) -> 
             raise ValueError(f"Row {row}: invalid {field}") from None
     for pattern in DATE_FORMATS[date_format]:
         try:
-            return datetime.strptime(text, pattern).date()
+            parsed = datetime.strptime(text, pattern).date()
         except ValueError:
             continue
+        if seen is not None:
+            first, second = re.findall(r"\d+", text)[:2]
+            seen.append((int(first), int(second)))
+        return parsed
     raise ValueError(f"Row {row}: {field} '{text[:30]}' is not a recognised date (format {date_format})")
 
 
@@ -221,12 +232,17 @@ def _member(archive: zipfile.ZipFile, name: str, *, required: bool = True) -> by
 
 
 def _xml(raw: bytes) -> ET.Element:
-    head = raw.lower()
-    if b"<!doctype" in head or b"<!entity" in head:
+    def refuse(*_args: object) -> None:
         raise StatementFileError("XLSX contains a DTD or entity declaration")
+
+    # Encoding-independent scan: expat reports declarations whatever the member's encoding.
+    scanner = expat.ParserCreate()
+    scanner.StartDoctypeDeclHandler = refuse
+    scanner.EntityDeclHandler = refuse
     try:
-        return ET.fromstring(raw)  # noqa: S314 - DTD/entities refused above; expat never fetches
-    except ET.ParseError:
+        scanner.Parse(raw, True)
+        return ET.fromstring(raw)  # noqa: S314 - DTD/entities refused by the scan above
+    except (expat.ExpatError, ET.ParseError):
         raise StatementFileError("XLSX contains malformed XML") from None
 
 
@@ -439,6 +455,7 @@ def parse_statement(data: bytes, file_format: str, *, date_format: str = "iso") 
     source_rows = 0
     occurrences: Counter[tuple] = Counter()
     seen_identity: set[tuple] = set()
+    seen_pairs: list[tuple[int, int]] = []
     for offset, cells in enumerate(body):
         row_no = header_index + offset + 2
         values = {mapping[i]: (cells[i] if i < len(cells) else None) for i in mapping}
@@ -448,7 +465,7 @@ def parse_statement(data: bytes, file_format: str, *, date_format: str = "iso") 
         if source_rows > MAX_ROWS:
             raise StatementFileError(f"Statement has more than {MAX_ROWS} rows")
         try:
-            line = _row_to_line(values, row_no, layout, date_format)
+            line = _row_to_line(values, row_no, layout, date_format, seen_pairs)
         except ValueError as exc:
             if len(errors) < MAX_ERRORS:
                 errors.append(str(exc))
@@ -469,6 +486,11 @@ def parse_statement(data: bytes, file_format: str, *, date_format: str = "iso") 
             continue
         seen_identity.add(identity)
         lines.append(ParsedLine(row_no, len(lines) + 1, tdate, direction, amount, ext, desc, ref, cp, vdate, code))
+    if seen_pairs and all(a <= 12 and b <= 12 for a, b in seen_pairs):
+        errors.append(
+            f"Every {date_format} date has day and month both 12 or less, so day/month order cannot be "
+            "verified; use ISO dates (YYYY-MM-DD) or a file with an unambiguous date"
+        )
     if not lines and not errors:
         errors.append("The statement contains no transaction rows")
     return ParsedStatement(
@@ -482,10 +504,10 @@ def parse_statement(data: bytes, file_format: str, *, date_format: str = "iso") 
     )
 
 
-def _row_to_line(values: dict[str, object], row: int, layout: str, date_format: str):
-    tdate = parse_date(values.get("transaction_date"), "transaction_date", row, date_format)
+def _row_to_line(values: dict[str, object], row: int, layout: str, date_format: str, seen: list):
+    tdate = parse_date(values.get("transaction_date"), "transaction_date", row, date_format, seen)
     vdate = values.get("value_date")
-    value_date = parse_date(vdate, "value_date", row, date_format) if _text(vdate) else None
+    value_date = parse_date(vdate, "value_date", row, date_format, seen) if _text(vdate) else None
     running = parse_amount(values.get("running_balance"), "running_balance", row)
     if layout == "debit_credit":
         debit = parse_amount(values.get("debit"), "debit", row)

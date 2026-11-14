@@ -222,3 +222,39 @@ def test_xlsx_zip_bomb_is_refused():
     big = "A" * (21 * 1024 * 1024)
     with pytest.raises(StatementFileError, match=r"expands|too large"):
         parse_statement(make_xlsx([["Date", "Debit"]], extra_members={"xl/junk.bin": big}), "xlsx")
+
+
+@pytest.mark.parametrize(
+    "amount,expected", [("1,500.50", "1500.50"), ("1500.50", "1500.50"), ("12,345,678", "12345678")]
+)
+def test_commas_are_thousands_separators_only(amount, expected):
+    parsed = parse_statement(f'date,debit,credit\n2026-01-01,,"{amount}"\n'.encode(), "csv")
+    assert not parsed.errors and parsed.lines[0].amount == Decimal(expected)
+
+
+@pytest.mark.parametrize("amount", ["1500,50", "1,50", "1,5000", "15,00,000", ",500", "1,500,5"])
+def test_decimal_comma_and_bad_grouping_are_refused(amount):
+    parsed = parse_statement(f'date,debit,credit\n2026-01-01,,"{amount}"\n'.encode(), "csv")
+    assert parsed.errors and not parsed.lines
+
+
+@pytest.mark.parametrize("fmt", ["dmy", "mdy"])
+def test_day_month_ambiguous_file_is_refused_unless_a_row_disambiguates(fmt):
+    ambiguous = "date,debit,credit\n03/04/2026,1.00,\n05/06/2026,,2.00\n"
+    parsed = parse_statement(ambiguous.encode(), "csv", date_format=fmt)
+    assert any("cannot be verified" in e for e in parsed.errors)
+    resolved = ambiguous + ("25/06/2026,1.00,\n" if fmt == "dmy" else "06/25/2026,1.00,\n")
+    assert not parse_statement(resolved.encode(), "csv", date_format=fmt).errors
+
+
+def test_iso_dates_are_never_ambiguous():
+    assert not parse_statement(b"date,debit,credit\n2026-03-04,1.00,\n", "csv", date_format="dmy").errors
+
+
+def test_utf16_doctype_in_xlsx_member_is_refused():
+    sheet = (
+        '<!DOCTYPE x [<!ENTITY a "b">]><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>'
+    )
+    data = make_xlsx([["Date", "Debit"]], extra_members={"xl/worksheets/sheet1.xml": sheet.encode("utf-16")})
+    with pytest.raises(StatementFileError, match="DTD"):
+        parse_statement(data, "xlsx")

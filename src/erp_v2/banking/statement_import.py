@@ -30,6 +30,7 @@ from dotmac_banking.service import BankingConflict, BankingNotFound, MatchRuleVi
 from dotmac_kernel.money import Currency, Money
 from dotmac_kernel.transactions import conflict_savepoint
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from erp_v2.banking.statement_file import ParsedStatement, StatementFileError, parse_statement
@@ -184,9 +185,28 @@ def build_plan(
                 BankStatement.statement_ref == ref,
             )
         )
+        overlap = (
+            db.scalar(
+                select(BankStatement.statement_ref)
+                .where(
+                    BankStatement.tenant_id == tenant_id,
+                    BankStatement.account_id == account.id,
+                    BankStatement.period_start <= period_end,
+                    BankStatement.period_end >= period_start,
+                )
+                .limit(1)
+            )
+            if period_start and period_end
+            else None
+        )
         duplicates = _duplicates(db, tenant_id, account.id, lines, period_start, period_end)
     if same_file is not None:
         blockers.append("This exact file has already been imported")
+    if overlap is not None:
+        blockers.append(
+            f"The statement period overlaps existing statement '{overlap}' on this account "
+            "(including statements imported from the legacy system)"
+        )
     if same_ref is not None:
         blockers.append("A statement with this reference already exists for the account")
     if duplicates:
@@ -313,6 +333,8 @@ def import_statement(
                 sha256=plan.parsed.sha256,
                 line_count=len(plan.parsed.lines),
             )
+    except IntegrityError:
+        raise StatementImportRefused(["A concurrent import of this statement won; nothing was imported"]) from None
     except (BankingConflict, BankingNotFound, MatchRuleViolation) as exc:
         raise StatementImportRefused([f"Banking owner refused the statement: {exc}"]) from None
     return ImportResult(

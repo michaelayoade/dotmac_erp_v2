@@ -264,6 +264,7 @@ def test_bad_account_id_and_amount_inputs_are_refused(browser: Browser):
     token = browser.sign_in("reconciler")
     assert browser.post(PREVIEW, token=token, extra={"account_id": "nope"}).status_code == 400
     assert browser.post(PREVIEW, token=token, extra={"opening_balance": "1e9"}).status_code == 400
+    assert browser.post(PREVIEW, token=token, extra={"opening_balance": "1500,50"}).status_code == 400
     browser.preview.assert_not_called()
 
 

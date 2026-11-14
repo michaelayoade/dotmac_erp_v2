@@ -222,3 +222,58 @@ def test_audit_failure_rolls_back_the_statement(env):
     with pytest.raises(RuntimeError):
         run(db, tenant, a1, FILE_A, audit=Mock(side_effect=RuntimeError("audit down")))
     assert count(db, BankStatement) == 0 and count(db, BankStatementLine) == 0
+
+
+def _legacy_statement(db, tenant, account, start, end):
+    """Shaped like the importer's statements: lines carry a provenance source_key, no bank reference."""
+    statement = BankStatement(
+        id=uuid4(),
+        tenant_id=tenant.id,
+        account_id=account.id,
+        statement_ref="legacy-2026-01",
+        period_start=start,
+        period_end=end,
+        total_credits=Decimal(0),
+        total_debits=Decimal(0),
+        currency_code="NGN",
+        minor_units=2,
+        status="imported",
+        total_lines=1,
+        matched_lines=0,
+        source_ref="legacy:erp:1",
+        source_version="1",
+        evidence_ref="legacy",
+        imported_by_id=uuid4(),
+        imported_at=NOW,
+    )
+    db.add(statement)
+    db.flush()
+    db.add(
+        BankStatementLine(
+            tenant_id=tenant.id,
+            statement_id=statement.id,
+            line_number=1,
+            transaction_date=start,
+            direction="credit",
+            amount=Decimal("1.00"),
+            external_ref="legacy:source_key:abc",
+            description="legacy",
+            is_matched=False,
+        )
+    )
+    db.commit()
+
+
+def test_upload_overlapping_a_legacy_imported_period_is_refused(env):
+    db, tenant, a1, a2, *_ = env
+    _legacy_statement(db, tenant, a1, date(2026, 1, 1), date(2026, 1, 31))
+    assert "overlaps existing statement 'legacy-2026-01'" in refusal(db, tenant, a1, FILE_A)
+    assert count(db, BankStatement) == 1
+    run(db, tenant, a2, FILE_A)  # other account unaffected
+
+
+def test_adjacent_period_after_legacy_statement_imports(env):
+    db, tenant, a1, *_ = env
+    _legacy_statement(db, tenant, a1, date(2025, 12, 1), date(2026, 1, 14))
+    run(db, tenant, a1, FILE_A)
+    assert count(db, BankStatement) == 2
