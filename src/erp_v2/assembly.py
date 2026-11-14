@@ -61,7 +61,6 @@ from dotmac_inbox.manifest import module as inbox_module
 from dotmac_inventory.manifest import module as inventory_module
 from dotmac_kernel.api_documentation import environment_api_documentation_policy
 from dotmac_kernel.assembly import ProductAssemblySpec, ProductSecurityPolicy
-from dotmac_kernel.permission_provisioning import RoleDefinition, RoleGrant, RoleGrantProfile
 from dotmac_kernel.web_deps import TENANT_COOKIE_AUTHENTICATION
 from dotmac_kernel.web_surfaces import (
     AuthenticationProfileBinding,
@@ -90,14 +89,11 @@ from erp_v2 import (
     settings_specs,  # noqa: F401 - registers browser setting declarations
     ui,
 )
-from erp_v2.academy_sync.routes import academy_sync_feature
-from erp_v2.banking.routes import banking_web_feature
+from erp_v2.access import ROLE_DEFINITIONS, ROLE_GRANT_PROFILES
 from erp_v2.database import build_database_runtime, database_startup_checks
+from erp_v2.features import ERP_FEATURES
 from erp_v2.migration_bindings import ASSEMBLY_MODULE_PLANES
-from erp_v2.readiness import readiness_feature
-from erp_v2.web.payroll_routes import PAYROLL_MANAGE_PERMISSION, payroll_web_feature
-from erp_v2.web.revenue_routes import WRITE_PERMISSION, revenue_web_feature
-from erp_v2.web.routes import ACCESS_PERMISSION, erp_web_feature
+from erp_v2.web.routes import ACCESS_PERMISSION
 
 PRODUCT_NAME: Final = "dotmac-erp"
 
@@ -117,12 +113,7 @@ assembly: Final = ProductAssemblySpec(
     # Order canonical: readiness feature first, then product modules
     # alphabetically by module code (legacy product_assembly convention).
     modules=(
-        readiness_feature,
-        academy_sync_feature,
-        erp_web_feature,
-        revenue_web_feature,
-        payroll_web_feature,
-        banking_web_feature,
+        *ERP_FEATURES,
         accounting_module,
         commercial_agreements_module,
         ai_operations_module,
@@ -206,19 +197,8 @@ assembly: Final = ProductAssemblySpec(
             security_plane=BrowserSecurityPlane.TENANT,
         ),
     ),
-    role_definitions=(RoleDefinition("admin"), RoleDefinition("staff")),
-    role_grant_profiles=(
-        RoleGrantProfile(
-            code="erp.web",
-            version=2,
-            grants=(
-                RoleGrant("admin", ACCESS_PERMISSION),
-                RoleGrant("admin", WRITE_PERMISSION),
-                RoleGrant("admin", PAYROLL_MANAGE_PERMISSION),
-                RoleGrant("staff", ACCESS_PERMISSION),
-            ),
-        ),
-    ),
+    role_definitions=ROLE_DEFINITIONS,
+    role_grant_profiles=ROLE_GRANT_PROFILES,
     assembly_template_dir=_ROOT / "templates",
     assembly_static_dir=_ROOT / "static",
     packaged_static_dirs=(static_dir(),),
