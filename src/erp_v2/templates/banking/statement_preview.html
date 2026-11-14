@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Preview bank statement — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Preview bank statement</h1>
+<p><a href="/finance/banking/statements/import">Back to upload</a></p>
+<table><tbody>
+<tr><th>Account</th><td>{{ plan.account_code }} ({{ plan.currency_code }})</td></tr>
+<tr><th>Statement reference</th><td>{{ plan.statement_ref }}</td></tr>
+<tr><th>File format / layout</th><td>{{ plan.parsed.file_format }} / {{ plan.parsed.layout }}</td></tr>
+<tr><th>File SHA-256</th><td><code>{{ plan.parsed.sha256 }}</code></td></tr>
+<tr><th>Period</th><td>{{ plan.period_start }} to {{ plan.period_end }}</td></tr>
+<tr><th>Lines</th><td>{{ plan.parsed.lines|length }} (balance-only rows skipped: {{ plan.parsed.skipped_balance_rows }})</td></tr>
+<tr><th>Total credits</th><td>{{ plan.total_credits }}</td></tr>
+<tr><th>Total debits</th><td>{{ plan.total_debits }}</td></tr>
+</tbody></table>
+{% if plan.blockers %}
+<div role="alert"><p>This statement cannot be imported:</p><ul>{% for b in plan.blockers %}<li>{{ b }}</li>{% endfor %}</ul></div>
+{% if duplicate_sample %}
+<h2>Lines already on this account</h2>
+<table><thead><tr><th>Row</th><th>Date</th><th>Direction</th><th>Amount</th><th>Existing statement</th></tr></thead><tbody>
+{% for d in duplicate_sample %}<tr><td>{{ d.source_row }}</td><td>{{ d.transaction_date }}</td><td>{{ d.direction }}</td><td>{{ d.amount }}</td><td>{{ d.existing_statement_ref }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+{% else %}
+<form method="post" action="/finance/banking/statements/import" enctype="multipart/form-data">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="expected_sha256" value="{{ plan.parsed.sha256 }}">
+  {% for name in ['account_id', 'date_format', 'statement_ref', 'opening_balance', 'closing_balance'] %}
+  <input type="hidden" name="{{ name }}" value="{{ values.get(name, '') }}">
+  {% endfor %}
+  <p><label>Select the same file again to confirm <input type="file" name="file" accept=".csv,.xlsx" required></label></p>
+  <p>Importing is permanent for this file: the same file or overlapping lines cannot be imported again.</p>
+  <button type="submit">Import statement</button>
+</form>
+{% endif %}
+<h2>First {{ sample|length }} lines</h2>
+<table><thead><tr><th>Row</th><th>Date</th><th>Direction</th><th>Amount</th><th>Reference</th><th>Description</th></tr></thead><tbody>
+{% for l in sample %}<tr><td>{{ l.source_row }}</td><td>{{ l.transaction_date }}</td><td>{{ l.direction }}</td><td>{{ l.amount }}</td><td>{{ l.external_ref }}</td><td>{{ l.description }}</td></tr>
+{% else %}<tr><td colspan="6">No lines.</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}
