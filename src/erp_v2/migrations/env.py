@@ -74,6 +74,7 @@ from erp_v2.migration_bindings import (
     ASSEMBLY_MODULE_PLANES,
     ASSEMBLY_PREREQUISITE_BINDINGS,
 )
+from erp_v2.payees import models as payee_models  # noqa: F401
 
 config = context.config
 

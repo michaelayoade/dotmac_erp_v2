@@ -55,6 +55,12 @@ def test_facet_declared_with_kernel_cookie_auth() -> None:
         ("erp_revenue", "legacy", "supplier_invoice_detail"),
         ("erp_revenue", "legacy", "supplier_invoice_submit"),
         ("erp_banking", "legacy", "banking_workspace"),
+        ("erp_payee_bank", "legacy", "payee_bank_list"),
+        ("erp_payee_bank", "legacy", "payee_bank_propose"),
+        ("erp_payee_bank", "legacy", "payee_bank_reveal"),
+        ("erp_payee_bank", "legacy", "payee_bank_approve"),
+        ("erp_payee_bank", "legacy", "payee_bank_reject"),
+        ("erp_payee_bank", "legacy", "payee_bank_revoke"),
     }
     assert assembly.authentication_profiles[0].code == "erp_tenant_session"
     from erp_v2.access import NEW_ROLES

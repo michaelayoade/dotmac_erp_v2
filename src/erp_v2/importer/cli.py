@@ -683,7 +683,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # Non-map-feeding mints run after the specs so every parent
             # row they reference is imported (same caller transaction;
             # dry-run rollback below covers them).
-            post_mints = tuple(enrolment.mint(step) for step in ("pay_rule_bases", "tax_rules"))
+            post_steps = ("pay_rule_bases", "tax_rules", "payee_bank_instructions")
+            post_mints = tuple(enrolment.mint(step) for step in post_steps)
         # Lifecycle staging: fiscal periods / journals / payables
         # documents were inserted at their module-mandated initial
         # status; walk them to legacy final states now that every

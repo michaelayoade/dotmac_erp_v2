@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Payee bank details — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Payee bank details</h1>
+<p><a href="/finance">Finance</a></p>
+<p>A change to a payee's bank details is a proposal. A different person must approve it before it can be used for payment. Account numbers are masked.</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<h2>Propose bank details</h2>
+<form method="post" action="/finance/payee-bank-details" autocomplete="off">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><label>Payee type <select name="payee_kind" required><option value="supplier">Supplier</option><option value="employee">Employee</option></select></label></p>
+  {% for name, label, maxlength in [
+    ('payee_ref', 'Payee reference (supplier reference or employee id)', 255), ('payee_label', 'Payee name', 200),
+    ('bank_code', 'Bank code', 6), ('bank_name', 'Bank name', 120), ('account_number', 'Account number (10 digits)', 10),
+    ('account_name', 'Account name', 200), ('evidence_ref', 'Evidence reference (signed letter, form, call-back record)', 240)
+  ] %}
+  <p><label>{{ label }} <input name="{{ name }}" maxlength="{{ maxlength }}" required autocomplete="off"></label></p>
+  {% endfor %}
+  <p><button type="submit">Propose</button></p>
+</form>
+<h2>Instructions</h2>
+<table>
+  <thead><tr><th>Payee</th><th>Type</th><th>Bank</th><th>Account</th><th>Account name</th><th>Status</th><th>Origin</th><th>Evidence</th><th>Shared account</th><th>Actions</th></tr></thead>
+  <tbody>{% for i in instructions %}
+    <tr><td>{{ i.payee_label }}</td><td>{{ i.payee_kind }}</td><td>{{ i.bank_name }} {{ i.bank_code }}</td><td>{{ i.account_masked }}</td><td>{{ i.account_name }}</td><td>{{ i.status }}</td><td>{{ i.origin }}</td><td>{{ i.evidence_ref }}</td>
+      <td>{% if i.shared_account_payees %}Also used by {{ i.shared_account_payees }} other payee(s){% endif %}</td>
+      <td>
+      {% if i.status == 'proposed' %}
+        <form method="post" action="/finance/payee-bank-details/{{ i.id }}/approve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Approve</button></form>
+        <form method="post" action="/finance/payee-bank-details/{{ i.id }}/reject"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Reject</button></form>
+      {% elif i.status == 'approved' %}
+        <form method="post" action="/finance/payee-bank-details/{{ i.id }}/revoke"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Revoke</button></form>
+      {% endif %}
+      {% if i.status in ('proposed', 'approved') %}
+        <form method="post" action="/finance/payee-bank-details/{{ i.id }}/reveal"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="200" placeholder="Reason to view" required><button type="submit">Show full number</button></form>
+      {% endif %}
+      </td></tr>
+  {% else %}<tr><td colspan="10">No payee bank instructions.</td></tr>{% endfor %}</tbody>
+</table>
+{% endblock %}

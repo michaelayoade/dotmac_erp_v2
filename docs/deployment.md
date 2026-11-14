@@ -298,7 +298,8 @@ this does not authorize adjusting balances or switching traffic.
 - Financial writes require admin-only dedicated permissions, not the broad
   staff portal permission. Reprovision the versioned role-grant profile on
   an isolated test destination and verify denial/CSRF before host adoption.
-- New lineage head is `e2_0013_banking_observations`; the old staging receipt
+- New lineage head is `e2_0014_payee_bank_instructions` (B8; previously
+  `e2_0013_banking_observations`, see `docs/payee-bank-instructions.md`); the old staging receipt
   at `e2_0012_academy_sync` is not proof of this schema. Fresh exact-wheel
   CI, image build and test-server genesis/runtime proof remain mandatory.
 

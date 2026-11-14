@@ -18,8 +18,8 @@ def grants(role):
     return {g.permission_code for g in profile().grants if g.role_code == role}
 
 
-def test_profile_is_erp_web_v3():
-    assert (profile().code, profile().version) == ("erp.web", 3)
+def test_profile_is_erp_web_v4():
+    assert (profile().code, profile().version) == ("erp.web", 4)
 
 
 def test_admin_and_staff_get_nothing_new():
@@ -29,7 +29,7 @@ def test_admin_and_staff_get_nothing_new():
 
 def test_no_new_permission_defaults_to_admin_or_staff():
     for spec in access.PERMISSION_SPECS:
-        assert len(spec.default_roles) == 1
+        assert len(spec.default_roles) >= 1
         assert not {"admin", "staff"} & set(spec.default_roles), spec.code
 
 
@@ -87,3 +87,46 @@ def test_feature_registry_order_is_canonical():
 
     assert ERP_FEATURES[0].name == "erp_shell.readiness"
     assert [m.name for m in assembly.modules[: len(ERP_FEATURES)]] == [m.name for m in ERP_FEATURES]
+
+
+PAYEE_PERMISSIONS = set(access.PAYEE_BANK_CODES)
+
+
+def holders_of(code):
+    return {g.role_code for g in profile().grants if g.permission_code == code}
+
+
+def test_payee_bank_permissions_declared_once_and_admin_staff_gain_nothing():
+    assert PAYEE_PERMISSIONS <= access.NEW_PERMISSION_CODES
+    declared = [s.code for m in assembly.modules for s in getattr(m, "permissions", ())]
+    for code in PAYEE_PERMISSIONS:
+        assert declared.count(code) == 1
+        assert not {"admin", "staff"} & holders_of(code), code
+    assert grants("admin") == BEFORE_ADMIN and grants("staff") == {ACCESS_PERMISSION}
+
+
+def test_treasury_holds_no_payee_bank_power_beyond_masked_read():
+    assert grants("treasury") & PAYEE_PERMISSIONS == {access.PAYEE_BANK_READ}
+    for code in PAYEE_PERMISSIONS - {access.PAYEE_BANK_READ}:
+        assert "treasury" not in holders_of(code), code
+
+
+def test_payee_bank_propose_and_approve_are_different_roles_that_cannot_be_combined():
+    proposers, approvers = holders_of(access.PAYEE_BANK_PROPOSE), holders_of(access.PAYEE_BANK_APPROVE)
+    assert proposers == {"finance_preparer"} and approvers == {"finance_approver"}
+    assert not proposers & approvers
+    # one person may not hold propose+approve, nor treasury+approve (role SoD pairs)
+    assert frozenset({"finance_preparer", "finance_approver"}) in access.SOD_CONFLICT_PAIRS
+    assert frozenset({"finance_approver", "treasury"}) in access.SOD_CONFLICT_PAIRS
+
+
+def test_every_role_holding_approve_conflicts_with_treasury_and_with_propose_roles():
+    for approver in holders_of(access.PAYEE_BANK_APPROVE):
+        for other in (*holders_of(access.PAYEE_BANK_PROPOSE), "treasury"):
+            assert frozenset({approver, other}) in access.SOD_CONFLICT_PAIRS, (approver, other)
+
+
+def test_only_approver_sees_unmasked_numbers_and_revokes():
+    assert holders_of(access.PAYEE_BANK_READ_UNMASKED) == {"finance_approver"}
+    assert holders_of(access.PAYEE_BANK_REVOKE) == {"finance_approver"}
+    assert holders_of(access.PAYEE_BANK_READ) == {"finance_preparer", "finance_approver", "treasury"}

@@ -25,6 +25,7 @@ rest run as an explicit phase via `mint_all`.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -762,6 +763,155 @@ def mint_bank_institutions_from_accounts(source: sa.Connection, dest: sa.Connect
     return result
 
 
+# --- payees: legacy bank details land as PROPOSED, never approved (B8, W10) -------------------
+
+
+def _canon_ref(value: Any) -> str:
+    """Canonical dashed lowercase UUID spelling when the value is a UUID, else the text."""
+
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return str(value)
+
+
+def _supplier_bank_details(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
+    """Import retained legacy payee bank details as imported-pending-approval instructions.
+
+    Sources: ``employee.bank_name/bank_account_number/bank_account_name`` and
+    ``supplier.bank_details`` (JSON). Every row lands as status ``proposed``, origin
+    ``legacy_import``, with no proposer: a finance_approver (a person, never treasury) must
+    approve each one individually; nothing is approved by import and there is no bulk path.
+
+    - Employees whose destination row was not imported are not minted (blocker by id).
+    - Legacy employee rows carry a branch code, not a bank code, so ``bank_code`` stays NULL;
+      such rows cannot be approved as imported (approval refuses ``incomplete_instruction``) and
+      need a corrected human proposal. Supplier rows keep their legacy ``bank_code``.
+    - Rows with no full account number (empty, or supplier last-4 only) mint nothing.
+    - Blockers and receipts name legacy ids only, never account numbers or names.
+    - A payee that already has a proposed or approved instruction is counted ``existing``.
+    """
+
+    result = MintResult("payee_bank_instructions")
+    tenant = _canon_ref(ctx.tenant_id)
+    stamp = _now(ctx)
+    imported_employees = {
+        _canon_ref(r[0])
+        for r in dest.execute(sa.text("SELECT id FROM mod_people.employees WHERE tenant_id = :t"), {"t": ctx.tenant_id})
+    }
+    live = {
+        (str(kind), str(ref))
+        for kind, ref in dest.execute(
+            sa.text(
+                "SELECT payee_kind, payee_ref FROM payee_bank_instructions "
+                "WHERE tenant_id = :t AND status IN ('proposed', 'approved')"
+            ),
+            {"t": ctx.tenant_id},
+        )
+    }
+    candidates: list[dict[str, Any]] = []
+    not_imported = 0
+
+    def _add(kind: str, ref: str, label: str, fields: dict[str, Any], evidence: str) -> None:
+        number = str(fields.get("account_number") or "").strip()
+        if not number:
+            return
+        values = {
+            "bank_code": (str(fields.get("bank_code") or "").strip() or None),
+            "bank_name": (str(fields.get("bank_name") or "").strip() or None),
+            "account_name": (str(fields.get("account_name") or "").strip() or None),
+        }
+        too_long = (
+            len(number) > 34
+            or len(ref) > 255
+            or len(label) > 200
+            or len(values["bank_code"] or "") > 10
+            or len(values["bank_name"] or "") > 120
+            or len(values["account_name"] or "") > 200
+        )
+        if too_long:
+            result.blockers.append(f"payee_bank_instructions: {kind} {ref} has an over-long legacy bank field")
+            return
+        if (kind, ref) in live:
+            result.existing += 1
+            return
+        candidates.append(
+            {
+                "id": _mint_id("payee_bank_instructions", ctx.tenant_id, f"{kind}:{ref}"),
+                "tenant_id": ctx.tenant_id,
+                "payee_kind": kind,
+                "payee_ref": ref,
+                "payee_label": label or ref,
+                **values,
+                "account_number": number,
+                "account_last4": number[-4:],
+                "status": "proposed",
+                "origin": "legacy_import",
+                "evidence_ref": evidence,
+                "proposed_by_party_id": None,
+                "proposed_at": stamp,
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+        )
+
+    for row in source.execute(
+        sa.text(
+            "SELECT employee_id, organization_id, employee_code, bank_name, bank_account_number, "
+            "bank_account_name FROM employee"
+        )
+    ).mappings():
+        if _canon_ref(row["organization_id"]) != tenant:
+            continue
+        ref = _canon_ref(row["employee_id"])
+        if not str(row["bank_account_number"] or "").strip():
+            continue
+        if ref not in imported_employees:
+            not_imported += 1
+            continue
+        _add(
+            "employee",
+            ref,
+            str(row["employee_code"] or ""),
+            {
+                "bank_name": row["bank_name"],
+                "account_number": row["bank_account_number"],
+                "account_name": row["bank_account_name"],
+            },
+            "legacy-import:employee.bank_account",
+        )
+    for row in source.execute(
+        sa.text("SELECT supplier_id, organization_id, legal_name, trading_name, bank_details FROM supplier")
+    ).mappings():
+        if _canon_ref(row["organization_id"]) != tenant:
+            continue
+        details = _supplier_bank_details(row["bank_details"])
+        if not details:
+            continue
+        label = str(row["legal_name"] or "").strip() or str(row["trading_name"] or "").strip()
+        _add(
+            "supplier",
+            _canon_ref(row["supplier_id"]),
+            label,
+            details,
+            "legacy-import:supplier.bank_details",
+        )
+    if not_imported:
+        result.blockers.append(f"payee_bank_instructions: {not_imported} employees with bank details not yet imported")
+    _insert(dest, "payee_bank_instructions", candidates)
+    result.created = len(candidates)
+    return result
+
+
 MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("kernel_tenants", mint_kernel_tenants),
     ("pay_structure_revisions", mint_pay_structure_revisions),
@@ -772,6 +922,7 @@ MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("sales_leads", mint_sales_leads),
     ("document_libraries_types", mint_document_libraries_types),
     ("bank_institutions_from_accounts", mint_bank_institutions_from_accounts),
+    ("payee_bank_instructions", mint_payee_bank_instructions),
 )
 
 # Enrolment map name -> mint step that must run before the map builds.
