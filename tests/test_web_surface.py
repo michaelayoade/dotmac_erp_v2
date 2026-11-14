@@ -54,6 +54,7 @@ def test_facet_declared_with_kernel_cookie_auth() -> None:
         ("erp_revenue", "legacy", "supplier_invoice_create"),
         ("erp_revenue", "legacy", "supplier_invoice_detail"),
         ("erp_revenue", "legacy", "supplier_invoice_submit"),
+        ("erp_revenue_approval", "legacy", "supplier_invoice_approve"),
         ("erp_banking", "legacy", "banking_workspace"),
         ("erp_payee_bank", "legacy", "payee_bank_list"),
         ("erp_payee_bank", "legacy", "payee_bank_propose"),

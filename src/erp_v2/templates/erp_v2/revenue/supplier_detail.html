@@ -20,6 +20,12 @@
   <button type="submit">Submit for review (admin)</button>
 </form>
 {% endif %}
+{% if invoice.status == 'SUBMITTED' %}
+<form method="post" action="/finance/supplier-invoices/{{ invoice.id }}/approve">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Approve and post to payables control (finance approver; not the submitter)</button>
+</form>
+{% endif %}
 <h2>Document lines</h2>
 <table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Line amount</th><th>Supplier-stated tax</th></tr></thead>
 <tbody>{% for line in lines %}<tr><td>{{ line.description }}</td><td>{{ line.quantity }}</td><td>{{ line.unit_price }}</td><td>{{ line.line_amount }}</td><td>{{ line.tax_amount }}</td></tr>{% endfor %}</tbody></table>

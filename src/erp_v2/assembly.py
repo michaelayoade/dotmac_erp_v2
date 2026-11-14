@@ -182,6 +182,7 @@ assembly: Final = ProductAssemblySpec(
                 WebRouteRef("erp_revenue", "legacy", "supplier_invoice_create"),
                 WebRouteRef("erp_revenue", "legacy", "supplier_invoice_detail"),
                 WebRouteRef("erp_revenue", "legacy", "supplier_invoice_submit"),
+                WebRouteRef("erp_revenue_approval", "legacy", "supplier_invoice_approve"),
                 WebRouteRef("erp_banking", "legacy", "banking_workspace"),
                 *(
                     WebRouteRef("erp_payee_bank", "legacy", name)
