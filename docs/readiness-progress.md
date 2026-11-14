@@ -140,3 +140,24 @@ can discard valid business events; recovery requires a reconciled repair/replay
 procedure. No production route switch, balance adjustment or live
 payroll/payment execution is authorized by this checkpoint.
 
+
+### Payroll workflow diagnostic candidate, 2026-11-14
+
+The payroll-workflow-preflight importer command takes a manifest, snapshot file,
+source run UUID, source-policy revision, operator revision and new private receipt.
+It collects bounded SELECT-only observations in serializable read-only transactions.
+The dump digest and database identities must match the manifest; an independent
+restore receipt must establish that the source database came from those dump bytes.
+
+Operator and source-policy revisions are declared provenance. The manifest revision
+continues to identify the imported data and may differ from the verifier operator.
+Installed PermissionSpec default roles and dependency versions are observed separately
+from provisioning grants. Missing external claims or module enablement remain unknown.
+
+Authority, employee coverage, approval effects and per-slip creator verdicts are
+independent. Employee coverage uses current policy as of the snapshot, rather than
+claiming the original historical payroll cohort. Duplicate assignments are exceptions.
+Required loan or GL effects without an owner handoff remain blocked. Historical
+admission stays blocked and this diagnostic never enables a workflow or business write.
+Receipts are new mode-0600 files; exit 3 means diagnostic complete, exit 2 means refusal.
+Tests run in hosted CI. Source integration remains held until Step-3 S6 exit.

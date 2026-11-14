@@ -819,6 +819,15 @@ def build_parser() -> argparse.ArgumentParser:
                 "--source-version",
                 help="provenance source version (default: manifest candidate_revision)",
             )
+
+    from erp_v2.importer.payroll_workflow_preflight import command as payroll_preflight
+
+    diagnostic = sub.add_parser("payroll-workflow-preflight", help="read-only payroll workflow diagnostic")
+    diagnostic.set_defaults(func=payroll_preflight)
+    for flag in ("manifest", "snapshot-file", "run-id", "source-policy-revision", "operator-revision", "receipt"):
+        diagnostic.add_argument("--" + flag, required=True)
+    diagnostic.add_argument("--source-url-env", default="LEGACY_DATABASE_URL")
+    diagnostic.add_argument("--dest-url-env", default="MIGRATION_DATABASE_URL")
     return parser
 
 
