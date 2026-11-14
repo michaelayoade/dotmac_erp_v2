@@ -8,7 +8,8 @@ asserted from the catalog.
 import os
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -16,7 +17,9 @@ import sqlalchemy as sa
 from dotmac_kernel import audit_actions
 from dotmac_kernel.audit import AuditEvent
 from dotmac_kernel.audit_actions import AuditActionRegistry
-from dotmac_kernel.models import Tenant
+from dotmac_kernel.models import Party, PartyPerson, PartyType, Tenant
+from dotmac_payables.models import SupplierInvoice
+from dotmac_people.models import Employee
 from sqlalchemy.orm import Session
 
 from erp_v2.importer.minting import MintContext, run_mint_step
@@ -88,28 +91,66 @@ def audit_registry(monkeypatch):
     )
 
 
-def new_tenant(engine):
+def new_tenant(engine, suppliers=("sup-1", "sup-2", "sup-3")):
+    """Tenant with payees in the REAL systems of record (payables supplier set)."""
     tenant_id = uuid4()
     with Session(engine) as db:
         db.add(Tenant(id=tenant_id, slug=f"t{tenant_id.hex[:24]}", name="Payee"))
+        db.flush()
+        for n, ref in enumerate(suppliers):
+            add_supplier(db, tenant_id, ref, n)
         db.commit()
     return tenant_id
 
 
-def propose(db, tenant, *, ref="sup-1", number=NUMBER, by=PREPARER):
-    return service.propose(
-        db,
+def add_supplier(db, tenant_id, ref, n=0):
+    db.add(
+        SupplierInvoice(
+            tenant_id=tenant_id,
+            number=f"N-{ref}-{n}",
+            supplier_ref=ref,
+            supplier_name_snapshot=f"System {ref}",
+            invoice_date=date(2026, 1, 1),
+            received_date=date(2026, 1, 1),
+            currency_code="NGN",
+            exchange_rate=Decimal(1),
+            liability_account_ref="x",
+            subtotal=Decimal(10),
+            tax_amount=Decimal(0),
+            total_amount=Decimal(10),
+            payment_schedule=[],
+            request_fingerprint="f" * 64,
+        )
+    )
+    db.flush()
+
+
+def add_employee(db, tenant_id, code="E001"):
+    party = uuid4()
+    db.add(Party(id=party, tenant_id=tenant_id, party_type=PartyType.person, display_name=code, email=f"{code}@x.io"))
+    db.flush()
+    db.add(PartyPerson(party_id=party, first_name="Ada", last_name="Test"))
+    db.flush()
+    emp = Employee(tenant_id=tenant_id, party_id=party, employee_code=code, date_of_joining=date(2025, 1, 1))
+    db.add(emp)
+    db.flush()
+    return emp
+
+
+def propose(db, tenant, *, ref="sup-1", number=NUMBER, by=PREPARER, kind="supplier", **over):
+    args = dict(
         tenant_id=tenant,
         proposer_party_id=by,
-        payee_kind="supplier",
+        payee_kind=kind,
         payee_ref=ref,
-        payee_label="Acme Supplies",
         bank_code="058",
         bank_name="Example Bank",
         account_number=number,
         account_name="ACME SUPPLIES LTD",
         evidence_ref="letter-1",
     )
+    args.update(over)
+    return service.propose(db, **args)
 
 
 def test_migration_creates_the_table_with_rls_and_lifecycle_only_runtime_privileges(engine):
@@ -297,6 +338,9 @@ def test_legacy_import_mint_writes_proposed_rows_on_the_real_table_and_each_need
         )
     )
     supplier = uuid4()
+    with Session(engine) as db:
+        add_supplier(db, tenant, str(supplier))
+        db.commit()
     details = (
         '{"bank_code": "058", "bank_name": "Example Bank", "account_name": "SUP", "account_number": "%s"}' % NUMBER
     )
@@ -317,6 +361,131 @@ def test_legacy_import_mint_writes_proposed_rows_on_the_real_table_and_each_need
             None,
             str(supplier),
         )
-        approved = service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
+        with pytest.raises(PayeeBankError) as unverified:
+            service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
+        assert unverified.value.code == "verification_required"
+        approved = service.approve(
+            db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER, note="call-back ref 12"
+        )
         assert approved.status == "approved"
         db.commit()
+
+
+def test_real_systems_of_record_resolve_payees_and_unknowns_are_refused(engine):
+    tenant, other = new_tenant(engine), new_tenant(engine, suppliers=())
+    with Session(engine) as db:
+        emp = add_employee(db, tenant)
+        row = propose(db, tenant, ref=str(emp.id), kind="employee")
+        assert row.payee_label == "E001 Ada Test"
+        sup = propose(db, tenant, ref="sup-1")
+        assert sup.payee_label == "System sup-1"
+        db.commit()
+    with Session(engine) as db:
+        for kwargs in ({"ref": "sup-1", "tenant": other}, {"ref": "nobody"}, {"ref": str(uuid4()), "kind": "employee"}):
+            kwargs.setdefault("tenant", tenant)
+            with pytest.raises(PayeeBankError) as err:
+                propose(db, **kwargs)
+            assert err.value.code == "unknown_payee"
+            db.rollback()
+
+
+def test_a_correction_replaces_an_open_legacy_proposal_on_real_postgres(engine):
+    tenant = new_tenant(engine)
+    with Session(engine) as db:
+        emp = add_employee(db, tenant)
+        legacy = PayeeBankInstruction(
+            tenant_id=tenant,
+            payee_kind="employee",
+            payee_ref=str(emp.id),
+            payee_label="legacy",
+            bank_code=None,
+            bank_name="Example Bank",
+            account_number=NUMBER,
+            account_last4=NUMBER[-4:],
+            status="proposed",
+            origin="legacy_import",
+            proposed_at=datetime.now(UTC),
+        )
+        db.add(legacy)
+        db.flush()
+        new = propose(db, tenant, ref=str(emp.id), kind="employee", number=OTHER)
+        db.commit()
+        legacy_id, new_id = legacy.id, new.id
+    with Session(engine) as db:
+        old = db.get(PayeeBankInstruction, legacy_id)
+        assert (old.status, old.decision_note) == ("rejected", f"replaced by {new_id}")
+        service.approve(db, tenant_id=tenant, instruction_id=new_id, approver_party_id=APPROVER)
+        db.commit()
+        events = db.scalars(sa.select(AuditEvent).where(AuditEvent.tenant_id == tenant)).all()
+        assert any(e.action == service.AUDIT_REJECTED and e.details["replaced_by"] == str(new_id) for e in events)
+
+
+@pytest.fixture()
+def runtime_engine(engine):
+    """NOBYPASSRLS LOGIN member of app_user: the role the runtime actually uses."""
+    role = f"payee_rt_{uuid4().hex[:12]}"
+    admin = sa.create_engine(
+        sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
+    )
+    with admin.connect() as c:
+        c.exec_driver_sql(f'CREATE ROLE "{role}" LOGIN NOBYPASSRLS')
+        c.exec_driver_sql(f'GRANT app_user TO "{role}"')
+    rt = sa.create_engine(engine.url.set(username=role), hide_parameters=True)
+    try:
+        yield rt
+    finally:
+        rt.dispose()
+        with admin.connect() as c:
+            c.exec_driver_sql(f'DROP ROLE "{role}"')
+        admin.dispose()
+
+
+def scoped(rt, tenant):
+    db = Session(rt)
+    db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant)})
+    return db
+
+
+def test_runtime_role_lifecycle_rls_and_privileges_without_bypass(engine, runtime_engine):
+    tenant, other = new_tenant(engine), new_tenant(engine)
+    with engine.connect() as c:
+        assert (
+            c.scalar(
+                sa.text("SELECT rolbypassrls FROM pg_roles WHERE rolname = :r"), {"r": runtime_engine.url.username}
+            )
+            is False
+        )
+    with scoped(runtime_engine, tenant) as db:
+        first = propose(db, tenant)
+        service.approve(db, tenant_id=tenant, instruction_id=first.id, approver_party_id=APPROVER)
+        assert (
+            service.reveal_account_number(
+                db, tenant_id=tenant, instruction_id=first.id, actor_party_id=APPROVER, reason="verify"
+            )
+            == NUMBER
+        )
+        service.revoke(db, tenant_id=tenant, instruction_id=first.id, revoker_party_id=APPROVER2, reason="closed")
+        second = propose(db, tenant, number=OTHER)
+        second_id = second.id
+        db.commit()
+    with scoped(runtime_engine, tenant) as db:
+        assert db.scalar(sa.select(sa.func.count()).select_from(PayeeBankInstruction)) == 2
+        for statement in (
+            "UPDATE payee_bank_instructions SET account_number = '1111111111'",
+            "UPDATE payee_bank_instructions SET payee_ref = 'x'",
+            "DELETE FROM payee_bank_instructions",
+            "TRUNCATE payee_bank_instructions",
+        ):
+            with pytest.raises(sa.exc.ProgrammingError) as err:
+                db.execute(sa.text(statement))
+            assert "permission denied" in str(err.value.orig).lower(), statement
+            db.rollback()
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant)})
+    with scoped(runtime_engine, other) as db:  # another tenant sees nothing, and cannot touch it
+        assert db.scalar(sa.select(sa.func.count()).select_from(PayeeBankInstruction)) == 0
+        db.execute(sa.text("UPDATE payee_bank_instructions SET status = 'revoked' WHERE id = :i"), {"i": second_id})
+        db.commit()
+    with Session(engine) as db:
+        assert db.get(PayeeBankInstruction, second_id).status == "proposed"
+    with Session(runtime_engine) as db:  # no tenant scope at all: RLS yields no rows
+        assert db.scalar(sa.select(sa.func.count()).select_from(PayeeBankInstruction)) == 0

@@ -184,17 +184,8 @@ assembly: Final = ProductAssemblySpec(
                 WebRouteRef("erp_revenue", "legacy", "supplier_invoice_submit"),
                 WebRouteRef("erp_revenue_approval", "legacy", "supplier_invoice_approve"),
                 WebRouteRef("erp_banking", "legacy", "banking_workspace"),
-                *(
-                    WebRouteRef("erp_payee_bank", "legacy", name)
-                    for name in (
-                        "payee_bank_list",
-                        "payee_bank_propose",
-                        "payee_bank_reveal",
-                        "payee_bank_approve",
-                        "payee_bank_reject",
-                        "payee_bank_revoke",
-                    )
-                ),
+                # Payee bank routes are deliberately NOT entry routes (REVIEW-B8 R2): entry routes skip the
+                # facet admission check (erp.web.access), so a finance role without staff must be refused.
             ),
             login_route=WebRouteRef("erp_web", "legacy", "login_page"),
             landing_route=WebRouteRef("erp_web", "legacy", "home"),

@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Final
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -70,6 +70,7 @@ class PayeeBankView:
     decided_at: datetime | None
     approved_at: datetime | None
     shared_account_payees: int = 0
+    system_name: str | None = None  # name from the system of record; None = unknown payee
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,44 @@ class PaymentDestination:
 
     def __repr__(self) -> str:
         return f"PaymentDestination({self.instruction_id}, {self.payee_kind}, ****{self.account_number[-4:]})"
+
+
+def resolve_payee(db: Session, tenant_id: UUID, payee_kind: str, payee_ref: str) -> str | None:
+    """System-of-record name for a payee inside the tenant, or None when unknown.
+
+    Employee: ``mod_people.employees`` by canonical dashed UUID (code plus person name).
+    Supplier: the payables supplier reference set (``supplier_invoices.supplier_ref`` with the
+    latest name snapshot); v2 has no separate supplier master. Never free text.
+    """
+
+    if payee_kind == PayeeKind.EMPLOYEE.value:
+        from dotmac_kernel.models import PartyPerson
+        from dotmac_people.models import Employee
+
+        try:
+            employee_id = UUID(payee_ref)
+        except ValueError:
+            return None
+        if str(employee_id) != payee_ref:
+            return None
+        found = db.execute(
+            select(Employee.employee_code, PartyPerson.first_name, PartyPerson.last_name)
+            .join(PartyPerson, PartyPerson.party_id == Employee.party_id, isouter=True)
+            .where(Employee.tenant_id == tenant_id, Employee.id == employee_id)
+        ).first()
+        if found is None:
+            return None
+        return " ".join(part for part in found if part)
+    if payee_kind == PayeeKind.SUPPLIER.value:
+        from dotmac_payables.models import SupplierInvoice
+
+        return db.scalar(
+            select(SupplierInvoice.supplier_name_snapshot)
+            .where(SupplierInvoice.tenant_id == tenant_id, SupplierInvoice.supplier_ref == payee_ref)
+            .order_by(SupplierInvoice.created_at.desc())
+            .limit(1)
+        )
+    return None
 
 
 def mask_account(account_number: str) -> str:
@@ -190,6 +229,7 @@ def view(db: Session, row: PayeeBankInstruction) -> PayeeBankView:
         decided_at=row.decided_at,
         approved_at=row.approved_at,
         shared_account_payees=_shared_count(db, row),
+        system_name=resolve_payee(db, row.tenant_id, row.payee_kind, row.payee_ref),
     )
 
 
@@ -200,7 +240,6 @@ def propose(
     proposer_party_id: UUID,
     payee_kind: str,
     payee_ref: str,
-    payee_label: str,
     bank_code: str,
     bank_name: str,
     account_number: str,
@@ -213,7 +252,10 @@ def propose(
     except ValueError as exc:
         raise PayeeBankError("invalid_input", "payee_kind must be supplier or employee") from exc
     ref = _text(payee_ref, "payee_ref", limit=255)
-    label = _text(payee_label, "payee_label", limit=200)
+    system_name = resolve_payee(db, tenant_id, kind.value, ref or "")
+    if system_name is None:
+        raise PayeeBankError("unknown_payee", "payee is not a known supplier or employee in this tenant")
+    label = system_name[:200]
     code = _text(bank_code, "bank_code", limit=10)
     if not _BANK_CODE.match(code or ""):
         raise PayeeBankError("invalid_input", "bank_code must be 3 to 6 digits")
@@ -234,6 +276,7 @@ def propose(
     ):
         raise PayeeBankError("unchanged", "the approved instruction already has these bank details")
     row = PayeeBankInstruction(
+        id=uuid4(),
         tenant_id=tenant_id,
         payee_kind=kind.value,
         payee_ref=ref,
@@ -250,15 +293,34 @@ def propose(
         proposed_at=now or _now(),
     )
     open_proposal = db.scalar(
-        select(PayeeBankInstruction.id).where(
+        select(PayeeBankInstruction)
+        .where(
             PayeeBankInstruction.tenant_id == tenant_id,
             PayeeBankInstruction.payee_kind == kind.value,
             PayeeBankInstruction.payee_ref == ref,
             PayeeBankInstruction.status == InstructionStatus.PROPOSED.value,
         )
+        .with_for_update()
     )
     if open_proposal is not None:
-        raise PayeeBankError("open_proposal_exists", "this payee already has a proposal awaiting decision")
+        if open_proposal.origin != InstructionOrigin.LEGACY_IMPORT.value:
+            raise PayeeBankError("open_proposal_exists", "this payee already has a proposal awaiting decision")
+        # A human correction replaces an open (typically incomplete) legacy-import proposal in
+        # the same transaction. Reject the old row BEFORE inserting: one proposed row per payee.
+        stamp = row.proposed_at
+        open_proposal.status = InstructionStatus.REJECTED.value
+        open_proposal.decided_by_party_id = proposer_party_id
+        open_proposal.decided_at = stamp
+        open_proposal.decision_note = f"replaced by {row.id}"
+        db.flush()
+        _audit(
+            db,
+            tenant_id=tenant_id,
+            actor=proposer_party_id,
+            action=AUDIT_REJECTED,
+            row=open_proposal,
+            replaced_by=str(row.id),
+        )
     db.add(row)
     db.flush()
     _audit(db, tenant_id=tenant_id, actor=proposer_party_id, action=AUDIT_PROPOSED, row=row)
@@ -279,13 +341,22 @@ def approve(
         raise PayeeBankError("wrong_state", f"only a proposed instruction can be approved (is {row.status})")
     if row.proposed_by_party_id is not None and row.proposed_by_party_id == approver_party_id:
         raise PayeeBankError("same_person", "the proposer cannot approve their own proposal")
+    if resolve_payee(db, tenant_id, row.payee_kind, row.payee_ref) is None:
+        raise PayeeBankError("unknown_payee", "payee is not a known supplier or employee in this tenant")
+    verification = _text(note, "note", limit=500, required=False)
+    if row.origin == InstructionOrigin.LEGACY_IMPORT.value and not verification:
+        raise PayeeBankError(
+            "verification_required",
+            "approving a legacy-imported instruction needs a note naming the verification evidence "
+            "(call-back record or signed letter)",
+        )
     missing = missing_for_approval(row)
     if missing:
         raise PayeeBankError(
             "incomplete_instruction",
             "cannot approve: invalid or missing " + ", ".join(missing) + "; propose corrected details instead",
         )
-    decision_note = _text(note, "note", limit=500, required=False)
+    decision_note = verification
     stamp = now or _now()
     previous = db.scalar(
         select(PayeeBankInstruction)
@@ -315,6 +386,8 @@ def approve(
         action=AUDIT_APPROVED,
         row=row,
         superseded=str(previous.id) if previous is not None else None,
+        origin=row.origin,
+        verification_note=decision_note if row.origin == InstructionOrigin.LEGACY_IMPORT.value else None,
         shared_account_payees=_shared_count(db, row),
     )
     return row

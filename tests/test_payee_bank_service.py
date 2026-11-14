@@ -26,8 +26,18 @@ OTHER_NUMBER = "9876543210"
 PREPARER, APPROVER, APPROVER2 = uuid4(), uuid4(), uuid4()
 
 
+KNOWN = {
+    ("supplier", "sup-1"): "Acme Supplies (system)",
+    ("supplier", "sup-2"): "Beta Ltd (system)",
+    ("supplier", "sup-3"): "Gamma (system)",
+    ("employee", "emp-1"): "E-001 Ada Test",
+    ("employee", "emp-2"): "E-002 Bo Test",
+}
+
+
 @pytest.fixture()
 def env(monkeypatch):
+    monkeypatch.setattr(service, "resolve_payee", lambda db, tenant_id, kind, ref: KNOWN.get((kind, ref)))
     monkeypatch.setattr(
         audit_actions, "_active_registry", AuditActionRegistry.from_manifests([payee_bank_feature]), raising=False
     )
@@ -47,7 +57,6 @@ def propose(db, tenant, *, ref="sup-1", number=NUMBER, by=PREPARER, kind="suppli
         proposer_party_id=by,
         payee_kind=kind,
         payee_ref=ref,
-        payee_label="Acme Supplies",
         bank_code="058",
         bank_name="Example Bank",
         account_number=number,
@@ -215,7 +224,7 @@ def _imported(db, tenant, *, bank_code, ref="emp-1"):
         tenant_id=tenant,
         payee_kind="employee",
         payee_ref=ref,
-        payee_label="E-001",
+        payee_label="legacy name",
         bank_code=bank_code,
         bank_name="Example Bank",
         account_number=NUMBER,
@@ -236,11 +245,13 @@ def test_imported_rows_need_individual_approval_and_incomplete_ones_cannot_be_ap
     db, tenant = env
     incomplete = _imported(db, tenant, bank_code=None)
     with pytest.raises(PayeeBankError) as err:
-        service.approve(db, tenant_id=tenant, instruction_id=incomplete.id, approver_party_id=APPROVER)
+        service.approve(
+            db, tenant_id=tenant, instruction_id=incomplete.id, approver_party_id=APPROVER, note="call-back"
+        )
     assert err.value.code == "incomplete_instruction" and "bank_code" in str(err.value)
     assert NUMBER not in str(err.value) and incomplete.status == "proposed"
     complete = _imported(db, tenant, bank_code="058", ref="emp-2")
-    service.approve(db, tenant_id=tenant, instruction_id=complete.id, approver_party_id=APPROVER)
+    service.approve(db, tenant_id=tenant, instruction_id=complete.id, approver_party_id=APPROVER, note="letter L-9")
     assert complete.status == "approved"
 
 
@@ -283,3 +294,63 @@ def test_no_account_number_anywhere_in_audit_trail_for_a_full_lifecycle(env):
     events = audit_rows(db)
     assert len(events) == 4
     assert not any(NUMBER in repr(e.details) or NUMBER in (e.entity_id or "") for e in events)
+
+
+def test_label_comes_from_the_system_of_record_and_unknown_payees_are_refused(env):
+    db, tenant = env
+    row = propose(db, tenant)
+    assert row.payee_label == "Acme Supplies (system)"
+    (view,) = service.list_instructions(db, tenant_id=tenant)
+    assert view.system_name == "Acme Supplies (system)"
+    with pytest.raises(PayeeBankError) as err:
+        propose(db, tenant, ref="nobody")
+    assert err.value.code == "unknown_payee"
+    assert db.scalar(sa.select(sa.func.count()).select_from(PayeeBankInstruction)) == 1
+
+
+def test_approve_refuses_a_payee_that_is_no_longer_known(env, monkeypatch):
+    db, tenant = env
+    row = propose(db, tenant)
+    monkeypatch.setattr(service, "resolve_payee", lambda *a: None)
+    with pytest.raises(PayeeBankError) as err:
+        service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
+    assert err.value.code == "unknown_payee" and row.status == "proposed"
+
+
+def test_legacy_import_approval_needs_a_verification_note_recorded_in_audit(env):
+    db, tenant = env
+    row = _imported(db, tenant, bank_code="058", ref="emp-1")
+    with pytest.raises(PayeeBankError) as err:
+        service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
+    assert err.value.code == "verification_required" and row.status == "proposed"
+    service.approve(
+        db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER, note="call-back 2026-11-14 ref 77"
+    )
+    assert row.status == "approved"
+    details = event(db, service.AUDIT_APPROVED).details
+    assert details["origin"] == "legacy_import" and details["verification_note"] == "call-back 2026-11-14 ref 77"
+    assert NUMBER not in repr(details)
+
+
+def test_a_proposal_replaces_an_open_legacy_import_proposal_in_one_transaction(env):
+    db, tenant = env
+    legacy = _imported(db, tenant, bank_code=None, ref="emp-1")
+    new = propose(db, tenant, ref="emp-1", kind="employee")
+    assert (legacy.status, legacy.decision_note) == ("rejected", f"replaced by {new.id}")
+    assert legacy.decided_by_party_id == PREPARER and new.status == "proposed"
+    rejected = event(db, service.AUDIT_REJECTED)
+    assert rejected.details["replaced_by"] == str(new.id) and rejected.entity_id == str(legacy.id)
+    # the replacement still needs a second person
+    with pytest.raises(PayeeBankError) as err:
+        service.approve(db, tenant_id=tenant, instruction_id=new.id, approver_party_id=PREPARER)
+    assert err.value.code == "same_person"
+    service.approve(db, tenant_id=tenant, instruction_id=new.id, approver_party_id=APPROVER)
+    assert new.status == "approved"
+
+
+def test_a_manual_open_proposal_is_never_replaced_this_way(env):
+    db, tenant = env
+    propose(db, tenant, ref="emp-2", kind="employee")
+    with pytest.raises(PayeeBankError) as err:
+        propose(db, tenant, ref="emp-2", kind="employee", number=OTHER_NUMBER)
+    assert err.value.code == "open_proposal_exists"

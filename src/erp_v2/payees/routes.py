@@ -97,7 +97,6 @@ async def payee_bank_propose(
             proposer_party_id=party.id,
             payee_kind=values.get("payee_kind", ""),
             payee_ref=values.get("payee_ref", ""),
-            payee_label=values.get("payee_label", ""),
             bank_code=values.get("bank_code", ""),
             bank_name=values.get("bank_name", ""),
             account_number=values.get("account_number", ""),
@@ -176,6 +175,8 @@ async def payee_bank_reveal(
         )
     except service.PayeeBankError as exc:
         return _page(request, db, tenant, party, error=f"{exc.code}: {exc}", status_code=400)
+    # The audit row must be durable before the number is shown (REVIEW-B8 L1).
+    db.commit()
     response = render(request, "payees/reveal.html", _context(request, party, account_number=number))
     response.headers["Cache-Control"] = "no-store"
     return response

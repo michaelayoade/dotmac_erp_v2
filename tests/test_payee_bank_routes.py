@@ -39,6 +39,10 @@ PRINCIPALS = {
     "preparer": ("staff", "finance_preparer"),
     "approver": ("staff", "finance_approver"),
     "treasury": ("staff", "treasury"),
+    # REVIEW-B8 R2: finance roles WITHOUT staff/erp.web.access (e.g. a leaver whose staff grant was removed)
+    "preparer_nostaff": ("finance_preparer",),
+    "approver_nostaff": ("finance_approver",),
+    "treasury_nostaff": ("treasury",),
     "payroll": ("staff", "payroll_approver", "payroll_finalizer", "bank_reconciler"),
 }
 # route -> (method, path, principals that must be admitted, spied service function)
@@ -227,3 +231,19 @@ def test_route_permission_table_matches_the_access_profile():
         "revoke": access.PAYEE_BANK_REVOKE,
         "reveal": access.PAYEE_BANK_READ_UNMASKED,
     }
+
+
+@pytest.mark.parametrize("who", ["preparer_nostaff", "approver_nostaff", "treasury_nostaff"])
+def test_finance_role_without_portal_access_is_refused_everywhere(browser, who):
+    token = browser.sign_in(who)
+    assert browser.client.get(BASE).status_code in (302, 403)
+    for _, path, _, _ in ACTIONS.values():
+        response = _post(browser, path, token, reason="r", note="n", payee_kind="supplier")
+        assert response.status_code in (302, 403), (who, path)
+    for spy in browser.spies.values():
+        spy.assert_not_called()
+
+
+def test_payee_routes_are_not_facet_entry_routes():
+    refs = {r.module for r in assembly.web_facets[0].entry_routes}
+    assert "erp_payee_bank" not in refs

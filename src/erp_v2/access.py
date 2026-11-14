@@ -140,6 +140,10 @@ SOD_CONFLICT_PAIRS: Final = frozenset(
     )
 )
 
+# Never waivable by an allowlist ``sod_exceptions`` entry (REVIEW-B8 R3, F7): whoever approves a
+# payee destination or a payment must not also generate the bank file.
+NON_WAIVABLE_SOD_PAIRS: Final = frozenset({frozenset(("finance_approver", "treasury"))})
+
 AUDIT_ROLE_GRANTED: Final = "erp.access.role_granted"
 
 access_feature: Final = FeatureManifest(

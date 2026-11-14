@@ -47,6 +47,30 @@ propose. Routes are dormant until the roles have holders (access_cli).
 Treasury's file generation (B3/B5) will read destinations through `destination_for_payment`
 under its own `disbursement_files.generate` permission, not through the UI.
 
+## Review changes (REVIEW-B8, applied on PR #39)
+
+- R2: the payee routes are NOT facet entry routes (entry routes skip the `erp.web.access`
+  admission check). A finance role without staff/admin is refused on every route (tested).
+- R3: `finance_approver + treasury` is non-waivable (`NON_WAIVABLE_SOD_PAIRS`): an allowlist
+  `sod_exceptions` entry for it is refused at parse (`sod_pair_not_waivable`).
+- R4 (interim): approving a `legacy_import` row requires a note naming the verification evidence
+  (`verification_required`); the note is recorded in the audit details. Whether "legacy record
+  = first person" is accepted for W10 awaits Michael's ruling.
+- R5: a human proposal replaces an open `legacy_import` proposal in the same transaction (old row
+  `rejected`, note `replaced by <id>`, audited with `replaced_by`); the replacement still needs a
+  second person. An open manual proposal is never replaced.
+- R6: payee identity comes from the systems of record, never free text: employees from
+  `mod_people.employees` (tenant, canonical dashed UUID; label = code + person name), suppliers
+  from the payables supplier reference set (`supplier_invoices.supplier_ref`; a supplier with no
+  invoice cannot yet have an instruction because v2 has no supplier master). Unknown payees are
+  refused at propose and again at approve; the approver sees the system-of-record name.
+- R7: Postgres tests run as a NOBYPASSRLS member of `app_user` (lifecycle, UPDATE of content and
+  DELETE/TRUNCATE denied, other tenant sees nothing). Run 'g' must read back
+  `has_column_privilege`/`has_table_privilege` for the real runtime role.
+- L1: reveal commits the audit row before rendering the number.
+- L5: the importer's deterministic row id collides if a legacy row was rejected and the importer
+  is rerun on the same destination (fresh destinations only today).
+
 ## Account number handling
 
 Stored in the account_number column (PII). It never appears in `repr`, logs, audit details,
