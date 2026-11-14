@@ -26,7 +26,7 @@ from uuid import UUID
 from dotmac_kernel.audit import write_audit_event
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.idempotency import IdempotencyConflict
-from dotmac_kernel.models import Party, Tenant
+from dotmac_kernel.models import Party, Tenant, UserCredential
 from dotmac_payables import service as payables
 from dotmac_payables.contracts import AccountingReceiptInput, InvoiceStatus, PayablesError
 from dotmac_payables.models import AccountingReceipt, HistoricalInvoiceReceipt, SupplierInvoice, SupplierInvoiceLine
@@ -74,6 +74,28 @@ def _audit(db: Session, *, tenant: Tenant, party: Party, invoice_id: UUID, actio
     )
 
 
+def _submitter_party_id(db: Session, tenant_id: UUID, submitted_by: str) -> UUID:
+    """Resolve the recorded submitter to a tenant Party id, or refuse.
+
+    Imported invoices carry the legacy UserCredential id, native ones the Party id.
+    """
+    try:
+        raw = UUID(submitted_by)
+    except ValueError:
+        raw = None
+    if raw is not None:
+        if db.scalar(select(Party.id).where(Party.tenant_id == tenant_id, Party.id == raw)) is not None:
+            return raw
+        credential_party = db.scalar(
+            select(UserCredential.party_id).where(UserCredential.tenant_id == tenant_id, UserCredential.id == raw)
+        )
+        if credential_party is not None:
+            return credential_party
+    raise ApprovalRefused(
+        "submitter_unresolved", "The submitter cannot be resolved to a person, so separation of duties cannot hold"
+    )
+
+
 def _guarded(db: Session, *, tenant: Tenant, party: Party, invoice_id: UUID, now: datetime) -> ApprovalOutcome:
     scope = TenantScope(tenant.id)
     actor = str(party.id)
@@ -110,7 +132,7 @@ def _guarded(db: Session, *, tenant: Tenant, party: Party, invoice_id: UUID, now
         raise ApprovalRefused("receipt_exists", "A submitted invoice already has a ledger receipt; refer it for review")
     if not invoice.submitted_by:
         raise ApprovalRefused("submitter_unknown", "The submitter is not recorded, so separation of duties cannot hold")
-    if invoice.submitted_by == actor:
+    if _submitter_party_id(db, tenant.id, invoice.submitted_by) == party.id:
         raise ApprovalRefused("sod_submitter_is_approver", "You submitted this invoice; another person must approve it")
     lines = list(
         db.scalars(

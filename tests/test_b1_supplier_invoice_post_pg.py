@@ -4,6 +4,8 @@ Real payables, accounting and kernel migrations; real create/approve/post comman
 Reuses the disposable-database fixture and tenant/account seed of the bridge test.
 """
 
+import threading
+import time
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,7 +15,7 @@ from dotmac_accounting.contracts import AccountClass, AccountKind, NormalBalance
 from dotmac_accounting.models import Account, AccountCategory, JournalEntry, JournalLine, PostedLedgerLine
 from dotmac_kernel.audit import AuditEvent
 from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
-from dotmac_kernel.models import Party, PartyType, Tenant
+from dotmac_kernel.models import Party, PartyType, Tenant, UserCredential
 from dotmac_payables import service as payables
 from dotmac_payables.contracts import InvoiceStatus
 from dotmac_payables.models import (
@@ -336,3 +338,68 @@ def test_other_tenants_invoice_is_not_found(engine):
                 db, tenant=db.get(Tenant, env.tenant_id), party=db.get(Party, env.party_ids[1]), invoice_id=iid, now=NOW
             )
         assert exc.value.code == "not_found"
+
+
+def _submit_as(engine, env, iid, submitted_by):
+    with Session(engine) as db:
+        payables.submit_invoice(db, scope=env.scope, invoice_id=iid, submitted_by=submitted_by, submitted_at=NOW)
+        db.commit()
+
+
+def test_credential_id_submitter_cannot_self_approve_but_others_can(engine):
+    env = world(engine)
+    with Session(engine) as db:
+        credential = UserCredential(tenant_id=env.tenant_id, party_id=env.party_ids[1], password_hash="x")  # noqa: S106
+        db.add(credential)
+        db.commit()
+        credential_id = str(credential.id)
+    iid = invoice(engine, env, submit=False)
+    _submit_as(engine, env, iid, credential_id)  # imported-style: legacy credential id
+    refusal(engine, env, iid, "sod_submitter_is_approver", party_index=1)
+    assert status(engine, iid) == InvoiceStatus.SUBMITTED
+    assert approve(engine, env, iid, party_index=2).replayed is False
+
+
+def test_party_id_submitter_resolves_and_unresolvable_submitter_refuses(engine):
+    env = world(engine)
+    iid = invoice(engine, env, submit=False)
+    _submit_as(engine, env, iid, str(env.party_ids[1]).upper())  # non-canonical spelling still the same person
+    refusal(engine, env, iid, "sod_submitter_is_approver", party_index=1)
+    for bad in (str(uuid4()), "legacy-user-7"):
+        jid = invoice(engine, env, number=f"AP-{bad[:6]}", submit=False)
+        _submit_as(engine, env, jid, bad)
+        refusal(engine, env, jid, "submitter_unresolved", party_index=1)
+
+
+def test_concurrent_approvers_yield_one_journal_and_one_receipt(engine):
+    env = world(engine)
+    iid = invoice(engine, env)
+    holder = Session(engine)
+    winner = svc.approve_and_post(
+        holder,
+        tenant=holder.get(Tenant, env.tenant_id),
+        party=holder.get(Party, env.party_ids[1]),
+        invoice_id=iid,
+        now=NOW,
+    )
+    outcome: dict[str, object] = {}
+
+    def second():
+        try:
+            outcome["result"] = approve(engine, env, iid, party_index=2)
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=second)
+    thread.start()
+    time.sleep(1.0)  # the second approver is blocked on the invoice row lock
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive() and "error" not in outcome, outcome
+    assert winner.replayed is False
+    assert outcome["result"].replayed is True
+    assert outcome["result"].accounting_reference == winner.accounting_reference
+    c = counts(engine, env.tenant_id)
+    assert c["journal_entries"] == 1 and c["accounting_receipts"] == 1 and c["payment_obligations"] == 1
+    assert len(audits(engine, env.tenant_id, svc.AUDIT_APPROVED_POSTED)) == 1
