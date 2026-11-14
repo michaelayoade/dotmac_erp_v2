@@ -143,7 +143,7 @@ def browser(monkeypatch):
         monkeypatch.setattr(tenant_middleware, "resolver_session", resolver_session)
         app = create_app(replace(assembly, web_enabled=True, database_runtime=None, require_database_runtime=False))
         app.dependency_overrides[get_db] = request_session
-        preview = Mock(side_effect=lambda **kw: make_plan(kw["data"]))
+        preview = Mock(side_effect=lambda *_args, **kw: make_plan(kw["data"]))
         do_import = Mock(return_value=SimpleNamespace(statement_id=uuid4()))
         monkeypatch.setattr(routes.service, "preview", preview)
         monkeypatch.setattr(routes.service, "import_statement", do_import)
@@ -215,7 +215,7 @@ def test_preview_renders_escaped_content_and_import_form_with_hash(browser: Brow
 
 
 def test_preview_with_blockers_offers_no_import(browser: Browser):
-    browser.preview.side_effect = lambda **kw: make_plan(kw["data"], blockers=("1 line(s) already exist",))
+    browser.preview.side_effect = lambda *_args, **kw: make_plan(kw["data"], blockers=("1 line(s) already exist",))
     token = browser.sign_in("reconciler")
     response = browser.post(PREVIEW, token=token)
     assert response.status_code == 200 and "already exist" in response.text
