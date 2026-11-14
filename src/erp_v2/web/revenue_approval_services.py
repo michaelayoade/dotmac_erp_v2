@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from erp_v2.posting import post_consequence
+from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
 
 AUDIT_APPROVED_POSTED = "erp.finance.supplier_invoice.approved_posted"
