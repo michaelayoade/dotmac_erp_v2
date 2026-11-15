@@ -21,6 +21,7 @@ EXPECTED_MODULE_VERSIONS = {
     "erp_payee_bank": None,
     "erp_journals": None,
     "erp_banking_statements": None,
+    "erp_banking_reconciliation": None,
     "erp_access": None,
     "erp_payroll": None,
     "accounting": "0.1.0a1",

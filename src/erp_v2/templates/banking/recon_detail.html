@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Reconciliation — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Reconciliation {{ account.account_code }}, period ending {{ recon.period_end }}</h1>
+<p><a href="{{ base }}">{% if approver %}Approval queue{% else %}Reconciliations{% endif %}</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>Status</dt><dd>{{ recon.status }}</dd>
+  <dt>Statement</dt><dd>{{ statement.statement_ref }} ({{ statement.period_start }} to {{ statement.period_end }})</dd>
+  <dt>Opened by</dt><dd>{{ people.get(recon.opened_by_party_id, recon.opened_by_party_id) }}</dd>
+  {% if recon.prepared_by_party_id %}<dt>Prepared by</dt><dd>{{ people.get(recon.prepared_by_party_id, recon.prepared_by_party_id) }}</dd>{% endif %}
+  {% if recon.approved_by_party_id %}<dt>Approved by</dt><dd>{{ people.get(recon.approved_by_party_id, recon.approved_by_party_id) }}</dd>{% endif %}
+  {% if recon.return_reason %}<dt>Last returned</dt><dd>{{ recon.return_reason }}</dd>{% endif %}
+  {% if recon.cancel_reason %}<dt>Cancelled</dt><dd>{{ recon.cancel_reason }}</dd>{% endif %}
+</dl>
+
+<h2>Balances</h2>
+{% set closing = evaluation.statement_closing if evaluation else recon.statement_closing_balance %}
+{% set glb = evaluation.gl_balance if evaluation else recon.gl_balance %}
+{% set itot = evaluation.items_total if evaluation else recon.items_total %}
+{% set diff = evaluation.difference if evaluation else recon.difference %}
+<table><tbody>
+  <tr><th>Statement closing balance</th><td>{{ closing }} {{ recon.currency_code }}</td></tr>
+  <tr><th>GL balance (cash account, to {{ recon.period_end }})</th><td>{{ glb }}</td></tr>
+  <tr><th>Reconciling items</th><td>{{ itot }}</td></tr>
+  <tr><th>Unexplained difference</th><td><strong>{{ diff }}</strong></td></tr>
+</tbody></table>
+<p>The statement closing balance must equal the GL balance plus the reconciling items exactly.</p>
+{% if evaluation and evaluation.issues %}<p role="alert">Not ready: {{ evaluation.issues|join(', ') }}.
+  {% if 'unrecorded_bank_items' in evaluation.issues %}Unrecorded bank items need a manual journal first (Finance, journals), then match the new ledger line to the statement line; nothing is posted from here.{% endif %}</p>{% endif %}
+
+<h2>Reconciling items</h2>
+<table><thead><tr><th>Type</th><th>Side</th><th>Line</th><th>Amount</th><th>Note</th>{% if recon.status == 'open' and not approver %}<th></th>{% endif %}</tr></thead><tbody>
+{% for i in items %}<tr>
+  <td>{{ i.item_type }}</td><td>{{ i.side }}</td>
+  <td>{% if i.side == 'bank' %}{{ bank_text.get(i.ref_id)[1] if bank_text.get(i.ref_id) else i.ref_id }}{% else %}{{ gl_text.get(i.ref_id)[1] if gl_text.get(i.ref_id) else i.ref_id }}{% endif %}</td>
+  <td>{{ i.signed_amount }}</td><td>{{ i.note }}</td>
+  {% if recon.status == 'open' and not approver %}<td><form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/items/{{ i.id }}/remove"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Remove</button></form></td>{% endif %}
+</tr>{% else %}<tr><td colspan="6">None.</td></tr>{% endfor %}
+</tbody></table>
+
+{% if recon.status in ('open', 'prepared') %}
+<h2>Matches inside this period</h2>
+<table><thead><tr><th>Amount</th><th>Statement lines</th><th>Ledger lines</th><th>Matched by</th>{% if not approver %}<th>Release</th>{% endif %}</tr></thead><tbody>
+{% for x in matches %}<tr>
+  <td>{{ x.net_amount }}</td>
+  <td>{{ members.get(x.id, [])|selectattr('side', 'equalto', 'bank')|list|length }}</td>
+  <td>{{ members.get(x.id, [])|selectattr('side', 'equalto', 'gl')|list|length }}</td>
+  <td>{{ people.get(x.matched_by_party_id, x.matched_by_party_id) }}</td>
+  {% if not approver %}<td>{% if x.locked_by_reconciliation_id %}locked{% else %}<form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/unmatch"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="match_id" value="{{ x.id }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Unmatch</button></form>{% endif %}</td>{% endif %}
+</tr>{% else %}<tr><td colspan="5">No matches yet.</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+
+{% if recon.status in ('open', 'prepared') %}
+<h2>Uncleared lines</h2>
+{% if not approver and recon.status == 'open' %}
+<form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/match">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{% endif %}
+<h3>Statement lines not matched ({{ bank_total }})</h3>
+<table><thead><tr>{% if not approver and recon.status == 'open' %}<th></th>{% endif %}<th>Date</th><th>Direction</th><th>Amount</th><th>Description</th><th>Reference</th><th>Item</th></tr></thead><tbody>
+{% for l in bank_open %}{% set t = bank_text.get(l[0]) %}<tr>
+  {% if not approver and recon.status == 'open' %}<td><input type="checkbox" name="bank_line" value="{{ l[0] }}"></td>{% endif %}
+  <td>{{ l[1] }}</td><td>{{ l[2] }}</td><td>{{ l[3] }}</td><td>{{ t[1] if t else '' }}</td><td>{{ t[2] if t else '' }}</td><td>{% if ('bank', l[0]) in item_refs %}itemized{% endif %}</td>
+</tr>{% else %}<tr><td colspan="7">None.</td></tr>{% endfor %}
+</tbody></table>
+{% if bank_total > page_size %}<p>Page {{ bank_page }}: <a href="?bank_page={{ bank_page - 1 if bank_page > 1 else 1 }}&gl_page={{ gl_page }}">previous</a> <a href="?bank_page={{ bank_page + 1 }}&gl_page={{ gl_page }}">next</a></p>{% endif %}
+<h3>Ledger lines not matched ({{ gl_total }})</h3>
+<table><thead><tr>{% if not approver and recon.status == 'open' %}<th></th>{% endif %}<th>Date</th><th>Journal</th><th>Effect on cash</th><th>Description</th><th>Reference</th><th>Item</th></tr></thead><tbody>
+{% for l in gl_open %}{% set t = gl_text.get(l[0]) %}<tr>
+  {% if not approver and recon.status == 'open' %}<td><input type="checkbox" name="gl_line" value="{{ l[0] }}"></td>{% endif %}
+  <td>{{ l[1] }}</td><td>{{ t[1] if t else '' }}</td><td>{{ l[2] }}</td><td>{{ t[2] if t else '' }}</td><td>{{ t[3] if t else '' }}</td><td>{% if ('gl', l[0]) in item_refs %}itemized{% endif %}</td>
+</tr>{% else %}<tr><td colspan="7">None.</td></tr>{% endfor %}
+</tbody></table>
+{% if gl_total > page_size %}<p>Page {{ gl_page }}: <a href="?bank_page={{ bank_page }}&gl_page={{ gl_page - 1 if gl_page > 1 else 1 }}">previous</a> <a href="?bank_page={{ bank_page }}&gl_page={{ gl_page + 1 }}">next</a></p>{% endif %}
+{% if not approver and recon.status == 'open' %}
+  <p><button type="submit">Match the selected lines</button> (net effect on cash must be exactly equal; select one or more of each, or a reversal pair of ledger lines)</p>
+  <h3>Explain the selected lines as reconciling items</h3>
+  <p><label>Ledger lines <select name="gl_item_type">{% for t in timing_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select></label>
+     <label>Statement lines <select name="bank_item_type">{% for t in unrecorded_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select></label>
+     <label>Note <input name="note" maxlength="500"></label>
+     <button type="submit" formaction="/finance/banking/reconciliations/{{ recon.id }}/items">Add reconciling items</button></p>
+  <p>Deposits in transit and outstanding payments are timing items. An unrecorded bank charge or receipt cannot be prepared: it needs a manual journal, and nothing is posted from here.</p>
+</form>
+
+{% if suggestions %}
+<h2>Suggested matches</h2>
+<p>Exact amount within a few days. Nothing is accepted automatically: tick both lines above and press Match.</p>
+<table><thead><tr><th>Statement line</th><th>Ledger line</th><th>Day gap</th><th>Reference hit</th></tr></thead><tbody>
+{% for s in suggestions %}<tr><td>{{ s.bank_line_id }}</td><td>{{ s.gl_line_id }}</td><td>{{ s.day_gap }}</td><td>{{ 'yes' if s.reference_hit else 'no' }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+{% endif %}
+{% endif %}
+
+{% if not approver %}
+  {% if recon.status == 'open' %}
+  <form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/prepare"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Prepare for approval</button></form>
+  {% endif %}
+  {% if recon.status in ('open', 'prepared') %}
+  <form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Cancel reconciliation</button></form>
+  {% endif %}
+{% else %}
+  {% if recon.status == 'prepared' %}
+  <form method="post" action="/finance/banking/reconciliation-approvals/{{ recon.id }}/approve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Approve (zero difference required)</button></form>
+  <form method="post" action="/finance/banking/reconciliation-approvals/{{ recon.id }}/return"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Return to preparer</button></form>
+  {% endif %}
+{% endif %}
+{% endblock %}

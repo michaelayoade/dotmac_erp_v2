@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Bank reconciliations — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Bank reconciliations</h1>
+<p><a href="/finance/banking">Banking</a></p>
+<p>A reconciliation matches imported statement lines to posted ledger lines on the bank account's cash account. It records nothing in the ledger: anything the bank did that the books did not record needs a manual journal first.</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<h2>Start a reconciliation</h2>
+{% if openable %}
+<form method="post" action="/finance/banking/reconciliations">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><label>Statement <select name="statement_id" required>
+    <option value="">Select a statement</option>
+    {% for o in openable %}<option value="{{ o.statement.id }}">{{ o.account.account_code }} — {{ o.statement.statement_ref }} ({{ o.statement.period_start }} to {{ o.statement.period_end }}, closing {{ o.statement.closing_balance }} {{ o.statement.currency_code }})</option>{% endfor %}
+  </select></label></p>
+  <button type="submit">Open reconciliation</button>
+</form>
+{% else %}<p>No imported statement with a closing balance is waiting for reconciliation.</p>{% endif %}
+<h2>Reconciliations</h2>
+<table><thead><tr><th>Account</th><th>Period end</th><th>Status</th><th>Difference</th></tr></thead><tbody>
+{% for r in rows %}<tr>
+  <td><a href="/finance/banking/reconciliations/{{ r.recon.id }}">{{ r.account.account_code }}</a></td>
+  <td>{{ r.recon.period_end }}</td><td>{{ r.recon.status }}</td><td>{{ r.recon.difference if r.recon.difference is not none else '—' }}</td>
+</tr>{% else %}<tr><td colspan="4">None yet.</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}
