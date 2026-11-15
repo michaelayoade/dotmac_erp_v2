@@ -173,3 +173,19 @@ def test_receipt_path_symlink_is_refused(tmp_path):
     with pytest.raises(OSError):
         cli._receipt(link)
     assert target.read_text() == "keep"
+
+
+def test_preflight_is_the_historical_destination_preflight_and_keeps_its_refusals(monkeypatch):
+    from erp_v2.importer import payables_history_cli as history
+
+    seen = []
+    monkeypatch.setattr(history, "_destination_preflight", lambda session, tenant: seen.append((session, tenant)))
+    cli._preflight("session", UUID(TENANT))
+    assert seen == [("session", UUID(TENANT))]
+
+    def refuse(session, tenant):
+        raise history.OperatorRefusal("destination_role_not_nonprivileged")
+
+    monkeypatch.setattr(history, "_destination_preflight", refuse)
+    with pytest.raises(cli.RecognizeRefusal, match="destination_role_not_nonprivileged"):
+        cli._preflight("session", UUID(TENANT))

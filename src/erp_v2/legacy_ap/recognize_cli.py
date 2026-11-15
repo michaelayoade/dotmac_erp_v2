@@ -478,23 +478,14 @@ def _authorized(args) -> bool:
 
 
 def _preflight(session: Session, tenant: UUID) -> None:
-    from erp_v2.importer.payables_history_cli import REQUIRED_PAYABLES_HEAD, _expected_schema_heads
+    """The historical-payables destination preflight: non-privileged role (inherited roles, session_user and
+    owned objects included), exact schema heads, and the tenant binding, on the connection actually used."""
+    from erp_v2.importer import payables_history_cli
 
-    posture = session.execute(
-        sa.text("SELECT rolsuper, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user")
-    ).one()
-    _require(posture.rolsuper is False and posture.rolbypassrls is False, "destination_role_not_nonprivileged")
-    expected = _expected_schema_heads()
-    actual = list(session.scalars(sa.text("SELECT version_num FROM public.alembic_version")))
-    _require(
-        REQUIRED_PAYABLES_HEAD in expected and len(actual) == len(set(actual)) and set(actual) == expected,
-        "destination_schema_heads_mismatch",
-    )
-    selected = session.scalar(
-        sa.text("SELECT set_config('app.current_tenant', :tenant, true)"), {"tenant": str(tenant)}
-    )
-    observed = session.scalar(sa.text("SELECT public.app_current_tenant_id()"))
-    _require(selected == str(tenant) and str(observed) == str(tenant), "destination_tenant_binding_mismatch")
+    try:
+        payables_history_cli._destination_preflight(session, tenant)
+    except payables_history_cli.OperatorRefusal as exc:
+        raise RecognizeRefusal(exc.reason) from exc
 
 
 def _install_audit_actions() -> None:
