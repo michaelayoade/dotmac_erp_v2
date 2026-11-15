@@ -632,3 +632,18 @@ def test_only_the_run_creator_may_batch_calculate_so_the_uploader_cannot_approve
     refusal(engine, env, svc.batch_calculate, run_id, "sod_not_run_creator", 3, input_bytes=GOOD_FILE)  # not creator
     refusal(engine, env, svc.batch_calculate, run_id, "sod_not_run_creator", 1, input_bytes=GOOD_FILE)  # the approver
     assert batch(engine, env, run_id).calculated == 3  # the creator can
+
+
+def test_mapping_classes_are_an_allowlist_liability_for_payables_expense_for_expenses(engine):
+    # a deduction mapped to an EXPENSE account, and (separately) an earning mapped to a LIABILITY account
+    env = world(engine, paye_liability="5100")
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    err = refusal(engine, env, svc.approve, run_id, "mapping_account_class_refused", 1)
+    assert "LIABILITY-class" in str(err)
+    env = world(engine)
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    blank_mapping(engine, "expense_account_ref", "BASIC", str(env.accounts["2110"]))
+    err = refusal(engine, env, svc.approve, run_id, "mapping_account_class_refused", 1)
+    assert "EXPENSE-class" in str(err)

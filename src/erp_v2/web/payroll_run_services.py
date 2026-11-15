@@ -257,6 +257,14 @@ def _resolve(db: Session, tenant_id: UUID, ref: str, *, label: str) -> Account:
     return account
 
 
+def _account_class(db: Session, account: Account) -> AccountClass | None:
+    return db.scalar(
+        select(AccountCategory.account_class).where(
+            AccountCategory.tenant_id == account.tenant_id, AccountCategory.id == account.category_id
+        )
+    )
+
+
 def check_mappings(db: Session, run: PayrollRun) -> UUID:
     """Every component line and revision has a Finance mapping that resolves; returns the 2040 account id.
 
@@ -324,20 +332,26 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
                 f"The net payable account of {_listed(sorted(who))} is not {PAYROLL_PAYABLE_CODE} Payroll Payable",
             )
     for ref, who in expense_refs.items():
-        _resolve(db, tenant_id, ref, label=f"Expense account of {_listed(sorted(who))}")
+        account = _resolve(db, tenant_id, ref, label=f"Expense account of {_listed(sorted(who))}")
+        if _account_class(db, account) != AccountClass.EXPENSE:
+            raise RunRefused(
+                "mapping_account_class_refused",
+                f"{_listed(sorted(who))}: expense mapping {account.code} must be an EXPENSE-class account",
+            )
     for ref, who in liability_refs.items():
         account = _resolve(db, tenant_id, ref, label=f"Liability account of {_listed(sorted(who))}")
-        category = db.scalar(
-            select(AccountCategory).where(
-                AccountCategory.tenant_id == tenant_id, AccountCategory.id == account.category_id
-            )
-        )
-        if category is not None and category.account_class == AccountClass.ASSET:
+        klass = _account_class(db, account)
+        if klass == AccountClass.ASSET:
             raise RunRefused(
                 "internal_recovery_unsupported",
                 f"{_listed(sorted(who))} credits asset account {account.code} (internal recovery such as a staff "
                 "loan). Payroll creates an external payable for every deduction, which must never become a "
                 "remittance or payout; refer to the payroll owner change before this component is used",
+            )
+        if klass != AccountClass.LIABILITY:
+            raise RunRefused(
+                "mapping_account_class_refused",
+                f"{_listed(sorted(who))}: liability mapping {account.code} must be a LIABILITY-class account",
             )
         if account.id == payable.id:
             raise RunRefused(
