@@ -10,19 +10,18 @@ posting bridge. They are dormant until named parties hold the role (`python -m e
 | Approve | `/payroll/runs/{id}/approve` | `erp.payroll.runs.approve` | `payroll_approver` |
 | Finalize and post | `/payroll/runs/{id}/finalize` | `erp.payroll.runs.finalize` | `payroll_finalizer` |
 
-Creator, approver and finalizer must be three different people (the owner enforces creator != approver
+Only the run creator may enter calculations (batch or single-employee), so the person who uploads the amounts cannot approve them. Creator, approver and finalizer must be three different people (the owner enforces creator != approver
 and approver != finalizer; this workflow also refuses creator == finalizer). Role-level SoD
 (`payroll_approver` + `payroll_finalizer` on one person) is blocked at grant time.
 
 ## Batch calculation
 
 Every active assignment effective at the run's period end is calculated with the released
-`calculate_employee_payroll` (proration 1; use the single-employee form first when an employee needs proration,
-the batch skips employees that already have a calculation). It is all or nothing in one savepoint.
+`calculate_employee_payroll` (proration 1). An uncalculated assignment starting after the period start is refused (`proration_required`): calculate it with the single-employee form first; the batch skips employees that already have a calculation. It is all or nothing in one savepoint.
 Employees whose structure has input rules need rows in an uploaded UTF-8 CSV
 `employee_ref,component_code,amount,evidence_ref`; the evidence reference is mandatory on every row, amounts are
 exact at the currency scale (nothing is rounded), a missing, surplus or unknown row refuses the whole batch.
-The file is never stored or echoed; the audit event keeps only its sha256 and row count.
+The file is capped at 512 KiB so it never spools to disk, and is never stored or echoed; the audit event keeps only its sha256 and row count.
 
 ## Guards (batch, approve and finalize)
 
@@ -32,7 +31,7 @@ The file is never stored or echoed; the audit event keeps only its sha256 and ro
   the payroll tables, so every existing run counts (imported runs arrive finalized).
 - Roster and evidence: every active assignment has a calculation, no calculation lacks an active assignment, and
   every component line has an evidence reference (re-checked at approval and finalization).
-- Mappings (Finance input, never created here): every earning/employer-liability line has an expense account,
+- Mappings (Finance input, never created here; class allowlist: expense refs EXPENSE, deduction/employer-liability refs LIABILITY, asset refs refused as `internal_recovery_unsupported`): every earning/employer-liability line has an expense account,
   every deduction/employer-liability line has a liability account and destination, every revision has a net payable
   account, and each reference resolves to exactly one active, postable tenant account in a declared form
   (account UUID, or the code `2040` for the net payable). The net payable must be account 2040. Anything else refuses

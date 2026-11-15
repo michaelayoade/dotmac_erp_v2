@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final
 
-MAX_FILE_BYTES: Final = 2 * 1024 * 1024
+# Below Starlette's 1 MiB spool threshold even with form overhead, so an upload (which carries pay
+# amounts) is held in memory and never written to a temporary file.
+MAX_FILE_BYTES: Final = 512 * 1024
 MAX_ROWS: Final = 20_000
 HEADER: Final = ("employee_ref", "component_code", "amount", "evidence_ref")
 _AMOUNT: Final = re.compile(r"[0-9]+(?:\.[0-9]+)?")
@@ -51,7 +53,7 @@ EMPTY = ParsedInput({}, hashlib.sha256(b"").hexdigest(), 0)
 
 def parse_input_file(data: bytes, *, minor_units: int) -> ParsedInput:
     if len(data) > MAX_FILE_BYTES:
-        raise InputFileRefused([f"The input file exceeds {MAX_FILE_BYTES // (1024 * 1024)} MiB"])
+        raise InputFileRefused([f"The input file exceeds {MAX_FILE_BYTES // 1024} KiB"])
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError:

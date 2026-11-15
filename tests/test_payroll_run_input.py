@@ -85,3 +85,10 @@ def test_run_step_template_compiles():
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(root), autoescape=True)
     for name in ("payroll/run_step.html", "payroll/actions.html"):
         env.get_template(name)
+
+
+def test_upload_cap_keeps_the_whole_form_below_starlettes_disk_spool_threshold():
+    from erp_v2.web.payroll_run_routes import FORM_OVERHEAD_BYTES
+
+    assert inp.MAX_FILE_BYTES == 512 * 1024
+    assert inp.MAX_FILE_BYTES + FORM_OVERHEAD_BYTES < 1024 * 1024

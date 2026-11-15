@@ -60,7 +60,7 @@ def _page(
             "step": step,
             "error": error,
             "notice": notice,
-            "max_mib": MAX_FILE_BYTES // (1024 * 1024),
+            "max_kib": MAX_FILE_BYTES // 1024,
         },
         status_code=400 if error else 200,
     )
