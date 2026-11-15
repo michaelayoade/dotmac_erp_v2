@@ -341,7 +341,14 @@ async def cancel(
 ) -> HTMLResponse | RedirectResponse:
     values = await _values(request)
     try:
-        service.cancel_payment(db, tenant=tenant, party=party, payment_id=payment_id, reason=values.get("reason", ""))
+        service.cancel_payment(
+            db,
+            tenant=tenant,
+            party=party,
+            payment_id=payment_id,
+            reason=values.get("reason", ""),
+            recall_reference=values.get("recall_reference", ""),
+        )
     except PaymentRefused as exc:
         return _detail_page(
             request, db, tenant, party, payment_id, mode="approve", back=APPROVE_BASE, error=_message(exc)

@@ -37,6 +37,10 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("tenant_id", "id", name="uq_erp_disbursement_file_receipts_tenant_id_id"),
+        # One file per document: a second file for the same payment/payout is never issued.
+        sa.UniqueConstraint(
+            "tenant_id", "document_kind", "document_id", name="uq_erp_disbursement_file_receipts_document"
+        ),
         sa.CheckConstraint(
             "document_kind IN ('supplier_payment', 'payroll_payout')", name="ck_erp_disbursement_file_receipts_kind"
         ),

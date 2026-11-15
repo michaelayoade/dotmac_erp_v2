@@ -342,8 +342,27 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
     return PaymentOutcome(payment.id, False)
 
 
+def _file_receipts(db: Session, tenant_id: UUID, payment_id: UUID) -> list[DisbursementFileReceipt]:
+    return list(
+        db.scalars(
+            select(DisbursementFileReceipt).where(
+                DisbursementFileReceipt.tenant_id == tenant_id,
+                DisbursementFileReceipt.document_kind == KIND_SUPPLIER_PAYMENT,
+                DisbursementFileReceipt.document_id == payment_id,
+            )
+        )
+    )
+
+
 def _cancel(
-    db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, reason: str, now: datetime
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    payment_id: UUID,
+    reason: str,
+    recall_reference: str | None,
+    now: datetime,
 ) -> PaymentOutcome:
     actor = str(party.id)
     payment = _locked_payment(db, tenant.id, payment_id)
@@ -353,6 +372,18 @@ def _cancel(
         raise PaymentRefused("not_cancellable", "Only a draft or approved supplier payment can be cancelled")
     if not reason or not reason.strip():
         raise PaymentRefused("reason_required", "Give a reason for the cancellation")
+    recall = (recall_reference or "").strip()
+    if _file_receipts(db, tenant.id, payment.id):
+        # The bank may already hold a file for this payment: cancelling needs proof it was rejected or recalled.
+        if not recall:
+            raise PaymentRefused(
+                "file_issued",
+                "A bank file was issued for this payment; give the bank's rejection or recall reference to cancel it",
+            )
+        if len(recall) > 255 or any(ord(c) < 32 or ord(c) == 127 for c in recall):
+            raise PaymentRefused(
+                "recall_reference_invalid", "The recall reference must be 255 printable characters at most"
+            )
     payables.cancel_supplier_payment(
         db,
         scope=TenantScope(tenant.id),
@@ -370,7 +401,7 @@ def _cancel(
         entity_id=str(payment.id),
         action=AUDIT_CANCELLED,
         success=True,
-        details={"number": payment.number},
+        details={"number": payment.number, "recall_reference": recall or None},
     )
     return PaymentOutcome(payment.id, False)
 
@@ -386,16 +417,10 @@ def _bank_reference(value: str) -> str:
 
 def _check_file_destination(db: Session, tenant_id: UUID, payment: SupplierPayment) -> None:
     """If a bank file was generated, the payee destination must be unchanged since the file."""
-    latest = db.scalar(
-        select(DisbursementFileReceipt)
-        .where(
-            DisbursementFileReceipt.tenant_id == tenant_id,
-            DisbursementFileReceipt.document_kind == KIND_SUPPLIER_PAYMENT,
-            DisbursementFileReceipt.document_id == payment.id,
-        )
-        .order_by(DisbursementFileReceipt.generated_at.desc(), DisbursementFileReceipt.created_at.desc())
-        .limit(1)
-    )
+    receipts = _file_receipts(db, tenant_id, payment.id)
+    if len(receipts) > 1:  # unique per payment in the schema; defence in depth
+        raise PaymentRefused("file_receipt_ambiguous", "More than one bank file receipt exists for this payment")
+    latest = receipts[0] if receipts else None
     if latest is None:
         return
     try:
@@ -593,6 +618,12 @@ def _generate_file(
         if payment.status != SupplierPaymentStatus.APPROVED:
             raise PaymentRefused("not_approved", f"Payment {payment.number} is not approved")
         _refuse_wht(payment)
+        if _file_receipts(db, tenant.id, payment.id):
+            raise PaymentRefused(
+                "file_already_issued",
+                f"A bank file was already issued for payment {payment.number}; cancel it with the bank's recall "
+                "reference and prepare it again",
+            )
         try:
             destination = payee_service.destination_for_payment(
                 db, tenant_id=tenant.id, payee_kind=PayeeKind.SUPPLIER.value, payee_ref=payment.supplier_ref
@@ -726,7 +757,14 @@ def approve_payment(
 
 
 def cancel_payment(
-    db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, reason: str, now: datetime | None = None
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    payment_id: UUID,
+    reason: str,
+    recall_reference: str | None = None,
+    now: datetime | None = None,
 ) -> PaymentOutcome:
     moment = now or datetime.now(UTC)
     return _guard(
@@ -735,7 +773,15 @@ def cancel_payment(
         party=party,
         entity_id=str(payment_id),
         action="cancel",
-        work=lambda: _cancel(db, tenant=tenant, party=party, payment_id=payment_id, reason=reason, now=moment),
+        work=lambda: _cancel(
+            db,
+            tenant=tenant,
+            party=party,
+            payment_id=payment_id,
+            reason=reason,
+            recall_reference=recall_reference,
+            now=moment,
+        ),
     )
 
 

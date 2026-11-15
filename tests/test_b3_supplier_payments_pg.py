@@ -927,3 +927,67 @@ def test_receipts_are_insert_only_for_the_runtime_role_and_tenant_isolated(engin
                 )
             )
             db.flush()
+
+
+# --- review round 1: one file per payment ----------------------------------
+
+
+def test_one_file_per_payment_in_schema_and_service(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    seed_payee(engine, env)
+    enable_file(engine, env)
+    generate(engine, env, [pid])
+    refused(lambda: generate(engine, env, [pid]), "file_already_issued")
+    assert counts(engine, env)["file_receipts"] == 1
+    with Session(engine) as db:  # the schema refuses a second receipt even when the service is bypassed
+        db.add(
+            DisbursementFileReceipt(
+                tenant_id=env.tenant_id,
+                document_kind="supplier_payment",
+                document_id=pid,
+                payee_instruction_id=uuid4(),
+                file_format="generic-csv-v1",
+                file_sha256="b" * 64,
+                row_count=1,
+                generated_by_party_id=env.people["recorder"],
+                generated_at=NOW,
+            )
+        )
+        with pytest.raises(sa.exc.IntegrityError):
+            db.flush()
+        db.rollback()
+
+
+def test_cancel_after_a_file_needs_a_recall_reference_which_is_audited(engine):
+    env = world(engine)
+    oid = open_obligation(engine, env)
+    pid = approved_payment(engine, env, oid)
+    seed_payee(engine, env)
+    enable_file(engine, env)
+    generate(engine, env, [pid])
+    refused(
+        lambda: act(engine, env, "approver", svc.cancel_payment, payment_id=pid, reason="wrong amount"),
+        "file_issued",
+    )
+    assert payment(engine, pid).status == SupplierPaymentStatus.APPROVED
+    act(
+        engine,
+        env,
+        "approver",
+        svc.cancel_payment,
+        payment_id=pid,
+        reason="wrong amount",
+        recall_reference="BANK-RECALL-9",
+    )
+    assert payment(engine, pid).status == SupplierPaymentStatus.CANCELLED
+    (event,) = audits(engine, env, svc.AUDIT_CANCELLED)
+    assert event.details["recall_reference"] == "BANK-RECALL-9"
+
+
+def test_cancel_without_a_file_needs_no_recall_reference(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    act(engine, env, "approver", svc.cancel_payment, payment_id=pid, reason="duplicate")
+    (event,) = audits(engine, env, svc.AUDIT_CANCELLED)
+    assert event.details["recall_reference"] is None

@@ -26,6 +26,9 @@ class DisbursementFileReceipt(Base):
     __tablename__ = "erp_disbursement_file_receipts"
     __table_args__ = (
         UniqueConstraint("tenant_id", "id", name="uq_erp_disbursement_file_receipts_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id", "document_kind", "document_id", name="uq_erp_disbursement_file_receipts_document"
+        ),
         CheckConstraint(
             "document_kind IN ('supplier_payment', 'payroll_payout')", name="ck_erp_disbursement_file_receipts_kind"
         ),

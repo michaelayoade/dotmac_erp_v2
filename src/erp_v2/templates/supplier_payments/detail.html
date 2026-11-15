@@ -41,6 +41,7 @@
   <form method="post" action="{{ bases.approve }}/{{ payment.id }}/cancel">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p><label>Reason <input name="reason" maxlength="2000" required></label></p>
+    {% if file_receipts %}<p><label>Bank rejection or recall reference (required: a bank file was issued) <input name="recall_reference" maxlength="255" required></label></p>{% endif %}
     <button type="submit">Cancel payment</button>
   </form>
   {% endif %}
