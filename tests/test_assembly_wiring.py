@@ -45,7 +45,7 @@ EXPECTED_MODULE_VERSIONS = {
     "inventory": "0.2.0a1",
     "numbering": "0.1.0a3",
     "party": "0.1.0a1",
-    "payables": "0.1.0a3",
+    "payables": "0.1.0a5",
     "payments": "0.1.0a3",
     "payroll": "0.1.0a3",
     "people": "0.1.0a2",

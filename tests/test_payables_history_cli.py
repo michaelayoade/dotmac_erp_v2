@@ -231,7 +231,8 @@ def operator(monkeypatch, tmp_path):
             privileged_roles=0,
             owned_objects=0,
         ),
-        schema_heads=["pa_0003_historical_invoice", "assembly_head"],
+        schema_heads=[cli.REQUIRED_PAYABLES_HEAD, "assembly_head"],
+        table_rows={},
         transaction_tenant=None,
         tenant_observed=TENANT,
         planned=0,
@@ -311,6 +312,9 @@ def operator(monkeypatch, tmp_path):
             if sql == "SELECT set_config('app.current_tenant', :tenant, true)":
                 state["transaction_tenant"] = parameters["tenant"]
                 return parameters["tenant"]
+            if sql.startswith("SELECT count(*) FROM mod_payables."):
+                assert parameters == {"tenant": TENANT} and state["transaction_tenant"] == TENANT
+                return state["table_rows"].get(sql.split("mod_payables.")[1].split(" ")[0], 0)
             assert sql == "SELECT public.app_current_tenant_id()"
             return state["tenant_observed"]
 
@@ -347,8 +351,8 @@ def operator(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(cli, "_dependencies", dependencies)
-    monkeypatch.setattr(cli, "_installed_payables_version", lambda: "0.1.0a3")
-    monkeypatch.setattr(cli, "_expected_schema_heads", lambda: {"pa_0003_historical_invoice", "assembly_head"})
+    monkeypatch.setattr(cli, "_installed_payables_version", lambda: "0.1.0a5")
+    monkeypatch.setattr(cli, "_expected_schema_heads", lambda: {"pa_0005_reversal_settled_history", "assembly_head"})
     monkeypatch.setattr(cli, "_safe_engine", lambda url: Engine())
     monkeypatch.setattr(cli, "Session", FakeSession)
     for name in ("DATABASE_URL", "PLATFORM_DATABASE_URL"):
@@ -394,7 +398,7 @@ def test_operator_plan_no_owner_calls_and_only_read_queries(operator):
     assert all(flag in posture for flag in ("rolsuper", "rolbypassrls", "rolcreaterole", "rolreplication"))
 
 
-@pytest.mark.parametrize("installed", ["0.1.0a2", "0.1.0a4", "0.1.0a3+local"])
+@pytest.mark.parametrize("installed", ["0.1.0a2", "0.1.0a3", "0.1.0a4", "0.1.0a5+local", "0.1.0a6"])
 def test_unqualified_payables_runtime_refuses_before_database_access(operator, monkeypatch, installed):
     args, state, _ = operator
     monkeypatch.setattr(cli, "_installed_payables_version", lambda: installed)
@@ -431,9 +435,11 @@ def test_unsafe_destination_role_refuses_before_plan_or_owner(operator, tmp_path
     "heads",
     [
         ["pa_0002_optional_supplier_doc", "assembly_head"],
-        ["pa_0003_historical_invoice"],
-        ["pa_0003_historical_invoice", "assembly_head", "unknown_head"],
-        ["pa_0003_historical_invoice", "assembly_head", "assembly_head"],
+        ["pa_0003_historical_invoice", "assembly_head"],  # stale a3 head
+        ["pa_0004_supplier_payments", "assembly_head"],  # stale a4 head
+        ["pa_0005_reversal_settled_history"],
+        ["pa_0005_reversal_settled_history", "assembly_head", "unknown_head"],
+        ["pa_0005_reversal_settled_history", "assembly_head", "assembly_head"],
     ],
 )
 def test_destination_requires_complete_exact_schema_before_planning(operator, heads):
@@ -443,6 +449,39 @@ def test_destination_requires_complete_exact_schema_before_planning(operator, he
         cli._run(args)
     assert state["planned"] == 0 and not state["calls"]
     assert state["transaction_tenant"] is None
+
+
+def test_pins_are_a5_and_head_is_an_expected_stamped_head():
+    from erp_v2.migrate import EXPECTED_HEADS, EXPECTED_STAMPED_HEADS
+
+    assert cli.REQUIRED_PAYABLES_VERSION == "0.1.0a5"
+    assert cli.REQUIRED_PAYABLES_HEAD == "pa_0005_reversal_settled_history"
+    assert cli.REQUIRED_PAYABLES_HEAD in EXPECTED_STAMPED_HEADS
+    stale = {"pa_0003_historical_invoice", "pa_0004_supplier_payments"}
+    assert not stale & set(EXPECTED_HEADS) and not stale & set(EXPECTED_STAMPED_HEADS)
+
+
+@pytest.mark.parametrize("table", cli.PREIMPORT_EMPTY_TABLES)
+@pytest.mark.parametrize("apply", [False, True])
+def test_preexisting_payment_or_settlement_rows_refuse_before_planning(operator, tmp_path, table, apply):
+    if apply:
+        review(operator, tmp_path)
+    args, state, _ = operator
+    planned_before = state["planned"]
+    state["table_rows"][table] = 1
+    with pytest.raises(cli.OperatorRefusal, match="destination_payables_history_not_empty"):
+        cli._run(args)
+    assert state["planned"] == planned_before and not state["calls"]
+
+
+def test_zero_row_assertion_covers_the_ruled_tables():
+    assert set(cli.PREIMPORT_EMPTY_TABLES) == {
+        "supplier_payments",
+        "supplier_payment_allocations",
+        "supplier_payment_withholdings",
+        "historical_settlements",
+        "settlement_observations",
+    }
 
 
 def test_destination_tenant_readback_must_match_bound_cohort(operator):
@@ -730,7 +769,7 @@ def test_hosted_postgres_refuses_unqualified_schema_heads(hosted_postgres, chang
                 connection.execute(
                     sa.text(
                         "UPDATE public.alembic_version SET version_num='pa_0002_optional_supplier_doc' "
-                        "WHERE version_num='pa_0003_historical_invoice'"
+                        "WHERE version_num='pa_0005_reversal_settled_history'"
                     )
                 )
         with Session(engines["operator"]) as session, session.begin():
