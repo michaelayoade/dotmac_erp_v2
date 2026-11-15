@@ -407,6 +407,13 @@ def _guarded_batch(
         )
     )
     todo = [a for a in assignments if a.employee_ref not in calculated]
+    partial = sorted(a.employee_ref for a in todo if a.effective_from > run.period_start)
+    if partial:
+        raise RunRefused(
+            "proration_required",
+            f"{len(partial)} employee(s) joined after the period start and need a proration factor: "
+            f"{_listed(partial)}. Calculate them with the single-employee form, then run the batch again",
+        )
     stray = sorted(set(parsed.by_employee) - {a.employee_ref for a in todo})
     if stray:
         raise RunRefused(

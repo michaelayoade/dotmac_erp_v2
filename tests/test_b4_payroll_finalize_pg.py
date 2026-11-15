@@ -647,3 +647,35 @@ def test_mapping_classes_are_an_allowlist_liability_for_payables_expense_for_exp
     blank_mapping(engine, "expense_account_ref", "BASIC", str(env.accounts["2110"]))
     err = refusal(engine, env, svc.approve, run_id, "mapping_account_class_refused", 1)
     assert "EXPENSE-class" in str(err)
+
+
+def test_mid_period_joiner_needs_the_single_employee_form_for_proration(engine):
+    env = world(engine)
+    run_id = new_run(engine, env)
+    with Session(engine) as db:
+        payroll.assign_employee_pay_structure(
+            db,
+            tenant_id=env.tenant_id,
+            employee_ref="E5",
+            revision_id=env.fixed_revision_id,
+            effective_from=date(2026, 1, 15),
+            effective_to=None,
+            source_ref="test",
+            source_version="1",
+        )
+        db.commit()
+    err = refusal(engine, env, svc.batch_calculate, run_id, "proration_required", 0, input_bytes=GOOD_FILE)
+    assert "E5" in str(err)
+    with Session(engine) as db:  # once calculated by the single-employee path, the batch skips them
+        payroll.calculate_employee_payroll(
+            db,
+            tenant_id=env.tenant_id,
+            run_id=run_id,
+            employee_ref="E5",
+            proration_factor=Decimal("0.5"),
+            inputs=(),
+            calculated_at=NOW,
+        )
+        db.commit()
+    out = batch(engine, env, run_id)
+    assert out.calculated == 3 and out.skipped_existing == 1
