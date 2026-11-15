@@ -572,6 +572,7 @@ def _mint_dict(result: MintResult) -> dict[str, object]:
         "blockers": list(result.blockers),
         "refused": result.refused,
         "excluded_sub_origin": result.excluded_sub_origin,
+        "details": dict(result.details),
     }
 
 

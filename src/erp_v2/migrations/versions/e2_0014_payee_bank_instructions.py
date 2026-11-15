@@ -53,6 +53,8 @@ def upgrade() -> None:
         sa.Column("status", sa.String(16), nullable=False),
         sa.Column("origin", sa.String(16), nullable=False),
         sa.Column("evidence_ref", sa.String(240), nullable=True),
+        sa.Column("source_ref", sa.String(255), nullable=True),
+        sa.Column("source_fingerprint", sa.String(64), nullable=True),
         sa.Column("proposed_by_party_id", sa.Uuid(), nullable=True),
         sa.Column("proposed_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("decided_by_party_id", sa.Uuid(), nullable=True),

@@ -25,6 +25,7 @@ rest run as an explicit phase via `mint_all`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -68,6 +69,7 @@ class MintResult:
     blockers: list[str] = field(default_factory=list)
     refused: str | None = None
     excluded_sub_origin: int = 0  # Sub-tagged legacy rows deliberately not minted (M11 pending)
+    details: dict[str, int] = field(default_factory=dict)  # named counts (never values)
 
 
 def _norm(value: Any) -> Any:
@@ -763,7 +765,7 @@ def mint_bank_institutions_from_accounts(source: sa.Connection, dest: sa.Connect
     return result
 
 
-# --- payees: legacy bank details land as PROPOSED, never approved (B8, W10) -------------------
+# --- payees: legacy bank details migrate (complete: approved; incomplete: proposed) (B8) ---
 
 
 def _canon_ref(value: Any) -> str:
@@ -784,26 +786,86 @@ def _supplier_bank_details(raw: Any) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
+def _migration_actor(actor_id: str) -> uuid.UUID:
+    """The declared enrolment actor as a party-shaped id: itself if a UUID, else a stable uuid5."""
+
+    try:
+        return uuid.UUID(str(actor_id))
+    except ValueError:
+        return uuid.uuid5(_NS, f"erp-v2-migration-actor:{actor_id}")
+
+
+def _write_migration_audit(dest: sa.Connection, ctx: MintContext, approved: Sequence[Mapping[str, Any]]) -> None:
+    """One audit event per migrated approval, in the caller's transaction (fail closed)."""
+
+    from dotmac_kernel.audit import write_audit_event
+    from dotmac_kernel.audit_actions import AuditActionRegistry, AuditActionsNotInstalledError, install_audit_actions
+    from dotmac_kernel.features import FeatureManifest
+    from sqlalchemy.orm import Session
+
+    from erp_v2.payees.service import AUDIT_ACTIONS, AUDIT_MIGRATED, SOURCE_APPLICATION
+
+    try:
+        from dotmac_kernel.audit_actions import active_audit_actions
+
+        active_audit_actions()
+    except AuditActionsNotInstalledError:
+        # Importer CLI builds no app: declare the payee vocabulary itself, as the kernel requires.
+        install_audit_actions(
+            AuditActionRegistry.from_manifests([FeatureManifest(name="erp_payee_bank", audit_actions=AUDIT_ACTIONS)])
+        )
+    with Session(bind=dest, join_transaction_mode="create_savepoint") as session:
+        for row in approved:
+            write_audit_event(
+                session,
+                tenant_id=uuid.UUID(str(ctx.tenant_id)),
+                actor_type="service",
+                actor_id=str(ctx.actor_id),
+                actor_label="erp_v2.importer",
+                source_application=SOURCE_APPLICATION,
+                action=AUDIT_MIGRATED,
+                entity_type="payee_bank_instruction",
+                entity_id=str(uuid.UUID(str(row["id"]))),
+                is_success=True,
+                details={
+                    "payee_kind": row["payee_kind"],
+                    "payee_ref": row["payee_ref"],
+                    "account_last4": row["account_last4"],
+                    "source_ref": row["source_ref"],
+                    "source_fingerprint": row["source_fingerprint"],
+                },
+            )
+        session.commit()  # releases only the session's savepoint; the caller owns the real transaction
+
+
 def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
-    """Import retained legacy payee bank details as imported-pending-approval instructions.
+    """Migrate retained legacy payee bank details (Michael, register v1294: data migration).
 
     Sources: ``employee.bank_name/bank_account_number/bank_account_name`` and
-    ``supplier.bank_details`` (JSON). Every row lands as status ``proposed``, origin
-    ``legacy_import``, with no proposer: a finance_approver (a person, never treasury) must
-    approve each one individually; nothing is approved by import and there is no bulk path.
+    ``supplier.bank_details`` (JSON).
 
+    - COMPLETE rows (bank code 3-6 digits, 10-digit account number, account name) land directly as
+      ``approved``, origin ``legacy_import``, decided by the declared enrolment actor, with
+      provenance (``source_ref``), a sha256 source fingerprint and one audit event each
+      (``erp.payees.bank_details.migrated``). No human proposer or approver is needed.
+    - INCOMPLETE rows (e.g. every legacy employee row: it carries a branch code, never a bank code)
+      land as ``proposed``/``legacy_import`` and are never active: Finance corrects them through
+      the normal two-person propose/approve (a human proposal replaces the open legacy row).
+    - Every change after migration stays two-person.
     - Employees whose destination row was not imported are not minted (blocker by id).
-    - Legacy employee rows carry a branch code, not a bank code, so ``bank_code`` stays NULL;
-      such rows cannot be approved as imported (approval refuses ``incomplete_instruction``) and
-      need a corrected human proposal. Supplier rows keep their legacy ``bank_code``.
     - Rows with no full account number (empty, or supplier last-4 only) mint nothing.
-    - Blockers and receipts name legacy ids only, never account numbers or names.
+    - Blockers, details and receipts name legacy ids and counts only, never numbers or names.
     - A payee that already has a proposed or approved instruction is counted ``existing``.
     """
 
     result = MintResult("payee_bank_instructions")
+    if not ctx.actor_id:
+        raise MintRefusal("payee_bank_instructions minting requires an enrolment actor_id (migration actor)")
+    from erp_v2.payees.service import missing_fields
+
     tenant = _canon_ref(ctx.tenant_id)
     stamp = _now(ctx)
+    actor_party = _migration_actor(ctx.actor_id)
     imported_employees = {
         _canon_ref(r[0])
         for r in dest.execute(sa.text("SELECT id FROM mod_people.employees WHERE tenant_id = :t"), {"t": ctx.tenant_id})
@@ -821,7 +883,7 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
     candidates: list[dict[str, Any]] = []
     not_imported = 0
 
-    def _add(kind: str, ref: str, label: str, fields: dict[str, Any], evidence: str) -> None:
+    def _add(kind: str, ref: str, label: str, fields: dict[str, Any], source_ref: str) -> None:
         number = str(fields.get("account_number") or "").strip()
         if not number:
             return
@@ -844,6 +906,13 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
         if (kind, ref) in live:
             result.existing += 1
             return
+        complete = not missing_fields(values["bank_code"], number, values["account_name"])
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                [_canon_ref(ctx.tenant_id), kind, ref, values["bank_code"], number, values["account_name"]],
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         candidates.append(
             {
                 "id": _mint_id("payee_bank_instructions", ctx.tenant_id, f"{kind}:{ref}"),
@@ -854,11 +923,17 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
                 **values,
                 "account_number": number,
                 "account_last4": number[-4:],
-                "status": "proposed",
+                "status": "approved" if complete else "proposed",
                 "origin": "legacy_import",
-                "evidence_ref": evidence,
+                "evidence_ref": f"legacy-import:{source_ref}",
+                "source_ref": f"legacy:{source_ref}:{ref}",
+                "source_fingerprint": fingerprint,
                 "proposed_by_party_id": None,
                 "proposed_at": stamp,
+                "decided_by_party_id": actor_party.hex if complete else None,
+                "decided_at": stamp if complete else None,
+                "approved_at": stamp if complete else None,
+                "decision_note": f"legacy data migration by {ctx.actor_id}"[:500] if complete else None,
                 "created_at": stamp,
                 "updated_at": stamp,
             }
@@ -887,7 +962,7 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
                 "account_number": row["bank_account_number"],
                 "account_name": row["bank_account_name"],
             },
-            "legacy-import:employee.bank_account",
+            "employee.bank_account",
         )
     for row in source.execute(
         sa.text("SELECT supplier_id, organization_id, legal_name, trading_name, bank_details FROM supplier")
@@ -898,17 +973,18 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
         if not details:
             continue
         label = str(row["legal_name"] or "").strip() or str(row["trading_name"] or "").strip()
-        _add(
-            "supplier",
-            _canon_ref(row["supplier_id"]),
-            label,
-            details,
-            "legacy-import:supplier.bank_details",
-        )
+        _add("supplier", _canon_ref(row["supplier_id"]), label, details, "supplier.bank_details")
     if not_imported:
         result.blockers.append(f"payee_bank_instructions: {not_imported} employees with bank details not yet imported")
     _insert(dest, "payee_bank_instructions", candidates)
+    approved = [c for c in candidates if c["status"] == "approved"]
+    if approved:
+        try:
+            _write_migration_audit(dest, ctx, approved)
+        except (ValueError, TypeError) as exc:  # fail closed: no approved row without its audit event
+            raise MintRefusal(f"migration audit could not be written ({type(exc).__name__})") from exc
     result.created = len(candidates)
+    result.details = {"approved": len(approved), "proposed_incomplete": len(candidates) - len(approved)}
     return result
 
 

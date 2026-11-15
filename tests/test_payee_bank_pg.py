@@ -321,7 +321,7 @@ def test_concurrent_approvals_of_one_proposal_have_exactly_one_winner(engine):
         )
 
 
-def test_legacy_import_mint_writes_proposed_rows_on_the_real_table_and_each_needs_approval(engine):
+def test_legacy_import_mint_migrates_complete_rows_as_approved_on_the_real_table(engine):
     tenant = new_tenant(engine)
     src = sa.create_engine("sqlite://").connect()
     src.execute(sa.text("ATTACH DATABASE ':memory:' AS public"))
@@ -348,26 +348,34 @@ def test_legacy_import_mint_writes_proposed_rows_on_the_real_table_and_each_need
         sa.text("INSERT INTO public.supplier VALUES (:s, :t, 'Acme', NULL, :d)"),
         {"s": str(supplier), "t": str(tenant), "d": details},
     )
-    ctx = MintContext(tenant_id=str(tenant), actor_id="a", occurred_at=datetime(2026, 11, 14, tzinfo=UTC))
+    ctx = MintContext(tenant_id=str(tenant), actor_id="enrolment-actor", occurred_at=datetime(2026, 11, 14, tzinfo=UTC))
     with engine.connect() as dest:
         result = run_mint_step("payee_bank_instructions", src, dest, ctx)
         dest.commit()
     assert result.refused is None and result.created == 1
     with Session(engine) as db:
         row = db.scalar(sa.select(PayeeBankInstruction).where(PayeeBankInstruction.tenant_id == tenant))
+        # complete legacy row: migrated straight to approved by the declared actor, with provenance
         assert (row.status, row.origin, row.proposed_by_party_id, row.payee_ref) == (
-            "proposed",
+            "approved",
             "legacy_import",
             None,
             str(supplier),
         )
-        with pytest.raises(PayeeBankError) as unverified:
-            service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
-        assert unverified.value.code == "verification_required"
-        approved = service.approve(
-            db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER, note="call-back ref 12"
-        )
-        assert approved.status == "approved"
+        assert row.decided_by_party_id is not None and row.approved_at is not None
+        assert row.source_ref == f"legacy:supplier.bank_details:{supplier}" and len(row.source_fingerprint) == 64
+        migrated = db.scalars(
+            sa.select(AuditEvent).where(AuditEvent.tenant_id == tenant, AuditEvent.action == service.AUDIT_MIGRATED)
+        ).all()
+        assert len(migrated) == 1 and NUMBER not in repr(migrated[0].details)
+        dest = service.destination_for_payment(db, tenant_id=tenant, payee_kind="supplier", payee_ref=str(supplier))
+        assert dest.instruction_id == row.id
+        # every later change is two-person: the migration actor is not a bypass for anyone else
+        change = propose(db, tenant, ref=str(supplier), number=OTHER)
+        with pytest.raises(PayeeBankError) as same:
+            service.approve(db, tenant_id=tenant, instruction_id=change.id, approver_party_id=PREPARER)
+        assert same.value.code == "same_person"
+        service.approve(db, tenant_id=tenant, instruction_id=change.id, approver_party_id=APPROVER)
         db.commit()
 
 

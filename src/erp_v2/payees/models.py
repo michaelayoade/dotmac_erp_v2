@@ -119,6 +119,9 @@ class PayeeBankInstruction(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default=InstructionStatus.PROPOSED.value)
     origin: Mapped[str] = mapped_column(String(16), nullable=False, default=InstructionOrigin.MANUAL.value)
     evidence_ref: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    # Legacy-migration provenance: which source record, and a sha256 over its bank fields.
+    source_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     proposed_by_party_id: Mapped[UUID | None] = mapped_column(Uuid(), nullable=True)
     proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     decided_by_party_id: Mapped[UUID | None] = mapped_column(Uuid(), nullable=True)

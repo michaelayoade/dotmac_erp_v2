@@ -34,7 +34,15 @@ AUDIT_APPROVED: Final = "erp.payees.bank_details.approved"
 AUDIT_REJECTED: Final = "erp.payees.bank_details.rejected"
 AUDIT_REVOKED: Final = "erp.payees.bank_details.revoked"
 AUDIT_UNMASKED_READ: Final = "erp.payees.bank_details.unmasked_read"
-AUDIT_ACTIONS: Final = (AUDIT_PROPOSED, AUDIT_APPROVED, AUDIT_REJECTED, AUDIT_REVOKED, AUDIT_UNMASKED_READ)
+AUDIT_MIGRATED: Final = "erp.payees.bank_details.migrated"
+AUDIT_ACTIONS: Final = (
+    AUDIT_PROPOSED,
+    AUDIT_APPROVED,
+    AUDIT_REJECTED,
+    AUDIT_REVOKED,
+    AUDIT_UNMASKED_READ,
+    AUDIT_MIGRATED,
+)
 
 SOURCE_APPLICATION: Final = "dotmac_erp"
 _BANK_CODE = re.compile(r"^[0-9]{3,6}$")
@@ -146,17 +154,21 @@ def _text(value: str | None, field_name: str, *, limit: int, required: bool = Tr
     return cleaned
 
 
-def missing_for_approval(row: PayeeBankInstruction) -> list[str]:
-    """Names (never values) of fields that fail the strict approval rules."""
+def missing_fields(bank_code: str | None, account_number: str | None, account_name: str | None) -> list[str]:
+    """Names (never values) of fields that fail the strict usability rules."""
 
     missing = []
-    if not row.bank_code or not _BANK_CODE.match(row.bank_code):
+    if not bank_code or not _BANK_CODE.match(bank_code):
         missing.append("bank_code")
-    if not _NUBAN.match(row.account_number or ""):
+    if not _NUBAN.match(account_number or ""):
         missing.append("account_number")
-    if not (row.account_name or "").strip():
+    if not (account_name or "").strip():
         missing.append("account_name")
     return missing
+
+
+def missing_for_approval(row: PayeeBankInstruction) -> list[str]:
+    return missing_fields(row.bank_code, row.account_number, row.account_name)
 
 
 def _audit(db: Session, *, tenant_id: UUID, actor: UUID, action: str, row: PayeeBankInstruction, **details) -> None:
@@ -343,20 +355,13 @@ def approve(
         raise PayeeBankError("same_person", "the proposer cannot approve their own proposal")
     if resolve_payee(db, tenant_id, row.payee_kind, row.payee_ref) is None:
         raise PayeeBankError("unknown_payee", "payee is not a known supplier or employee in this tenant")
-    verification = _text(note, "note", limit=500, required=False)
-    if row.origin == InstructionOrigin.LEGACY_IMPORT.value and not verification:
-        raise PayeeBankError(
-            "verification_required",
-            "approving a legacy-imported instruction needs a note naming the verification evidence "
-            "(call-back record or signed letter)",
-        )
+    decision_note = _text(note, "note", limit=500, required=False)
     missing = missing_for_approval(row)
     if missing:
         raise PayeeBankError(
             "incomplete_instruction",
             "cannot approve: invalid or missing " + ", ".join(missing) + "; propose corrected details instead",
         )
-    decision_note = verification
     stamp = now or _now()
     previous = db.scalar(
         select(PayeeBankInstruction)
@@ -387,7 +392,6 @@ def approve(
         row=row,
         superseded=str(previous.id) if previous is not None else None,
         origin=row.origin,
-        verification_note=decision_note if row.origin == InstructionOrigin.LEGACY_IMPORT.value else None,
         shared_account_payees=_shared_count(db, row),
     )
     return row

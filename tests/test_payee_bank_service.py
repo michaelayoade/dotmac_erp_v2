@@ -245,9 +245,7 @@ def test_imported_rows_need_individual_approval_and_incomplete_ones_cannot_be_ap
     db, tenant = env
     incomplete = _imported(db, tenant, bank_code=None)
     with pytest.raises(PayeeBankError) as err:
-        service.approve(
-            db, tenant_id=tenant, instruction_id=incomplete.id, approver_party_id=APPROVER, note="call-back"
-        )
+        service.approve(db, tenant_id=tenant, instruction_id=incomplete.id, approver_party_id=APPROVER)
     assert err.value.code == "incomplete_instruction" and "bank_code" in str(err.value)
     assert NUMBER not in str(err.value) and incomplete.status == "proposed"
     complete = _imported(db, tenant, bank_code="058", ref="emp-2")
@@ -317,19 +315,27 @@ def test_approve_refuses_a_payee_that_is_no_longer_known(env, monkeypatch):
     assert err.value.code == "unknown_payee" and row.status == "proposed"
 
 
-def test_legacy_import_approval_needs_a_verification_note_recorded_in_audit(env):
+def test_a_legacy_proposed_row_needs_no_verification_note_but_still_a_different_person(env):
+    # Michael (register v1294): legacy data is migrated, not re-verified. Only incomplete rows stay
+    # proposed; this complete one (not produced by the importer) approves like any proposal.
     db, tenant = env
     row = _imported(db, tenant, bank_code="058", ref="emp-1")
-    with pytest.raises(PayeeBankError) as err:
-        service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
-    assert err.value.code == "verification_required" and row.status == "proposed"
-    service.approve(
-        db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER, note="call-back 2026-11-14 ref 77"
-    )
+    service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
     assert row.status == "approved"
-    details = event(db, service.AUDIT_APPROVED).details
-    assert details["origin"] == "legacy_import" and details["verification_note"] == "call-back 2026-11-14 ref 77"
-    assert NUMBER not in repr(details)
+    assert event(db, service.AUDIT_APPROVED).details["origin"] == "legacy_import"
+
+
+def test_changing_a_migrated_approved_row_is_two_person(env):
+    db, tenant = env
+    migrated = _imported(db, tenant, bank_code="058", ref="emp-1")
+    migrated.status, migrated.approved_at, migrated.decided_by_party_id = "approved", migrated.proposed_at, uuid4()
+    db.flush()
+    new = propose(db, tenant, ref="emp-1", kind="employee", number=OTHER_NUMBER)
+    with pytest.raises(PayeeBankError) as err:
+        service.approve(db, tenant_id=tenant, instruction_id=new.id, approver_party_id=PREPARER)
+    assert err.value.code == "same_person"
+    service.approve(db, tenant_id=tenant, instruction_id=new.id, approver_party_id=APPROVER)
+    assert (migrated.status, new.status) == ("superseded", "approved")
 
 
 def test_a_proposal_replaces_an_open_legacy_import_proposal_in_one_transaction(env):

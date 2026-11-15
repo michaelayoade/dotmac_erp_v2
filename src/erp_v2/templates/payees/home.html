@@ -26,7 +26,7 @@
       <td>{% if i.shared_account_payees %}Also used by {{ i.shared_account_payees }} other payee(s){% endif %}</td>
       <td>
       {% if i.status == 'proposed' %}
-        <form method="post" action="/finance/payee-bank-details/{{ i.id }}/approve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="note" maxlength="500" placeholder="{% if i.origin == 'legacy_import' %}Verification evidence (required){% else %}Note{% endif %}" {% if i.origin == 'legacy_import' %}required{% endif %}><button type="submit">Approve</button></form>
+        <form method="post" action="/finance/payee-bank-details/{{ i.id }}/approve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="note" maxlength="500" placeholder="Note"><button type="submit">Approve</button></form>
         <form method="post" action="/finance/payee-bank-details/{{ i.id }}/reject"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Reject</button></form>
       {% elif i.status == 'approved' %}
         <form method="post" action="/finance/payee-bank-details/{{ i.id }}/revoke"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Revoke</button></form>
