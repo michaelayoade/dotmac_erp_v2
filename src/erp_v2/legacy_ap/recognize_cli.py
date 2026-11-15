@@ -448,16 +448,19 @@ def run_cohort(
     _require(held is not None, "approver_lacks_finance_approver")
     evidence_ref = evidence_reference(list_sha256)
     verifier = ApprovedInvoiceVerifier(source, manifest, evidence_ref)
+    if apply:
+        # One apply at a time per list, taken BEFORE the plan is built: a concurrent identical apply
+        # waits here, then classifies every invoice as already done (a no-op), instead of planning
+        # from a snapshot taken before the first one committed.
+        session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": "erp.b1b:" + list_sha256}
+        )
     plan = build_plan(
         session, scope, verifier, ids, evidence_ref=evidence_ref, bindings=bindings or {}, actor=actor_party_id
     )
     if not apply:
         return receipt_of(plan, mode="plan")
     _require(bool(re.fullmatch(r"[0-9a-f]{64}", reviewed_digest or "")), "reviewed_plan_required")
-    # One run at a time per list: a concurrent identical run waits, then sees every id done.
-    session.execute(
-        sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": "erp.b1b:" + list_sha256}
-    )
     posted_total = apply_plan(
         session,
         scope,

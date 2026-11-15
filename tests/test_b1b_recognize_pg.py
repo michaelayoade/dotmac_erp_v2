@@ -639,3 +639,30 @@ def test_non_functional_currency_or_amount_mismatch_is_unsupported(engine, setup
     legacy.overrides[iid] = override
     legacy.build((iid,))
     assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"legacy_evidence:unsupported_currency": 1}
+
+
+def test_advisory_lock_is_taken_before_any_invoice_is_read_and_only_for_apply(engine, setup):
+    env, legacy = setup
+    ids = (imported(engine, env),)
+    legacy.build(ids)
+    plan = legacy.run(engine, ids, apply=False)
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        legacy.run(engine, ids, apply=True, digest=plan["plan_digest"])
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    lock = next(i for i, text in enumerate(statements) if "pg_advisory_xact_lock" in text)
+    first_read = next(i for i, text in enumerate(statements) if "supplier_invoices" in text)
+    assert lock < first_read
+    statements.clear()
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        legacy.run(engine, ids, apply=False)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    assert not any("pg_advisory_xact_lock" in text for text in statements)
