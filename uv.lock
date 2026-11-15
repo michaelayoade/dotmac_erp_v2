@@ -215,15 +215,15 @@ wheels = [
 
 [[package]]
 name = "dotmac-accounting"
-version = "0.1.0a1"
+version = "0.1.0a2"
 source = { registry = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" }
 dependencies = [
     { name = "dotmac-kernel" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-accounting/0.1.0a1/dotmac_accounting-0.1.0a1.tar.gz", hash = "sha256:7a669d5e84e88935173b3d9a3a0e23cb5e1305739e76c2557ed9497b68591362" }
+sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-accounting/0.1.0a2/dotmac_accounting-0.1.0a2.tar.gz", hash = "sha256:e5026ff63bafaa3bf4f249723ec56b80102d3477ad3082daca2db3f9be1256ac" }
 wheels = [
-    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-accounting/0.1.0a1/dotmac_accounting-0.1.0a1-py3-none-any.whl", hash = "sha256:79fc97fefb224e0e6e1da8e6d773a38dfce82aeccba767bb7e04bba15965dbc9" },
+    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-accounting/0.1.0a2/dotmac_accounting-0.1.0a2-py3-none-any.whl", hash = "sha256:adb95227531f9cfffc20a848210b8ff78f8a1a2d358730ca487916d75c617d81" },
 ]
 
 [[package]]
@@ -262,15 +262,15 @@ dependencies = [
 
 [[package]]
 name = "dotmac-approvals"
-version = "0.1.0a8"
+version = "0.1.0a9"
 source = { registry = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" }
 dependencies = [
     { name = "dotmac-kernel" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-approvals/0.1.0a8/dotmac_approvals-0.1.0a8.tar.gz", hash = "sha256:61fee66eded417b43e4eb752a7ce206d08c59238c794b38e8710c7d250f986de" }
+sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-approvals/0.1.0a9/dotmac_approvals-0.1.0a9.tar.gz", hash = "sha256:3c77960015e6a3a220be3b4a7b277dd2faec68d08d22773e638340f0555df482" }
 wheels = [
-    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-approvals/0.1.0a8/dotmac_approvals-0.1.0a8-py3-none-any.whl", hash = "sha256:f37f02ac98734b6a65690f2f39c839fde9c0cb6545a71e70e090666deb8f01d7" },
+    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-approvals/0.1.0a9/dotmac_approvals-0.1.0a9-py3-none-any.whl", hash = "sha256:eb6fe38f63731cf6d326a806dd63ee2867c47840ea4249ffbd4e1cae8dc7cee5" },
 ]
 
 [[package]]
@@ -434,11 +434,11 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = "==1.13.2" },
-    { name = "dotmac-accounting", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
+    { name = "dotmac-accounting", specifier = "==0.1.0a2", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-ai-operations", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-analytics", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-app-sync", git = "https://github.com/michaelayoade/dotmac_starter_mt.git?subdirectory=packages%2Fdotmac-app-sync&rev=e1bfa54e23bd8184c20beb2dc1d9f0938fa336f6" },
-    { name = "dotmac-approvals", specifier = "==0.1.0a8", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
+    { name = "dotmac-approvals", specifier = "==0.1.0a9", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-assets", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-banking", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-billing", specifier = "==0.1.0a11", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
@@ -459,7 +459,7 @@ requires-dist = [
     { name = "dotmac-party", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-payables", specifier = "==0.1.0a3", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-payments", specifier = "==0.1.0a3", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
-    { name = "dotmac-payroll", specifier = "==0.1.0a2", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
+    { name = "dotmac-payroll", specifier = "==0.1.0a3", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-people", specifier = "==0.1.0a2", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-procurement", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-projects", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
@@ -639,15 +639,15 @@ wheels = [
 
 [[package]]
 name = "dotmac-payroll"
-version = "0.1.0a2"
+version = "0.1.0a3"
 source = { registry = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" }
 dependencies = [
     { name = "dotmac-kernel" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a2/dotmac_payroll-0.1.0a2.tar.gz", hash = "sha256:a87b557bff8ae18d655d387d4d696430cadc619f49a7dc1f2dfa7d7a755ec932" }
+sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a3/dotmac_payroll-0.1.0a3.tar.gz", hash = "sha256:6cadfec03704a78ab98586c4f544128d21b0594ddba9aa4808a8720301e4194c" }
 wheels = [
-    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a2/dotmac_payroll-0.1.0a2-py3-none-any.whl", hash = "sha256:ae059ee2a6095d7964a49a50fa92abc0d7a95e5b7bf888f062bacbd4373821cb" },
+    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a3/dotmac_payroll-0.1.0a3-py3-none-any.whl", hash = "sha256:60d1bd38ae909e6c3db0845c0fcd84fe0eb2b763fb4de089d2268d6cfa18aa4e" },
 ]
 
 [[package]]
