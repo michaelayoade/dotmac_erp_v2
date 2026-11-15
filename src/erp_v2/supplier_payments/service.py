@@ -493,6 +493,10 @@ def _record(
     if payment.status != SupplierPaymentStatus.APPROVED:
         raise PaymentRefused("not_approved", "Only an approved supplier payment can be recorded")
     _refuse_wht(payment)
+    if payment.value_date > now.astimezone(UTC).date():
+        raise PaymentRefused(
+            "value_date_future", "The payment's value date is in the future; record it on or after that date"
+        )
     if _same(payment.prepared_by, actor):
         raise PaymentRefused("sod_recorder_is_preparer", "You prepared this payment; someone else must record it")
     if _same(payment.approved_by, actor):

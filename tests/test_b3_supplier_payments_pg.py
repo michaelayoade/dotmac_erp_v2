@@ -8,7 +8,7 @@ so the AP control account holds the liability before any payment is proposed.
 import os
 import threading
 import time
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -58,7 +58,7 @@ from erp_v2.supplier_payments.service import AllocationRequest, PaymentRefused
 
 engine = bridge_pg.engine  # disposable-database fixture under its own name
 
-VALUE_DATE = date(2026, 1, 20)
+VALUE_DATE = date(2026, 1, 12)  # on or before NOW (2026-01-15): recording a future value date is refused
 ACCOUNT_NUMBER = "0123456789"
 
 
@@ -1059,3 +1059,20 @@ def test_approver_independence_is_rechecked_at_file_and_record(engine):
     refused(lambda: generate(engine, env, [pid]), "sod_approver_is_instruction_party")
     refused(lambda: record(engine, env, pid), "sod_approver_is_instruction_party")
     assert counts(engine, env) == before
+
+
+def test_record_refuses_a_future_value_date_and_accepts_the_day_itself(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    before = counts(engine, env)
+    early = datetime(2026, 1, 11, 23, 59, tzinfo=UTC)
+    refused(
+        lambda: act(engine, env, "recorder", svc.record_payment, payment_id=pid, bank_reference="REF-F", now=early),
+        "value_date_future",
+    )
+    assert counts(engine, env) == before
+    on_day = datetime(2026, 1, 12, 0, 0, tzinfo=UTC)
+    assert (
+        act(engine, env, "recorder", svc.record_payment, payment_id=pid, bank_reference="REF-F", now=on_day).replayed
+        is False
+    )
