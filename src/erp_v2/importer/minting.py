@@ -25,6 +25,8 @@ rest run as an explicit phase via `mint_all`.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -67,6 +69,7 @@ class MintResult:
     blockers: list[str] = field(default_factory=list)
     refused: str | None = None
     excluded_sub_origin: int = 0  # Sub-tagged legacy rows deliberately not minted (M11 pending)
+    details: dict[str, int] = field(default_factory=dict)  # named counts (never values)
 
 
 def _norm(value: Any) -> Any:
@@ -762,8 +765,323 @@ def mint_bank_institutions_from_accounts(source: sa.Connection, dest: sa.Connect
     return result
 
 
+# --- payees: legacy bank details migrate (complete: approved; incomplete: proposed) (B8) ---
+
+
+def _canon_ref(value: Any) -> str:
+    """Canonical dashed lowercase UUID spelling when the value is a UUID, else the text."""
+
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return str(value)
+
+
+def _supplier_bank_details(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _migration_actor(actor_id: str) -> uuid.UUID:
+    """The declared enrolment actor as a party-shaped id: itself if a UUID, else a stable uuid5."""
+
+    try:
+        return uuid.UUID(str(actor_id))
+    except ValueError:
+        return uuid.uuid5(_NS, f"erp-v2-migration-actor:{actor_id}")
+
+
+def _write_migration_audit(dest: sa.Connection, ctx: MintContext, approved: Sequence[Mapping[str, Any]]) -> None:
+    """One audit event per migrated approval, in the caller's transaction (fail closed)."""
+
+    from dotmac_kernel.audit import write_audit_event
+    from dotmac_kernel.audit_actions import AuditActionRegistry, AuditActionsNotInstalledError, install_audit_actions
+    from dotmac_kernel.features import FeatureManifest
+    from sqlalchemy.orm import Session
+
+    from erp_v2.payees.service import AUDIT_ACTIONS, AUDIT_MIGRATED, SOURCE_APPLICATION
+
+    try:
+        from dotmac_kernel.audit_actions import active_audit_actions
+
+        active_audit_actions()
+    except AuditActionsNotInstalledError:
+        # Importer CLI builds no app: declare the payee vocabulary itself, as the kernel requires.
+        install_audit_actions(
+            AuditActionRegistry.from_manifests([FeatureManifest(name="erp_payee_bank", audit_actions=AUDIT_ACTIONS)])
+        )
+    with Session(bind=dest, join_transaction_mode="create_savepoint") as session:
+        for row in approved:
+            write_audit_event(
+                session,
+                tenant_id=uuid.UUID(str(ctx.tenant_id)),
+                actor_type="service",
+                actor_id=str(ctx.actor_id),
+                actor_label="erp_v2.importer",
+                source_application=SOURCE_APPLICATION,
+                action=AUDIT_MIGRATED,
+                entity_type="payee_bank_instruction",
+                entity_id=str(uuid.UUID(str(row["id"]))),
+                is_success=True,
+                details={
+                    "payee_kind": row["payee_kind"],
+                    "payee_ref": row["payee_ref"],
+                    "account_last4": row["account_last4"],
+                    "source_ref": row["source_ref"],
+                    "source_fingerprint": row["source_fingerprint"],
+                },
+            )
+        session.commit()  # releases only the session's savepoint; the caller owns the real transaction
+
+
+def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
+    """Migrate retained legacy payee bank details (Michael, register v1294: data migration).
+
+    Sources: ``employee.bank_name/bank_account_number/bank_account_name`` and
+    ``supplier.bank_details`` (JSON).
+
+    - COMPLETE rows (bank code 3-6 digits, 10-digit account number, account name) land directly as
+      ``approved``, origin ``legacy_import``, decided by the declared enrolment actor, with
+      provenance (``source_ref``), a sha256 source fingerprint and one audit event each
+      (``erp.payees.bank_details.migrated``). No human proposer or approver is needed.
+    - INCOMPLETE rows (e.g. every legacy employee row: it carries a branch code, never a bank code)
+      land as ``proposed``/``legacy_import`` and are never active: Finance corrects them through
+      the normal two-person propose/approve (a human proposal replaces the open legacy row).
+    - Every change after migration stays two-person.
+    - Employees whose destination row was not imported are not minted (blocker by id).
+    - Rows with no full account number (empty, or supplier last-4 only) mint nothing.
+    - Blockers, details and receipts name legacy ids and counts only, never numbers or names.
+    - A payee that already has ANY instruction row (any status, so a rerun after reject, revoke or
+      supersede never re-mints) is counted ``existing``.
+    """
+
+    result = MintResult("payee_bank_instructions")
+    if not ctx.actor_id:
+        raise MintRefusal("payee_bank_instructions minting requires an enrolment actor_id (migration actor)")
+    from erp_v2.payees.service import missing_fields
+
+    tenant = _canon_ref(ctx.tenant_id)
+    stamp = _now(ctx)
+    actor_party = _migration_actor(ctx.actor_id)
+    imported_employees = {
+        _canon_ref(r[0])
+        for r in dest.execute(sa.text("SELECT id FROM mod_people.employees WHERE tenant_id = :t"), {"t": ctx.tenant_id})
+    }
+    live = {
+        (str(kind), str(ref))
+        for kind, ref in dest.execute(
+            sa.text("SELECT payee_kind, payee_ref FROM payee_bank_instructions WHERE tenant_id = :t"),
+            {"t": ctx.tenant_id},
+        )
+    }
+    known_suppliers = {
+        str(r[0])
+        for r in dest.execute(
+            sa.text("SELECT DISTINCT supplier_ref FROM mod_payables.supplier_invoices WHERE tenant_id = :t"),
+            {"t": ctx.tenant_id},
+        )
+    }
+    candidates: list[dict[str, Any]] = []
+    not_imported = 0
+
+    def _add(kind: str, ref: str, label: str, fields: dict[str, Any], source_ref: str) -> None:
+        number = str(fields.get("account_number") or "").strip()
+        if not number:
+            return
+        values = {
+            "bank_code": (str(fields.get("bank_code") or "").strip() or None),
+            "bank_name": (str(fields.get("bank_name") or "").strip() or None),
+            "account_name": (str(fields.get("account_name") or "").strip() or None),
+        }
+        too_long = (
+            len(number) > 34
+            or len(ref) > 255
+            or len(label) > 200
+            or len(values["bank_code"] or "") > 10
+            or len(values["bank_name"] or "") > 120
+            or len(values["account_name"] or "") > 200
+        )
+        if too_long:
+            result.blockers.append(f"payee_bank_instructions: {kind} {ref} has an over-long legacy bank field")
+            return
+        if (kind, ref) in live:
+            result.existing += 1
+            return
+        complete = not missing_fields(values["bank_code"], number, values["account_name"])
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                [_canon_ref(ctx.tenant_id), kind, ref, values["bank_code"], number, values["account_name"]],
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        candidates.append(
+            {
+                "id": _mint_id("payee_bank_instructions", ctx.tenant_id, f"{kind}:{ref}"),
+                "tenant_id": ctx.tenant_id,
+                "payee_kind": kind,
+                "payee_ref": ref,
+                "payee_label": label or ref,
+                **values,
+                "account_number": number,
+                "account_last4": number[-4:],
+                "status": "approved" if complete else "proposed",
+                "origin": "legacy_import",
+                "evidence_ref": f"legacy-import:{source_ref}",
+                "source_ref": f"legacy:{source_ref}:{ref}",
+                "source_fingerprint": fingerprint,
+                "proposed_by_party_id": None,
+                "proposed_at": stamp,
+                "decided_by_party_id": actor_party.hex if complete else None,
+                "decided_at": stamp if complete else None,
+                "approved_at": stamp if complete else None,
+                "decision_note": f"legacy data migration by {ctx.actor_id}"[:500] if complete else None,
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+        )
+
+    for row in source.execute(
+        sa.text(
+            "SELECT employee_id, organization_id, employee_code, bank_name, bank_account_number, "
+            "bank_account_name FROM employee"
+        )
+    ).mappings():
+        if _canon_ref(row["organization_id"]) != tenant:
+            continue
+        ref = _canon_ref(row["employee_id"])
+        if not str(row["bank_account_number"] or "").strip():
+            continue
+        if ref not in imported_employees:
+            not_imported += 1
+            continue
+        _add(
+            "employee",
+            ref,
+            str(row["employee_code"] or ""),
+            {
+                "bank_name": row["bank_name"],
+                "account_number": row["bank_account_number"],
+                "account_name": row["bank_account_name"],
+            },
+            "employee.bank_account",
+        )
+    for row in source.execute(
+        sa.text("SELECT supplier_id, organization_id, legal_name, trading_name, bank_details FROM supplier")
+    ).mappings():
+        if _canon_ref(row["organization_id"]) != tenant:
+            continue
+        details = _supplier_bank_details(row["bank_details"])
+        if not details:
+            continue
+        label = str(row["legal_name"] or "").strip() or str(row["trading_name"] or "").strip()
+        _add("supplier", _canon_ref(row["supplier_id"]), label, details, "supplier.bank_details")
+    if not_imported:
+        result.blockers.append(f"payee_bank_instructions: {not_imported} employees with bank details not yet imported")
+    _insert(dest, "payee_bank_instructions", candidates)
+    approved = [c for c in candidates if c["status"] == "approved"]
+    if approved:
+        try:
+            _write_migration_audit(dest, ctx, approved)
+        except (ValueError, TypeError) as exc:  # fail closed: no approved row without its audit event
+            raise MintRefusal(f"migration audit could not be written ({type(exc).__name__})") from exc
+    result.created = len(candidates)
+    result.details = {
+        "approved": len(approved),
+        "proposed_incomplete": len(candidates) - len(approved),
+        # Migrated suppliers with no payables invoice: they cannot receive a new proposal (resolver)
+        # until the supplier appears in the payables supplier set.
+        "supplier_unresolved": sum(
+            1 for c in candidates if c["payee_kind"] == "supplier" and c["payee_ref"] not in known_suppliers
+        ),
+    }
+    return result
+
+
+def mint_functional_currency_settings(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
+    """Tenant functional currency setting from legacy ``organization.functional_currency_code``.
+
+    One tenant-scoped ``accounting_policy/functional_currency`` row per organisation, with
+    a history row naming the import. Never overwrites: an existing row with the same value
+    counts ``existing``; a different value, an invalid code or a missing tenant is a named
+    blocker, not a repair. Runs after ``kernel_tenants`` (FK to tenants).
+    """
+
+    result = MintResult("functional_currency_settings")
+    tenants = {_norm(r[0]) for r in dest.execute(sa.text("SELECT id FROM tenants"))}
+    existing = {
+        _norm(r[0]): r[1]
+        for r in dest.execute(
+            sa.text(
+                "SELECT tenant_id, value_text FROM domain_settings WHERE scope_kind = 'tenant' "
+                "AND domain = :domain AND key = :key"
+            ),
+            {"domain": "accounting_policy", "key": "functional_currency"},
+        )
+    }
+    rows: list[dict[str, Any]] = []
+    history: list[dict[str, Any]] = []
+    legacy = source.execute(sa.text("SELECT organization_id, functional_currency_code FROM organization")).mappings()
+    for row in legacy:
+        tenant_id = _norm(row["organization_id"])
+        code = row["functional_currency_code"]
+        code = code.strip().upper() if isinstance(code, str) else ""
+        if len(code) != 3 or not code.isascii() or not code.isalpha():
+            result.blockers.append(f"organisation {tenant_id}: functional currency is missing or not a 3-letter code")
+            continue
+        if tenant_id not in tenants:
+            result.blockers.append(f"organisation {tenant_id}: tenant not minted yet")
+            continue
+        if tenant_id in existing:
+            if existing[tenant_id] == code:
+                result.existing += 1
+            else:
+                result.blockers.append(
+                    f"organisation {tenant_id}: a different functional currency setting exists (not overwritten)"
+                )
+            continue
+        setting_id = _mint_id("functional_currency_settings", tenant_id, "accounting_policy/functional_currency")
+        rows.append(
+            {
+                "id": setting_id,
+                "tenant_id": tenant_id,
+                "scope_kind": "tenant",
+                "domain": "accounting_policy",
+                "key": "functional_currency",
+                "value_type": "string",
+                "value_text": code,
+                "is_secret": False,
+                "is_active": True,
+                "created_at": _now(ctx),
+                "updated_at": _now(ctx),
+            }
+        )
+        history.append(
+            {
+                "id": _mint_id("functional_currency_settings_history", tenant_id, "create"),
+                "tenant_id": tenant_id,
+                "domain": "accounting_policy",
+                "key": "functional_currency",
+                "setting_id": setting_id,
+                "action": "create",
+                "value_after": code,
+                "secret_changed": False,
+                "changed_at": _now(ctx),
+                "change_reason": "legacy organization.functional_currency_code import",
+            }
+        )
+    _insert(dest, "domain_settings", rows)
+    _insert(dest, "domain_setting_history", history)
+    result.created = len(rows)
+    return result
+
+
 MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("kernel_tenants", mint_kernel_tenants),
+    ("functional_currency_settings", mint_functional_currency_settings),
     ("pay_structure_revisions", mint_pay_structure_revisions),
     ("pay_rule_bases", mint_pay_rule_bases),
     ("tax_authorities", mint_tax_authorities),
@@ -772,6 +1090,7 @@ MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("sales_leads", mint_sales_leads),
     ("document_libraries_types", mint_document_libraries_types),
     ("bank_institutions_from_accounts", mint_bank_institutions_from_accounts),
+    ("payee_bank_instructions", mint_payee_bank_instructions),
 )
 
 # Enrolment map name -> mint step that must run before the map builds.

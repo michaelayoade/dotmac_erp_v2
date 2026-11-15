@@ -70,10 +70,12 @@ from erp_v2.hr import lifecycle as hr_lifecycle_models  # noqa: F401
 from erp_v2.hr import models as hr_models  # noqa: F401
 from erp_v2.hr import recruitment as hr_recruitment_models  # noqa: F401
 from erp_v2.hr import training as hr_training_models  # noqa: F401
+from erp_v2.journals import models as journals_models  # noqa: F401
 from erp_v2.migration_bindings import (
     ASSEMBLY_MODULE_PLANES,
     ASSEMBLY_PREREQUISITE_BINDINGS,
 )
+from erp_v2.payees import models as payee_models  # noqa: F401
 
 config = context.config
 

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Held legacy journals — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Held legacy journals</h1>
+<p><a href="/finance/journals">Manual journals</a></p>
+<p>These imported legacy journals are held as drafts. Each is reviewed and posted individually after Finance review; there is no bulk action. {{ total }} remain without a posting request.</p>
+{% if journals %}
+<table>
+  <thead><tr><th>Number</th><th>Posting date</th><th>Source</th><th>Total</th><th></th></tr></thead>
+  <tbody>
+  {% for j in journals %}
+    <tr>
+      <td>{{ j.number }}</td><td>{{ j.posting_date }}</td>
+      <td>{{ j.source_owner }}</td>
+      <td>{{ j.total_debit }} {{ j.currency_code }}</td>
+      <td><a href="/finance/journals/held/{{ j.id }}">Review</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>No held legacy journals on this page.</p>{% endif %}
+{% if page > 1 %}<a href="?page={{ page - 1 }}">Previous page</a>{% endif %}
+{% if has_more and page < max_page %}<a href="?page={{ page + 1 }}">Next page</a>{% endif %}
+{% endblock %}

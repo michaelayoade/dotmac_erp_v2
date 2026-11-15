@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Manual journals — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Manual journals</h1>
+<p><a href="/finance/journals/new">Prepare a journal</a> · <a href="/finance/journals/held">Held legacy journals</a></p>
+{% if rows %}
+<table>
+  <thead><tr><th>Number</th><th>Posting date</th><th>Evidence</th><th>State</th><th>Total</th><th>Currency</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><a href="/finance/journals/{{ r.manual.id }}">{{ r.journal.number }}</a></td>
+      <td>{{ r.journal.posting_date }}</td>
+      <td>{{ r.manual.evidence_ref }}</td>
+      <td>{{ r.manual.state }}</td>
+      <td>{{ r.journal.total_debit }}</td>
+      <td>{{ r.journal.currency_code }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>No manual journals yet.</p>{% endif %}
+{% endblock %}

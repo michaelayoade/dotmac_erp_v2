@@ -186,6 +186,8 @@ assembly: Final = ProductAssemblySpec(
                 WebRouteRef("erp_legacy_reentry", "legacy", "legacy_reentry_new"),
                 WebRouteRef("erp_legacy_reentry", "legacy", "legacy_reentry_create"),
                 WebRouteRef("erp_banking", "legacy", "banking_workspace"),
+                # Payee bank routes are deliberately NOT entry routes (REVIEW-B8 R2): entry routes skip the
+                # facet admission check (erp.web.access), so a finance role without staff must be refused.
             ),
             login_route=WebRouteRef("erp_web", "legacy", "login_page"),
             landing_route=WebRouteRef("erp_web", "legacy", "home"),

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Review held journal {{ journal.number }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Review held journal {{ journal.number }}</h1>
+<p><a href="/finance/journals/held">Held legacy journals</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>Status</dt><dd>{{ journal.status.value }}</dd>
+  <dt>Posting date</dt><dd>{{ journal.posting_date }}</dd>
+  <dt>Description</dt><dd>{{ journal.description }}</dd>
+  <dt>Legacy source</dt><dd>{{ journal.source_owner }}:{{ journal.source_document_kind }}:{{ journal.source_document_id }}:{{ journal.source_version }}</dd>
+</dl>
+{% include "journals/_lines.html" %}
+{% if workflow and workflow.state != 'REJECTED' %}
+<p>A posting request already exists for this journal (state {{ workflow.state }}). <a href="/finance/journals/{{ workflow.id }}">Open it</a>.</p>
+{% elif journal.status.value == 'DRAFT' %}
+{% if workflow %}<p>An earlier request was rejected: {{ workflow.rejection_reason }}. A new review reference and requester are required.</p>{% endif %}
+<form method="post" action="/finance/journals/held/{{ journal.id }}/request-post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><label>Finance review reference <input name="review_ref" maxlength="255" required></label></p>
+  <button type="submit">Request posting of this journal</button>
+</form>
+{% endif %}
+{% endblock %}

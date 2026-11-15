@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Journal approvals — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Journal approvals</h1>
+<p>You cannot approve a journal you prepared or requested.</p>
+{% if rows %}
+<table>
+  <thead><tr><th>Number</th><th>Posting date</th><th>Evidence</th><th>Waiting for</th><th>Total</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><a href="/finance/journal-approvals/{{ r.manual.id }}">{{ r.journal.number }}</a></td>
+      <td>{{ r.journal.posting_date }}</td>
+      <td>{{ r.manual.evidence_ref }}</td>
+      <td>{% if r.manual.state == 'REVERSAL_REQUESTED' %}reversal approval{% else %}posting approval{% endif %}</td>
+      <td>{{ r.journal.total_debit }} {{ r.journal.currency_code }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>Nothing is waiting for approval.</p>{% endif %}
+{% endblock %}
