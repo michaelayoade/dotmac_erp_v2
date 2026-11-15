@@ -54,6 +54,7 @@ from sqlalchemy.orm import Session
 REQUIRED_PAYABLES_VERSION = "0.1.0a5"
 MAX_INVOICES = 1000
 DOCUMENT_KIND = "supplier_invoice"
+FINANCE_APPROVER = "finance_approver"
 _REASON = re.compile(r"[a-z][a-z0-9_:.-]*")
 
 
@@ -132,7 +133,7 @@ def _money(value) -> str:
     return format(Decimal(value).quantize(Decimal("0.01")), "f")
 
 
-def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: str) -> str | None:
+def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: str, actor: UUID) -> str | None:
     """Destination-side state. None = eligible; 'already_done' = completed under this list."""
     from dotmac_accounting.contracts import PeriodStatus
     from dotmac_accounting.models import FiscalPeriod
@@ -149,6 +150,7 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
 
     from erp_v2.posting import bridge, rules
     from erp_v2.posting.rules import PostingRefused
+    from erp_v2.web.revenue_approval_services import ApprovalRefused, _submitter_party_id
 
     invoice = session.scalar(
         sa.select(SupplierInvoice).where(SupplierInvoice.tenant_id == tenant, SupplierInvoice.id == invoice_id)
@@ -181,6 +183,18 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
         or exists(PaymentObligation, PaymentObligation.invoice_id == invoice_id)
     ):
         return "existing_ledger_state"
+    # Separation of duties, resolved the B1-1 way: imported submitted_by/approved_by hold legacy
+    # credential ids, native ones party ids. The approver must be neither the submitter nor the
+    # legacy approver; an unrecorded or unresolvable person cannot be proven different, so it refuses.
+    for recorded, label in ((invoice.submitted_by, "submitter"), (invoice.approved_by, "legacy_approver")):
+        if not recorded:
+            return f"{label}_unknown"
+        try:
+            person = _submitter_party_id(session, tenant, recorded)
+        except ApprovalRefused:
+            return f"{label}_unresolved"
+        if person == actor:
+            return f"approver_is_{label}"
     lines = list(
         session.scalars(
             sa.select(SupplierInvoiceLine).where(
@@ -222,14 +236,14 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
     return None
 
 
-def build_plan(session: Session, scope, verifier, ids, *, evidence_ref: str, bindings: dict) -> dict:
+def build_plan(session: Session, scope, verifier, ids, *, evidence_ref: str, bindings: dict, actor: UUID) -> dict:
     """Read-only. Returns the plan (with private ids for apply) and its digest."""
     from erp_v2.importer.payables_history import HistoricalEvidenceError
 
     tenant = scope.tenant_id
     eligible, done, refused = [], [], []
     for invoice_id in ids:
-        state = _classify(session, tenant, invoice_id, evidence_ref)
+        state = _classify(session, tenant, invoice_id, evidence_ref, actor)
         if state == "already_done":
             done.append(dict(invoice_id=str(invoice_id)))
             continue
@@ -302,11 +316,13 @@ def apply_plan(
     now: datetime,
 ) -> Decimal:
     """Recognize and post every eligible invoice in the caller's transaction (never commits)."""
+    from dotmac_kernel.audit import write_audit_event
     from dotmac_kernel.idempotency import IdempotencyConflict
     from dotmac_payables import service as payables
     from dotmac_payables.contracts import AccountingReceiptInput, PayablesError
     from dotmac_payables.models import SupplierInvoice
 
+    from erp_v2.legacy_ap.audit import AUDIT_RECOGNIZED_POSTED, SOURCE_APPLICATION
     from erp_v2.posting.bridge import post_consequence
     from erp_v2.posting.rules import PostingRefused
 
@@ -359,6 +375,24 @@ def apply_plan(
                     idempotency_expires_at=None,
                     recorded_at=now,
                 )
+                write_audit_event(
+                    session,
+                    tenant_id=tenant,
+                    actor_party_id=UUID(actor),
+                    actor_type="user",
+                    actor_id=actor,
+                    source_application=SOURCE_APPLICATION,
+                    action=AUDIT_RECOGNIZED_POSTED,
+                    entity_type="supplier_invoice",
+                    entity_id=str(invoice_id),
+                    is_success=True,
+                    details={
+                        "journal_id": str(posted.journal_id),
+                        "consequence_fingerprint": consequence.fingerprint,
+                        "list_sha256": list_sha256,
+                        "evidence_fingerprint": command.evidence_fingerprint,
+                    },
+                )
                 posted_total += credit
         except RecognizeRefusal:
             raise
@@ -397,11 +431,26 @@ def run_cohort(
     from erp_v2.legacy_ap.recognition_verifier import ApprovedInvoiceVerifier
 
     scope = TenantScope(tenant)
+    from dotmac_kernel.models import PartyRoleGrant, Role
+
     party = session.scalar(sa.select(Party).where(Party.tenant_id == tenant, Party.id == actor_party_id))
-    _require(party is not None, "approver_unknown")
+    _require(party is not None and party.is_active, "approver_unknown")
+    held = session.scalar(
+        sa.select(PartyRoleGrant.id)
+        .join(Role, sa.and_(Role.tenant_id == PartyRoleGrant.tenant_id, Role.id == PartyRoleGrant.role_id))
+        .where(
+            PartyRoleGrant.tenant_id == tenant,
+            PartyRoleGrant.party_id == actor_party_id,
+            Role.slug == FINANCE_APPROVER,
+        )
+        .limit(1)
+    )
+    _require(held is not None, "approver_lacks_finance_approver")
     evidence_ref = evidence_reference(list_sha256)
     verifier = ApprovedInvoiceVerifier(source, manifest, evidence_ref)
-    plan = build_plan(session, scope, verifier, ids, evidence_ref=evidence_ref, bindings=bindings or {})
+    plan = build_plan(
+        session, scope, verifier, ids, evidence_ref=evidence_ref, bindings=bindings or {}, actor=actor_party_id
+    )
     if not apply:
         return receipt_of(plan, mode="plan")
     _require(bool(re.fullmatch(r"[0-9a-f]{64}", reviewed_digest or "")), "reviewed_plan_required")
@@ -448,6 +497,22 @@ def _preflight(session: Session, tenant: UUID) -> None:
     _require(selected == str(tenant) and str(observed) == str(tenant), "destination_tenant_binding_mismatch")
 
 
+def _install_audit_actions() -> None:
+    from dotmac_kernel.audit_actions import (
+        AuditActionRegistry,
+        AuditActionsNotInstalledError,
+        active_audit_actions,
+        install_audit_actions,
+    )
+
+    try:
+        active_audit_actions()
+    except AuditActionsNotInstalledError:
+        from erp_v2.assembly import assembly
+
+        install_audit_actions(AuditActionRegistry.from_manifests(assembly.modules))
+
+
 def _run(args) -> dict:
     from importlib.metadata import version
 
@@ -461,6 +526,7 @@ def _run(args) -> dict:
         "DATABASE_URL" not in os.environ and "PLATFORM_DATABASE_URL" not in os.environ,
         "serving_database_materials_forbidden",
     )
+    _install_audit_actions()
     manifest_bytes, list_bytes = args.manifest.read_bytes(), args.list.read_bytes()
     try:
         manifest = _manifest(json.dumps(_json(manifest_bytes)).encode())

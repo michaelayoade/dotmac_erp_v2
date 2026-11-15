@@ -50,6 +50,28 @@ BOOLEANS = {"is_prepayment", "is_reversal"}
 INTEGERS = {"line_number"}
 
 
+@pytest.fixture(scope="module", autouse=True)
+def audit_registry():
+    from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
+
+    from erp_v2.assembly import assembly
+
+    install_audit_actions(AuditActionRegistry.from_manifests(assembly.modules))
+
+
+def grant(engine, env, party_id, slug="finance_approver"):
+    from dotmac_kernel.models import PartyRoleGrant, Role
+
+    with Session(engine) as db:
+        role = db.scalar(sa.select(Role).where(Role.tenant_id == env.tenant_id, Role.slug == slug))
+        if role is None:
+            role = Role(tenant_id=env.tenant_id, slug=slug, name=slug)
+            db.add(role)
+            db.flush()
+        db.add(PartyRoleGrant(tenant_id=env.tenant_id, party_id=party_id, role_id=role.id))
+        db.commit()
+
+
 def counts(engine, tenant_id) -> dict[str, int]:
     with Session(engine) as db:
         return {
@@ -58,11 +80,15 @@ def counts(engine, tenant_id) -> dict[str, int]:
         }
 
 
-def imported(engine, env, *, number="AP-1", status_value="APPROVED", **kw):
+def imported(engine, env, *, number="AP-1", status_value="APPROVED", approved_by=None, **kw):
     """An imported-style invoice: APPROVED by direct update, no event/obligation/receipt/journal."""
     iid = invoice(engine, env, number=number, submit=True, **kw)
     with Session(engine) as db:
-        db.execute(sa.update(SupplierInvoice).where(SupplierInvoice.id == iid).values(status=status_value))
+        db.execute(
+            sa.update(SupplierInvoice)
+            .where(SupplierInvoice.id == iid)
+            .values(status=status_value, approved_by=approved_by or str(env.party_ids[2]))
+        )
         db.commit()
     return iid
 
@@ -181,6 +207,7 @@ class Legacy:
 @pytest.fixture
 def setup(engine, tmp_path):
     env = world(engine)
+    grant(engine, env, env.party_ids[1])  # the approver: submitter is party 0, legacy approver party 2
     return env, Legacy(tmp_path, env, engine)
 
 
@@ -462,3 +489,81 @@ def test_invoice_date_outside_the_first_open_period_is_refused(engine, setup):
     assert plan["counts"] == dict(requested=5, eligible=2, already_done=0, refused=3)
     with Session(engine) as db:  # amounts and dates untouched
         assert {db.get(SupplierInvoice, i).invoice_date.isoformat() for i in in_later} == {"2026-02-10"}
+
+
+def test_approver_must_hold_finance_approver(engine, tmp_path):
+    env = world(engine)  # nobody holds the grant
+    ids = (imported(engine, env),)
+    legacy = Legacy(tmp_path, env, engine)
+    legacy.build(ids)
+    with pytest.raises(cli.RecognizeRefusal, match="approver_lacks_finance_approver"):
+        legacy.run(engine, ids, apply=False)
+    grant(engine, env, env.party_ids[1], slug="staff")  # another role does not count
+    with pytest.raises(cli.RecognizeRefusal, match="approver_lacks_finance_approver"):
+        legacy.run(engine, ids, apply=False)
+    assert counts(engine, env.tenant_id) == {m.__tablename__: 0 for m in MODELS}
+
+
+def test_approver_cannot_be_the_submitter_or_the_legacy_approver(engine, setup):
+    env, legacy = setup
+    ids = (imported(engine, env, number="AP-1"), imported(engine, env, number="AP-2"))
+    legacy.build(ids)
+    grant(engine, env, env.party_ids[0])  # the submitter holds the grant too
+    grant(engine, env, env.party_ids[2])  # and so does the legacy approver
+    by_submitter = legacy.run(engine, ids, apply=False, actor=env.party_ids[0])
+    assert by_submitter["refusals_by_reason"] == {"approver_is_submitter": 2}
+    by_legacy = legacy.run(engine, ids, apply=False, actor=env.party_ids[2])
+    assert by_legacy["refusals_by_reason"] == {"approver_is_legacy_approver": 2}
+    assert legacy.run(engine, ids, apply=False)["counts"]["eligible"] == 2
+
+
+def test_credential_id_of_the_approver_counts_as_the_approver(engine, setup):
+    from dotmac_kernel.models import UserCredential
+
+    env, legacy = setup
+    iid = imported(engine, env)
+    with Session(engine) as db:
+        credential = UserCredential(tenant_id=env.tenant_id, party_id=env.party_ids[1], password_hash="x")  # noqa: S106
+        db.add(credential)
+        db.flush()
+        db.execute(sa.update(SupplierInvoice).where(SupplierInvoice.id == iid).values(approved_by=str(credential.id)))
+        credential_id = credential.id
+        db.commit()
+    assert credential_id
+    legacy.build((iid,))
+    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"approver_is_legacy_approver": 1}
+
+
+def test_unrecorded_or_unresolvable_people_refuse(engine, setup):
+    env, legacy = setup
+    unknown = imported(engine, env, number="AP-1")
+    unresolved = imported(engine, env, number="AP-2", approved_by="legacy-user-7")
+    with Session(engine) as db:
+        db.execute(sa.update(SupplierInvoice).where(SupplierInvoice.id == unknown).values(approved_by=None))
+        db.commit()
+    ids = tuple(sorted([unknown, unresolved], key=str))
+    legacy.build(ids)
+    plan = legacy.run(engine, ids, apply=False)
+    assert plan["refusals_by_reason"] == {"legacy_approver_unknown": 1, "legacy_approver_unresolved": 1}
+
+
+def test_apply_writes_one_audit_event_per_approval(engine, setup):
+    from dotmac_kernel.audit import AuditEvent
+
+    from erp_v2.legacy_ap.audit import AUDIT_RECOGNIZED_POSTED
+
+    env, legacy = setup
+    ids = tuple(sorted([imported(engine, env, number="AP-1"), imported(engine, env, number="AP-2")], key=str))
+    legacy.build(ids)
+    plan_then_apply(engine, legacy, ids)
+    with Session(engine) as db:
+        events = list(
+            db.scalars(
+                sa.select(AuditEvent).where(
+                    AuditEvent.tenant_id == env.tenant_id, AuditEvent.action == AUDIT_RECOGNIZED_POSTED
+                )
+            )
+        )
+    assert sorted(e.entity_id for e in events) == sorted(str(i) for i in ids)
+    assert all(e.is_success and e.actor_id == str(env.party_ids[1]) for e in events)
+    assert all(e.details["list_sha256"] == LIST_SHA and e.details["journal_id"] for e in events)
