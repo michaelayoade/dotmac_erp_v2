@@ -303,6 +303,9 @@ this does not authorize adjusting balances or switching traffic.
   `e2_0012_academy_sync`, `e2_0013_banking_observations` and `e2_0014_manual_journals` are not proof of
   this schema. Fresh exact-wheel
   CI, image build and test-server genesis/runtime proof remain mandatory.
+- Bank reconciliation (B7, `docs/bank-reconciliation.md`) adds the head `e2_0017_bank_reconciliation`
+  (after `e2_0016_legacy_invoice_refs`; additive, four tables, no foreign key into accounting). The e2 head
+  in this section moves to it; the same exact-wheel CI, image and genesis proof applies.
 
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
