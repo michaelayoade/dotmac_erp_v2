@@ -133,12 +133,13 @@ def test_apply_without_authorization_refuses_before_any_file_or_database_use(mon
             "--snapshot-file", str(tmp_path / "s"),
             "--list", str(tmp_path / "l.json"),
             "--receipt", str(receipt),
+            "--plan-file", str(tmp_path / "plan.json"),
             "--list-sha256", "c" * 64,
             "--approver-party-id", str(UUID(int=5)),
             "--apply",
         ]
     )  # fmt: skip
-    assert code == 2 and not receipt.exists()
+    assert code == 2 and not receipt.exists() and not (tmp_path / "plan.json").exists()
     assert "refused" in capsys.readouterr().out
 
 
@@ -152,6 +153,7 @@ def test_plan_mode_failure_receipt_is_private_and_opaque(monkeypatch, tmp_path):
             "--snapshot-file", str(tmp_path / "s"),
             "--list", str(tmp_path / "l.json"),
             "--receipt", str(receipt),
+            "--plan-file", str(tmp_path / "plan.json"),
             "--list-sha256", "c" * 64,
             "--approver-party-id", str(UUID(int=5)),
         ]
@@ -189,3 +191,54 @@ def test_preflight_is_the_historical_destination_preflight_and_keeps_its_refusal
     monkeypatch.setattr(history, "_destination_preflight", refuse)
     with pytest.raises(cli.RecognizeRefusal, match="destination_role_not_nonprivileged"):
         cli._preflight("session", UUID(TENANT))
+
+
+def test_plan_file_path_must_be_new_private_and_not_a_symlink(monkeypatch, tmp_path, capsys):
+    taken = tmp_path / "plan.json"
+    taken.write_text("keep")
+    args = [
+        "--manifest", str(tmp_path / "m.json"),
+        "--snapshot-file", str(tmp_path / "s"),
+        "--list", str(tmp_path / "l.json"),
+        "--receipt", str(tmp_path / "receipt.json"),
+        "--plan-file", str(taken),
+        "--list-sha256", "c" * 64,
+        "--approver-party-id", str(UUID(int=5)),
+    ]  # fmt: skip
+    assert cli.main(args) == 2 and taken.read_text() == "keep"
+    link = tmp_path / "link.json"
+    link.symlink_to(tmp_path / "elsewhere.json")
+    args[args.index("--plan-file") + 1] = str(link)
+    args[args.index("--receipt") + 1] = str(tmp_path / "receipt2.json")
+    assert cli.main(args) == 2 and not (tmp_path / "elsewhere.json").exists()
+
+
+def test_failed_run_leaves_a_private_empty_plan_file(monkeypatch, tmp_path):
+    for name in ("LEGACY_DATABASE_URL", "MIGRATION_DATABASE_URL"):
+        monkeypatch.setenv(name, "postgresql://u:p@127.0.0.1/none")
+    plan_file = tmp_path / "plan.json"
+    code = cli.main(
+        [
+            "--manifest", str(tmp_path / "missing.json"),
+            "--snapshot-file", str(tmp_path / "s"),
+            "--list", str(tmp_path / "l.json"),
+            "--receipt", str(tmp_path / "receipt.json"),
+            "--plan-file", str(plan_file),
+            "--list-sha256", "c" * 64,
+            "--approver-party-id", str(UUID(int=5)),
+        ]
+    )  # fmt: skip
+    assert code == 2 and oct(os.stat(plan_file).st_mode & 0o777) == "0o600" and plan_file.read_text() == ""
+
+
+def test_plan_file_carries_ids_dates_amounts_and_reasons_only():
+    detail = [
+        dict(invoice_id=str(UUID(int=10)), outcome="eligible", reason=None, invoice_date="2026-01-10",
+             subtotal="200.00", tax="15.00", total="215.00"),
+        dict(invoice_id=str(UUID(int=13)), outcome="refused", reason="not_approved", invoice_date="2026-02-10",
+             subtotal="1.00", tax="0.00", total="1.00"),
+    ]  # fmt: skip
+    payload = cli.plan_file_of(plan() | {"detail": detail})
+    assert payload["plan_digest"] == "f" * 64 and payload["invoices"] == detail
+    assert set(payload) == {"version", "plan_digest", "bindings", "invoices"}
+    assert "invoices" not in cli.receipt_of(plan() | {"detail": detail}, mode="plan")

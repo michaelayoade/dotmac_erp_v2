@@ -258,28 +258,49 @@ def build_plan(session: Session, scope, verifier, ids, *, evidence_ref: str, bin
             continue
         invoice = _invoice_amounts(session, tenant, invoice_id)
         eligible.append(dict(invoice_id=str(invoice_id), evidence_fingerprint=evidence.fingerprint(), **invoice))
+    # Per-invoice detail for the PRIVATE plan file only (never the receipt): id, date, amounts, outcome.
+    detail = []
+    for outcome, items in (("eligible", eligible), ("already_done", done), ("refused", refused)):
+        for item in items:
+            facts = _invoice_amounts(session, tenant, UUID(item["invoice_id"]))
+            detail.append(dict(invoice_id=item["invoice_id"], outcome=outcome, reason=item.get("reason"), **facts))
+    detail.sort(key=lambda row: row["invoice_id"])
     plan = dict(
         version=1,
         bindings=bindings,
         eligible=eligible,
         already_done=done,
         refused=refused,
+        detail=detail,
     )
     plan["digest"] = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return plan
 
 
 def _invoice_amounts(session: Session, tenant: UUID, invoice_id: UUID) -> dict:
+    """Date and amounts of an invoice as stored (empty if it does not exist). No names, no PII."""
     from dotmac_payables.models import SupplierInvoice
 
     invoice = session.scalar(
         sa.select(SupplierInvoice).where(SupplierInvoice.tenant_id == tenant, SupplierInvoice.id == invoice_id)
     )
-    return dict(subtotal=_money(invoice.subtotal), tax=_money(invoice.tax_amount), total=_money(invoice.total_amount))
+    if invoice is None:
+        return {}
+    return dict(
+        invoice_date=invoice.invoice_date.isoformat(),
+        subtotal=_money(invoice.subtotal),
+        tax=_money(invoice.tax_amount),
+        total=_money(invoice.total_amount),
+    )
 
 
 def _totals(rows: list[dict]) -> dict:
     return {key: _money(sum((Decimal(row[key]) for row in rows), Decimal(0))) for key in ("subtotal", "tax", "total")}
+
+
+def plan_file_of(plan: dict) -> dict:
+    """The private per-invoice plan: ids, dates, amounts and reason codes. Never goes in the receipt."""
+    return dict(version=1, plan_digest=plan["digest"], bindings=plan["bindings"], invoices=plan["detail"])
 
 
 def receipt_of(plan: dict, *, mode: str, applied: int = 0, posted_total: Decimal | None = None) -> dict:
@@ -423,6 +444,7 @@ def run_cohort(
     reviewed_digest: str | None = None,
     bindings: dict | None = None,
     now: datetime | None = None,
+    plan_sink=None,
 ) -> dict:
     """Core of both modes; caller owns the transaction and (for plan) its READ ONLY setting."""
     from dotmac_kernel.cache import TenantScope
@@ -458,6 +480,8 @@ def run_cohort(
     plan = build_plan(
         session, scope, verifier, ids, evidence_ref=evidence_ref, bindings=bindings or {}, actor=actor_party_id
     )
+    if plan_sink is not None:
+        plan_sink(plan_file_of(plan))
     if not apply:
         return receipt_of(plan, mode="plan")
     _require(bool(re.fullmatch(r"[0-9a-f]{64}", reviewed_digest or "")), "reviewed_plan_required")
@@ -577,11 +601,20 @@ def _run(args) -> dict:
                         apply=args.apply,
                         reviewed_digest=args.reviewed_plan_sha256,
                         bindings=bindings,
+                        plan_sink=lambda payload: _dump(args.plan_fd, payload),
                     )
         finally:
             destination_engine.dispose()
     finally:
         source_engine.dispose()
+
+
+def _dump(fd: int, payload: dict) -> None:
+    with os.fdopen(os.dup(fd), "w") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _receipt(path: Path) -> int:
@@ -591,7 +624,7 @@ def _receipt(path: Path) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m erp_v2.legacy_ap.recognize_cli")
-    for name in ("manifest", "snapshot-file", "list", "receipt"):
+    for name in ("manifest", "snapshot-file", "list", "receipt", "plan-file"):
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--list-sha256", required=True)
     parser.add_argument("--approver-party-id", required=True)
@@ -601,10 +634,11 @@ def main(argv=None) -> int:
     try:
         _require(_authorized(args), "explicit_apply_authorization_required")
         fd = _receipt(args.receipt)
+        args.plan_fd = _receipt(args.plan_file)  # private per-invoice plan: 0600, O_EXCL, no symlinks
     except Exception:
         print("legacy recognition refused: authorization or private receipt path")
         return 2
-    with os.fdopen(fd, "w") as stream:
+    with os.fdopen(fd, "w") as stream, os.fdopen(args.plan_fd, "a"):
         try:
             payload = _run(args)
             code = 0 if payload["counts"]["refused"] == 0 else 3

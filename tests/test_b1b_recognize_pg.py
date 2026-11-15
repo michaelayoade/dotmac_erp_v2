@@ -191,7 +191,7 @@ class Legacy:
                     conn.execute(tables[name].insert(), rows)
         source.dispose()
 
-    def run(self, engine, ids, *, apply, digest=None, actor=None, now=NOW, readonly=None):
+    def run(self, engine, ids, *, apply, digest=None, actor=None, now=NOW, readonly=None, plan_sink=None):
         source = sa.create_engine(f"sqlite:///{self.path}")
         try:
             with source.connect() as src:
@@ -211,6 +211,7 @@ class Legacy:
                         reviewed_digest=digest,
                         bindings=dict(list_sha256=LIST_SHA),
                         now=now,
+                        plan_sink=plan_sink,
                     )
         finally:
             source.dispose()
@@ -666,3 +667,31 @@ def test_advisory_lock_is_taken_before_any_invoice_is_read_and_only_for_apply(en
     finally:
         sa.event.remove(engine, "before_cursor_execute", record)
     assert not any("pg_advisory_xact_lock" in text for text in statements)
+
+
+def test_private_plan_has_per_invoice_detail_and_the_receipt_has_none(engine, setup):
+    env, legacy = setup
+    good = imported(engine, env, number="AP-1")
+    bad = invoice(engine, env, number="AP-2")  # SUBMITTED: refused
+    ids = tuple(sorted([good, bad], key=str))
+    legacy.build(ids)
+    captured = []
+    receipt = legacy.run(engine, ids, apply=False, plan_sink=captured.append)
+    (private,) = captured
+    assert private["plan_digest"] == receipt["plan_digest"]
+    rows = {row["invoice_id"]: row for row in private["invoices"]}
+    assert rows[str(good)] == dict(
+        invoice_id=str(good),
+        outcome="eligible",
+        reason=None,
+        invoice_date="2026-01-10",
+        subtotal="200.00",
+        tax="15.00",
+        total="215.00",
+    )
+    assert rows[str(bad)]["outcome"] == "refused" and rows[str(bad)]["reason"] == "not_approved"
+    assert rows[str(bad)]["invoice_date"] == "2026-01-10"
+    flat = json.dumps(private)
+    assert "Supplier One" not in flat and "supplier-1" not in flat and "supplier_ref" not in flat
+    text = json.dumps(receipt)
+    assert str(good) not in text and "invoice_date" not in text and "2026-01-10" not in text
