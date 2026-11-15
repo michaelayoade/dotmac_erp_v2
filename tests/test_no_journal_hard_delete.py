@@ -104,18 +104,27 @@ def app(monkeypatch):
     return create_app(replace(assembly, web_enabled=True, database_runtime=None, require_database_runtime=False))
 
 
-def test_no_mounted_route_deletes_or_purges_and_journals_have_no_draft_removal_path(app):
-    from fastapi.routing import APIRoute
-
-    routes = [r for r in app.routes if isinstance(r, APIRoute)]
-    assert any(r.path == "/finance/journals" for r in routes)  # the real journal facet is mounted
+def flatten(routes, prefix=""):
     for route in routes:
-        assert "DELETE" not in route.methods, route.path
-        assert "PUT" not in route.methods or "journal" not in route.path, route.path
-        if "journal" in route.path or "/finance/" in route.path:
-            assert not re.search(r"delete|purge|remove|truncate|destroy", route.path, re.I), route.path
+        path = prefix + getattr(route, "path", "")
+        children = getattr(route, "routes", None)
+        if children is not None:
+            yield from flatten(children, path)
+        elif getattr(route, "methods", None):
+            yield path, set(route.methods)
+
+
+def test_no_mounted_route_deletes_or_purges_and_journals_have_no_draft_removal_path(app):
+    routes = list(flatten(app.routes))
+    paths = sorted({path for path, _ in routes})
+    assert "/finance/journals" in paths, paths[:40]  # the real journal facet is mounted
+    for path, methods in routes:
+        assert "DELETE" not in methods, path
+        assert "PUT" not in methods or "journal" not in path, path
+        if "journal" in path or "/finance/" in path:
+            assert not re.search(r"delete|purge|remove|truncate|destroy", path, re.I), path
     # every mutation of a journal is a POST to a named governed command, never a bare resource verb
-    journal_posts = sorted(r.path for r in routes if "journal" in r.path and "POST" in r.methods)
+    journal_posts = sorted(path for path, methods in routes if "journal" in path and "POST" in methods)
     assert journal_posts and all(
         p == "/finance/journals" or re.search(r"/(request-post|request-reversal|approve|approve-reversal|reject)$", p)
         for p in journal_posts

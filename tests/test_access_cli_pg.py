@@ -210,14 +210,14 @@ def test_apply_gates_refuse_before_any_write(engine, runner):
 
 def test_revoke_removes_grant_audits_and_is_idempotent(engine, runner):
     tenant, (party,) = seed(engine)
-    assert runner.run("apply", tenant, [(party, "treasury"), (party, "bank_reconciler")])[0] == 0
+    assert runner.run("apply", tenant, [(party, "treasury"), (party, "payroll_approver")])[0] == 0
     code, receipt = runner.run("revoke-plan", tenant, [(party, "treasury")])
     assert code == 0 and receipt["access"]["revokes"] == 1
-    assert held(engine, tenant, party) == {"staff", "treasury", "bank_reconciler"}
+    assert held(engine, tenant, party) == {"staff", "treasury", "payroll_approver"}
     assert audits(engine, tenant, access.AUDIT_ROLE_REVOKED) == []
     code, receipt = runner.run("revoke-apply", tenant, [(party, "treasury")])
     assert code == 0 and receipt["access"]["revokes"] == 1 and receipt["access"]["noops"] == 0
-    assert held(engine, tenant, party) == {"staff", "bank_reconciler"}
+    assert held(engine, tenant, party) == {"staff", "payroll_approver"}
     events = audits(engine, tenant, access.AUDIT_ROLE_REVOKED)
     assert len(events) == 1 and events[0].actor_type == "service" and events[0].actor_id == "ops-1"
     assert events[0].entity_id == str(party) and events[0].details["role"] == "treasury"
@@ -230,9 +230,9 @@ def test_revoke_removes_grant_audits_and_is_idempotent(engine, runner):
 
 def test_revoke_multiple_parties_one_audit_per_removed_grant(engine, runner):
     tenant, (a, b) = seed(engine, parties=2)
-    assert runner.run("apply", tenant, [(a, "treasury"), (b, "treasury"), (b, "bank_reconciler")])[0] == 0
+    assert runner.run("apply", tenant, [(a, "treasury"), (b, "treasury"), (b, "payroll_approver")])[0] == 0
     code, receipt = runner.run(
-        "revoke-apply", tenant, [(a, "treasury"), (b, "treasury"), (b, "bank_reconciler"), (a, "payroll_approver")]
+        "revoke-apply", tenant, [(a, "treasury"), (b, "treasury"), (b, "payroll_approver"), (a, "payroll_approver")]
     )
     assert code == 0 and receipt["access"]["revokes"] == 3 and receipt["access"]["noops"] == 1
     assert held(engine, tenant, a) == {"staff"} and held(engine, tenant, b) == {"staff"}
