@@ -92,6 +92,7 @@ def plan():
         dict(
             invoice_id=str(UUID(int=n)),
             evidence_fingerprint="cv1:" + "e" * 64,
+            period="2026-01-01..2026-01-31",
             subtotal="200.00",
             tax="15.00",
             total="215.00",

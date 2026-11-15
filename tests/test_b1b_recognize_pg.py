@@ -524,7 +524,7 @@ def test_invoices_post_on_their_original_date_into_their_original_open_period(en
 
 def test_period_missing_closed_or_not_open_is_refused(engine, setup):
     env, legacy = setup
-    no_period = imported(engine, env, number="AP-M", period_date="2026-03-10")  # no March period exists
+    no_period = imported(engine, env, number="AP-M", period_date="2025-12-10")  # no December period exists
     jan = imported(engine, env, number="AP-J")
     ids = tuple(sorted([no_period, jan], key=str))
     legacy.build(ids)
