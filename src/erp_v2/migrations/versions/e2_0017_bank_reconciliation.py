@@ -6,8 +6,8 @@ service; accounting a1 owns the ledger and B7 never writes it).
 
 Security posture:
 - RLS forced with a tenant isolation policy on every table, like every other e2 table.
-- The runtime role has no DELETE on reconciliations, matches or match lines; items can be deleted
-  only while their reconciliation is OPEN (trigger). UPDATE is column-limited to lifecycle columns.
+- The runtime role has no DELETE on any of the four tables;
+  items are insert-only (withdrawal columns only, while OPEN). UPDATE is column-limited to lifecycle columns.
 - An APPROVED (or CANCELLED) reconciliation is immutable: any UPDATE is refused by trigger, its
   items cannot change, and the matches it covers are locked (cannot be unmatched).
 - CHECK constraints enforce the two-person rule (approver differs from preparer) and the zero
@@ -130,23 +130,26 @@ DECLARE
     parent_id uuid;
     parent_tenant uuid;
 BEGIN
-    IF TG_OP = 'UPDATE' THEN
-        RAISE EXCEPTION 'reconciling items are never updated' USING ERRCODE = '23000';
-    END IF;
     IF TG_OP = 'DELETE' THEN
-        parent_id := OLD.reconciliation_id;
-        parent_tenant := OLD.tenant_id;
-    ELSE
-        parent_id := NEW.reconciliation_id;
-        parent_tenant := NEW.tenant_id;
+        RAISE EXCEPTION 'reconciling items are never deleted; withdraw them' USING ERRCODE = '23000';
     END IF;
+    IF TG_OP = 'UPDATE' THEN
+        -- The one allowed change: a governed withdrawal of a still-active item.
+        IF OLD.withdrawn_at IS NOT NULL OR NEW.withdrawn_at IS NULL
+           OR NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
+           OR NEW.reconciliation_id IS DISTINCT FROM OLD.reconciliation_id OR NEW.side IS DISTINCT FROM OLD.side
+           OR NEW.ref_id IS DISTINCT FROM OLD.ref_id OR NEW.item_type IS DISTINCT FROM OLD.item_type
+           OR NEW.signed_amount IS DISTINCT FROM OLD.signed_amount OR NEW.note IS DISTINCT FROM OLD.note
+           OR NEW.created_by_party_id IS DISTINCT FROM OLD.created_by_party_id THEN
+            RAISE EXCEPTION 'reconciling items are insert-only; only a withdrawal is allowed' USING ERRCODE = '23000';
+        END IF;
+    END IF;
+    parent_id := NEW.reconciliation_id;
+    parent_tenant := NEW.tenant_id;
     SELECT status INTO parent_status FROM public.erp_bank_reconciliations
         WHERE id = parent_id AND tenant_id = parent_tenant;
     IF parent_status IS DISTINCT FROM 'open' THEN
         RAISE EXCEPTION 'reconciling items can change only while the reconciliation is open' USING ERRCODE = '23000';
-    END IF;
-    IF TG_OP = 'DELETE' THEN
-        RETURN OLD;
     END IF;
     RETURN NEW;
 END
@@ -337,7 +340,9 @@ def upgrade() -> None:
         sa.Column("signed_amount", money, nullable=False),
         sa.Column("note", sa.String(500), nullable=False),
         _party("created_by_party_id", nullable=False),
-        sa.UniqueConstraint("tenant_id", "reconciliation_id", "side", "ref_id", name="uq_erp_bank_recon_items_line"),
+        _party("withdrawn_by_party_id"),
+        sa.Column("withdrawn_at", sa.DateTime(timezone=True)),
+        sa.Column("withdraw_reason", sa.String(500)),
         sa.ForeignKeyConstraint(["tenant_id", "reconciliation_id"], [f"{RECON}.tenant_id", f"{RECON}.id"]),
         sa.CheckConstraint(
             "(side = 'gl' AND item_type IN ('deposit_in_transit', 'outstanding_payment')) "
@@ -351,6 +356,20 @@ def upgrade() -> None:
             name="ck_erp_bank_recon_items_sign",
         ),
         sa.CheckConstraint("length(btrim(note)) > 0", name="ck_erp_bank_recon_items_note"),
+        sa.CheckConstraint(
+            "(withdrawn_at IS NULL AND withdrawn_by_party_id IS NULL AND withdraw_reason IS NULL) "
+            "OR (withdrawn_at IS NOT NULL AND withdrawn_by_party_id IS NOT NULL "
+            "AND withdraw_reason IS NOT NULL AND length(btrim(withdraw_reason)) > 0)",
+            name="ck_erp_bank_recon_items_withdrawn",
+        ),
+    )
+    # One ACTIVE item per line and reconciliation; withdrawn rows stay as the audit trail.
+    op.create_index(
+        "uq_erp_bank_recon_items_line",
+        ITEM,
+        ["tenant_id", "reconciliation_id", "side", "ref_id"],
+        unique=True,
+        postgresql_where=sa.text("withdrawn_at IS NULL"),
     )
     for table in _TABLES:
         _rls(table)
@@ -367,7 +386,8 @@ def upgrade() -> None:
     )
     op.execute(f"GRANT SELECT, INSERT ON public.{MATCH_LINE} TO app_user")
     op.execute(f"GRANT UPDATE (active) ON public.{MATCH_LINE} TO app_user")
-    op.execute(f"GRANT SELECT, INSERT, DELETE ON public.{ITEM} TO app_user")
+    op.execute(f"GRANT SELECT, INSERT ON public.{ITEM} TO app_user")
+    op.execute(f"GRANT UPDATE (withdrawn_by_party_id, withdrawn_at, withdraw_reason) ON public.{ITEM} TO app_user")
     for function, table, events in (
         (_RECON_FN, RECON, "UPDATE OR DELETE"),
         (_MATCH_FN, MATCH, "UPDATE OR DELETE"),

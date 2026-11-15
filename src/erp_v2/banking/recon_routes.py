@@ -246,8 +246,8 @@ async def recon_add_items(
     return await _act(request, db, tenant, party, reconciliation_id, action)
 
 
-@router.post(BASE + "/{reconciliation_id}/items/{item_id}/remove", response_model=None)
-async def recon_remove_item(
+@router.post(BASE + "/{reconciliation_id}/items/{item_id}/withdraw", response_model=None)
+async def recon_withdraw_item(
     reconciliation_id: UUID,
     item_id: UUID,
     request: Request,
@@ -255,8 +255,15 @@ async def recon_remove_item(
     tenant: Tenant = Depends(require_tenant),
     party: Party = Depends(require_web_permission(PREPARE)),
 ) -> HTMLResponse | RedirectResponse:
-    def action(_values: dict[str, list[str]]) -> None:
-        svc.remove_item(db, tenant_id=tenant.id, actor=party.id, reconciliation_id=reconciliation_id, item_id=item_id)
+    def action(values: dict[str, list[str]]) -> None:
+        svc.withdraw_item(
+            db,
+            tenant_id=tenant.id,
+            actor=party.id,
+            reconciliation_id=reconciliation_id,
+            item_id=item_id,
+            reason=_one(values, "reason"),
+        )
 
     return await _act(request, db, tenant, party, reconciliation_id, action)
 

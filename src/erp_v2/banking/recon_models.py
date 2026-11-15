@@ -126,6 +126,9 @@ class BankReconItem(Base):
     signed_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     note: Mapped[str] = mapped_column(String(500), nullable=False)
     created_by_party_id: Mapped[UUID] = _party(nullable=False)
+    withdrawn_by_party_id: Mapped[UUID | None] = _party()
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    withdraw_reason: Mapped[str | None] = mapped_column(String(500))
 
 
 RECON_TABLES = (

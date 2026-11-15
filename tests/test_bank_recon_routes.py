@@ -45,7 +45,7 @@ PREPARE = [
     ("POST", f"{BASE}/{ID}/match"),
     ("POST", f"{BASE}/{ID}/unmatch"),
     ("POST", f"{BASE}/{ID}/items"),
-    ("POST", f"{BASE}/{ID}/items/{ID}/remove"),
+    ("POST", f"{BASE}/{ID}/items/{ID}/withdraw"),
     ("POST", f"{BASE}/{ID}/prepare"),
     ("POST", f"{BASE}/{ID}/cancel"),
 ]
@@ -61,7 +61,7 @@ SERVICE_NAMES = (
     "match",
     "unmatch",
     "add_items",
-    "remove_item",
+    "withdraw_item",
     "prepare",
     "cancel",
     "approve",
@@ -201,7 +201,7 @@ def browser(monkeypatch):
         app.dependency_overrides[get_db] = request_session
         row = SimpleNamespace(id=ID, status="prepared")
         service = {name: Mock(return_value=row) for name in SERVICE_NAMES}
-        service["remove_item"].return_value = True
+        service["withdraw_item"].return_value = True
         service["live_reconciliation_account"] = Mock(return_value=uuid4())
         for name, spy in service.items():
             monkeypatch.setattr(routes.svc, name, spy)

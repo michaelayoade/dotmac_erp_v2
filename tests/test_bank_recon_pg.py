@@ -6,7 +6,9 @@ inserted as banking-owner rows exactly as B6 leaves them; ledger lines come from
 create/post/reverse commands, so the reconciliation reads the genuine posted ledger.
 """
 
+import os
 import threading
+import time
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -48,6 +50,7 @@ from sqlalchemy.orm import Session
 from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (hosted-Postgres fixture)
 
 from erp_v2.banking import recon_models as m
+from erp_v2.banking import recon_queries
 from erp_v2.banking import recon_service as svc
 from erp_v2.banking.recon_routes import banking_recon_feature
 from erp_v2.banking.recon_service import ItemRequest, ReconRefused
@@ -410,8 +413,14 @@ def test_full_flow_prepare_approve_freezes_everything(engine):
     ):
         with Session(engine) as db, pytest.raises((IntegrityError, DBAPIError)):
             db.execute(sa.text(stmt), {"id": rid})
-    with Session(engine) as db, pytest.raises((IntegrityError, DBAPIError)):
-        db.execute(sa.text("DELETE FROM erp_bank_recon_items WHERE reconciliation_id=:id"), {"id": rid})
+    for stmt in (
+        "DELETE FROM erp_bank_recon_items WHERE reconciliation_id=:id",
+        "UPDATE erp_bank_recon_items SET signed_amount = signed_amount WHERE reconciliation_id=:id",
+        "UPDATE erp_bank_recon_items SET withdrawn_at=now(), withdrawn_by_party_id=created_by_party_id, "
+        "withdraw_reason='x' WHERE reconciliation_id=:id",  # parent approved: even a withdrawal is refused
+    ):
+        with Session(engine) as db, pytest.raises((IntegrityError, DBAPIError)):
+            db.execute(sa.text(stmt), {"id": rid})
     with Session(engine) as db, pytest.raises((IntegrityError, DBAPIError)):
         db.execute(sa.text("UPDATE erp_bank_recon_matches SET status='unmatched' WHERE id=:id"), {"id": match_id})
     with Session(engine) as db, pytest.raises((IntegrityError, DBAPIError)):
@@ -563,11 +572,12 @@ def test_unrecorded_bank_charge_is_typed_blocks_prepare_and_is_never_posted(engi
     _, gl_charge = post(engine, env, debit_code="5000", credit_code="1000", amount="10", day=date(2026, 1, 30))
     run(
         engine,
-        svc.remove_item,
+        svc.withdraw_item,
         tenant_id=env.tenant_id,
         actor=env.parties["opener"],
         reconciliation_id=recon.id,
         item_id=_item_id(engine, env, charge),
+        reason="journal now posted",
     )
     do_match(engine, env, [charge], [gl_charge])
     run(engine, svc.prepare, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=recon.id)
@@ -989,3 +999,393 @@ def test_database_refuses_double_active_match_even_if_service_bypassed(engine):
             ),
             {"id": uuid4(), "t": env.tenant_id, "m": out.match_id, "r": env.gl_a},
         )
+
+
+# --- R1: serialise against postings to the cash GL ---------------------------------------
+
+
+def _in_thread(fn):
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return thread, box
+
+
+def test_a_posting_in_flight_blocks_approve_until_it_commits_then_drift_is_refused(engine):
+    env = scenario(engine)
+    rid = prepared(engine, env)
+    # Session A posts to the cash GL and holds its locks (uncommitted).
+    holder = Session(engine)
+    scope = TenantScope(env.tenant_id)
+    journal = accounting.create_journal(
+        holder,
+        scope=scope,
+        command=CreateJournal(
+            number=f"HOLD-{uuid4().hex[:8]}",
+            kind=JournalKind.STANDARD,
+            entry_date=date(2026, 1, 25),
+            posting_date=date(2026, 1, 25),
+            currency_code="NGN",
+            exchange_rate=Decimal(1),
+            description="held",
+            source=SourceIdentity("test", "journal", uuid4().hex, "1", "d" * 64),
+            lines=(
+                JournalLineInput(env.accounts["1000"], debit=Decimal(9)),
+                JournalLineInput(env.accounts["4000"], credit=Decimal(9)),
+            ),
+        ),
+        idempotency_key=f"hold:{uuid4()}",
+        idempotency_expires_at=None,
+        recorded_at=NOW,
+    )
+    accounting.post_journal(
+        holder,
+        scope=scope,
+        journal_id=journal.id,
+        approval_reference="appr",
+        posted_by="test",
+        idempotency_key=f"hold-post:{uuid4()}",
+        idempotency_expires_at=None,
+        posted_at=NOW,
+    )
+    thread, box = _in_thread(
+        lambda: run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties["approver"], reconciliation_id=rid)
+    )
+    time.sleep(1.5)
+    assert thread.is_alive(), "approve must wait for the in-flight posting to the cash GL"
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert isinstance(box.get("error"), ReconRefused), box
+    assert box["error"].code in {"difference_nonzero", "not_reconcilable", "snapshot_drift"}
+    assert row(engine, "erp_bank_reconciliations", id=rid)["status"] == "prepared"
+
+
+def test_approve_in_flight_makes_a_posting_wait_and_the_posting_survives(engine):
+    env = scenario(engine)
+    rid = prepared(engine, env)
+    holder = Session(engine, expire_on_commit=False)
+    svc.approve(holder, tenant_id=env.tenant_id, actor=env.parties["approver"], reconciliation_id=rid, now=NOW)
+    thread, box = _in_thread(
+        lambda: post(engine, env, debit_code="1000", credit_code="4000", amount="3", day=date(2026, 1, 26))
+    )
+    time.sleep(1.5)
+    assert thread.is_alive(), "a posting to the cash GL must wait for the approval to finish"
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert "error" not in box, box
+    assert row(engine, "erp_bank_reconciliations", id=rid)["status"] == "approved"
+    # the late posting is a normal later finding: it is uncleared, the approval stays untouched
+    with Session(engine) as db:
+        recon = db.get(m.BankReconciliation, rid)
+        assert recon.gl_balance == Decimal("310")
+
+
+# --- R2/L4: items are insert-only with a governed withdrawal --------------------------------
+
+
+def test_items_are_withdrawn_not_deleted_and_can_be_itemized_again(engine):
+    env = scenario(engine)
+    recon = open_recon(engine, env)
+    req = ItemRequest(m.SIDE_GL, env.gl_pay, m.ITEM_OUTSTANDING_PAYMENT, "cheque")
+    run(
+        engine,
+        svc.add_items,
+        tenant_id=env.tenant_id,
+        actor=env.parties["opener"],
+        reconciliation_id=recon.id,
+        requests=[req],
+    )
+    item_id = _item_id(engine, env, env.gl_pay)
+    with pytest.raises(ReconRefused):
+        run(
+            engine,
+            svc.withdraw_item,
+            tenant_id=env.tenant_id,
+            actor=env.parties["opener"],
+            reconciliation_id=recon.id,
+            item_id=item_id,
+            reason=" ",
+        )
+    assert run(
+        engine,
+        svc.withdraw_item,
+        tenant_id=env.tenant_id,
+        actor=env.parties["matcher"],
+        reconciliation_id=recon.id,
+        item_id=item_id,
+        reason="wrong line",
+    )
+    assert not run(
+        engine,
+        svc.withdraw_item,
+        tenant_id=env.tenant_id,
+        actor=env.parties["matcher"],
+        reconciliation_id=recon.id,
+        item_id=item_id,
+        reason="again",
+    )
+    withdrawn = row(engine, "erp_bank_recon_items", id=item_id)
+    assert withdrawn["withdrawn_by_party_id"] == env.parties["matcher"] and withdrawn["withdraw_reason"] == "wrong line"
+    with Session(engine) as db:
+        assert svc.evaluate(db, env.tenant_id, db.get(m.BankReconciliation, recon.id)).items_total == 0
+        event = db.scalar(
+            sa.select(AuditEvent).where(
+                AuditEvent.tenant_id == env.tenant_id, AuditEvent.action == svc.AUDIT_ITEM_WITHDRAWN
+            )
+        )
+        assert event.details["ref_id"] == str(env.gl_pay) and event.details["side"] == "gl"
+    run(
+        engine,
+        svc.add_items,
+        tenant_id=env.tenant_id,
+        actor=env.parties["opener"],
+        reconciliation_id=recon.id,
+        requests=[req],
+    )
+    with Session(engine) as db:
+        assert (
+            db.scalar(
+                sa.select(sa.func.count())
+                .select_from(m.BankReconItem)
+                .where(m.BankReconItem.tenant_id == env.tenant_id)
+            )
+            == 2
+        )
+    for stmt in (
+        "DELETE FROM erp_bank_recon_items WHERE id=:id",
+        "UPDATE erp_bank_recon_items SET note='tampered' WHERE id=:id",
+        "UPDATE erp_bank_recon_items SET withdrawn_at=NULL, withdraw_reason=NULL WHERE id=:id",
+    ):
+        with Session(engine) as db, pytest.raises((IntegrityError, DBAPIError)):
+            db.execute(sa.text(stmt), {"id": item_id})
+
+
+# --- L1: releasing a match is participation ---------------------------------------------
+
+
+def test_someone_who_unmatched_in_scope_cannot_approve(engine):
+    env = scenario(engine)
+    recon = open_recon(engine, env)
+    first = do_match(engine, env, [env.bank["a"]], [env.gl_a])
+    run(
+        engine,
+        svc.unmatch,
+        tenant_id=env.tenant_id,
+        actor=env.parties["approver2"],
+        match_id=first.match_id,
+        reason="redo",
+    )
+    do_match(engine, env, [env.bank["a"]], [env.gl_a])
+    do_match(engine, env, [env.bank["b"]], [env.gl_b])
+    run(
+        engine,
+        svc.add_items,
+        tenant_id=env.tenant_id,
+        actor=env.parties["opener"],
+        reconciliation_id=recon.id,
+        requests=[ItemRequest(m.SIDE_GL, env.gl_pay, m.ITEM_OUTSTANDING_PAYMENT, "cheque")],
+    )
+    run(engine, svc.prepare, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=recon.id)
+    with pytest.raises(ReconRefused) as exc:
+        run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties["approver2"], reconciliation_id=recon.id)
+    assert exc.value.code == "sod_participant"
+    run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties["approver"], reconciliation_id=recon.id)
+
+
+# --- D3: sequencing and continuity -------------------------------------------------------
+
+
+def test_periods_only_move_forward_and_one_in_flight_per_account(engine):
+    env = scenario(engine)
+    feb = statement(engine, env, closing="0.00", start=date(2026, 2, 1), end=date(2026, 2, 28), ref="FEB")
+    early = statement(engine, env, closing="0.00", start=date(2026, 1, 1), end=date(2026, 1, 15), ref="EARLY")
+    rid = prepared(engine, env)
+    with pytest.raises(ReconRefused) as exc:  # Jan is in flight: no second one on the account
+        run(
+            engine,
+            svc.open_reconciliation,
+            tenant_id=env.tenant_id,
+            actor=env.parties["opener"],
+            account_id=env.bank_id,
+            statement_id=feb,
+        )
+    assert exc.value.code == "reconciliation_exists"
+    run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties["approver"], reconciliation_id=rid)
+    with pytest.raises(ReconRefused) as exc:  # not after the latest approved period end
+        run(
+            engine,
+            svc.open_reconciliation,
+            tenant_id=env.tenant_id,
+            actor=env.parties["opener"],
+            account_id=env.bank_id,
+            statement_id=early,
+        )
+    assert exc.value.code == "period_not_after_approved"
+    feb_recon = run(
+        engine,
+        svc.open_reconciliation,
+        tenant_id=env.tenant_id,
+        actor=env.parties["opener"],
+        account_id=env.bank_id,
+        statement_id=feb,
+    )
+    with Session(engine) as db:  # Feb opening balance (0) != Jan closing (350): a warning, not a block
+        page = recon_queries.workspace(db, tenant_id=env.tenant_id, reconciliation_id=feb_recon.id)
+        assert "differs from the previous approved closing" in page["continuity_warning"]
+
+
+# --- D4: B7 is the single owner of reconciliation state --------------------------------------
+
+
+def test_b7_never_writes_banking_reconciliation_tables_nor_reads_is_matched():
+    import re
+    from pathlib import Path
+
+    import erp_v2.banking as pkg
+
+    banned = (
+        "MatchDecision",
+        "MatchAllocation",
+        "MatchPolicy",
+        "CashAccountObservation",
+        "accept_match",
+        "prepare_reconciliation",
+        "approve_reconciliation",
+        "record_cash_observation",
+        "suggest_matches",
+        "is_matched",
+        "matched_lines",
+        "mod_banking.reconciliations",
+    )
+    for path in Path(pkg.__file__).parent.glob("recon_*.py"):
+        text = path.read_text()
+        for word in banned:
+            assert not re.search(rf"\b{re.escape(word)}\b", text.replace("dotmac_banking.models import", "")), (
+                path.name,
+                word,
+            )
+        for imported in re.findall(r"from dotmac_banking\.\w+ import \(?([^)\n]+)", text):
+            assert "Reconciliation" not in imported.split(", "), path.name
+
+
+# --- R3: the runtime role (NOBYPASSRLS member of app_user), tenant scope --------------------------
+
+
+@pytest.fixture()
+def runtime_engine(engine):
+    role = f"recon_rt_{uuid4().hex[:12]}"
+    admin = sa.create_engine(
+        sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
+    )
+    with admin.connect() as c:
+        c.exec_driver_sql(f'CREATE ROLE "{role}" LOGIN NOBYPASSRLS')
+        c.exec_driver_sql(f'GRANT app_user TO "{role}"')
+    rt = sa.create_engine(engine.url.set(username=role), hide_parameters=True)
+    try:
+        yield rt
+    finally:
+        rt.dispose()
+        with admin.connect() as c:
+            c.exec_driver_sql(f'DROP ROLE "{role}"')
+        admin.dispose()
+
+
+def _scoped(rt, tenant_id):
+    db = Session(rt, expire_on_commit=False)
+    db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant_id)})
+    return db
+
+
+def _rt(rt, env, fn, **kwargs):
+    with _scoped(rt, env.tenant_id) as db:
+        result = fn(db, tenant_id=env.tenant_id, now=NOW, **kwargs)
+        db.commit()
+        return result
+
+
+def test_runtime_role_full_flow_identity_and_delete_denied_and_tenant_isolation(engine, runtime_engine):
+    env, other = scenario(engine), scenario(engine)
+    with engine.connect() as c:
+        assert (
+            c.scalar(sa.text("SELECT rolbypassrls FROM pg_roles WHERE rolname=:r"), {"r": runtime_engine.url.username})
+            is False
+        )
+    recon = _rt(
+        runtime_engine,
+        env,
+        svc.open_reconciliation,
+        actor=env.parties["opener"],
+        account_id=env.bank_id,
+        statement_id=env.statement,
+    )
+    _rt(
+        runtime_engine,
+        env,
+        svc.match,
+        actor=env.parties["matcher"],
+        account_id=env.bank_id,
+        bank_line_ids=[env.bank["a"]],
+        gl_line_ids=[env.gl_a],
+    )
+    second = _rt(
+        runtime_engine,
+        env,
+        svc.match,
+        actor=env.parties["matcher"],
+        account_id=env.bank_id,
+        bank_line_ids=[env.bank["b"]],
+        gl_line_ids=[env.gl_b],
+    )
+    _rt(
+        runtime_engine,
+        env,
+        svc.add_items,
+        actor=env.parties["opener"],
+        reconciliation_id=recon.id,
+        requests=[ItemRequest(m.SIDE_GL, env.gl_pay, m.ITEM_OUTSTANDING_PAYMENT, "cheque")],
+    )
+    _rt(runtime_engine, env, svc.prepare, actor=env.parties["preparer"], reconciliation_id=recon.id)
+    # includes the FOR UPDATE on the accounting account row under the runtime role
+    approved = _rt(runtime_engine, env, svc.approve, actor=env.parties["approver"], reconciliation_id=recon.id)
+    assert approved.status == m.STATUS_APPROVED
+    with pytest.raises(ReconRefused):
+        _rt(runtime_engine, env, svc.unmatch, actor=env.parties["matcher"], match_id=second.match_id, reason="x")
+    tables = (
+        "erp_bank_reconciliations",
+        "erp_bank_recon_matches",
+        "erp_bank_recon_match_lines",
+        "erp_bank_recon_items",
+    )
+    with _scoped(runtime_engine, env.tenant_id) as db:
+        for statement_sql in (
+            "UPDATE erp_bank_reconciliations SET account_id = gl_account_id",
+            "UPDATE erp_bank_reconciliations SET period_end = period_start",
+            "UPDATE erp_bank_recon_matches SET net_amount = 0",
+            "UPDATE erp_bank_recon_match_lines SET ref_id = id",
+            "UPDATE erp_bank_recon_items SET signed_amount = 0",
+            *(f"DELETE FROM {t}" for t in tables),  # noqa: S608
+            *(f"TRUNCATE {t}" for t in tables),
+        ):
+            with pytest.raises(sa.exc.ProgrammingError) as err:
+                db.execute(sa.text(statement_sql))
+            assert "permission denied" in str(err.value.orig).lower(), statement_sql
+            db.rollback()
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
+    with _scoped(runtime_engine, other.tenant_id) as db:  # the other tenant sees none of it
+        for table in tables:
+            assert db.scalar(sa.text(f"SELECT count(*) FROM {table}")) == 0, table  # noqa: S608
+        db.execute(sa.text("UPDATE erp_bank_reconciliations SET status='cancelled'"))
+        db.commit()
+    with Session(engine) as db:
+        assert db.get(m.BankReconciliation, recon.id).status == m.STATUS_APPROVED
+    with Session(runtime_engine) as db:  # no tenant scope at all: no rows
+        assert db.scalar(sa.text("SELECT count(*) FROM erp_bank_reconciliations")) == 0

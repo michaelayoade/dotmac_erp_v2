@@ -61,7 +61,7 @@ AUDIT_OPENED: Final = "erp.bank_recon.opened"
 AUDIT_MATCHED: Final = "erp.bank_recon.matched"
 AUDIT_UNMATCHED: Final = "erp.bank_recon.unmatched"
 AUDIT_ITEM_ADDED: Final = "erp.bank_recon.item_added"
-AUDIT_ITEM_REMOVED: Final = "erp.bank_recon.item_removed"
+AUDIT_ITEM_WITHDRAWN: Final = "erp.bank_recon.item_withdrawn"
 AUDIT_PREPARED: Final = "erp.bank_recon.prepared"
 AUDIT_RETURNED: Final = "erp.bank_recon.returned"
 AUDIT_APPROVED: Final = "erp.bank_recon.approved"
@@ -71,7 +71,7 @@ AUDIT_ACTIONS: Final = (
     AUDIT_MATCHED,
     AUDIT_UNMATCHED,
     AUDIT_ITEM_ADDED,
-    AUDIT_ITEM_REMOVED,
+    AUDIT_ITEM_WITHDRAWN,
     AUDIT_PREPARED,
     AUDIT_RETURNED,
     AUDIT_APPROVED,
@@ -299,7 +299,11 @@ def _items(db: Session, tenant_id: UUID, reconciliation_id: UUID) -> list[BankRe
     return list(
         db.scalars(
             select(BankReconItem)
-            .where(BankReconItem.tenant_id == tenant_id, BankReconItem.reconciliation_id == reconciliation_id)
+            .where(
+                BankReconItem.tenant_id == tenant_id,
+                BankReconItem.reconciliation_id == reconciliation_id,
+                BankReconItem.withdrawn_at.is_(None),
+            )
             .order_by(BankReconItem.side, BankReconItem.ref_id)
         )
     )
@@ -430,6 +434,19 @@ def live_reconciliation_account(db: Session, tenant_id: UUID, reconciliation_id:
     return row.account_id
 
 
+def _lock_gl_account(db: Session, tenant_id: UUID, recon: BankReconciliation) -> None:
+    """Serialise against postings to the cash GL (accounting a1 post_journal locks each line's Account row).
+
+    Global lock order: bank account -> reconciliation -> GL account. Never lock a banking account row
+    after posting. Every posting then either committed before this lock or waits until we commit.
+    """
+    found = db.scalar(
+        select(Account.id).where(Account.tenant_id == tenant_id, Account.id == recon.gl_account_id).with_for_update()
+    )
+    if found is None:
+        raise ReconRefused("gl_account_unresolved", "the cash GL account no longer exists")
+
+
 def open_reconciliation(
     db: Session, *, tenant_id: UUID, actor: UUID, account_id: UUID, statement_id: UUID, now: datetime | None = None
 ) -> BankReconciliation:
@@ -453,19 +470,30 @@ def open_reconciliation(
                 raise ReconRefused("statement_unusable", "statement currency does not match the bank account")
             _require_functional(db, tenant_id, account.currency_code)
             gl_account_id = resolve_gl_account(db, tenant_id, account)
-            live = db.scalar(
+            # One in-flight reconciliation per account, and periods only move forward: a new period end
+            # must be after the latest approved one (no back-filling once later matches are locked).
+            in_flight = db.scalar(
                 select(BankReconciliation.id).where(
                     BankReconciliation.tenant_id == tenant_id,
                     BankReconciliation.account_id == account.id,
-                    BankReconciliation.status.in_(m.LIVE_STATUSES),
-                    or_(
-                        BankReconciliation.statement_id == statement.id,
-                        BankReconciliation.period_end == statement.period_end,
-                    ),
+                    BankReconciliation.status.in_((m.STATUS_OPEN, m.STATUS_PREPARED)),
                 )
             )
-            if live is not None:
-                raise ReconRefused("reconciliation_exists", "this statement period already has a live reconciliation")
+            if in_flight is not None:
+                raise ReconRefused(
+                    "reconciliation_exists", "this account already has an open or prepared reconciliation"
+                )
+            latest = db.scalar(
+                select(func.max(BankReconciliation.period_end)).where(
+                    BankReconciliation.tenant_id == tenant_id,
+                    BankReconciliation.account_id == account.id,
+                    BankReconciliation.status == m.STATUS_APPROVED,
+                )
+            )
+            if latest is not None and statement.period_end <= latest:
+                raise ReconRefused(
+                    "period_not_after_approved", f"the latest approved reconciliation already covers {latest}"
+                )
             row = BankReconciliation(
                 tenant_id=tenant_id,
                 account_id=account.id,
@@ -497,6 +525,7 @@ def prepare(
             _, row = _locked_recon(db, tenant_id, reconciliation_id)
             if row.status != m.STATUS_OPEN:
                 raise ReconRefused("state_refused", f"only an open reconciliation can be prepared, not {row.status}")
+            _lock_gl_account(db, tenant_id, row)
             result = evaluate(db, tenant_id, row)
             if not result.clean:
                 raise ReconRefused("not_reconcilable", ",".join(result.issues))
@@ -528,13 +557,31 @@ def _participants(db: Session, tenant_id: UUID, recon: BankReconciliation) -> se
     people: set[UUID] = {recon.opened_by_party_id}
     if recon.prepared_by_party_id is not None:
         people.add(recon.prepared_by_party_id)
-    people.update(
-        db.scalars(
-            select(BankReconItem.created_by_party_id).where(
-                BankReconItem.tenant_id == tenant_id, BankReconItem.reconciliation_id == recon.id
+    for column in (BankReconItem.created_by_party_id, BankReconItem.withdrawn_by_party_id):
+        people.update(
+            p
+            for p in db.scalars(
+                select(column).where(BankReconItem.tenant_id == tenant_id, BankReconItem.reconciliation_id == recon.id)
             )
+            if p is not None
+        )
+    # Releasing a match is participation too: whoever unmatched in-scope lines since the last approval.
+    last_approved = db.scalar(
+        select(func.max(BankReconciliation.approved_at)).where(
+            BankReconciliation.tenant_id == tenant_id,
+            BankReconciliation.account_id == recon.account_id,
+            BankReconciliation.status == m.STATUS_APPROVED,
         )
     )
+    released = select(BankReconMatch.unmatched_by_party_id).where(
+        BankReconMatch.tenant_id == tenant_id,
+        BankReconMatch.account_id == recon.account_id,
+        BankReconMatch.status == m.MATCH_UNMATCHED,
+        BankReconMatch.latest_date <= recon.period_end,
+    )
+    if last_approved is not None:
+        released = released.where(BankReconMatch.unmatched_at > last_approved)
+    people.update(p for p in db.scalars(released) if p is not None)
     people.update(
         db.scalars(
             select(BankReconMatch.matched_by_party_id).where(
@@ -566,6 +613,7 @@ def approve(
                 raise ReconRefused(
                     "sod_participant", "the approver took part in opening, matching or itemizing this reconciliation"
                 )
+            _lock_gl_account(db, tenant_id, row)
             result = evaluate(db, tenant_id, row)
             if result.difference != 0:
                 raise ReconRefused("difference_nonzero", f"unexplained difference {result.difference}")
@@ -982,16 +1030,26 @@ def add_items(
                     entity_id=row.id,
                     count=len(created),
                     types=sorted({i.item_type for i in created}),
+                    lines=sorted(f"{i.side}:{i.ref_id}" for i in created),
                 )
             return created
     except IntegrityError:
         raise ReconRefused("conflict", "a conflicting reconciling item already exists") from None
 
 
-def remove_item(
-    db: Session, *, tenant_id: UUID, actor: UUID, reconciliation_id: UUID, item_id: UUID, now: datetime | None = None
+def withdraw_item(
+    db: Session,
+    *,
+    tenant_id: UUID,
+    actor: UUID,
+    reconciliation_id: UUID,
+    item_id: UUID,
+    reason: str,
+    now: datetime | None = None,
 ) -> bool:
-    _now(now)
+    """Governed withdrawal (who/when/reason, audited); items are never deleted."""
+    moment = _now(now)
+    reason = _text(reason, "reason")
     try:
         _actor(db, tenant_id, actor)
         with db.begin_nested():
@@ -1003,23 +1061,29 @@ def remove_item(
                     BankReconItem.tenant_id == tenant_id,
                     BankReconItem.reconciliation_id == row.id,
                     BankReconItem.id == item_id,
+                    BankReconItem.withdrawn_at.is_(None),
                 )
             )
             if item is None:
                 return False
-            db.delete(item)
+            item.withdrawn_by_party_id = actor
+            item.withdrawn_at = moment
+            item.withdraw_reason = reason
             db.flush()
             _audit(
                 db,
                 tenant_id=tenant_id,
                 actor=actor,
-                action=AUDIT_ITEM_REMOVED,
+                action=AUDIT_ITEM_WITHDRAWN,
                 entity_id=row.id,
                 item_type=item.item_type,
+                side=item.side,
+                ref_id=item.ref_id,
+                reason=reason,
             )
             return True
     except IntegrityError:
-        raise ReconRefused("conflict", "the item could not be removed") from None
+        raise ReconRefused("conflict", "the item could not be withdrawn") from None
 
 
 # --- suggestions (read-only) -------------------------------------------------

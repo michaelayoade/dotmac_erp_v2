@@ -10,7 +10,7 @@ from uuid import UUID
 from dotmac_accounting.models import JournalEntry, PostedLedgerLine
 from dotmac_banking.models import BankAccount, BankStatement, BankStatementLine
 from dotmac_kernel.models import Party
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from erp_v2.banking import recon_models as m
@@ -176,6 +176,48 @@ def workspace(
             )
         ):
             members.setdefault(line.match_id, []).append(line)
+    previous = db.execute(
+        select(BankReconciliation.period_end, BankReconciliation.approved_at, BankStatement.closing_balance)
+        .join(
+            BankStatement,
+            and_(
+                BankStatement.tenant_id == BankReconciliation.tenant_id,
+                BankStatement.id == BankReconciliation.statement_id,
+            ),
+        )
+        .where(
+            BankReconciliation.tenant_id == tenant_id,
+            BankReconciliation.account_id == recon.account_id,
+            BankReconciliation.status == m.STATUS_APPROVED,
+            BankReconciliation.period_end < recon.period_end,
+        )
+        .order_by(BankReconciliation.period_end.desc())
+        .limit(1)
+    ).first()
+    continuity_warning = None
+    late_postings = 0
+    if previous is not None:
+        if (
+            statement is not None
+            and statement.opening_balance is not None
+            and previous[2] is not None
+            and Decimal(statement.opening_balance) != Decimal(previous[2])
+        ):
+            continuity_warning = (
+                f"statement opening balance {statement.opening_balance} differs from the previous approved "
+                f"closing balance {previous[2]}"
+            )
+        if live:
+            late_postings = db.scalar(
+                select(func.count())
+                .select_from(PostedLedgerLine)
+                .where(
+                    PostedLedgerLine.tenant_id == tenant_id,
+                    PostedLedgerLine.account_id == recon.gl_account_id,
+                    PostedLedgerLine.posting_date <= previous[0],
+                    PostedLedgerLine.posted_at > previous[1],
+                )
+            )
     suggested = svc.suggestions(db, tenant_id, recon) if recon.status == m.STATUS_OPEN else []
     people = _names(
         db,
@@ -209,6 +251,8 @@ def workspace(
         "members": members,
         "suggestions": suggested,
         "people": people,
+        "continuity_warning": continuity_warning,
+        "late_postings": late_postings or 0,
         "item_types": m.ITEM_TYPES,
         "timing_types": m.TIMING_TYPES,
         "unrecorded_types": m.UNRECORDED_TYPES,

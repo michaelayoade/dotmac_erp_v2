@@ -26,6 +26,8 @@
   <tr><th>Unexplained difference</th><td><strong>{{ diff }}</strong></td></tr>
 </tbody></table>
 <p>The statement closing balance must equal the GL balance plus the reconciling items exactly.</p>
+{% if continuity_warning %}<p role="alert">Warning: {{ continuity_warning }}</p>{% endif %}
+{% if late_postings %}<p role="alert">Warning: {{ late_postings }} ledger line(s) dated on or before the previous approved period were posted after that approval and are uncleared here.</p>{% endif %}
 {% if evaluation and evaluation.issues %}<p role="alert">Not ready: {{ evaluation.issues|join(', ') }}.
   {% if 'unrecorded_bank_items' in evaluation.issues %}Unrecorded bank items need a manual journal first (Finance, journals), then match the new ledger line to the statement line; nothing is posted from here.{% endif %}</p>{% endif %}
 
@@ -35,7 +37,7 @@
   <td>{{ i.item_type }}</td><td>{{ i.side }}</td>
   <td>{% if i.side == 'bank' %}{{ bank_text.get(i.ref_id)[1] if bank_text.get(i.ref_id) else i.ref_id }}{% else %}{{ gl_text.get(i.ref_id)[1] if gl_text.get(i.ref_id) else i.ref_id }}{% endif %}</td>
   <td>{{ i.signed_amount }}</td><td>{{ i.note }}</td>
-  {% if recon.status == 'open' and not approver %}<td><form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/items/{{ i.id }}/remove"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Remove</button></form></td>{% endif %}
+  {% if recon.status == 'open' and not approver %}<td><form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/items/{{ i.id }}/withdraw"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Withdraw</button></form></td>{% endif %}
 </tr>{% else %}<tr><td colspan="6">None.</td></tr>{% endfor %}
 </tbody></table>
 
