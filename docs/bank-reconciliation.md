@@ -37,9 +37,41 @@ One live reconciliation per account and period end (partial unique index).
 * **Immutability**: an approved or cancelled reconciliation, its items and the matches it covers cannot
   be changed or deleted (triggers; runtime role has no DELETE except items of an open reconciliation).
 
-## Not covered / carried forward
-* Banking a1's own statement `is_matched`/`reconciliations` tables are not touched; B7 keeps its own
-  state. Statement lines imported from legacy (18,187) arrive unmatched: they need matching or items
-  against legacy-imported ledger lines before the first approval.
-* Foreign-currency bank accounts are refused (ledger functional legs only).
-* Reconciliations are not forced to be sequential by period.
+## Baseline at the flip date (Michael, register v1310)
+Each bank account gets ONE opening reconciliation (`kind = baseline`) at a declared date D (the flip date):
+open with `baseline_date` = D, anchored to the statement that ends exactly on D; prepare and approve by two
+different people; statement balance at D == cash GL balance at D + typed outstanding timing items
+(deposit in transit / outstanding payment) bound to real ledger lines. No plug, no statement-side items,
+no coverage of history. Any other gap is fixed first by governed B2 journals. Once approved it is immutable
+and unique per account (partial unique index). A periodic reconciliation needs the approved baseline and a
+period end after it; its scope is statement lines and ledger lines dated after D plus the baseline's
+carried-forward items (those ledger lines still need an item until they clear). Matching lines dated on or
+before D is refused (`before_baseline`), except the carried ledger lines, which may be matched to later
+statement lines. Periods only move forward and one reconciliation per account is in flight at a time;
+a statement whose opening balance differs from the previous approved closing balance is a warning.
+
+## Unrecorded bank items in a closed period (D2)
+In an OPEN period an unrecorded bank charge/receipt still blocks preparation (post a back-dated B2 journal,
+then match). In a closed (soft-closed/locked) period it is allowed only when linked to a live B2 manual
+journal dated in the first open period that books exactly the bank line's effect on this cash GL; the
+approver sees the link and the next reconciliation matches the bank line to that journal's ledger line.
+No free items, no auto-posting, no reopening.
+
+## Shared cash GL and foreign currency
+* Two bank accounts on one cash GL (census: GL 1210 and 1211 are each shared by two accounts) are REFUSED
+  (`shared_cash_gl`) for open, baseline and matching: the GL balance mixes both accounts and no allocation
+  is invented. Finance splits the cash GL (one per bank account) or reconciles that pair outside ERP.
+* Non-functional-currency bank accounts (census: one USD account) stay refused; reconcile them outside ERP.
+
+## Ownership and locking
+B7 is the single owner of reconciliation state: banking a1 reconciliation/match/observation aggregates and
+`is_matched` are never written or read (guard test). Declared debt: extract B7 into Starter banking after
+cutover. Global lock order: bank account row -> reconciliation row -> cash GL account row (prepare/approve
+lock the GL account so postings serialise against them); never lock a banking account row after posting.
+Reconciling items are insert-only; a governed withdrawal (who/when/reason, audited) replaces deletion and
+the runtime role has no DELETE on any B7 table.
+
+## Not covered
+* Banking a1's own statement `is_matched`/`reconciliations` tables are not touched.
+* Backdated postings after approval surface as uncleared lines in the next reconciliation (soft-close the
+  period after approval to prevent them).

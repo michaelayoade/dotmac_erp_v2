@@ -35,8 +35,8 @@ from decimal import Decimal
 from typing import Final
 from uuid import UUID
 
-from dotmac_accounting.contracts import JournalStatus
-from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
+from dotmac_accounting.contracts import JournalStatus, PeriodStatus
+from dotmac_accounting.models import Account, FiscalPeriod, JournalEntry, JournalLine, PostedLedgerLine
 from dotmac_banking.models import BankAccount, BankStatement, BankStatementLine
 from dotmac_kernel.audit import write_audit_event
 from dotmac_kernel.models import Party
@@ -46,6 +46,7 @@ from sqlalchemy.orm import Session
 
 from erp_v2.banking import recon_models as m
 from erp_v2.banking.recon_models import BankReconciliation, BankReconItem, BankReconMatch, BankReconMatchLine
+from erp_v2.journals import models as journal_models
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
 
 SOURCE_APPLICATION: Final = "dotmac_erp"
@@ -168,7 +169,26 @@ def resolve_gl_account(db: Session, tenant_id: UUID, account: BankAccount) -> UU
     rows = list(db.scalars(select(Account.id).where(Account.tenant_id == tenant_id, column)))
     if len(rows) != 1:
         raise ReconRefused("gl_account_unresolved", "the cash account reference does not resolve to one account")
+    _refuse_shared_gl(db, tenant_id, account, rows[0])
     return rows[0]
+
+
+def _refuse_shared_gl(db: Session, tenant_id: UUID, account: BankAccount, gl_account_id: UUID) -> None:
+    """Two bank accounts on one cash GL cannot be reconciled one by one: the GL balance mixes both.
+
+    Refused (fail closed) rather than guessed. Finance splits the shared GL (one cash account per bank
+    account) or reconciles the pair outside ERP; no allocation between the accounts is invented here.
+    """
+    code = db.scalar(select(Account.code).where(Account.tenant_id == tenant_id, Account.id == gl_account_id))
+    for other in db.scalars(
+        select(BankAccount).where(BankAccount.tenant_id == tenant_id, BankAccount.id != account.id)
+    ):
+        ref = (other.cash_account_ref or "").strip()
+        if ref == str(gl_account_id) or ref == code:
+            raise ReconRefused(
+                "shared_cash_gl",
+                f"bank account {other.account_code} shares this cash GL account; reconcile outside ERP or split the GL",
+            )
 
 
 def _require_functional(db: Session, tenant_id: UUID, currency_code: str) -> None:
@@ -209,26 +229,77 @@ def _cleared(side: str, ref_column, as_of: date, tenant_id: UUID):
     )
 
 
-def _bank_scope(tenant_id: UUID, recon: BankReconciliation):
-    return and_(
+@dataclass(frozen=True, slots=True)
+class Base:
+    """The approved baseline of an account: lines dated on or before ``date`` are out of scope, except the
+    ledger lines the baseline carried forward as open timing items."""
+
+    date: date
+    carried: frozenset[UUID]
+    reconciliation_id: UUID
+
+
+def approved_baseline(db: Session, tenant_id: UUID, account_id: UUID) -> Base | None:
+    row = db.scalar(
+        select(BankReconciliation).where(
+            BankReconciliation.tenant_id == tenant_id,
+            BankReconciliation.account_id == account_id,
+            BankReconciliation.kind == m.KIND_BASELINE,
+            BankReconciliation.status == m.STATUS_APPROVED,
+        )
+    )
+    if row is None:
+        return None
+    carried = frozenset(
+        db.scalars(
+            select(BankReconItem.ref_id).where(
+                BankReconItem.tenant_id == tenant_id,
+                BankReconItem.reconciliation_id == row.id,
+                BankReconItem.side == m.SIDE_GL,
+                BankReconItem.withdrawn_at.is_(None),
+            )
+        )
+    )
+    return Base(row.period_end, carried, row.id)
+
+
+def _require_base(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Base:
+    base = approved_baseline(db, tenant_id, recon.account_id)
+    if base is None:
+        raise ReconRefused("baseline_required", "the account needs an approved baseline reconciliation first")
+    return base
+
+
+def _bank_scope(tenant_id: UUID, recon: BankReconciliation, base: Base | None):
+    cond = and_(
         BankStatement.tenant_id == tenant_id,
         BankStatement.account_id == recon.account_id,
         BankStatement.period_end <= recon.period_end,
     )
+    if base is not None:
+        cond = and_(cond, BankStatementLine.transaction_date > base.date)
+    return cond
 
 
-def _gl_scope(tenant_id: UUID, recon: BankReconciliation):
-    return and_(
+def _gl_scope(tenant_id: UUID, recon: BankReconciliation, base: Base | None):
+    cond = and_(
         PostedLedgerLine.tenant_id == tenant_id,
         PostedLedgerLine.account_id == recon.gl_account_id,
         PostedLedgerLine.posting_date <= recon.period_end,
     )
+    if base is not None:
+        after = PostedLedgerLine.posting_date > base.date
+        cond = and_(cond, or_(after, PostedLedgerLine.id.in_(base.carried)) if base.carried else after)
+    return cond
 
 
 def uncleared_bank_lines(
-    db: Session, tenant_id: UUID, recon: BankReconciliation
+    db: Session, tenant_id: UUID, recon: BankReconciliation, base: Base | None = None
 ) -> list[tuple[UUID, date, str, Decimal]]:
     """(line id, transaction date, direction, amount) of in-scope lines with no wholly-in-scope match."""
+    if recon.kind == m.KIND_BASELINE:
+        return []  # a baseline needs no statement-line coverage: history is summarised by its balance
+    base = base or _require_base(db, tenant_id, recon)
     rows = db.execute(
         select(
             BankStatementLine.id,
@@ -245,7 +316,7 @@ def uncleared_bank_lines(
         )
         .where(
             BankStatementLine.tenant_id == tenant_id,
-            _bank_scope(tenant_id, recon),
+            _bank_scope(tenant_id, recon, base),
             ~_cleared(m.SIDE_BANK, BankStatementLine.id, recon.period_end, tenant_id),
         )
         .order_by(BankStatementLine.transaction_date, BankStatementLine.id)
@@ -253,23 +324,102 @@ def uncleared_bank_lines(
     return [(r[0], r[1], r[2], Decimal(r[3])) for r in rows]
 
 
-def uncleared_gl_lines(db: Session, tenant_id: UUID, recon: BankReconciliation) -> list[tuple[UUID, date, Decimal]]:
+def uncleared_gl_lines(
+    db: Session, tenant_id: UUID, recon: BankReconciliation, base: Base | None = None
+) -> list[tuple[UUID, date, Decimal]]:
     """(ledger line id, posting date, effect) of in-scope cash GL lines with no wholly-in-scope match."""
+    if recon.kind == m.KIND_BASELINE:
+        return []  # baseline items are validated line by line, never by scanning the whole history
+    base = base or _require_base(db, tenant_id, recon)
     rows = db.execute(
         select(PostedLedgerLine.id, PostedLedgerLine.posting_date, PostedLedgerLine.debit, PostedLedgerLine.credit)
-        .where(_gl_scope(tenant_id, recon), ~_cleared(m.SIDE_GL, PostedLedgerLine.id, recon.period_end, tenant_id))
+        .where(
+            _gl_scope(tenant_id, recon, base), ~_cleared(m.SIDE_GL, PostedLedgerLine.id, recon.period_end, tenant_id)
+        )
         .order_by(PostedLedgerLine.posting_date, PostedLedgerLine.id)
     ).all()
     return [(r[0], r[1], gl_effect(r[2], r[3])) for r in rows]
 
 
 def gl_balance(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Decimal:
+    """Cumulative cash GL balance to the period end (never scoped by the baseline)."""
     value = db.scalar(
         select(func.coalesce(func.sum(PostedLedgerLine.debit - PostedLedgerLine.credit), 0)).where(
-            _gl_scope(tenant_id, recon)
+            _gl_scope(tenant_id, recon, None)
         )
     )
     return Decimal(value or 0)
+
+
+def baseline_gl_page(
+    db: Session, tenant_id: UUID, recon: BankReconciliation, page: int
+) -> tuple[list[tuple[UUID, date, Decimal]], int]:
+    """Cash GL lines dated on or before the baseline date, newest first, one page (for choosing items)."""
+    where = _gl_scope(tenant_id, recon, None)
+    total = db.scalar(select(func.count()).select_from(PostedLedgerLine).where(where)) or 0
+    rows = db.execute(
+        select(PostedLedgerLine.id, PostedLedgerLine.posting_date, PostedLedgerLine.debit, PostedLedgerLine.credit)
+        .where(where)
+        .order_by(PostedLedgerLine.posting_date.desc(), PostedLedgerLine.id)
+        .offset((max(1, page) - 1) * PAGE_SIZE)
+        .limit(PAGE_SIZE)
+    ).all()
+    return [(r[0], r[1], gl_effect(r[2], r[3])) for r in rows], int(total)
+
+
+# --- D2: unrecorded bank items in a closed period -------------------------------
+
+
+def _first_open_period(db: Session, tenant_id: UUID) -> FiscalPeriod | None:
+    return db.scalar(
+        select(FiscalPeriod)
+        .where(FiscalPeriod.tenant_id == tenant_id, FiscalPeriod.status == PeriodStatus.OPEN)
+        .order_by(FiscalPeriod.start_date)
+        .limit(1)
+    )
+
+
+def _period_is_open(db: Session, tenant_id: UUID, day: date) -> bool:
+    status = db.scalar(
+        select(FiscalPeriod.status).where(
+            FiscalPeriod.tenant_id == tenant_id, FiscalPeriod.start_date <= day, FiscalPeriod.end_date >= day
+        )
+    )
+    return status == PeriodStatus.OPEN
+
+
+def _link_valid(
+    db: Session, tenant_id: UUID, recon: BankReconciliation, journal_id: UUID, line_date: date, effect: Decimal
+) -> bool:
+    """The linked B2 manual journal is live, dated in the first open period, and books exactly the bank
+    line's effect on this cash GL, so the next reconciliation can match the bank line to its ledger line."""
+    if _period_is_open(db, tenant_id, line_date):
+        return False
+    manual = db.scalar(
+        select(journal_models.ManualJournal).where(
+            journal_models.ManualJournal.tenant_id == tenant_id, journal_models.ManualJournal.id == journal_id
+        )
+    )
+    if manual is None or manual.state not in (
+        journal_models.STATE_PREPARED,
+        journal_models.STATE_POST_REQUESTED,
+        journal_models.STATE_POSTED,
+    ):
+        return False
+    journal = db.scalar(
+        select(JournalEntry).where(JournalEntry.tenant_id == tenant_id, JournalEntry.id == manual.journal_id)
+    )
+    period = _first_open_period(db, tenant_id)
+    if journal is None or period is None or not (period.start_date <= journal.posting_date <= period.end_date):
+        return False
+    booked = db.scalar(
+        select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0)).where(
+            JournalLine.tenant_id == tenant_id,
+            JournalLine.journal_id == journal.id,
+            JournalLine.account_id == recon.gl_account_id,
+        )
+    )
+    return Decimal(booked or 0) == effect
 
 
 # --- evaluation (the zero-difference gate) -------------------------------
@@ -316,8 +466,11 @@ def evaluate(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Evaluat
     if statement is None or statement.closing_balance is None:
         raise ReconRefused("statement_unusable", "the statement has no closing balance")
     closing = Decimal(statement.closing_balance)
-    bank_open = uncleared_bank_lines(db, tenant_id, recon)
-    gl_open = uncleared_gl_lines(db, tenant_id, recon)
+    if recon.kind == m.KIND_BASELINE:
+        return _evaluate_baseline(db, tenant_id, recon, closing)
+    base = _require_base(db, tenant_id, recon)
+    bank_open = uncleared_bank_lines(db, tenant_id, recon, base)
+    gl_open = uncleared_gl_lines(db, tenant_id, recon, base)
     bank_by_id = {row[0]: row for row in bank_open}
     gl_by_id = {row[0]: row for row in gl_open}
     items = _items(db, tenant_id, recon.id)
@@ -337,9 +490,13 @@ def evaluate(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Evaluat
         if expected is None or expected != Decimal(item.signed_amount):
             stale.append(item.id)
             continue
-        total += Decimal(item.signed_amount)
         if item.item_type in m.UNRECORDED_TYPES:
-            unrecorded.append(item.id)
+            if item.journal_id is None:
+                unrecorded.append(item.id)  # open period: needs a journal first, blocks preparation
+            elif not _link_valid(db, tenant_id, recon, item.journal_id, line[1], expected):
+                stale.append(item.id)
+                continue
+        total += Decimal(item.signed_amount)
     balance = gl_balance(db, tenant_id, recon)
     difference = closing - (balance + total)
     cleared_bank = db.scalar(
@@ -354,14 +511,14 @@ def evaluate(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Evaluat
         )
         .where(
             BankStatementLine.tenant_id == tenant_id,
-            _bank_scope(tenant_id, recon),
+            _bank_scope(tenant_id, recon, base),
             _cleared(m.SIDE_BANK, BankStatementLine.id, recon.period_end, tenant_id),
         )
     )
     cleared_gl = db.scalar(
         select(func.count())
         .select_from(PostedLedgerLine)
-        .where(_gl_scope(tenant_id, recon), _cleared(m.SIDE_GL, PostedLedgerLine.id, recon.period_end, tenant_id))
+        .where(_gl_scope(tenant_id, recon, base), _cleared(m.SIDE_GL, PostedLedgerLine.id, recon.period_end, tenant_id))
     )
     issues: list[str] = []
     if uncovered_bank:
@@ -382,7 +539,9 @@ def evaluate(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Evaluat
                 "as_of": recon.period_end.isoformat(),
                 "closing": str(closing),
                 "gl": str(balance),
-                "items": sorted([i.side, str(i.ref_id), i.item_type, str(i.signed_amount)] for i in items),
+                "items": sorted(
+                    [i.side, str(i.ref_id), i.item_type, str(i.signed_amount), str(i.journal_id)] for i in items
+                ),
                 "cleared": [int(cleared_bank or 0), int(cleared_gl or 0)],
             },
             sort_keys=True,
@@ -400,6 +559,70 @@ def evaluate(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Evaluat
         unrecorded_items=tuple(unrecorded),
         cleared_bank_count=int(cleared_bank or 0),
         cleared_gl_count=int(cleared_gl or 0),
+        snapshot_sha256=digest,
+        issues=tuple(issues),
+    )
+
+
+def _evaluate_baseline(db: Session, tenant_id: UUID, recon: BankReconciliation, closing: Decimal) -> Evaluation:
+    """Opening reconciliation at the baseline date: statement balance == cash GL balance + outstanding timing
+    items bound to real ledger lines. No plug, no coverage of history, no statement-side items."""
+    items = _items(db, tenant_id, recon.id)
+    ledger = {
+        row[0]: row
+        for row in db.execute(
+            select(
+                PostedLedgerLine.id, PostedLedgerLine.posting_date, PostedLedgerLine.debit, PostedLedgerLine.credit
+            ).where(
+                _gl_scope(tenant_id, recon, None),
+                PostedLedgerLine.id.in_([i.ref_id for i in items if i.side == m.SIDE_GL]),
+            )
+        )
+    }
+    stale: list[UUID] = []
+    total = Decimal(0)
+    for item in items:
+        row = ledger.get(item.ref_id) if item.side == m.SIDE_GL else None
+        if row is None or item.item_type not in m.TIMING_TYPES or item.journal_id is not None:
+            stale.append(item.id)
+            continue
+        if -gl_effect(row[2], row[3]) != Decimal(item.signed_amount):
+            stale.append(item.id)
+            continue
+        total += Decimal(item.signed_amount)
+    balance = gl_balance(db, tenant_id, recon)
+    difference = closing - (balance + total)
+    issues = []
+    if stale:
+        issues.append("stale_items")
+    if difference != 0:
+        issues.append("difference_nonzero")
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "recon": str(recon.id),
+                "kind": "baseline",
+                "statement": str(recon.statement_id),
+                "as_of": recon.period_end.isoformat(),
+                "closing": str(closing),
+                "gl": str(balance),
+                "items": sorted([i.side, str(i.ref_id), i.item_type, str(i.signed_amount)] for i in items),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return Evaluation(
+        statement_closing=closing,
+        gl_balance=balance,
+        items_total=total,
+        difference=difference,
+        uncovered_bank=(),
+        uncovered_gl=(),
+        stale_items=tuple(stale),
+        unrecorded_items=(),
+        cleared_bank_count=0,
+        cleared_gl_count=0,
         snapshot_sha256=digest,
         issues=tuple(issues),
     )
@@ -448,8 +671,20 @@ def _lock_gl_account(db: Session, tenant_id: UUID, recon: BankReconciliation) ->
 
 
 def open_reconciliation(
-    db: Session, *, tenant_id: UUID, actor: UUID, account_id: UUID, statement_id: UUID, now: datetime | None = None
+    db: Session,
+    *,
+    tenant_id: UUID,
+    actor: UUID,
+    account_id: UUID,
+    statement_id: UUID,
+    baseline_date: date | None = None,
+    now: datetime | None = None,
 ) -> BankReconciliation:
+    """Open a periodic reconciliation, or (with ``baseline_date``) the account's one opening baseline.
+
+    The baseline date is declared explicitly (the flip date) and must equal the anchor statement's end date.
+    A periodic reconciliation needs an approved baseline and a period end after it.
+    """
     moment = _now(now)
     try:
         _actor(db, tenant_id, actor)
@@ -494,9 +729,28 @@ def open_reconciliation(
                 raise ReconRefused(
                     "period_not_after_approved", f"the latest approved reconciliation already covers {latest}"
                 )
+            baseline = approved_baseline(db, tenant_id, account.id)
+            if baseline_date is not None:
+                if statement.period_end != baseline_date:
+                    raise ReconRefused(
+                        "baseline_date_mismatch", "the baseline statement must end exactly on the baseline date"
+                    )
+                exists_already = db.scalar(
+                    select(BankReconciliation.id).where(
+                        BankReconciliation.tenant_id == tenant_id,
+                        BankReconciliation.account_id == account.id,
+                        BankReconciliation.kind == m.KIND_BASELINE,
+                        BankReconciliation.status.in_(m.LIVE_STATUSES),
+                    )
+                )
+                if exists_already is not None:
+                    raise ReconRefused("baseline_exists", "this account already has a baseline reconciliation")
+            elif baseline is None:
+                raise ReconRefused("baseline_required", "the account needs an approved baseline reconciliation first")
             row = BankReconciliation(
                 tenant_id=tenant_id,
                 account_id=account.id,
+                kind=m.KIND_BASELINE if baseline_date is not None else m.KIND_PERIODIC,
                 statement_id=statement.id,
                 gl_account_id=gl_account_id,
                 period_start=statement.period_start,
@@ -580,7 +834,7 @@ def _participants(db: Session, tenant_id: UUID, recon: BankReconciliation) -> se
         BankReconMatch.latest_date <= recon.period_end,
     )
     if last_approved is not None:
-        released = released.where(BankReconMatch.unmatched_at > last_approved)
+        released = released.where(BankReconMatch.unmatched_at >= last_approved)
     people.update(p for p in db.scalars(released) if p is not None)
     people.update(
         db.scalars(
@@ -811,6 +1065,15 @@ def match(
                 raise ReconRefused("line_unknown", "a statement line does not belong to this bank account")
             if len(gl_rows) != len(gl_ids):
                 raise ReconRefused("line_unknown", "a ledger line is not a posted line of this bank account's cash GL")
+            base = approved_baseline(db, tenant_id, account.id)
+            if base is None:
+                raise ReconRefused("baseline_required", "the account needs an approved baseline before matching")
+            if any(r[1] <= base.date for r in bank_rows) or any(
+                r[1] <= base.date and r[0] not in base.carried for r in gl_rows
+            ):
+                raise ReconRefused(
+                    "before_baseline", "lines dated on or before the baseline are out of scope for matching"
+                )
             taken = db.scalar(
                 select(func.count())
                 .select_from(BankReconMatchLine)
@@ -952,6 +1215,7 @@ class ItemRequest:
     ref_id: UUID
     item_type: str
     note: str
+    journal_id: UUID | None = None
 
 
 def add_items(
@@ -973,6 +1237,7 @@ def add_items(
             _, row = _locked_recon(db, tenant_id, reconciliation_id)
             if row.status != m.STATUS_OPEN:
                 raise ReconRefused("state_refused", "items can change only while the reconciliation is open")
+            baseline_kind = row.kind == m.KIND_BASELINE
             bank_open = {r[0]: r for r in uncleared_bank_lines(db, tenant_id, row)}
             gl_open = {r[0]: r for r in uncleared_gl_lines(db, tenant_id, row)}
             existing = {(i.side, i.ref_id): i for i in _items(db, tenant_id, row.id)}
@@ -981,6 +1246,8 @@ def add_items(
                 note = _text(request.note, "note")
                 if request.item_type not in m.ITEM_TYPES:
                     raise ReconRefused("item_type_unknown", "unknown reconciling item type")
+                if baseline_kind and request.side == m.SIDE_BANK:
+                    raise ReconRefused("baseline_gl_items_only", "a baseline carries only ledger-side timing items")
                 if request.side == m.SIDE_BANK:
                     line = bank_open.get(request.ref_id)
                     if line is None:
@@ -988,7 +1255,11 @@ def add_items(
                     amount = bank_effect(line[2], line[3])
                     wanted = m.UNRECORDED_TYPES
                 elif request.side == m.SIDE_GL:
-                    gl_line = gl_open.get(request.ref_id)
+                    gl_line = (
+                        _baseline_line(db, tenant_id, row, request.ref_id)
+                        if baseline_kind
+                        else gl_open.get(request.ref_id)
+                    )
                     if gl_line is None:
                         raise ReconRefused("line_not_open", "the ledger line is not an uncleared line of this scope")
                     amount = -gl_line[2]
@@ -1002,6 +1273,29 @@ def add_items(
                 negative = request.item_type in (m.ITEM_DEPOSIT_IN_TRANSIT, m.ITEM_UNRECORDED_BANK_CHARGE)
                 if (amount < 0) != negative or amount == 0:
                     raise ReconRefused("item_type_direction", "the item type does not match the line's direction")
+                link: UUID | None = None
+                if request.item_type in m.UNRECORDED_TYPES:
+                    closed = not _period_is_open(db, tenant_id, line[1])
+                    if request.journal_id is not None and not closed:
+                        raise ReconRefused(
+                            "journal_link_not_allowed",
+                            "the period is open: post a journal in it, then match; no link is allowed",
+                        )
+                    if closed:
+                        if request.journal_id is None:
+                            raise ReconRefused(
+                                "journal_link_required",
+                                "the period is closed: link a manual journal dated in the first open period",
+                            )
+                        if not _link_valid(db, tenant_id, row, request.journal_id, line[1], amount):
+                            raise ReconRefused(
+                                "journal_link_invalid",
+                                "the linked journal is not live, not in the first open period, or does not book "
+                                "exactly the bank line's effect on this cash GL",
+                            )
+                        link = request.journal_id
+                elif request.journal_id is not None:
+                    raise ReconRefused("journal_link_not_allowed", "only unrecorded bank items link a journal")
                 prior = existing.get((request.side, request.ref_id))
                 if prior is not None:
                     if prior.item_type != request.item_type:
@@ -1015,6 +1309,7 @@ def add_items(
                     item_type=request.item_type,
                     signed_amount=amount,
                     note=note,
+                    journal_id=link,
                     created_by_party_id=actor,
                 )
                 db.add(item)
@@ -1035,6 +1330,17 @@ def add_items(
             return created
     except IntegrityError:
         raise ReconRefused("conflict", "a conflicting reconciling item already exists") from None
+
+
+def _baseline_line(
+    db: Session, tenant_id: UUID, recon: BankReconciliation, line_id: UUID
+) -> tuple[UUID, date, Decimal] | None:
+    r = db.execute(
+        select(
+            PostedLedgerLine.id, PostedLedgerLine.posting_date, PostedLedgerLine.debit, PostedLedgerLine.credit
+        ).where(_gl_scope(tenant_id, recon, None), PostedLedgerLine.id == line_id)
+    ).first()
+    return None if r is None else (r[0], r[1], gl_effect(r[2], r[3]))
 
 
 def withdraw_item(

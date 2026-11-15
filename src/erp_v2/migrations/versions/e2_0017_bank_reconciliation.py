@@ -40,7 +40,7 @@ BEGIN
     END IF;
     IF NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
        OR NEW.account_id IS DISTINCT FROM OLD.account_id OR NEW.statement_id IS DISTINCT FROM OLD.statement_id
-       OR NEW.gl_account_id IS DISTINCT FROM OLD.gl_account_id OR NEW.period_start IS DISTINCT FROM OLD.period_start
+       OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.gl_account_id IS DISTINCT FROM OLD.gl_account_id OR NEW.period_start IS DISTINCT FROM OLD.period_start
        OR NEW.period_end IS DISTINCT FROM OLD.period_end OR NEW.currency_code IS DISTINCT FROM OLD.currency_code
        OR NEW.opened_by_party_id IS DISTINCT FROM OLD.opened_by_party_id OR NEW.opened_at IS DISTINCT FROM OLD.opened_at THEN
         RAISE EXCEPTION 'reconciliation identity is immutable' USING ERRCODE = '23000';
@@ -140,7 +140,8 @@ BEGIN
            OR NEW.reconciliation_id IS DISTINCT FROM OLD.reconciliation_id OR NEW.side IS DISTINCT FROM OLD.side
            OR NEW.ref_id IS DISTINCT FROM OLD.ref_id OR NEW.item_type IS DISTINCT FROM OLD.item_type
            OR NEW.signed_amount IS DISTINCT FROM OLD.signed_amount OR NEW.note IS DISTINCT FROM OLD.note
-           OR NEW.created_by_party_id IS DISTINCT FROM OLD.created_by_party_id THEN
+           OR NEW.created_by_party_id IS DISTINCT FROM OLD.created_by_party_id
+           OR NEW.journal_id IS DISTINCT FROM OLD.journal_id THEN
             RAISE EXCEPTION 'reconciling items are insert-only; only a withdrawal is allowed' USING ERRCODE = '23000';
         END IF;
     END IF;
@@ -199,6 +200,7 @@ def upgrade() -> None:
         sa.Column("period_end", sa.Date(), nullable=False),
         sa.Column("currency_code", sa.String(3), nullable=False),
         sa.Column("status", sa.String(12), nullable=False),
+        sa.Column("kind", sa.String(10), nullable=False, server_default="periodic"),
         sa.Column("statement_closing_balance", money),
         sa.Column("gl_balance", money),
         sa.Column("items_total", money),
@@ -228,6 +230,7 @@ def upgrade() -> None:
             "status IN ('open', 'prepared', 'approved', 'cancelled')", name="ck_erp_bank_reconciliations_status"
         ),
         sa.CheckConstraint("period_end >= period_start", name="ck_erp_bank_reconciliations_period"),
+        sa.CheckConstraint("kind IN ('baseline', 'periodic')", name="ck_erp_bank_reconciliations_kind"),
         sa.CheckConstraint(
             "status NOT IN ('prepared', 'approved') OR (prepared_by_party_id IS NOT NULL AND prepared_at IS NOT NULL "
             "AND statement_closing_balance IS NOT NULL AND gl_balance IS NOT NULL AND items_total IS NOT NULL "
@@ -269,6 +272,14 @@ def upgrade() -> None:
         ["tenant_id", "statement_id"],
         unique=True,
         postgresql_where=live,
+    )
+    # One baseline (opening reconciliation at the declared date) per account, immutable once approved.
+    op.create_index(
+        "uq_erp_bank_reconciliations_baseline",
+        RECON,
+        ["tenant_id", "account_id"],
+        unique=True,
+        postgresql_where=sa.text("kind = 'baseline' AND status IN ('open', 'prepared', 'approved')"),
     )
     op.create_table(
         MATCH,
@@ -340,10 +351,19 @@ def upgrade() -> None:
         sa.Column("signed_amount", money, nullable=False),
         sa.Column("note", sa.String(500), nullable=False),
         _party("created_by_party_id", nullable=False),
+        sa.Column("journal_id", sa.Uuid()),
         _party("withdrawn_by_party_id"),
         sa.Column("withdrawn_at", sa.DateTime(timezone=True)),
         sa.Column("withdraw_reason", sa.String(500)),
         sa.ForeignKeyConstraint(["tenant_id", "reconciliation_id"], [f"{RECON}.tenant_id", f"{RECON}.id"]),
+        # D2: an unrecorded bank item in a closed period may link the B2 manual journal that records it.
+        sa.ForeignKeyConstraint(
+            ["tenant_id", "journal_id"], ["erp_manual_journals.tenant_id", "erp_manual_journals.id"]
+        ),
+        sa.CheckConstraint(
+            "journal_id IS NULL OR item_type IN ('unrecorded_bank_charge', 'unrecorded_bank_receipt')",
+            name="ck_erp_bank_recon_items_journal",
+        ),
         sa.CheckConstraint(
             "(side = 'gl' AND item_type IN ('deposit_in_transit', 'outstanding_payment')) "
             "OR (side = 'bank' AND item_type IN ('unrecorded_bank_charge', 'unrecorded_bank_receipt'))",

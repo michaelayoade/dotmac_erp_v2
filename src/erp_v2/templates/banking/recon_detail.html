@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Reconciliation — Dotmac ERP{% endblock %}
 {% block content %}
-<h1>Reconciliation {{ account.account_code }}, period ending {{ recon.period_end }}</h1>
+<h1>{% if recon.kind == 'baseline' %}Baseline reconciliation{% else %}Reconciliation{% endif %} {{ account.account_code }}, period ending {{ recon.period_end }}</h1>{% if recon.kind == 'baseline' %}<p>Opening reconciliation at the baseline date. Only outstanding ledger-side timing items bound to real ledger lines are allowed; any other gap must be fixed by a governed manual journal first. Later reconciliations cover only lines after this date plus the items carried from here.</p>{% endif %}
 <p><a href="{{ base }}">{% if approver %}Approval queue{% else %}Reconciliations{% endif %}</a></p>
 {% if error %}<p role="alert">{{ error }}</p>{% endif %}
 <dl>
@@ -36,7 +36,7 @@
 {% for i in items %}<tr>
   <td>{{ i.item_type }}</td><td>{{ i.side }}</td>
   <td>{% if i.side == 'bank' %}{{ bank_text.get(i.ref_id)[1] if bank_text.get(i.ref_id) else i.ref_id }}{% else %}{{ gl_text.get(i.ref_id)[1] if gl_text.get(i.ref_id) else i.ref_id }}{% endif %}</td>
-  <td>{{ i.signed_amount }}</td><td>{{ i.note }}</td>
+  <td>{{ i.signed_amount }}</td><td>{{ i.note }}{% if i.journal_id %} (linked manual journal <a href="/finance/journals/{{ i.journal_id }}">{{ i.journal_id }}</a>){% endif %}</td>
   {% if recon.status == 'open' and not approver %}<td><form method="post" action="/finance/banking/reconciliations/{{ recon.id }}/items/{{ i.id }}/withdraw"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Withdraw</button></form></td>{% endif %}
 </tr>{% else %}<tr><td colspan="6">None.</td></tr>{% endfor %}
 </tbody></table>
@@ -82,6 +82,7 @@
   <p><label>Ledger lines <select name="gl_item_type">{% for t in timing_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select></label>
      <label>Statement lines <select name="bank_item_type">{% for t in unrecorded_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select></label>
      <label>Note <input name="note" maxlength="500"></label>
+     <label>Linked manual journal (statement lines in a closed period only) <input name="journal_id" maxlength="36"></label>
      <button type="submit" formaction="/finance/banking/reconciliations/{{ recon.id }}/items">Add reconciling items</button></p>
   <p>Deposits in transit and outstanding payments are timing items. An unrecorded bank charge or receipt cannot be prepared: it needs a manual journal, and nothing is posted from here.</p>
 </form>

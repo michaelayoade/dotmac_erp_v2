@@ -115,7 +115,10 @@ def workspace(
     bank_open: list[tuple[UUID, date, str, Decimal]] = []
     gl_open: list[tuple[UUID, date, Decimal]] = []
     bank_total = gl_total = 0
-    if live:
+    if live and recon.kind == m.KIND_BASELINE:
+        gl_open, gl_total = svc.baseline_gl_page(db, tenant_id, recon, gl_page)
+        gl_offset = 0
+    elif live:
         bank_all = svc.uncleared_bank_lines(db, tenant_id, recon)
         gl_all = svc.uncleared_gl_lines(db, tenant_id, recon)
         bank_total, gl_total = len(bank_all), len(gl_all)

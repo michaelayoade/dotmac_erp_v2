@@ -13,6 +13,7 @@
     <option value="">Select a statement</option>
     {% for o in openable %}<option value="{{ o.statement.id }}">{{ o.account.account_code }} — {{ o.statement.statement_ref }} ({{ o.statement.period_start }} to {{ o.statement.period_end }}, closing {{ o.statement.closing_balance }} {{ o.statement.currency_code }})</option>{% endfor %}
   </select></label></p>
+  <p><label>Baseline date (only for the account's opening baseline; leave empty for a periodic reconciliation) <input type="date" name="baseline_date"></label><br>The baseline is the opening reconciliation at the flip date: the statement must end on that date, the statement balance must equal the cash GL balance plus outstanding timing items, with no plug. Two people, zero difference.</p>
   <button type="submit">Open reconciliation</button>
 </form>
 {% else %}<p>No imported statement with a closing balance is waiting for reconciliation.</p>{% endif %}

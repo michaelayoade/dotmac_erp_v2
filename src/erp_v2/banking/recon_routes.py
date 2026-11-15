@@ -11,6 +11,7 @@ preparation until a B2 manual journal records them.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Final
 from uuid import UUID
 
@@ -144,8 +145,14 @@ async def recon_open(
         account_id = queries.statement_account(db, tenant_id=tenant.id, statement_id=statement_id)
         if account_id is None:
             raise ReconRefused("statement_unknown", "statement not found in this tenant")
+        raw_date = _one(values, "baseline_date").strip()
         row = svc.open_reconciliation(
-            db, tenant_id=tenant.id, actor=party.id, account_id=account_id, statement_id=statement_id
+            db,
+            tenant_id=tenant.id,
+            actor=party.id,
+            account_id=account_id,
+            statement_id=statement_id,
+            baseline_date=date.fromisoformat(raw_date) if raw_date else None,
         )
     except ValueError as exc:
         error = _refusal(exc) if isinstance(exc, ReconRefused) else "Choose a statement"
@@ -238,9 +245,14 @@ async def recon_add_items(
 ) -> HTMLResponse | RedirectResponse:
     def action(values: dict[str, list[str]]) -> None:
         note = _one(values, "note")
+        raw_journal = _one(values, "journal_id").strip()
+        journal_id = UUID(raw_journal) if raw_journal else None
         requests = [
             ItemRequest(m.SIDE_GL, ref, _one(values, "gl_item_type"), note) for ref in _uuids(values, "gl_line")
-        ] + [ItemRequest(m.SIDE_BANK, ref, _one(values, "bank_item_type"), note) for ref in _uuids(values, "bank_line")]
+        ] + [
+            ItemRequest(m.SIDE_BANK, ref, _one(values, "bank_item_type"), note, journal_id)
+            for ref in _uuids(values, "bank_line")
+        ]
         svc.add_items(db, tenant_id=tenant.id, actor=party.id, reconciliation_id=reconciliation_id, requests=requests)
 
     return await _act(request, db, tenant, party, reconciliation_id, action)

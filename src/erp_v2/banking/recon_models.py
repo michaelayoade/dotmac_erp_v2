@@ -28,6 +28,9 @@ STATUS_APPROVED: Final = "approved"
 STATUS_CANCELLED: Final = "cancelled"
 LIVE_STATUSES: Final = (STATUS_OPEN, STATUS_PREPARED, STATUS_APPROVED)
 
+KIND_BASELINE: Final = "baseline"
+KIND_PERIODIC: Final = "periodic"
+
 MATCH_ACTIVE: Final = "active"
 MATCH_UNMATCHED: Final = "unmatched"
 
@@ -63,6 +66,7 @@ class BankReconciliation(Base, TimestampMixin):
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
     currency_code: Mapped[str] = mapped_column(String(3), nullable=False)
     status: Mapped[str] = mapped_column(String(12), nullable=False)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False, default=KIND_PERIODIC, server_default=KIND_PERIODIC)
     statement_closing_balance: Mapped[Decimal | None] = mapped_column(MONEY)
     gl_balance: Mapped[Decimal | None] = mapped_column(MONEY)
     items_total: Mapped[Decimal | None] = mapped_column(MONEY)
@@ -125,6 +129,7 @@ class BankReconItem(Base):
     item_type: Mapped[str] = mapped_column(String(32), nullable=False)
     signed_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     note: Mapped[str] = mapped_column(String(500), nullable=False)
+    journal_id: Mapped[UUID | None] = mapped_column(Uuid())
     created_by_party_id: Mapped[UUID] = _party(nullable=False)
     withdrawn_by_party_id: Mapped[UUID | None] = _party()
     withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
