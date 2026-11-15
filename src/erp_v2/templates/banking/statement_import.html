@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Import bank statement — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Import bank statement</h1>
+<p><a href="/finance/banking">Banking</a></p>
+<p>Upload a CSV or XLSX statement (up to {{ max_mib }} MiB, first worksheet only). You will see a preview before anything is saved. Importing records bank lines only; it posts nothing to the ledger.</p>
+{% if errors %}<div role="alert"><p>The statement was not accepted:</p><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
+{% if accounts %}
+<form method="post" action="/finance/banking/statements/preview" enctype="multipart/form-data">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><label>Bank account <select name="account_id" required>
+    <option value="">Select an account</option>
+    {% for a in accounts %}<option value="{{ a.id }}" {% if values.get('account_id') == a.id|string %}selected{% endif %}>{{ a.account_code }} — {{ a.account_name }} ({{ a.currency_code }})</option>{% endfor %}
+  </select></label></p>
+  <p><label>Statement file <input type="file" name="file" accept=".csv,.xlsx" required></label></p>
+  <p><label>Date format <select name="date_format">
+    {% for f in date_formats %}<option value="{{ f }}" {% if values.get('date_format', 'iso') == f %}selected{% endif %}>{{ f }}</option>{% endfor %}
+  </select></label> (ISO dates YYYY-MM-DD are always accepted; dmy = DD/MM/YYYY, mdy = MM/DD/YYYY)</p>
+  <p><label>Statement reference (optional) <input name="statement_ref" maxlength="120" value="{{ values.get('statement_ref', '') }}"></label></p>
+  <p><label>Opening balance (optional) <input name="opening_balance" inputmode="decimal" value="{{ values.get('opening_balance', '') }}"></label>
+     <label>Closing balance (optional) <input name="closing_balance" inputmode="decimal" value="{{ values.get('closing_balance', '') }}"></label></p>
+  <button type="submit">Preview</button>
+</form>
+{% else %}
+<p>No active bank accounts exist. Bank accounts must be provisioned before statements can be imported.</p>
+{% endif %}
+{% endblock %}

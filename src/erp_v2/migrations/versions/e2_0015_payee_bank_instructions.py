@@ -17,8 +17,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "e2_0014_payee_bank_instructions"
-down_revision = "e2_0013_banking_observations"
+revision = "e2_0015_payee_bank_instructions"
+down_revision = "e2_0014_manual_journals"
 branch_labels = None
 depends_on = None
 

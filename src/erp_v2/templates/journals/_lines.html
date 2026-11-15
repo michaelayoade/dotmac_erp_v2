@@ -1,0 +1,9 @@
+<table>
+  <thead><tr><th>#</th><th>Account</th><th>Debit</th><th>Credit</th><th>Description</th></tr></thead>
+  <tbody>
+  {% for line, account in lines %}
+    <tr><td>{{ line.line_number }}</td><td>{{ account.code }} — {{ account.name }}</td><td>{{ line.debit }}</td><td>{{ line.credit }}</td><td>{{ line.description or '' }}</td></tr>
+  {% endfor %}
+  </tbody>
+  <tfoot><tr><th colspan="2">Totals ({{ journal.currency_code }}, rate {{ journal.exchange_rate }})</th><th>{{ journal.total_debit }}</th><th>{{ journal.total_credit }}</th><th></th></tr></tfoot>
+</table>

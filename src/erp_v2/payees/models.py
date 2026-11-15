@@ -3,7 +3,7 @@
 One row is one *proposed instruction* for a payee; an approved row is the single
 active destination for that payee. Instruction content (bank, account number,
 account name) is immutable after insert: the runtime role holds no UPDATE
-privilege on those columns (see e2_0014), a change is always a NEW proposal
+privilege on those columns (see e2_0015), a change is always a NEW proposal
 that supersedes the old row only after a second person approves it.
 
 Security: the account number is PII. It is never part of ``repr``, logs, audit

@@ -6,7 +6,7 @@ details). Prerequisite of B3 supplier-payment and B5 payroll-payout bank files.
 
 ## Model
 
-`payee_bank_instructions` (migration `e2_0014_payee_bank_instructions`, additive, one table).
+`payee_bank_instructions` (migration `e2_0015_payee_bank_instructions`, additive, one table).
 One row = one proposed instruction for a supplier or employee. The approved row is the single
 active destination for the payee.
 
@@ -114,7 +114,7 @@ ledger 446,679), AP reconciliation byte-identical.
 
 Declared delta for the re-freeze run 'g' (dest6 + B8):
 
-1. Destination heads gain `e2_0014_payee_bank_instructions` (EXPECTED_HEADS).
+1. Destination heads: the e2 head moves from `e2_0014_manual_journals` (B2) to `e2_0015_payee_bank_instructions` (EXPECTED_HEADS; the migration's down_revision is `e2_0014_manual_journals`).
 2. Spec-row `written` and `exceptions` are unchanged: the payee rows come from a mint step and
    are reported in the receipt `mints` list (step `payee_bank_instructions`), not in `written`.
 3. New expected receipt evidence: mint step `payee_bank_instructions` with
