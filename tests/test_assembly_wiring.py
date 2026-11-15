@@ -19,6 +19,7 @@ EXPECTED_MODULE_VERSIONS = {
     "erp_legacy_reentry": None,
     "erp_banking": None,
     "erp_payee_bank": None,
+    "erp_supplier_payments": None,
     "erp_journals": None,
     "erp_banking_statements": None,
     "erp_banking_reconciliation": None,

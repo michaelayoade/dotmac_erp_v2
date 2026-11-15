@@ -78,6 +78,11 @@ POLICIES: Final = MappingProxyType(
     {
         ("payables", "supplier_invoice"): RefPolicy(),
         ("payables", "credit_note"): RefPolicy(),
+        # B3: Dr invoice liability account(s) (Account UUID), Cr the paying bank account's cash GL
+        # (Account UUID from the bank account record); a5 WHT accounts are UUIDs too (WHT itself
+        # is refused by the ERP workflow, so none are posted).
+        ("payables", "supplier_payment"): RefPolicy(),
+        ("payables", "supplier_payment_reversal"): RefPolicy(),
         ("payroll", "payroll_run"): RefPolicy(frozenset({"2040"})),
         ("payroll", "payroll_liability_settlement"): RefPolicy(frozenset({"2040"})),
     }

@@ -307,6 +307,11 @@ this does not authorize adjusting balances or switching traffic.
   (after `e2_0016_legacy_invoice_refs`; additive, four tables, no foreign key into accounting). The e2 head
   in this section moves to it; the same exact-wheel CI, image and genesis proof applies.
 
+- Supplier payments (B3, `docs/supplier-payments.md`) add the head `e2_0018_disbursement_receipts`
+  (after `e2_0017_bank_reconciliation`; additive, one insert-only receipt table, RLS forced). The e2 head
+  in this section moves to it; the same exact-wheel CI, image and genesis proof applies. File generation
+  is default OFF behind a typed tenant setting and no new environment variable is required.
+
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
 depends on `bk_0001_banking`; its stamped head is absorbed by that lineage.

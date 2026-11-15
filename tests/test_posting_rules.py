@@ -63,8 +63,18 @@ def test_both_sides_negative_and_scale_refuse():
 
 def test_unknown_owner_kind_refuses():
     assert refusal(consequence(owner="mystery")) == "unknown_consequence_kind"
-    assert refusal(consequence(kind="supplier_payment")) == "unknown_consequence_kind"
+    assert refusal(consequence(kind="supplier_payout")) == "unknown_consequence_kind"
     assert refusal(consequence(owner="payroll", kind="liability_settlement")) == "unknown_consequence_kind"
+
+
+def test_supplier_payment_kinds_are_declared_with_uuid_only_refs():
+    for kind in ("supplier_payment", "supplier_payment_reversal"):
+        policy = rules.policy_for("payables", kind)
+        assert policy.code_refs == frozenset()
+        assert rules.validate(consequence(kind=kind)) == policy
+        with pytest.raises(PostingRefused) as exc:
+            rules.classify_ref(policy, "2000")  # a code is not a declared form for these kinds
+        assert exc.value.code == "account_ref_form_refused"
 
 
 def test_account_ref_forms_one_declared_form_only():

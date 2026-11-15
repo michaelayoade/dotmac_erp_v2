@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Prepare supplier payment — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Prepare a supplier payment</h1>
+<p><a href="/finance/supplier-payments">Supplier payments</a></p>
+<p>A proposal pays open, ledger-posted supplier obligations of one supplier from one bank account. Nothing moves money: another person approves it, and a third records it as paid with the bank's evidence reference. Withholding tax and foreign-currency payments are not supported here.</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if currency_error %}<p role="alert">{{ currency_error }}</p>{% else %}
+<form method="post" action="/finance/supplier-payments">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="request_id" value="{{ request_id }}">
+  <p><label>Paying bank account ({{ currency }}) <select name="bank_account_id" required>
+    <option value="">Select a bank account</option>
+    {% for a in accounts %}<option value="{{ a.id }}">{{ a.account_code }} — {{ a.account_name }}</option>{% endfor %}
+  </select></label></p>
+  <p><label>Value date <input type="date" name="value_date" value="{{ today }}" required></label></p>
+  <table>
+    <thead><tr><th>Pay</th><th>Supplier</th><th>Invoice</th><th>Due</th><th>Outstanding</th><th>Reserved</th><th>Amount</th></tr></thead>
+    <tbody>
+    {% for o in obligations %}
+      <tr>
+        <td><input type="checkbox" name="obligation_id" value="{{ o.obligation.id }}" aria-label="Pay {{ o.invoice.number }}"></td>
+        <td>{{ o.invoice.supplier_name_snapshot }}</td>
+        <td>{{ o.invoice.number }}</td>
+        <td>{{ o.obligation.due_date }}</td>
+        <td>{{ o.obligation.outstanding_amount }}</td>
+        <td>{{ o.reserved }}</td>
+        <td><input name="amount_{{ o.obligation.id }}" value="{{ o.available }}" inputmode="decimal" aria-label="Amount for {{ o.invoice.number }}"></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7">No payable obligations.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <button type="submit">Prepare payment</button>
+</form>
+{% endif %}
+{% endblock %}
