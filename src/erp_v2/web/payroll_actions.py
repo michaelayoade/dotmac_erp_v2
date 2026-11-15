@@ -88,6 +88,7 @@ def calculate_employee(
     db: Session,
     *,
     tenant: Tenant,
+    party: Party,
     run_id: UUID,
     employee_ref: str,
     proration_factor: str,
@@ -100,6 +101,10 @@ def calculate_employee(
     run = db.scalar(select(PayrollRun).where(PayrollRun.tenant_id == tenant.id, PayrollRun.id == run_id))
     if run is None:
         raise PayrollActionError("Payroll run not found")
+    if run.created_by_id != party.id:
+        raise PayrollActionError(
+            "Only the person who created this run can enter its calculations; they cannot also approve it"
+        )
     currency = Currency(run.currency_code, run.minor_units)
     # An explicit input must belong to this employee's effective input rules.
     # The owner still resolves assignment ambiguity and all calculation policy.

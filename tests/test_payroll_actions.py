@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -104,7 +105,7 @@ def payroll():
     engine.dispose()
 
 
-def _calculate(db, tenant, run, **overrides):
+def _calculate(db, tenant, run, party=None, **overrides):
     values = dict(
         run_id=run.id,
         employee_ref="employee:1",
@@ -112,7 +113,7 @@ def _calculate(db, tenant, run, **overrides):
         component_inputs="BASE | 1000.02 | compensation:1\nTAX | 50.00 | tax:1",
     )
     values.update(overrides)
-    return actions.calculate_employee(db, tenant=tenant, **values)
+    return actions.calculate_employee(db, tenant=tenant, party=party or SimpleNamespace(id=run.created_by_id), **values)
 
 
 def _count(db, model):
@@ -233,3 +234,11 @@ def test_service_failure_after_flush_rolls_back_savepoint(payroll, monkeypatch):
             _calculate(db, tenant, run)
     assert _count(db, PayrollCalculation) == _count(db, PayrollCalculationLine) == 0
     assert _calculate(db, tenant, run).net_amount == Decimal("450.01")
+
+
+def test_only_the_run_creator_may_enter_calculations(payroll):
+    db, tenant, _, _, run = payroll
+    stranger = SimpleNamespace(id=uuid4())
+    with pytest.raises(actions.PayrollActionError, match="Only the person who created"):
+        _calculate(db, tenant, run, party=stranger)
+    assert _count(db, PayrollCalculation) == 0

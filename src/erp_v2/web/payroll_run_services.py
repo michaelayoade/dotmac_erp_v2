@@ -363,10 +363,17 @@ def _input_rules(db: Session, run: PayrollRun, revision_ids: set[UUID]) -> dict[
     return result
 
 
-def _guarded_batch(db: Session, *, tenant: Tenant, run_id: UUID, parsed: ParsedInput, now: datetime) -> BatchOutcome:
+def _guarded_batch(
+    db: Session, *, tenant: Tenant, party: Party, run_id: UUID, parsed: ParsedInput, now: datetime
+) -> BatchOutcome:
     run = _locked_run(db, tenant.id, run_id)
     if run.status != "draft":
         raise RunRefused("not_draft", "Only a draft payroll run can be calculated")
+    if run.created_by_id != party.id:
+        raise RunRefused(
+            "sod_not_run_creator",
+            "Only the person who created this run can enter its calculations; they cannot also approve it",
+        )
     check_currency(db, run)
     check_no_overlap(db, run)
     assignments = _active_assignments(db, run)
@@ -476,7 +483,7 @@ def batch_calculate(
         except InputFileRefused as exc:
             raise RunRefused("input_file_refused", "; ".join(exc.problems[:_LISTED])) from exc
         with db.begin_nested():
-            outcome = _guarded_batch(db, tenant=tenant, run_id=run_id, parsed=parsed, now=moment)
+            outcome = _guarded_batch(db, tenant=tenant, party=party, run_id=run_id, parsed=parsed, now=moment)
             if outcome.calculated:
                 _audit(
                     db,

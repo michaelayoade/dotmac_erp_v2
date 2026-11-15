@@ -126,6 +126,7 @@ async def payroll_calculate(
         payroll_actions.calculate_employee(
             db,
             tenant=tenant,
+            party=party,
             run_id=run_id,
             **{name: str(form.get(name, "")) for name in ("employee_ref", "proration_factor", "component_inputs")},
         )

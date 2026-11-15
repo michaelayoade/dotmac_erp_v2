@@ -624,3 +624,11 @@ def test_posted_journal_identity_is_the_payroll_consequence_source(engine):
         )
         assert journal.posting_date == date(2026, 1, 31) and journal.currency_code == "NGN"
         assert isinstance(journal.id, UUID) and datetime.now(UTC) > journal.created_at
+
+
+def test_only_the_run_creator_may_batch_calculate_so_the_uploader_cannot_approve(engine):
+    env = world(engine)
+    run_id = new_run(engine, env)
+    refusal(engine, env, svc.batch_calculate, run_id, "sod_not_run_creator", 3, input_bytes=GOOD_FILE)  # not creator
+    refusal(engine, env, svc.batch_calculate, run_id, "sod_not_run_creator", 1, input_bytes=GOOD_FILE)  # the approver
+    assert batch(engine, env, run_id).calculated == 3  # the creator can
