@@ -9,7 +9,7 @@ from dotmac_kernel.features import FeatureManifest
 from dotmac_kernel.models import Party, Tenant
 from dotmac_kernel.templating import render
 from dotmac_kernel.web_deps import require_web_permission
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,8 @@ def legacy_reentry_new(
     tenant: Tenant = Depends(require_tenant),
     party: Party = Depends(require_web_permission(WRITE_PERMISSION)),
 ) -> HTMLResponse:
+    if service.active_cohort(db, tenant.id) is None:
+        raise HTTPException(status_code=404, detail="Legacy re-entry is not enabled")
     return _page(request, db, tenant, party, {"request_id": str(uuid4())})
 
 

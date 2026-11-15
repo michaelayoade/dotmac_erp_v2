@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 
 from erp_v2.importer.identity_cli import _manifest, _safe_engine, _sha
 
+REFERENCED_SQL = "SELECT legacy_invoice_id FROM public.legacy_invoice_references WHERE tenant_id = :tenant"
+
 
 class OperatorRefusal(ValueError):
     def __init__(self, reason: str):
@@ -301,10 +303,7 @@ def _run(args) -> dict:
                     )
                     _destination_preflight(session, tenant)
                     referenced = frozenset(
-                        str(value)
-                        for value in session.scalars(
-                            sa.text("SELECT legacy_invoice_id FROM public.legacy_invoice_references")
-                        )
+                        str(value) for value in session.scalars(sa.text(REFERENCED_SQL).bindparams(tenant=tenant))
                     )
                     plan = _plan(verifier, scope, ids, session, bindings, referenced)
                     if args.apply:

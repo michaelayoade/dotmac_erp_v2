@@ -24,6 +24,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sqlalchemy.orm import Session
 
 from erp_v2 import ui
+from erp_v2.legacy_ap.models import LegacyInvoiceReference
 from erp_v2.web import revenue_queries as queries
 from erp_v2.web import revenue_services as services
 from erp_v2.web.revenue_routes import WRITE_PERMISSION, revenue_web_feature, router
@@ -50,6 +51,7 @@ def data():
             BillingAccount.__table__,
             BillingDocument.__table__,
             ConfirmedSettlement.__table__,
+            LegacyInvoiceReference.__table__,
         ],
     )
     with Session(engine) as db:

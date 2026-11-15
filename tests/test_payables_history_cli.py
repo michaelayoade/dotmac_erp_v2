@@ -293,7 +293,10 @@ def operator(monkeypatch, tmp_path):
 
         def scalars(self, statement):
             state["sql"].append(str(statement))
-            if str(statement) == "SELECT legacy_invoice_id FROM public.legacy_invoice_references":
+            if (
+                str(statement)
+                == "SELECT legacy_invoice_id FROM public.legacy_invoice_references WHERE tenant_id = :tenant"
+            ):
                 return iter(state.get("referenced", []))
             assert str(statement) == "SELECT version_num FROM public.alembic_version"
             return iter(state["schema_heads"])

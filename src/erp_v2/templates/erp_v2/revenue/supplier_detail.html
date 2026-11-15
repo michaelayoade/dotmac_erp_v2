@@ -14,6 +14,9 @@
   <dt>Exchange rate</dt><dd>{{ invoice.exchange_rate }}</dd>
   {% if invoice.submitted_by %}<dt>Submitted by</dt><dd>{{ invoice.submitted_by }} at {{ invoice.submitted_at }}</dd>{% endif %}
 </dl>
+{% if legacy_reference %}
+<p role="note"><strong>Legacy re-entry:</strong> legacy invoice {{ legacy_reference.legacy_invoice_id }}, entered by party {{ legacy_reference.entered_by }} from the census never-posted list (evidence {{ legacy_reference.evidence_ref }}). Approving posts this invoice to the ledger; confirm legacy never posted it.</p>
+{% endif %}
 {% if invoice.status == 'DRAFT' %}
 <form method="post" action="/finance/supplier-invoices/{{ invoice.id }}/submit">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
