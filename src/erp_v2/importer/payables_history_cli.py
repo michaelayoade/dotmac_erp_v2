@@ -41,6 +41,15 @@ PREIMPORT_EMPTY_TABLES = (
     "historical_settlements",
     "settlement_observations",
 )
+_EMPTY_TABLE_COUNT_SQL = {
+    "supplier_payments": "SELECT count(*) FROM mod_payables.supplier_payments WHERE tenant_id = :tenant",
+    "supplier_payment_allocations": "SELECT count(*) FROM mod_payables.supplier_payment_allocations"
+    " WHERE tenant_id = :tenant",
+    "supplier_payment_withholdings": "SELECT count(*) FROM mod_payables.supplier_payment_withholdings"
+    " WHERE tenant_id = :tenant",
+    "historical_settlements": "SELECT count(*) FROM mod_payables.historical_settlements WHERE tenant_id = :tenant",
+    "settlement_observations": "SELECT count(*) FROM mod_payables.settlement_observations WHERE tenant_id = :tenant",
+}
 REFERENCED_SQL = "SELECT legacy_invoice_id FROM public.legacy_invoice_references WHERE tenant_id = :tenant"
 
 
@@ -255,9 +264,7 @@ def _destination_preflight(session, tenant: UUID) -> None:
     # Tenant-bound (forced RLS) counts: an unpaid-cohort import starts from no payment,
     # settlement or withholding history for this tenant.
     for table in PREIMPORT_EMPTY_TABLES:
-        rows = session.scalar(
-            sa.text(f"SELECT count(*) FROM mod_payables.{table} WHERE tenant_id = :tenant"), {"tenant": str(tenant)}
-        )
+        rows = session.scalar(sa.text(_EMPTY_TABLE_COUNT_SQL[table]), {"tenant": str(tenant)})
         _require(rows == 0, "destination_payables_history_not_empty")
 
 

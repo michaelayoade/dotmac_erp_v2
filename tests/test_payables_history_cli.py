@@ -475,6 +475,7 @@ def test_preexisting_payment_or_settlement_rows_refuse_before_planning(operator,
 
 
 def test_zero_row_assertion_covers_the_ruled_tables():
+    assert tuple(cli._EMPTY_TABLE_COUNT_SQL) == cli.PREIMPORT_EMPTY_TABLES
     assert set(cli.PREIMPORT_EMPTY_TABLES) == {
         "supplier_payments",
         "supplier_payment_allocations",
