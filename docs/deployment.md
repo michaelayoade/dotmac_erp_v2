@@ -298,8 +298,9 @@ this does not authorize adjusting balances or switching traffic.
 - Financial writes require admin-only dedicated permissions, not the broad
   staff portal permission. Reprovision the versioned role-grant profile on
   an isolated test destination and verify denial/CSRF before host adoption.
-- New lineage head is `e2_0013_banking_observations`; the old staging receipt
-  at `e2_0012_academy_sync` is not proof of this schema. Fresh exact-wheel
+- New lineage head is `e2_0014_manual_journals` (B2: manual-journal maker-checker
+  state; additive); the old staging receipts at `e2_0012_academy_sync` and
+  `e2_0013_banking_observations` are not proof of this schema. Fresh exact-wheel
   CI, image build and test-server genesis/runtime proof remain mandatory.
 
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the

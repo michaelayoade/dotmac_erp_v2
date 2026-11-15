@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Prepare journal — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Prepare a manual journal</h1>
+<p><a href="/finance/journals">Manual journals</a></p>
+<p>A journal is saved as a draft. Another person must approve it before it posts. Every journal needs an evidence reference (for example the Sub report id for a summary journal).</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if currency_error %}
+<p role="alert">The tenant functional currency is not configured, so journals cannot be prepared.</p>
+{% elif accounts %}
+<p>Functional currency: <strong>{{ currency }}</strong> (read-only; exchange rate 1).</p>
+<form method="post" action="/finance/journals">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="request_id" value="{{ values.get('request_id', '') }}">
+  <p><label>Posting date <input type="date" name="posting_date" value="{{ values.get('posting_date', '') }}" required></label></p>
+  <p><label>Kind <select name="kind">
+    {% for k in ['STANDARD', 'ADJUSTMENT'] %}<option value="{{ k }}" {% if values.get('kind') == k %}selected{% endif %}>{{ k }}</option>{% endfor %}
+  </select></label></p>
+  <p><label>Evidence reference <input name="evidence_ref" value="{{ values.get('evidence_ref', '') }}" maxlength="255" required></label></p>
+  <p><label>Description <input name="description" value="{{ values.get('description', '') }}" maxlength="2000" required></label></p>
+  <table>
+    <thead><tr><th>#</th><th>Account</th><th>Debit</th><th>Credit</th><th>Line description</th></tr></thead>
+    <tbody>
+    {% for i in line_numbers %}
+      <tr>
+        <td>{{ i }}</td>
+        <td><select name="account_{{ i }}"><option value="">—</option>
+          {% for a in accounts %}<option value="{{ a.id }}" {% if values.get('account_' ~ i) == a.id|string %}selected{% endif %}>{{ a.code }} — {{ a.name }}</option>{% endfor %}
+        </select></td>
+        <td><input type="number" step="0.000001" min="0" name="debit_{{ i }}" value="{{ values.get('debit_' ~ i, '') }}"></td>
+        <td><input type="number" step="0.000001" min="0" name="credit_{{ i }}" value="{{ values.get('credit_' ~ i, '') }}"></td>
+        <td><input name="line_description_{{ i }}" value="{{ values.get('line_description_' ~ i, '') }}" maxlength="2000"></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <button type="submit">Save draft</button>
+</form>
+{% else %}
+<p>No active posting accounts are configured. The chart of accounts must exist before journals can be prepared.</p>
+{% endif %}
+{% endblock %}

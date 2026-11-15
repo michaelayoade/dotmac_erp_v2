@@ -329,3 +329,55 @@ def test_bank_institutions_from_accounts_mint_and_map() -> None:
     assert mapping["a1"] == "inst-zen"
     assert mapping["a2"] == mapping["a3"]
     assert mapping["a2"] != "inst-zen"
+
+
+def _currency_conns(rows: tuple[tuple[str, str], ...], tenants: tuple[str, ...] = ("org1", "org2")):
+    src = _conn(("CREATE TABLE organization (organization_id TEXT, functional_currency_code TEXT)",))
+    src.execute(sa.text("INSERT INTO organization VALUES (:a, :b)"), [{"a": a, "b": b} for a, b in rows])
+    dst = _conn(
+        (
+            "CREATE TABLE tenants (id TEXT)",
+            "CREATE TABLE domain_settings (id TEXT, tenant_id TEXT, scope_kind TEXT, domain TEXT, key TEXT, "
+            "value_type TEXT, value_text TEXT, is_secret INTEGER, is_active INTEGER, created_at TEXT, updated_at TEXT)",
+            "CREATE TABLE domain_setting_history (id TEXT, tenant_id TEXT, domain TEXT, key TEXT, setting_id TEXT, "
+            "action TEXT, value_after TEXT, secret_changed INTEGER, changed_at TEXT, change_reason TEXT)",
+        )
+    )
+    dst.execute(sa.text("INSERT INTO tenants VALUES (:t)"), [{"t": t} for t in tenants])
+    return src, dst
+
+
+def test_functional_currency_settings_mint_from_the_legacy_organisation() -> None:
+    src, dst = _currency_conns((("org1", "NGN"), ("org2", " usd ")))
+    first = run_mint_step("functional_currency_settings", src, dst, CTX)
+    assert (first.created, first.existing, first.refused, first.blockers) == (2, 0, None, [])
+    rows = dst.execute(
+        sa.text("SELECT tenant_id, scope_kind, domain, key, value_type, value_text FROM domain_settings ORDER BY 1")
+    ).all()
+    assert [tuple(r) for r in rows] == [
+        ("org1", "tenant", "accounting_policy", "functional_currency", "string", "NGN"),
+        ("org2", "tenant", "accounting_policy", "functional_currency", "string", "USD"),
+    ]
+    history = dst.execute(sa.text("SELECT action, value_after, change_reason FROM domain_setting_history")).all()
+    assert len(history) == 2 and {h[0] for h in history} == {"create"}
+    assert "organization.functional_currency_code" in history[0][2]
+    # Idempotent: a second run mints nothing.
+    second = run_mint_step("functional_currency_settings", src, dst, CTX)
+    assert (second.created, second.existing) == (0, 2)
+
+
+def test_functional_currency_settings_never_overwrite_or_guess() -> None:
+    src, dst = _currency_conns((("org1", "NGN"), ("org2", "N"), ("org3", "GHS")), tenants=("org1", "org2"))
+    dst.execute(
+        sa.text(
+            "INSERT INTO domain_settings VALUES ('x','org1','tenant','accounting_policy','functional_currency',"
+            "'string','USD',0,1,'t','t')"
+        )
+    )
+    result = run_mint_step("functional_currency_settings", src, dst, CTX)
+    assert result.created == 0 and result.existing == 0
+    assert len(result.blockers) == 3  # differing existing value, invalid code, tenant not minted
+    assert any("not overwritten" in b for b in result.blockers)
+    assert any("3-letter" in b for b in result.blockers)
+    assert any("not minted" in b for b in result.blockers)
+    assert dst.execute(sa.text("SELECT value_text FROM domain_settings")).scalar() == "USD"

@@ -762,8 +762,87 @@ def mint_bank_institutions_from_accounts(source: sa.Connection, dest: sa.Connect
     return result
 
 
+def mint_functional_currency_settings(source: sa.Connection, dest: sa.Connection, ctx: MintContext) -> MintResult:
+    """Tenant functional currency setting from legacy ``organization.functional_currency_code``.
+
+    One tenant-scoped ``accounting_policy/functional_currency`` row per organisation, with
+    a history row naming the import. Never overwrites: an existing row with the same value
+    counts ``existing``; a different value, an invalid code or a missing tenant is a named
+    blocker, not a repair. Runs after ``kernel_tenants`` (FK to tenants).
+    """
+
+    result = MintResult("functional_currency_settings")
+    tenants = {_norm(r[0]) for r in dest.execute(sa.text("SELECT id FROM tenants"))}
+    existing = {
+        _norm(r[0]): r[1]
+        for r in dest.execute(
+            sa.text(
+                "SELECT tenant_id, value_text FROM domain_settings WHERE scope_kind = 'tenant' "
+                "AND domain = :domain AND key = :key"
+            ),
+            {"domain": "accounting_policy", "key": "functional_currency"},
+        )
+    }
+    rows: list[dict[str, Any]] = []
+    history: list[dict[str, Any]] = []
+    legacy = source.execute(sa.text("SELECT organization_id, functional_currency_code FROM organization")).mappings()
+    for row in legacy:
+        tenant_id = _norm(row["organization_id"])
+        code = row["functional_currency_code"]
+        code = code.strip().upper() if isinstance(code, str) else ""
+        if len(code) != 3 or not code.isascii() or not code.isalpha():
+            result.blockers.append(f"organisation {tenant_id}: functional currency is missing or not a 3-letter code")
+            continue
+        if tenant_id not in tenants:
+            result.blockers.append(f"organisation {tenant_id}: tenant not minted yet")
+            continue
+        if tenant_id in existing:
+            if existing[tenant_id] == code:
+                result.existing += 1
+            else:
+                result.blockers.append(
+                    f"organisation {tenant_id}: a different functional currency setting exists (not overwritten)"
+                )
+            continue
+        setting_id = _mint_id("functional_currency_settings", tenant_id, "accounting_policy/functional_currency")
+        rows.append(
+            {
+                "id": setting_id,
+                "tenant_id": tenant_id,
+                "scope_kind": "tenant",
+                "domain": "accounting_policy",
+                "key": "functional_currency",
+                "value_type": "string",
+                "value_text": code,
+                "is_secret": False,
+                "is_active": True,
+                "created_at": _now(ctx),
+                "updated_at": _now(ctx),
+            }
+        )
+        history.append(
+            {
+                "id": _mint_id("functional_currency_settings_history", tenant_id, "create"),
+                "tenant_id": tenant_id,
+                "domain": "accounting_policy",
+                "key": "functional_currency",
+                "setting_id": setting_id,
+                "action": "create",
+                "value_after": code,
+                "secret_changed": False,
+                "changed_at": _now(ctx),
+                "change_reason": "legacy organization.functional_currency_code import",
+            }
+        )
+    _insert(dest, "domain_settings", rows)
+    _insert(dest, "domain_setting_history", history)
+    result.created = len(rows)
+    return result
+
+
 MINT_STEPS: Final[tuple[tuple[str, Any], ...]] = (
     ("kernel_tenants", mint_kernel_tenants),
+    ("functional_currency_settings", mint_functional_currency_settings),
     ("pay_structure_revisions", mint_pay_structure_revisions),
     ("pay_rule_bases", mint_pay_rule_bases),
     ("tax_authorities", mint_tax_authorities),
