@@ -10,6 +10,8 @@ from dotmac_payables.models import PaymentObligation, SettlementObservation, Sup
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from erp_v2.legacy_ap.models import LegacyInvoiceReference
+
 
 def billing_register(db: Session, *, tenant_id: UUID) -> dict[str, object]:
     documents = db.scalars(
@@ -83,4 +85,15 @@ def supplier_detail(db: Session, *, tenant_id: UUID, invoice_id: UUID) -> dict[s
         .where(PaymentObligation.tenant_id == tenant_id, PaymentObligation.invoice_id == invoice_id)
         .order_by(SettlementObservation.occurred_at.desc(), SettlementObservation.id)
     ).all()
-    return {"invoice": invoice, "lines": lines, "obligations": obligations, "observations": observations}
+    legacy_reference = db.scalar(
+        select(LegacyInvoiceReference)
+        .where(LegacyInvoiceReference.tenant_id == tenant_id, LegacyInvoiceReference.invoice_id == invoice_id)
+        .limit(1)
+    )
+    return {
+        "invoice": invoice,
+        "lines": lines,
+        "obligations": obligations,
+        "observations": observations,
+        "legacy_reference": legacy_reference,
+    }

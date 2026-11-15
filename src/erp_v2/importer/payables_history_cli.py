@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 
 from erp_v2.importer.identity_cli import _manifest, _safe_engine, _sha
 
+REFERENCED_SQL = "SELECT legacy_invoice_id FROM public.legacy_invoice_references WHERE tenant_id = :tenant"
+
 
 class OperatorRefusal(ValueError):
     def __init__(self, reason: str):
@@ -102,9 +104,13 @@ def _command_json(command) -> dict:
     )
 
 
-def _plan(verifier, scope, invoice_ids, session, bindings: dict) -> dict:
+def _plan(verifier, scope, invoice_ids, session, bindings: dict, referenced: frozenset[str] = frozenset()) -> dict:
     commands, refusals = [], []
     for invoice_id in invoice_ids:
+        if str(invoice_id) in referenced:
+            # Re-entered as a NEW ERP invoice with this legacy reference: never also admitted.
+            refusals.append(dict(invoice_id=str(invoice_id), reason="legacy_reference_entered"))
+            continue
         try:
             evidence = verifier.evidence(scope=scope, invoice_id=invoice_id, destination=session)
             commands.append(_command_json(verifier.command(evidence)))
@@ -296,7 +302,10 @@ def _run(args) -> dict:
                         "destination_database_mismatch",
                     )
                     _destination_preflight(session, tenant)
-                    plan = _plan(verifier, scope, ids, session, bindings)
+                    referenced = frozenset(
+                        str(value) for value in session.scalars(sa.text(REFERENCED_SQL).bindparams(tenant=tenant))
+                    )
+                    plan = _plan(verifier, scope, ids, session, bindings, referenced)
                     if args.apply:
                         _apply(session, scope, verifier, plan, reviewed, admit, command_type=command_type)
                     # Plan transaction has been forced read-only. Context exit
