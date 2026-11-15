@@ -50,9 +50,9 @@ class MigrationConfigurationError(RuntimeError):
 # on the dedicated test server, 2026-11-08: 31 stamped, 333 tables).
 EXPECTED_HEADS: tuple[str, ...] = (
     "0030_credential_tenant_key",  # kernel 0.1.0a107
-    "ac_0001_accounting",  # accounting 0.1.0a1
+    "ac_0003_draft_void",  # accounting 0.1.0a2
     "ao_0001_ai_operations",  # ai-operations 0.1.0a1
-    "ap_0003_withdrawals",  # approvals 0.1.0a8
+    "ap_0003_withdrawals",  # approvals 0.1.0a9
     "as_0001_assets",  # assets 0.1.0a1
     "ay_0001_analytics",  # analytics 0.1.0a1
     "bi_0014_opening_variance_ledger",  # billing 0.1.0a11
@@ -71,13 +71,13 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "im_0001_import_runs",  # imports 0.2.0a1
     "iv_0001_inventory",  # inventory 0.2.0a1
     "nu_0001_numbering",  # numbering 0.1.0a3
-    "pa_0003_historical_invoice",  # payables 0.1.0a3
+    "pa_0004_supplier_payments",  # payables 0.1.0a4
     "pc_0001_procurement",  # procurement 0.1.0a1
     "pe_0001_people_directory",  # people 0.1.0a2
     "pj_0001_projects",  # projects 0.1.0a1
     "pm_0006_cash_qualification",  # payments 0.1.0a3
     "pt_0001_party_context",  # party 0.1.0a1
-    "py_0001_payroll",  # payroll 0.1.0a2
+    "py_0001_payroll",  # payroll 0.1.0a3
     "sa_0001_sales",  # sales 0.1.0a1
     "tk_0001_tickets",  # ticketing 0.1.0a4
     "tx_0005_tax_dependencies",  # tax 0.1.0a7
