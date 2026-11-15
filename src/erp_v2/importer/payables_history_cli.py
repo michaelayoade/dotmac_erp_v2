@@ -1,5 +1,9 @@
 """Private, explicit historical payables cohort plan/apply operator boundary.
 
+Only the UNPAID admission path of payables 0.1.0a5 is used
+(``admit_historical_unpaid_invoice`` / ``HistoricalUnpaidInvoiceCommand``); the
+settled path, reversals and approved-invoice recognition are never invoked.
+
 A checked snapshot file binds bytes held by the operator; the operator's restore
 receipt must independently attest that the named source database came from those
 bytes. This command creates no settlement or Accounting posting. Candidate code
@@ -23,6 +27,29 @@ from sqlalchemy.orm import Session
 
 from erp_v2.importer.identity_cli import _manifest, _safe_engine, _sha
 
+# The only owner release whose admission contract this command is qualified for.
+REQUIRED_PAYABLES_VERSION = "0.1.0a5"
+REQUIRED_PAYABLES_HEAD = "pa_0005_reversal_settled_history"
+# Payables tables that must hold no tenant rows before an unpaid-cohort import:
+# the supplier-payment lifecycle, historical settlements and settlement observations
+# (the "settlements" of the ruling; payables has no table of that exact name, and the
+# wave-3 importer refuses every legacy payment row as settlement evidence).
+PREIMPORT_EMPTY_TABLES = (
+    "supplier_payments",
+    "supplier_payment_allocations",
+    "supplier_payment_withholdings",
+    "historical_settlements",
+    "settlement_observations",
+)
+_EMPTY_TABLE_COUNT_SQL = {
+    "supplier_payments": "SELECT count(*) FROM mod_payables.supplier_payments WHERE tenant_id = :tenant",
+    "supplier_payment_allocations": "SELECT count(*) FROM mod_payables.supplier_payment_allocations"
+    " WHERE tenant_id = :tenant",
+    "supplier_payment_withholdings": "SELECT count(*) FROM mod_payables.supplier_payment_withholdings"
+    " WHERE tenant_id = :tenant",
+    "historical_settlements": "SELECT count(*) FROM mod_payables.historical_settlements WHERE tenant_id = :tenant",
+    "settlement_observations": "SELECT count(*) FROM mod_payables.settlement_observations WHERE tenant_id = :tenant",
+}
 REFERENCED_SQL = "SELECT legacy_invoice_id FROM public.legacy_invoice_references WHERE tenant_id = :tenant"
 
 
@@ -226,7 +253,7 @@ def _destination_preflight(session, tenant: UUID) -> None:
     )
     actual = list(session.scalars(sa.text("SELECT version_num FROM public.alembic_version")))
     _require(
-        "pa_0003_historical_invoice" in expected and len(actual) == len(set(actual)) and set(actual) == expected,
+        REQUIRED_PAYABLES_HEAD in expected and len(actual) == len(set(actual)) and set(actual) == expected,
         "destination_schema_heads_mismatch",
     )
     selected = session.scalar(
@@ -234,6 +261,11 @@ def _destination_preflight(session, tenant: UUID) -> None:
     )
     observed = session.scalar(sa.text("SELECT public.app_current_tenant_id()"))
     _require(selected == str(tenant) and str(observed) == str(tenant), "destination_tenant_binding_mismatch")
+    # Tenant-bound (forced RLS) counts: an unpaid-cohort import starts from no payment,
+    # settlement or withholding history for this tenant.
+    for table in PREIMPORT_EMPTY_TABLES:
+        rows = session.scalar(sa.text(_EMPTY_TABLE_COUNT_SQL[table]), {"tenant": str(tenant)})
+        _require(rows == 0, "destination_payables_history_not_empty")
 
 
 def _authorized(args) -> bool:
@@ -278,7 +310,7 @@ def _run(args) -> dict:
         destination_database=manifest.destination_database,
         source_owner="legacy-erp",
     )
-    _require(_installed_payables_version() == "0.1.0a3", "released_payables_version_required")
+    _require(_installed_payables_version() == REQUIRED_PAYABLES_VERSION, "released_payables_version_required")
     scope_type, verifier_type, admit, command_type = _dependencies()
     scope = scope_type(tenant)
     source_engine = _safe_engine(source_url)
