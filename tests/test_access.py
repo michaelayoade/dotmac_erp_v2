@@ -71,7 +71,7 @@ def test_every_new_code_in_the_profile_is_a_declared_spec_with_matching_roles():
 def test_sod_pairs_reference_only_new_roles_and_audit_action_is_declared():
     for pair in access.SOD_CONFLICT_PAIRS:
         assert len(pair) == 2 and pair <= set(access.NEW_ROLES)
-    assert access.AUDIT_ROLE_GRANTED in access.access_feature.audit_actions
+    assert {access.AUDIT_ROLE_GRANTED, access.AUDIT_ROLE_REVOKED} <= set(access.access_feature.audit_actions)
 
 
 def test_segregation_roles_do_not_overlap_on_the_critical_pairs():

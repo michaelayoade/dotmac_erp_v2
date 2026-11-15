@@ -145,7 +145,8 @@ SOD_CONFLICT_PAIRS: Final = frozenset(
 NON_WAIVABLE_SOD_PAIRS: Final = frozenset({frozenset(("finance_approver", "treasury"))})
 
 AUDIT_ROLE_GRANTED: Final = "erp.access.role_granted"
+AUDIT_ROLE_REVOKED: Final = "erp.access.role_revoked"
 
 access_feature: Final = FeatureManifest(
-    name="erp_access", permissions=PERMISSION_SPECS, audit_actions=(AUDIT_ROLE_GRANTED,)
+    name="erp_access", permissions=PERMISSION_SPECS, audit_actions=(AUDIT_ROLE_GRANTED, AUDIT_ROLE_REVOKED)
 )
