@@ -10,15 +10,9 @@ not on the reviewed allowlist, or an HTTP route that deletes or purges.
 from __future__ import annotations
 
 import ast
+import importlib
 import re
-from dataclasses import replace
 from pathlib import Path
-
-import pytest
-from dotmac_kernel import create_app
-from dotmac_kernel.config import settings
-
-from erp_v2.assembly import assembly
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "erp_v2"
 LEDGER = (
@@ -97,35 +91,47 @@ def test_no_cascading_foreign_key_or_relationship_deletes_ledger_rows():
         assert not re.search(r"cascade\s*=\s*['\"][^'\"]*delete", text), path.name
 
 
-@pytest.fixture()
-def app(monkeypatch):
-    monkeypatch.setattr(settings, "platform_root_domain", "erp.test")
-    monkeypatch.setattr(settings, "trusted_hosts", "acme.erp.test")
-    return create_app(replace(assembly, web_enabled=True, database_runtime=None, require_database_runtime=False))
+ROUTER_MODULES = (
+    "erp_v2.journals.routes",
+    "erp_v2.web.routes",
+    "erp_v2.web.legacy_reentry_routes",
+    "erp_v2.web.payroll_routes",
+    "erp_v2.web.revenue_approval_routes",
+    "erp_v2.web.revenue_routes",
+    "erp_v2.banking.routes",
+    "erp_v2.banking.statement_routes",
+    "erp_v2.payees.routes",
+    "erp_v2.academy_sync.routes",
+    "erp_v2.readiness",
+)
 
 
-def flatten(routes, prefix=""):
-    for route in routes:
-        path = prefix + getattr(route, "path", "")
-        children = getattr(route, "routes", None)
-        if children is not None:
-            yield from flatten(children, path)
-        elif getattr(route, "methods", None):
-            yield path, set(route.methods)
+def all_routes():
+    for name in ROUTER_MODULES:
+        for route in importlib.import_module(name).router.routes:
+            yield name, route.path, set(route.methods)
 
 
-def test_no_mounted_route_deletes_or_purges_and_journals_have_no_draft_removal_path(app):
-    routes = list(flatten(app.routes))
-    paths = sorted({path for path, _ in routes})
-    assert "/finance/journals" in paths, paths[:40]  # the real journal facet is mounted
-    for path, methods in routes:
+def test_no_route_deletes_or_purges_and_journals_have_no_draft_removal_path():
+    routes = list(all_routes())
+    assert "/finance/journals" in {path for _, path, _ in routes}  # the real journal facet is covered
+    for _, path, methods in routes:
         assert "DELETE" not in methods, path
         assert "PUT" not in methods or "journal" not in path, path
         if "journal" in path or "/finance/" in path:
             assert not re.search(r"delete|purge|remove|truncate|destroy", path, re.I), path
     # every mutation of a journal is a POST to a named governed command, never a bare resource verb
-    journal_posts = sorted(path for path, methods in routes if "journal" in path and "POST" in methods)
+    journal_posts = sorted(path for _, path, methods in routes if "journal" in path and "POST" in methods)
     assert journal_posts and all(
         p == "/finance/journals" or re.search(r"/(request-post|request-reversal|approve|approve-reversal|reject)$", p)
         for p in journal_posts
     )
+
+
+def test_every_router_module_is_listed():
+    declared = {
+        "erp_v2." + ".".join(p.relative_to(SRC).with_suffix("").parts)
+        for p in source_files()
+        if re.search(r"^router\s*=\s*APIRouter\(", p.read_text(), re.M)
+    }
+    assert declared == set(ROUTER_MODULES)
