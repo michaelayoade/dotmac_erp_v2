@@ -4,8 +4,9 @@ Typed, reviewed input only (a JSON allowlist bound by sha256); role holders are
 never taken from env files or defaults. Only the roles declared in
 ``erp_v2.access.NEW_ROLES`` are grantable: ``admin``, ``staff`` and anything else
 refuse. Grants are additive (kernel ``ensure_grant``); nothing is revoked or
-widened. DSN is environment-only (``MIGRATION_DATABASE_URL``); the receipt (0600,
-created exclusively before any write) carries counts/codes, never identities.
+widened (revoke is a separate governed mode, below). DSN is environment-only
+(``MIGRATION_DATABASE_URL``); the receipt (0600, created exclusively before any write)
+carries counts/codes, never identities.
 
     python -m erp_v2.access_cli plan  --allowlist A.json --receipt R.json
     ERP_ACCESS_APPLY=1 python -m erp_v2.access_cli apply --allowlist A.json \
@@ -15,7 +16,15 @@ No access is widened: a party must already hold ``staff`` or ``admin`` (portal
 entry) and must not end up with a conflicting role pair (``SOD_CONFLICT_PAIRS``)
 unless the sha-bound allowlist lists that pair under ``sod_exceptions``. Every
 inserted grant writes a DB audit event (``erp.access.role_granted``) in the same
-transaction. There is no revoke path yet (required before the flip).
+transaction.
+
+Revoke (leavers, wrong grants) uses the same rails: ``revoke-plan`` / ``revoke-apply`` with the
+same sha-bound allowlist format (``sod_exceptions`` is refused: it is meaningless for removal),
+``ERP_ACCESS_APPLY=1``, ``--operator-ref``, MIGRATION_DATABASE_URL only, and a 0600 receipt with
+counts. Only roles in ``NEW_ROLES`` can be revoked: ``admin``/``staff`` (and so portal access,
+``erp.web.access``) are never touched. Revoking an absent grant is a no-op; each removed grant
+writes one ``erp.access.role_revoked`` audit event. Removal can never create a conflicting pair.
+Inactive parties may be revoked (that is the leaver case); missing parties refuse.
 """
 
 from __future__ import annotations
@@ -30,7 +39,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from erp_v2.access import AUDIT_ROLE_GRANTED, NEW_ROLES, NON_WAIVABLE_SOD_PAIRS, SOD_CONFLICT_PAIRS
+from erp_v2.access import (
+    AUDIT_ROLE_GRANTED,
+    AUDIT_ROLE_REVOKED,
+    LEGACY_ROLES,
+    NEW_ROLES,
+    NON_WAIVABLE_SOD_PAIRS,
+    SOD_CONFLICT_PAIRS,
+)
 
 MAX_GRANTS = 200
 
@@ -61,7 +77,7 @@ def _uuid(value: object, code: str) -> UUID:
     return parsed
 
 
-def parse_allowlist(raw_bytes: bytes) -> Allowlist:
+def parse_allowlist(raw_bytes: bytes, *, revoke: bool = False) -> Allowlist:
     try:
         raw = json.loads(raw_bytes)
     except ValueError:
@@ -70,6 +86,7 @@ def parse_allowlist(raw_bytes: bytes) -> Allowlist:
         not isinstance(raw, dict)
         or not {"version", "tenant_id", "grants"} <= set(raw)
         or set(raw) - {"version", "tenant_id", "grants", "sod_exceptions"}
+        or (revoke and "sod_exceptions" in raw)
         or type(raw["version"]) is not int
         or raw["version"] != 1
     ):
@@ -242,13 +259,118 @@ def apply_grants(db, allow: Allowlist, *, allowlist_sha256: str, operator_ref: s
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RevokePlan:
+    selected: int
+    revokes: int
+    noops: int
+    blockers: tuple[tuple[str, int], ...]
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "selected": self.selected,
+            "revokes": self.revokes,
+            "noops": self.noops,
+            "blockers": dict(self.blockers),
+            "ready": self.ready,
+        }
+
+
+def _write_revoke_audit(db, *, tenant_id, party_id, role, allowlist_sha256, operator_ref) -> None:
+    from dotmac_kernel.audit import write_audit_event
+
+    write_audit_event(
+        db,
+        tenant_id=tenant_id,
+        actor_type="service",
+        actor_id=operator_ref,
+        actor_label="erp_v2.access_cli",
+        source_application="dotmac_erp",
+        action=AUDIT_ROLE_REVOKED,
+        entity_type="party_role_grant",
+        entity_id=str(party_id),
+        is_success=True,
+        details={"role": role, "allowlist_sha256": allowlist_sha256},
+    )
+
+
+def _observe_revoke(
+    db, allow: Allowlist, *, write: bool, audit=None, allowlist_sha256: str = "", operator_ref: str = ""
+) -> RevokePlan:
+    from dotmac_kernel import identity_storage
+    from dotmac_kernel.models import Tenant
+    from dotmac_kernel.transactions import conflict_savepoint
+    from sqlalchemy import select
+
+    if any(role in LEGACY_ROLES or role not in NEW_ROLES for _, role in allow.grants):
+        _refuse("role_not_revocable")
+    blockers: Counter[str] = Counter()
+    tenant = db.scalar(select(Tenant).where(Tenant.id == allow.tenant_id).with_for_update())
+    if tenant is None or not tenant.is_active:
+        blockers["tenant_missing_or_inactive"] += 1
+        return RevokePlan(len(allow.grants), 0, 0, tuple(blockers.items()))
+    party_ids = tuple(sorted({party for party, _ in allow.grants}, key=str))
+    parties = {p.id: p for p in identity_storage.lock_parties(db, tenant_id=allow.tenant_id, party_ids=party_ids)}
+    for party_id in party_ids:
+        if party_id not in parties:
+            blockers["party_missing"] += 1
+    roles = {r.slug: r for r in identity_storage.lock_roles(db, tenant_id=allow.tenant_id)}
+    grant_rows = identity_storage.lock_grants(db, tenant_id=allow.tenant_id, party_ids=tuple(parties))
+    by_pair = {(g.party_id, g.role_id): g for g in grant_rows}
+    removals: dict[UUID, list] = {}
+    removed_roles: list[tuple[UUID, str]] = []
+    for party, role in allow.grants:
+        fact = by_pair.get((party, roles[role].id)) if role in roles else None
+        if fact is not None and party in parties:
+            removals.setdefault(party, []).append(fact)
+            removed_roles.append((party, role))
+    revokes = len(removed_roles)
+    if write and not blockers and removals:
+        with conflict_savepoint(db):
+            # All removals first: identity storage refuses pending caller work, so audit rows
+            # (pending inserts) are written only after every grant has been removed.
+            for party in sorted(removals, key=str):
+                identity_storage.remove_grants(
+                    db, tenant_id=allow.tenant_id, party_id=party, expected=tuple(removals[party])
+                )
+            for party, role in removed_roles:
+                (audit or _write_revoke_audit)(
+                    db,
+                    tenant_id=allow.tenant_id,
+                    party_id=party,
+                    role=role,
+                    allowlist_sha256=allowlist_sha256,
+                    operator_ref=operator_ref,
+                )
+    return RevokePlan(len(allow.grants), revokes, len(allow.grants) - revokes, tuple(sorted(blockers.items())))
+
+
+def plan_revokes(db, allow: Allowlist) -> RevokePlan:
+    return _observe_revoke(db, allow, write=False)
+
+
+def apply_revokes(db, allow: Allowlist, *, allowlist_sha256: str, operator_ref: str, audit=None) -> RevokePlan:
+    """Caller owns the transaction. Refused plans write nothing; each removed grant is audited."""
+    if not operator_ref or not operator_ref.strip() or len(operator_ref) > 120:
+        _refuse("operator_ref_required")
+    return _observe_revoke(
+        db, allow, write=True, audit=audit, allowlist_sha256=allowlist_sha256, operator_ref=operator_ref.strip()
+    )
+
+
 def _run(args) -> dict:
     raw = args.allowlist.read_bytes()
     sha = hashlib.sha256(raw).hexdigest()
-    allow = parse_allowlist(raw)
-    if args.mode == "apply" and args.approved_allowlist_sha256 != sha:
+    revoke = args.mode.startswith("revoke-")
+    applying = args.mode.endswith("apply")
+    allow = parse_allowlist(raw, revoke=revoke)
+    if applying and args.approved_allowlist_sha256 != sha:
         _refuse("allowlist_review_binding_required")
-    if args.mode == "apply" and not (args.operator_ref or "").strip():
+    if applying and not (args.operator_ref or "").strip():
         _refuse("operator_ref_required")
     url = os.environ.pop("MIGRATION_DATABASE_URL", "")
     if not url:
@@ -268,12 +390,19 @@ def _run(args) -> dict:
         if engine.dialect.name != "postgresql":
             _refuse("postgresql_required")
         with Session(engine) as db, db.begin():
-            plan = (
-                apply_grants(db, allow, allowlist_sha256=sha, operator_ref=args.operator_ref or "")
-                if args.mode == "apply"
-                else plan_grants(db, allow)
-            )
-            if args.mode == "plan" or not plan.ready:
+            if revoke:
+                plan = (
+                    apply_revokes(db, allow, allowlist_sha256=sha, operator_ref=args.operator_ref or "")
+                    if applying
+                    else plan_revokes(db, allow)
+                )
+            else:
+                plan = (
+                    apply_grants(db, allow, allowlist_sha256=sha, operator_ref=args.operator_ref or "")
+                    if applying
+                    else plan_grants(db, allow)
+                )
+            if not applying or not plan.ready:
                 db.rollback()
             return {"mode": args.mode, "allowlist_sha256": sha, "access": plan.receipt()}
     finally:
@@ -282,14 +411,14 @@ def _run(args) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m erp_v2.access_cli")
-    parser.add_argument("mode", choices=("plan", "apply"))
+    parser.add_argument("mode", choices=("plan", "apply", "revoke-plan", "revoke-apply"))
     parser.add_argument("--allowlist", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--approved-allowlist-sha256")
     parser.add_argument("--operator-ref", help="who is applying (recorded in the audit event)")
     args = parser.parse_args(argv)
     try:
-        if args.mode == "apply" and os.environ.get("ERP_ACCESS_APPLY") != "1":
+        if args.mode.endswith("apply") and os.environ.get("ERP_ACCESS_APPLY") != "1":
             _refuse("explicit_access_apply_required")
         # Reserve the receipt first: existing evidence blocks BEFORE any write.
         fd = os.open(args.receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
