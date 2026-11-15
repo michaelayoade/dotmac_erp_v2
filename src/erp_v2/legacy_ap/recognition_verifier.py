@@ -37,6 +37,7 @@ from erp_v2.importer.payables_history import (
     _amount,
     _at_scale,
     _database,
+    _day,
     _fingerprint,
     _id,
     _match,
@@ -160,8 +161,6 @@ class ApprovedInvoiceVerifier:
             {
                 key: key
                 for key in (
-                    "invoice_date",
-                    "received_date",
                     "currency_code",
                     "exchange_rate",
                     "subtotal",
@@ -171,6 +170,11 @@ class ApprovedInvoiceVerifier:
             }
         )
         _match(header, target, mapping, "header")
+        for name in ("invoice_date", "received_date"):
+            # Legacy dates may arrive as date or ISO text; compare as calendar days.
+            _require(
+                _day(header[name], "source_" + name) == _day(target[name], "destination_" + name), "header_" + name
+            )
         lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
         targets = _read(dest, "supplier_invoice_lines", schema="mod_payables", key="invoice_id", value=invoice_id)
         _tenant(targets, tenant, "invoice_line")

@@ -60,7 +60,7 @@ def test_digest_is_mandatory_and_must_match():
         ({"invoice_ids": []}, "explicit_bounded_list_required"),
         ({"invoice_ids": [INVOICE, INVOICE]}, "duplicate_invoice_id"),
         ({"invoice_ids": ["not-a-uuid"]}, "invalid_invoice_id"),
-        ({"invoice_ids": [INVOICE.upper()]}, "invalid_invoice_id"),
+        ({"invoice_ids": [str(UUID(int=0xABC)).upper()]}, "invalid_invoice_id"),
         ({"invoice_ids": [str(UUID(int=n)) for n in range(1, 1002)]}, "explicit_bounded_list_required"),
         ({"tenant_id": str(UUID(int=9))}, "tenant_extent_mismatch"),
         ({"snapshot_sha256": "c" * 64}, "list_snapshot_mismatch"),
