@@ -1013,7 +1013,10 @@ def test_payment_approver_may_not_be_the_instruction_proposer_or_decider_at_appr
         env = world(engine)
         created = prepare(engine, env, open_obligation(engine, env))
         seed_payee(engine, env, proposer=proposer, decider=decider)
-        refused(lambda: approve(engine, env, created.payment_id), "sod_approver_is_instruction_party")
+        refused(
+            lambda env=env, created=created: approve(engine, env, created.payment_id),
+            "sod_approver_is_instruction_party",
+        )
         assert payment(engine, created.payment_id).status == SupplierPaymentStatus.DRAFT
         approve(engine, env, created.payment_id, who="recorder")  # a different approver is fine
 

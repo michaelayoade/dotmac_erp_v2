@@ -1,10 +1,10 @@
 """Pure bank-file builder: rows in, bytes + sha256 + row count out. No database, no I/O.
 
 Format ``generic-csv-v1`` is a neutral, header-first CSV. Bank-specific layouts (legacy
-Zenith/Access/GTBank, W15) are not decided and are deliberately not implemented. Cell text that a
-spreadsheet could execute (leading ``= + - @`` or control characters) is neutralised, so a payee
-name cannot inject a formula. The account number appears only in the returned bytes; ``repr`` of a
-row and the receipt never contain it.
+Zenith/Access/GTBank, W15) are not decided and are deliberately not implemented. A cell holding a
+line break, tab, control character, comma, double quote or semicolon is REFUSED (never rewritten);
+a leading ``= + - @`` is neutralised so a payee name cannot inject a formula.
+The account number appears only in the returned bytes; ``repr`` of a row and the receipt never contain it.
 """
 
 from __future__ import annotations
@@ -31,8 +31,10 @@ HEADER: Final = (
     "narration",
     "debit_account",
 )
-_FORMULA_LEAD = re.compile(r"^[=+\-@\t\r]")
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_FORMULA_LEAD = re.compile(r"^[=+\-@]")
+# Refused, never rewritten: line breaks and tabs, C0/C1 controls (including U+0085), the Unicode line and
+# paragraph separators, and the delimiters comma, double quote and semicolon.
+_FORBIDDEN = re.compile('[\x00-\x1f\x7f-\x9f\u2028\u2029,";]')
 _DIGITS = re.compile(r"^[0-9]{3,34}$")
 
 
@@ -71,8 +73,13 @@ class DisbursementFile:
         return f"DisbursementFile({self.format}, rows={self.row_count}, sha256={self.sha256[:12]})"
 
 
-def _cell(value: str) -> str:
-    text = _CONTROL.sub(" ", str(value)).strip()
+def _cell(value: str, field_name: str) -> str:
+    text = str(value)
+    if _FORBIDDEN.search(text):
+        raise DisbursementFileError(
+            "invalid_cell", f"The {field_name} contains a character that is not allowed in a bank file"
+        )
+    text = text.strip()
     return "'" + text if _FORMULA_LEAD.match(text) else text
 
 
@@ -109,15 +116,15 @@ def build_csv(rows: list[DisbursementRow]) -> DisbursementFile:
             raise DisbursementFileError("invalid_destination", "A row has an incomplete payee destination")
         writer.writerow(
             [
-                _cell(row.reference),
+                _cell(row.reference, "reference"),
                 row.value_date.isoformat(),
-                _cell(row.currency),
+                _cell(row.currency, "currency"),
                 f"{row.amount:.2f}",
-                _cell(row.payee_name),
-                _cell(row.bank_code),
-                _cell(row.account_number),
-                _cell(row.narration),
-                _cell(row.debit_account),
+                _cell(row.payee_name, "payee name"),
+                _cell(row.bank_code, "bank code"),
+                _cell(row.account_number, "account number"),
+                _cell(row.narration, "narration"),
+                _cell(row.debit_account, "debit account"),
             ]
         )
     content = buffer.getvalue().encode("utf-8")

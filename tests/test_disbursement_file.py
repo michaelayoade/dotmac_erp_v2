@@ -49,14 +49,26 @@ def test_repr_never_carries_account_number_or_bytes():
 
 @pytest.mark.parametrize("lead", ["=", "+", "-", "@"])
 def test_spreadsheet_formulas_are_neutralised(lead):
-    built = bank_file.build_csv([row(payee_name=f'{lead}HYPERLINK("x")')])
+    built = bank_file.build_csv([row(payee_name=f"{lead}SUM(1)")])
     parsed = list(csv.reader(io.StringIO(built.content.decode())))
     assert parsed[1][4].startswith("'" + lead)
 
 
-def test_control_characters_are_removed_from_text():
-    built = bank_file.build_csv([row(payee_name="A\x00B\x1bC")])
-    assert list(csv.reader(io.StringIO(built.content.decode())))[1][4] == "A B C"
+FORBIDDEN = ["\r", "\n", "\t", "\x00", "\x1b", "\x7f", "\x80", "\x85", "\x9f", "\u2028", "\u2029", ",", '"', ";"]
+
+
+@pytest.mark.parametrize("char", FORBIDDEN)
+@pytest.mark.parametrize("field", ["reference", "payee_name", "bank_code", "narration", "debit_account", "currency"])
+def test_cells_with_forbidden_characters_are_refused_never_rewritten(char, field):
+    value = f"A{char}B"
+    with pytest.raises(DisbursementFileError) as exc:
+        bank_file.build_csv([row(**{field: value})])
+    assert exc.value.code == "invalid_cell"
+
+
+def test_ordinary_names_with_spaces_dots_and_ampersands_pass():
+    built = bank_file.build_csv([row(payee_name="A & B Supplies Ltd. (Lagos)")])
+    assert "A & B Supplies Ltd. (Lagos)" in built.content.decode()
 
 
 @pytest.mark.parametrize(
