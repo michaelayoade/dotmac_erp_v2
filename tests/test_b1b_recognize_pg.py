@@ -57,8 +57,9 @@ def audit_registry():
     from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
 
     from erp_v2.assembly import assembly
+    from erp_v2.legacy_ap.audit import legacy_recognize_feature
 
-    install_audit_actions(AuditActionRegistry.from_manifests(assembly.modules))
+    install_audit_actions(AuditActionRegistry.from_manifests([*assembly.modules, legacy_recognize_feature]))
 
 
 def grant(engine, env, party_id, slug="finance_approver"):
@@ -82,7 +83,10 @@ def counts(engine, tenant_id) -> dict[str, int]:
         }
 
 
-def imported(engine, env, *, number="AP-1", status_value="APPROVED", approved_by=None, draft_values=None, **kw):
+UNSET = object()
+
+
+def imported(engine, env, *, number="AP-1", status_value="APPROVED", approved_by=UNSET, draft_values=None, **kw):
     """An imported-style invoice: APPROVED by direct update, no event/obligation/receipt/journal."""
     iid = invoice(engine, env, number=number, submit=False, **kw)
     if draft_values:  # submitted documents are immutable (DB trigger), so draft-only fields go first
@@ -94,7 +98,7 @@ def imported(engine, env, *, number="AP-1", status_value="APPROVED", approved_by
         db.execute(
             sa.update(SupplierInvoice)
             .where(SupplierInvoice.id == iid)
-            .values(status=status_value, approved_by=approved_by or str(env.party_ids[2]))
+            .values(status=status_value, approved_by=str(env.party_ids[2]) if approved_by is UNSET else approved_by)
         )
         db.commit()
     return iid
@@ -445,7 +449,8 @@ def test_closed_period_refuses_in_plan(engine, setup):
     iid = imported(engine, env)
     legacy.build((iid,))
     soft_close(engine, env)
-    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"posting_period_closed": 1}
+    # With no open period left, the date cannot be in the first open one (and posting would also refuse).
+    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"posting_date_not_first_open_period": 1}
 
 
 def test_failure_midway_rolls_back_every_invoice(engine, setup, monkeypatch):
@@ -537,26 +542,20 @@ def test_credential_id_of_the_approver_counts_as_the_approver(engine, setup):
     from dotmac_kernel.models import UserCredential
 
     env, legacy = setup
-    iid = imported(engine, env)
     with Session(engine) as db:
         credential = UserCredential(tenant_id=env.tenant_id, party_id=env.party_ids[1], password_hash="x")  # noqa: S106
         db.add(credential)
-        db.flush()
-        db.execute(sa.update(SupplierInvoice).where(SupplierInvoice.id == iid).values(approved_by=str(credential.id)))
-        credential_id = credential.id
         db.commit()
-    assert credential_id
+        credential_id = str(credential.id)
+    iid = imported(engine, env, approved_by=credential_id)  # imported-style: legacy credential id
     legacy.build((iid,))
     assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"approver_is_legacy_approver": 1}
 
 
 def test_unrecorded_or_unresolvable_people_refuse(engine, setup):
     env, legacy = setup
-    unknown = imported(engine, env, number="AP-1")
+    unknown = imported(engine, env, number="AP-1", approved_by=None)
     unresolved = imported(engine, env, number="AP-2", approved_by="legacy-user-7")
-    with Session(engine) as db:
-        db.execute(sa.update(SupplierInvoice).where(SupplierInvoice.id == unknown).values(approved_by=None))
-        db.commit()
     ids = tuple(sorted([unknown, unresolved], key=str))
     legacy.build(ids)
     plan = legacy.run(engine, ids, apply=False)

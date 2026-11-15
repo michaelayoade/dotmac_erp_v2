@@ -527,8 +527,10 @@ def _install_audit_actions() -> None:
         active_audit_actions()
     except AuditActionsNotInstalledError:
         from erp_v2.assembly import assembly
+        from erp_v2.legacy_ap.audit import legacy_recognize_feature
 
-        install_audit_actions(AuditActionRegistry.from_manifests(assembly.modules))
+        # This operator command declares its own audit vocabulary; it is not an assembled feature.
+        install_audit_actions(AuditActionRegistry.from_manifests([*assembly.modules, legacy_recognize_feature]))
 
 
 def _run(args) -> dict:

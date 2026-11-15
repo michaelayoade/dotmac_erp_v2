@@ -13,7 +13,6 @@ from erp_v2.banking.recon_routes import banking_recon_feature
 from erp_v2.banking.routes import banking_web_feature
 from erp_v2.banking.statement_routes import banking_statements_feature
 from erp_v2.journals.routes import journals_web_feature
-from erp_v2.legacy_ap.audit import legacy_recognize_feature
 from erp_v2.payees.routes import payee_bank_feature
 from erp_v2.readiness import readiness_feature
 from erp_v2.web.legacy_reentry_routes import legacy_reentry_feature
@@ -36,5 +35,4 @@ ERP_FEATURES: tuple[FeatureManifest, ...] = (
     banking_recon_feature,
     payee_bank_feature,
     access_feature,
-    legacy_recognize_feature,
 )
