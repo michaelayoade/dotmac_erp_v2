@@ -1076,3 +1076,18 @@ def test_record_refuses_a_future_value_date_and_accepts_the_day_itself(engine):
         act(engine, env, "recorder", svc.record_payment, payment_id=pid, bank_reference="REF-F", now=on_day).replayed
         is False
     )
+
+
+def test_bank_reference_is_normalised_before_the_uniqueness_check(engine):
+    env = world(engine)
+    first = approved_payment(engine, env, open_obligation(engine, env, number="AP-1"))
+    out = record(engine, env, first, "  dup   ref-1 ")
+    assert payment(engine, first).bank_reference == "DUP REF-1"
+    assert record(engine, env, first, "Dup Ref-1").replayed is True  # same reference, different spelling
+    assert out.accounting_reference
+    second = approved_payment(engine, env, open_obligation(engine, env, number="AP-2"))
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, second, "DUP ref-1"), "payables_refused")  # non-breaking space collapses too
+    refused(lambda: record(engine, env, second, "dup ref-1"), "payables_refused")
+    assert counts(engine, env) == before
+    assert payment(engine, second).status == SupplierPaymentStatus.APPROVED

@@ -440,8 +440,13 @@ def _cancel(
 
 
 def _bank_reference(value: str) -> str:
-    text = (value or "").strip()
-    if len(text) < 3 or len(text) > 255 or any(ord(c) < 32 or ord(c) == 127 for c in text):
+    raw = value or ""
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw.strip()):
+        raise PaymentRefused("bank_reference_invalid", "The bank reference must not contain control characters")
+    # Normalised BEFORE the owner's per-instrument uniqueness check: trim, collapse inner whitespace,
+    # upper-case, so "ref  1" and "REF 1" are the same reference. The normalised form is what is stored.
+    text = " ".join(raw.split()).upper()
+    if len(text) < 3 or len(text) > 255:
         raise PaymentRefused(
             "bank_reference_invalid", "Enter the bank's evidence reference (3 to 255 printable characters)"
         )
