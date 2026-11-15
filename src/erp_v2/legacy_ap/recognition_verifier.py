@@ -172,6 +172,13 @@ class ApprovedInvoiceVerifier:
             header["total_amount"] > 0 and _sum([header["subtotal"], header["tax_amount"]]) == header["total_amount"],
             "source_total",
         )
+        organization = _one(_read(src, "organization", key="organization_id", value=tenant), "source_organization")
+        _require(
+            header["currency_code"] == organization["functional_currency_code"]
+            and header["exchange_rate"] == 1
+            and header["functional_currency_amount"] == header["total_amount"],
+            "unsupported_currency",
+        )
         # No legacy GL footprint of any kind: journals, journal lines, posted ledger lines.
         journals = _read(src, "journal_entry", key="source_document_id", value=invoice_id)
         _require(not journals, "source_gl_journal_present")

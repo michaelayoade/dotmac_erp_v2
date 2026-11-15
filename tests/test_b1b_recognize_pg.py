@@ -45,6 +45,7 @@ SOURCE_TABLES = {
     "payment_allocation": READ_FIELDS["payment_allocation"],
     "journal_entry": READ_FIELDS["journal_entry"],
     "posted_ledger_line": READ_FIELDS["posted_ledger_line"],
+    "organization": READ_FIELDS["organization"],
     "inventory_transaction": ["source_document_type", "source_document_id", "source_document_line_id"],
 }
 BOOLEANS = {"is_prepayment", "is_reversal"}
@@ -179,6 +180,7 @@ class Legacy:
                     row.update(self.line_overrides.get(iid, {}))
                     lines.append(row)
             for name, rows in (
+                ("organization", [dict(organization_id=str(self.env.tenant_id), functional_currency_code="NGN")]),
                 ("supplier_invoice", headers),
                 ("supplier_invoice_line", lines),
                 ("payment_allocation", self.allocations),
@@ -618,3 +620,19 @@ def test_legacy_inventory_transaction_citing_the_invoice_or_its_line_is_refused(
     plan = legacy.run(engine, ids, apply=False)
     assert plan["refusals_by_reason"] == {"legacy_evidence:source_inventory_transaction": 2}
     assert plan["counts"]["eligible"] == 1
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        dict(currency_code="USD"),
+        dict(exchange_rate="1500"),
+        dict(functional_currency_amount="214"),
+    ],
+)
+def test_non_functional_currency_or_amount_mismatch_is_unsupported(engine, setup, override):
+    env, legacy = setup
+    iid = imported(engine, env)
+    legacy.overrides[iid] = override
+    legacy.build((iid,))
+    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"legacy_evidence:unsupported_currency": 1}
