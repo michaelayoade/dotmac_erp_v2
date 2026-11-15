@@ -58,9 +58,9 @@ def counts(engine, tenant_id) -> dict[str, int]:
         }
 
 
-def imported(engine, env, *, number="AP-1", status_value="APPROVED"):
+def imported(engine, env, *, number="AP-1", status_value="APPROVED", **kw):
     """An imported-style invoice: APPROVED by direct update, no event/obligation/receipt/journal."""
-    iid = invoice(engine, env, number=number, submit=True)
+    iid = invoice(engine, env, number=number, submit=True, **kw)
     with Session(engine) as db:
         db.execute(sa.update(SupplierInvoice).where(SupplierInvoice.id == iid).values(status=status_value))
         db.commit()
@@ -425,3 +425,40 @@ def test_failure_midway_rolls_back_every_invoice(engine, setup, monkeypatch):
     with pytest.raises(cli.RecognizeRefusal, match="apply_posting_period_closed"):
         legacy.run(engine, ids, apply=True, digest=plan["plan_digest"])
     assert counts(engine, env.tenant_id) == {m.__tablename__: 0 for m in MODELS}
+
+
+def test_invoice_date_outside_the_first_open_period_is_refused(engine, setup):
+    """Payables a5 posts at invoice_date; only the first open period is accepted (date never changed)."""
+    from datetime import date
+
+    from dotmac_accounting import service as accounting
+    from dotmac_accounting.contracts import PeriodStatus
+    from dotmac_accounting.models import FiscalPeriod
+
+    env, legacy = setup
+    with Session(engine) as db:
+        year_id = db.scalar(sa.select(FiscalPeriod.fiscal_year_id).where(FiscalPeriod.id == env.period_id))
+        later = FiscalPeriod(
+            tenant_id=env.tenant_id,
+            fiscal_year_id=year_id,
+            period_number=2,
+            name="Feb",
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            status=PeriodStatus.FUTURE,
+        )
+        db.add(later)
+        db.flush()
+        accounting.open_period(db, scope=env.scope, period_id=later.id, actor_ref="test", occurred_at=NOW)
+        db.commit()
+    in_first = [imported(engine, env, number="AP-1"), imported(engine, env, number="AP-2")]
+    in_later = [
+        imported(engine, env, number=f"AP-F{n}", period_date="2026-02-10") for n in range(3)
+    ]  # census-style cohort: three of five fall after the first open month
+    ids = tuple(sorted(in_first + in_later, key=str))
+    legacy.build(ids)
+    plan = legacy.run(engine, ids, apply=False)
+    assert plan["refusals_by_reason"] == {"posting_date_not_first_open_period": 3}
+    assert plan["counts"] == dict(requested=5, eligible=2, already_done=0, refused=3)
+    with Session(engine) as db:  # amounts and dates untouched
+        assert {db.get(SupplierInvoice, i).invoice_date.isoformat() for i in in_later} == {"2026-02-10"}

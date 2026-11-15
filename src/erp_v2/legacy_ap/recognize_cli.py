@@ -134,6 +134,8 @@ def _money(value) -> str:
 
 def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: str) -> str | None:
     """Destination-side state. None = eligible; 'already_done' = completed under this list."""
+    from dotmac_accounting.contracts import PeriodStatus
+    from dotmac_accounting.models import FiscalPeriod
     from dotmac_payables.contracts import InvoiceStatus
     from dotmac_payables.models import (
         AccountingReceipt,
@@ -188,6 +190,21 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
     )
     if any(line.dimension_refs for line in lines):
         return "dimensions_unsupported"
+    # Payables a5 posts at posting_date = invoice_date (never changed here), so the invoice date
+    # must fall in the FIRST open accounting period: an older open period would be back-posted,
+    # and a later one would skip the earliest open month.
+    first_open = session.scalar(
+        sa.select(FiscalPeriod)
+        .where(
+            FiscalPeriod.tenant_id == tenant,
+            FiscalPeriod.status == PeriodStatus.OPEN,
+            FiscalPeriod.is_adjustment.is_(False),
+        )
+        .order_by(FiscalPeriod.start_date)
+        .limit(1)
+    )
+    if first_open is None or not first_open.start_date <= invoice.invoice_date <= first_open.end_date:
+        return "posting_date_not_first_open_period"
     refs = [invoice.liability_account_ref]
     for line in lines:
         refs.append(line.posting_account_ref)
