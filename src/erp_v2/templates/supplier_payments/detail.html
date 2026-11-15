@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Supplier payment {{ payment.number }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Supplier payment {{ payment.number }}</h1>
+<p><a href="{{ back }}">Back</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% set status = payment.status.value %}
+<dl>
+  <dt>Status</dt><dd>{{ status }}</dd>
+  <dt>Supplier</dt><dd>{{ payment.supplier_name_snapshot }} ({{ payment.supplier_ref }})</dd>
+  <dt>Value date</dt><dd>{{ payment.value_date }}</dd>
+  <dt>Gross / withheld / net</dt><dd>{{ payment.currency_code }} {{ payment.gross_amount }} / {{ payment.wht_amount }} / {{ payment.net_amount }}</dd>
+  <dt>Paying bank account</dt><dd>{% if bank %}{{ bank.account_code }} — {{ bank.account_name }}{% else %}unknown{% endif %}</dd>
+  <dt>Cash ledger account</dt><dd>{{ payment.cash_account_ref }}</dd>
+  <dt>Payee bank instruction</dt><dd>{% if payee_instruction %}approved: {{ payee_instruction.bank_name or payee_instruction.bank_code }} {{ payee_instruction.account_masked }}{% else %}none approved{% endif %}</dd>
+  <dt>Prepared by</dt><dd>{{ names.get(payment.prepared_by, payment.prepared_by) }} at {{ payment.prepared_at }}</dd>
+  {% if payment.approved_by %}<dt>Approved by</dt><dd>{{ names.get(payment.approved_by, payment.approved_by) }} at {{ payment.approved_at }}</dd>{% endif %}
+  {% if payment.recorded_by %}<dt>Recorded as paid by</dt><dd>{{ names.get(payment.recorded_by, payment.recorded_by) }} at {{ payment.recorded_at }}; bank reference {{ payment.bank_reference }}</dd>{% endif %}
+  {% if payment.cancelled_by %}<dt>Cancelled by</dt><dd>{{ names.get(payment.cancelled_by, payment.cancelled_by) }}: {{ payment.cancel_reason }}</dd>{% endif %}
+  {% if payment.reversed_by %}<dt>Reversed by</dt><dd>{{ names.get(payment.reversed_by, payment.reversed_by) }} for {{ payment.reversal_date }}: {{ payment.reversal_reason }}</dd>{% endif %}
+  {% if receipts.get('supplier_payment') %}<dt>Ledger journal</dt><dd>{{ receipts['supplier_payment'].accounting_reference }}</dd>{% endif %}
+  {% if receipts.get('supplier_payment_reversal') %}<dt>Reversal journal</dt><dd>{{ receipts['supplier_payment_reversal'].accounting_reference }}</dd>{% endif %}
+</dl>
+<h2>Allocations</h2>
+<table><thead><tr><th>Invoice</th><th>Due</th><th>Obligation outstanding</th><th>Paid by this payment</th></tr></thead><tbody>
+{% for a, o, i in lines %}<tr><td>{{ i.number }}</td><td>{{ o.due_date }}</td><td>{{ o.outstanding_amount }}</td><td>{{ a.amount }}</td></tr>{% endfor %}
+</tbody></table>
+{% if file_receipts %}
+<h2>Bank files generated</h2>
+<ul>{% for f in file_receipts %}<li>{{ f.generated_at }}: {{ f.file_format }}, {{ f.row_count }} row(s), sha256 {{ f.file_sha256 }}</li>{% endfor %}</ul>
+{% endif %}
+
+{% if mode == 'approve' %}
+  {% if status == 'DRAFT' %}
+  <form method="post" action="{{ bases.approve }}/{{ payment.id }}/approve">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Approve payment (not the preparer)</button>
+  </form>
+  {% endif %}
+  {% if status in ('DRAFT', 'APPROVED') %}
+  <form method="post" action="{{ bases.approve }}/{{ payment.id }}/cancel">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Reason <input name="reason" maxlength="2000" required></label></p>
+    <button type="submit">Cancel payment</button>
+  </form>
+  {% endif %}
+{% elif mode == 'treasury' %}
+  {% if status == 'APPROVED' %}
+  <form method="post" action="{{ bases.treasury }}/{{ payment.id }}/record">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Bank evidence reference <input name="bank_reference" maxlength="255" required></label><br>Recording asserts that the money left through the bank portal under this reference. It settles the invoices and posts to the ledger (not the preparer or approver).</p>
+    <button type="submit">Record as paid</button>
+  </form>
+  {% endif %}
+{% elif mode == 'reverse' %}
+  {% if status == 'RECORDED' %}
+  <form method="post" action="{{ bases.reverse }}/{{ payment.id }}/reverse">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Reversal date <input type="date" name="reversal_date" value="{{ reversal_default }}" required></label></p>
+    <p><label>Reason <input name="reason" maxlength="2000" required></label></p>
+    <p>Re-opens the invoices this payment settled and posts the mirror entry. For a payment that did not clear; not the recorder, approver or preparer. Any withholding certificate already issued needs a Finance note.</p>
+    <button type="submit">Reverse payment</button>
+  </form>
+  {% endif %}
+{% endif %}
+{% endblock %}

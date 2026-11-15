@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+{% if new_link %}<p><a href="{{ new_link }}">Prepare a supplier payment</a></p>{% endif %}
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if bank_file_action %}
+<form method="post" action="{{ bank_file_action }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{% endif %}
+<table>
+  <thead><tr>{% if bank_file_enabled %}<th>File</th>{% endif %}<th>Number</th><th>Supplier</th><th>Value date</th><th>Gross</th><th>Status</th></tr></thead>
+  <tbody>
+  {% for p in rows %}
+    <tr>
+      {% if bank_file_enabled %}<td>{% if p.status.value == 'APPROVED' %}<input type="checkbox" name="payment_id" value="{{ p.id }}" aria-label="Include {{ p.number }} in the bank file">{% endif %}</td>{% endif %}
+      <td><a href="{{ detail_base }}/{{ p.id }}">{{ p.number }}</a></td>
+      <td>{{ p.supplier_name_snapshot }}</td>
+      <td>{{ p.value_date }}</td>
+      <td>{{ p.currency_code }} {{ p.gross_amount }}</td>
+      <td>{{ p.status.value }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="{{ 6 if bank_file_enabled else 5 }}">None.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if bank_file_action %}
+  {% if bank_file_enabled %}<p><button type="submit">Generate bank upload file for the selected payments</button> The file is built for download only; the ERP never sends it to a bank.</p>{% endif %}
+</form>
+{% endif %}
+{% endblock %}
