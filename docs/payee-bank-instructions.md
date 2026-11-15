@@ -67,8 +67,7 @@ under its own `disbursement_files.generate` permission, not through the UI.
   DELETE/TRUNCATE denied, other tenant sees nothing). Run 'g' must read back
   `has_column_privilege`/`has_table_privilege` for the real runtime role.
 - L1: reveal commits the audit row before rendering the number.
-- L5: the importer's deterministic row id collides if a legacy row was rejected and the importer
-  is rerun on the same destination (fresh destinations only today).
+- L5: resolved: the mint skips any payee that already has a row (any status).
 
 ## Account number handling
 
@@ -96,6 +95,9 @@ account_number).
   `proposed`/`legacy_import` and are never active. Finance corrects them through the normal
   two-person path: a human proposal replaces the open legacy row (R5) and a different person
   approves.
+- `approve` refuses any row with no proposer (`no_proposer`): imported rows are migrated, never
+  approved by one person. Mint `details` also report `supplier_unresolved` (migrated suppliers with no
+  payables invoice yet). A rerun never re-mints a payee that has any row, whatever its status.
 - Every change after migration is two-person: the migration actor is a recorded decider only, not
   a role anyone can use afterwards. No bulk path.
 - Employees only if their destination `mod_people.employees` row was imported (blocker by id).

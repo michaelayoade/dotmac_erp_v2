@@ -29,7 +29,7 @@ def _no_registry_leak(monkeypatch):
 
 def _conn(ddl):
     conn = sa.create_engine("sqlite://").connect()
-    for schema in ("public", "mod_people"):
+    for schema in ("public", "mod_people", "mod_payables"):
         conn.execute(sa.text(f"ATTACH DATABASE ':memory:' AS {schema}"))
     for statement in ddl:
         conn.execute(sa.text(statement))
@@ -92,6 +92,7 @@ def _dest(imported=(EMP1,)):
     conn = _conn(
         [
             "CREATE TABLE mod_people.employees (id TEXT, tenant_id TEXT)",
+            "CREATE TABLE mod_payables.supplier_invoices (tenant_id TEXT, supplier_ref TEXT)",
             "CREATE TABLE public.payee_bank_instructions (id TEXT, tenant_id TEXT, payee_kind TEXT, payee_ref TEXT, "
             "payee_label TEXT, bank_code TEXT, bank_name TEXT, account_number TEXT, account_last4 TEXT, "
             "account_name TEXT, status TEXT, origin TEXT, evidence_ref TEXT, proposed_by_party_id TEXT, "
@@ -126,7 +127,7 @@ def test_complete_rows_migrate_as_approved_and_incomplete_rows_stay_proposed():
     src, dst = _source(), _dest()
     result = run_mint_step("payee_bank_instructions", src, dst, CTX)
     assert result.refused is None and result.created == 2 and result.existing == 0
-    assert result.details == {"approved": 1, "proposed_incomplete": 1}
+    assert result.details == {"approved": 1, "proposed_incomplete": 1, "supplier_unresolved": 1}
     rows = _rows(dst)
     assert set(rows) == {("employee", EMP1), ("supplier", SUP1)}
     employee, supplier = rows[("employee", EMP1)], rows[("supplier", SUP1)]
@@ -208,3 +209,21 @@ def test_over_long_legacy_field_is_a_blocker_by_id_only():
     result = run_mint_step("payee_bank_instructions", src, dst, CTX)
     assert ("employee", EMP1) not in _rows(dst)
     assert any(EMP1 in b and "over-long" in b for b in result.blockers)
+
+
+def test_supplier_known_to_payables_is_not_counted_unresolved():
+    src, dst = _source(), _dest()
+    _insert(dst, "mod_payables.supplier_invoices", ("tenant_id", "supplier_ref"), [(TENANT, SUP1)])
+    result = run_mint_step("payee_bank_instructions", src, dst, CTX)
+    assert result.details["supplier_unresolved"] == 0
+
+
+def test_rerun_after_revoke_reject_or_supersede_never_remints():
+    src, dst = _source(), _dest()
+    run_mint_step("payee_bank_instructions", src, dst, CTX)
+    for status in ("revoked", "rejected", "superseded"):
+        dst.execute(sa.text("UPDATE public.payee_bank_instructions SET status = :s"), {"s": status})
+        again = run_mint_step("payee_bank_instructions", src, dst, CTX)
+        assert again.refused is None and (again.created, again.existing) == (0, 2)
+        assert {r["status"] for r in _rows(dst).values()} == {status}
+    assert len(_audit_events(dst)) == 1

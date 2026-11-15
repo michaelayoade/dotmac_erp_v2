@@ -4,12 +4,15 @@ Lifecycle: proposed -> approved -> superseded | revoked, and proposed -> rejecte
 
 - propose: a named person records a new instruction with mandatory evidence.
 - approve: a DIFFERENT person approves. Proposer == approver is refused here and by a DB
-  CHECK. Roles are enforced one layer up (permissions + role SoD pairs): treasury can
-  never hold the approve permission. Approving supersedes the payee's previous approved
+  CHECK, and a row with no proposer is never approvable (``no_proposer``).
+  Roles are enforced one layer up (permissions + role SoD pairs): treasury can never hold the
+  approve permission. Approving supersedes the payee's previous approved
   instruction in the same transaction, so there is never more than one active destination.
 - reject / revoke: finance_approver-only fail-safe actions; both need a reason.
-- Legacy imports arrive as ``proposed`` with no proposer (origin ``legacy_import``) and
-  are approved one at a time like any other proposal. There is no bulk command.
+- Legacy bank details are MIGRATED by the importer (register v1294): complete rows land
+  ``approved`` (declared migration actor, audited), incomplete rows land ``proposed`` with no
+  proposer and can never be approved as imported; Finance replaces them with a human proposal
+  that a different person approves. There is no bulk command and no one-person path.
 
 Account numbers are PII: nothing here logs, audits or raises with one. Views expose only
 a masked form; ``reveal_account_number`` and ``destination_for_payment`` are the only
@@ -351,7 +354,11 @@ def approve(
     row = _locked(db, tenant_id, instruction_id)
     if row.status != InstructionStatus.PROPOSED.value:
         raise PayeeBankError("wrong_state", f"only a proposed instruction can be approved (is {row.status})")
-    if row.proposed_by_party_id is not None and row.proposed_by_party_id == approver_party_id:
+    if row.proposed_by_party_id is None:
+        # A proposal with no proposer (an imported row) has no first person: approving it would be
+        # one-person activation. Migrated rows are approved by the importer, not by approve().
+        raise PayeeBankError("no_proposer", "an instruction with no proposer cannot be approved; propose it")
+    if row.proposed_by_party_id == approver_party_id:
         raise PayeeBankError("same_person", "the proposer cannot approve their own proposal")
     if resolve_payee(db, tenant_id, row.payee_kind, row.payee_ref) is None:
         raise PayeeBankError("unknown_payee", "payee is not a known supplier or employee in this tenant")

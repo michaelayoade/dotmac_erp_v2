@@ -855,7 +855,8 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
     - Employees whose destination row was not imported are not minted (blocker by id).
     - Rows with no full account number (empty, or supplier last-4 only) mint nothing.
     - Blockers, details and receipts name legacy ids and counts only, never numbers or names.
-    - A payee that already has a proposed or approved instruction is counted ``existing``.
+    - A payee that already has ANY instruction row (any status, so a rerun after reject, revoke or
+      supersede never re-mints) is counted ``existing``.
     """
 
     result = MintResult("payee_bank_instructions")
@@ -873,10 +874,14 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
     live = {
         (str(kind), str(ref))
         for kind, ref in dest.execute(
-            sa.text(
-                "SELECT payee_kind, payee_ref FROM payee_bank_instructions "
-                "WHERE tenant_id = :t AND status IN ('proposed', 'approved')"
-            ),
+            sa.text("SELECT payee_kind, payee_ref FROM payee_bank_instructions WHERE tenant_id = :t"),
+            {"t": ctx.tenant_id},
+        )
+    }
+    known_suppliers = {
+        str(r[0])
+        for r in dest.execute(
+            sa.text("SELECT DISTINCT supplier_ref FROM mod_payables.supplier_invoices WHERE tenant_id = :t"),
             {"t": ctx.tenant_id},
         )
     }
@@ -984,7 +989,15 @@ def mint_payee_bank_instructions(source: sa.Connection, dest: sa.Connection, ctx
         except (ValueError, TypeError) as exc:  # fail closed: no approved row without its audit event
             raise MintRefusal(f"migration audit could not be written ({type(exc).__name__})") from exc
     result.created = len(candidates)
-    result.details = {"approved": len(approved), "proposed_incomplete": len(candidates) - len(approved)}
+    result.details = {
+        "approved": len(approved),
+        "proposed_incomplete": len(candidates) - len(approved),
+        # Migrated suppliers with no payables invoice: they cannot receive a new proposal (resolver)
+        # until the supplier appears in the payables supplier set.
+        "supplier_unresolved": sum(
+            1 for c in candidates if c["payee_kind"] == "supplier" and c["payee_ref"] not in known_suppliers
+        ),
+    }
     return result
 
 

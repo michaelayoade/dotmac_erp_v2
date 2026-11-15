@@ -246,11 +246,12 @@ def test_imported_rows_need_individual_approval_and_incomplete_ones_cannot_be_ap
     incomplete = _imported(db, tenant, bank_code=None)
     with pytest.raises(PayeeBankError) as err:
         service.approve(db, tenant_id=tenant, instruction_id=incomplete.id, approver_party_id=APPROVER)
-    assert err.value.code == "incomplete_instruction" and "bank_code" in str(err.value)
-    assert NUMBER not in str(err.value) and incomplete.status == "proposed"
+    assert err.value.code == "no_proposer" and NUMBER not in str(err.value) and incomplete.status == "proposed"
+    assert service.missing_for_approval(incomplete) == ["bank_code"]
     complete = _imported(db, tenant, bank_code="058", ref="emp-2")
-    service.approve(db, tenant_id=tenant, instruction_id=complete.id, approver_party_id=APPROVER, note="letter L-9")
-    assert complete.status == "approved"
+    with pytest.raises(PayeeBankError) as err2:
+        service.approve(db, tenant_id=tenant, instruction_id=complete.id, approver_party_id=APPROVER)
+    assert err2.value.code == "no_proposer" and complete.status == "proposed"
 
 
 def test_unmasked_read_is_audited_needs_reason_and_logs_no_number(env):
@@ -315,14 +316,16 @@ def test_approve_refuses_a_payee_that_is_no_longer_known(env, monkeypatch):
     assert err.value.code == "unknown_payee" and row.status == "proposed"
 
 
-def test_a_legacy_proposed_row_needs_no_verification_note_but_still_a_different_person(env):
-    # Michael (register v1294): legacy data is migrated, not re-verified. Only incomplete rows stay
-    # proposed; this complete one (not produced by the importer) approves like any proposal.
+def test_a_row_with_no_proposer_can_never_be_approved_by_one_person(env):
+    # RR1: even a COMPLETE proposed row with no proposer (imported rows are migrated as approved by the
+    # importer, never approved through approve()) is refused: there would be no first person.
     db, tenant = env
     row = _imported(db, tenant, bank_code="058", ref="emp-1")
-    service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
-    assert row.status == "approved"
-    assert event(db, service.AUDIT_APPROVED).details["origin"] == "legacy_import"
+    with pytest.raises(PayeeBankError) as err:
+        service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
+    assert err.value.code == "no_proposer"
+    assert row.status == "proposed" and row.approved_at is None and row.decided_by_party_id is None
+    assert not [e for e in audit_rows(db) if e.action == service.AUDIT_APPROVED]
 
 
 def test_changing_a_migrated_approved_row_is_two_person(env):
