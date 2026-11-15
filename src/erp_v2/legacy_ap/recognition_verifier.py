@@ -50,12 +50,45 @@ from erp_v2.importer.payables_history import (
     _require,
     _tenant,
 )
-from erp_v2.importer.payables_reconciliation import _sum
+from erp_v2.importer.payables_reconciliation import _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
 
 SOURCE_OWNER = "legacy-erp"
 FACTS_DOMAIN = "erp.payables.recognition-facts.v1"
 NOT_POSTED_STATUS = "APPROVED"
+
+
+def _hex_in(column, values) -> sa.ColumnElement:
+    return sa.func.replace(sa.cast(column, sa.Text), "-", "").in_([UUID(str(v)).hex for v in values])
+
+
+def _linked_rows(src: sa.Connection, name: str, schema: str, conditions: dict[str, list]) -> int:
+    """Rows of a legacy table matching ANY id in ``conditions`` (column -> ids); fail closed if absent."""
+    try:
+        table = _reflect(src, name, schema if src.dialect.name == "postgresql" else None)
+    except (sa.exc.NoSuchTableError, ValueError) as exc:
+        raise HistoricalEvidenceError(f"source_table_missing:{name}") from exc
+    clauses = []
+    for column, values in conditions.items():
+        if column not in table.c:
+            raise HistoricalEvidenceError(f"source_column_missing:{name}.{column}")
+        if values:
+            clauses.append(_hex_in(table.c[column], values))
+    if not clauses:
+        return 0
+    return src.execute(sa.select(sa.func.count()).select_from(table).where(sa.or_(*clauses))).scalar_one()
+
+
+def _items(src: sa.Connection, invoice_id: UUID) -> int:
+    """Invoice lines carrying an inventory item (legacy ``item_id``)."""
+    table = _reflect(src, "supplier_invoice_line", "ap" if src.dialect.name == "postgresql" else None)
+    if "item_id" not in table.c or "invoice_id" not in table.c:
+        raise HistoricalEvidenceError("source_column_missing:supplier_invoice_line.item_id")
+    return src.execute(
+        sa.select(sa.func.count())
+        .select_from(table)
+        .where(_hex_in(table.c.invoice_id, [invoice_id]), table.c.item_id.is_not(None))
+    ).scalar_one()
 
 
 @dataclass(frozen=True)
@@ -178,6 +211,28 @@ class ApprovedInvoiceVerifier:
         lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
         targets = _read(dest, "supplier_invoice_lines", schema="mod_payables", key="invoice_id", value=invoice_id)
         _tenant(targets, tenant, "invoice_line")
+        # Goods-receipt, purchase-order, stock and inventory links change the accounting (GRNI,
+        # inventory valuation) and are not supported: refuse rather than post the plain consequence.
+        _require(
+            target["procurement_ref"] is None and target["receipt_evidence_fingerprint"] is None,
+            "destination_procurement_ref",
+        )
+        _require(
+            all(row["po_line_id"] is None and row["goods_receipt_line_id"] is None for row in lines),
+            "source_procurement_link",
+        )
+        line_ids = [row["line_id"] for row in lines]
+        _require(_items(src, invoice_id) == 0, "source_item_link")
+        _require(
+            _linked_rows(
+                src,
+                "inventory_transaction",
+                "inv",
+                {"source_document_id": [invoice_id], "source_document_line_id": line_ids},
+            )
+            == 0,
+            "source_inventory_transaction",
+        )
         line_mapping = {k: k for k in ("invoice_id", "line_number", "description", "line_amount", "tax_amount")}
         line_mapping["posting_account_ref"] = "expense_account_id"
         for original, imported in _pair(lines, targets, "line_id", "invoice_line"):

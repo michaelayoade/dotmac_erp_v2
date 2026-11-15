@@ -26,7 +26,7 @@ from dotmac_payables.models import (
     SupplierInvoiceLine,
 )
 from sqlalchemy.orm import Session
-from test_b1_supplier_invoice_post_pg import NOW, invoice, world
+from test_b1_supplier_invoice_post_pg import NOW, invoice, submit, world
 from test_posting_bridge_pg import soft_close
 
 from erp_v2.importer.payables_history import READ_FIELDS
@@ -41,10 +41,11 @@ STAMP = "2025-01-01T00:00:00+00:00"
 MODELS = (InvoiceRecognition, LiabilityEvent, PaymentObligation, AccountingReceipt, JournalEntry)
 SOURCE_TABLES = {
     "supplier_invoice": READ_FIELDS["supplier_invoice"],
-    "supplier_invoice_line": READ_FIELDS["supplier_invoice_line"],
+    "supplier_invoice_line": [*READ_FIELDS["supplier_invoice_line"], "item_id"],
     "payment_allocation": READ_FIELDS["payment_allocation"],
     "journal_entry": READ_FIELDS["journal_entry"],
     "posted_ledger_line": READ_FIELDS["posted_ledger_line"],
+    "inventory_transaction": ["source_document_type", "source_document_id", "source_document_line_id"],
 }
 BOOLEANS = {"is_prepayment", "is_reversal"}
 INTEGERS = {"line_number"}
@@ -80,9 +81,14 @@ def counts(engine, tenant_id) -> dict[str, int]:
         }
 
 
-def imported(engine, env, *, number="AP-1", status_value="APPROVED", approved_by=None, **kw):
+def imported(engine, env, *, number="AP-1", status_value="APPROVED", approved_by=None, draft_values=None, **kw):
     """An imported-style invoice: APPROVED by direct update, no event/obligation/receipt/journal."""
-    iid = invoice(engine, env, number=number, submit=True, **kw)
+    iid = invoice(engine, env, number=number, submit=False, **kw)
+    if draft_values:  # submitted documents are immutable (DB trigger), so draft-only fields go first
+        with Session(engine) as db:
+            db.execute(sa.update(SupplierInvoice).where(SupplierInvoice.id == iid).values(**draft_values))
+            db.commit()
+    submit(engine, env, iid)
     with Session(engine) as db:
         db.execute(
             sa.update(SupplierInvoice)
@@ -103,6 +109,8 @@ class Legacy:
         self.overrides: dict[UUID, dict] = {}
         self.ledger: list[dict] = []
         self.allocations: list[dict] = []
+        self.inventory: list[dict] = []
+        self.line_overrides: dict[UUID, dict] = {}
         with db_engine.connect() as dest:
             self.destination_name = dest.scalar(sa.text("SELECT current_database()"))
 
@@ -155,7 +163,7 @@ class Legacy:
                 header.update(self.overrides.get(iid, {}))
                 headers.append(header)
                 for line in db.scalars(sa.select(SupplierInvoiceLine).where(SupplierInvoiceLine.invoice_id == iid)):
-                    row = dict.fromkeys(READ_FIELDS["supplier_invoice_line"])
+                    row = dict.fromkeys(READ_FIELDS["supplier_invoice_line"]) | {"item_id": None}
                     row.update(
                         line_id=str(line.id),
                         invoice_id=str(iid),
@@ -168,12 +176,14 @@ class Legacy:
                         expense_account_id=line.posting_account_ref,
                         created_at=STAMP,
                     )
+                    row.update(self.line_overrides.get(iid, {}))
                     lines.append(row)
             for name, rows in (
                 ("supplier_invoice", headers),
                 ("supplier_invoice_line", lines),
                 ("payment_allocation", self.allocations),
                 ("posted_ledger_line", self.ledger),
+                ("inventory_transaction", self.inventory),
             ):
                 if rows:
                     conn.execute(tables[name].insert(), rows)
@@ -567,3 +577,44 @@ def test_apply_writes_one_audit_event_per_approval(engine, setup):
     assert sorted(e.entity_id for e in events) == sorted(str(i) for i in ids)
     assert all(e.is_success and e.actor_id == str(env.party_ids[1]) for e in events)
     assert all(e.details["list_sha256"] == LIST_SHA and e.details["journal_id"] for e in events)
+
+
+@pytest.mark.parametrize(
+    "line,reason",
+    [
+        (dict(po_line_id="00000000-0000-0000-0000-0000000000a1"), "source_procurement_link"),
+        (dict(goods_receipt_line_id="00000000-0000-0000-0000-0000000000a2"), "source_procurement_link"),
+        (dict(item_id="00000000-0000-0000-0000-0000000000a3"), "source_item_link"),
+    ],
+)
+def test_goods_receipt_po_and_item_links_are_refused(engine, setup, line, reason):
+    env, legacy = setup
+    iid = imported(engine, env)
+    legacy.line_overrides[iid] = line
+    legacy.build((iid,))
+    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {f"legacy_evidence:{reason}": 1}
+
+
+def test_procurement_ref_on_the_destination_header_is_refused(engine, setup):
+    env, legacy = setup
+    iid = imported(engine, env, draft_values=dict(procurement_ref="PO-1"))
+    legacy.build((iid,))
+    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {
+        "legacy_evidence:destination_procurement_ref": 1
+    }
+
+
+def test_legacy_inventory_transaction_citing_the_invoice_or_its_line_is_refused(engine, setup):
+    env, legacy = setup
+    by_invoice, by_line, clean = (imported(engine, env, number=n) for n in ("AP-1", "AP-2", "AP-3"))
+    with Session(engine) as db:
+        line_id = db.scalar(sa.select(SupplierInvoiceLine.id).where(SupplierInvoiceLine.invoice_id == by_line))
+    legacy.inventory += [
+        dict(source_document_type="SUPPLIER_INVOICE", source_document_id=str(by_invoice), source_document_line_id=None),
+        dict(source_document_type="OTHER", source_document_id=None, source_document_line_id=str(line_id)),
+    ]
+    ids = tuple(sorted([by_invoice, by_line, clean], key=str))
+    legacy.build(ids)
+    plan = legacy.run(engine, ids, apply=False)
+    assert plan["refusals_by_reason"] == {"legacy_evidence:source_inventory_transaction": 2}
+    assert plan["counts"]["eligible"] == 1
