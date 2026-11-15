@@ -1087,7 +1087,54 @@ def test_bank_reference_is_normalised_before_the_uniqueness_check(engine):
     assert out.accounting_reference
     second = approved_payment(engine, env, open_obligation(engine, env, number="AP-2"))
     before = counts(engine, env)
-    refused(lambda: record(engine, env, second, "DUP ref-1"), "payables_refused")  # non-breaking space collapses too
+    refused(
+        lambda: record(engine, env, second, "DUP\u00a0ref-1"), "payables_refused"
+    )  # non-breaking space collapses too
     refused(lambda: record(engine, env, second, "dup ref-1"), "payables_refused")
     assert counts(engine, env) == before
     assert payment(engine, second).status == SupplierPaymentStatus.APPROVED
+
+
+def _run_downgrade(engine, *, with_receipt: bool):
+    from alembic.operations import Operations
+    from alembic.runtime.migration import MigrationContext
+
+    from erp_v2.migrations.versions import e2_0018_disbursement_receipts as migration
+
+    env = world(engine)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            if with_receipt:
+                connection.execute(
+                    sa.insert(DisbursementFileReceipt.__table__).values(
+                        id=uuid4(),
+                        tenant_id=env.tenant_id,
+                        document_kind="supplier_payment",
+                        document_id=uuid4(),
+                        payee_instruction_id=uuid4(),
+                        file_format="generic-csv-v1",
+                        file_sha256="c" * 64,
+                        row_count=1,
+                        generated_by_party_id=env.people["recorder"],
+                        generated_at=NOW,
+                    )
+                )
+            if not with_receipt:  # inside the rolled-back transaction: earlier tests' receipts do not matter
+                connection.execute(sa.text("DELETE FROM erp_disbursement_file_receipts"))
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.downgrade()
+            return connection.execute(sa.text("SELECT to_regclass('public.erp_disbursement_file_receipts')")).scalar()
+        finally:
+            transaction.rollback()  # DDL is transactional: the shared test schema is untouched
+
+
+def test_downgrade_refuses_when_receipts_exist(engine):
+    with pytest.raises(RuntimeError, match="receipts exist"):
+        _run_downgrade(engine, with_receipt=True)
+    with engine.connect() as c:
+        assert c.scalar(sa.text("SELECT to_regclass('public.erp_disbursement_file_receipts')")) is not None
+
+
+def test_downgrade_drops_an_empty_table(engine):
+    assert _run_downgrade(engine, with_receipt=False) is None

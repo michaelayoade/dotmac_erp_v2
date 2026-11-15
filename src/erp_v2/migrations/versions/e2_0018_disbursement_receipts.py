@@ -59,4 +59,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Receipts are the only record that a bank file was issued for a document: never drop them.
+    if op.get_bind().execute(sa.text("SELECT EXISTS (SELECT 1 FROM public.erp_disbursement_file_receipts)")).scalar():
+        raise RuntimeError("refusing to drop erp_disbursement_file_receipts: bank file receipts exist")
     op.drop_table(_TABLE)
