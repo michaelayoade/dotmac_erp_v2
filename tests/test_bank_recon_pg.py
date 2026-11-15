@@ -243,7 +243,7 @@ def bank_line(engine, env, statement_id, number, day, direction, amount) -> UUID
 _counter = {"n": 0}
 
 
-def post(engine, env, *, debit_code, credit_code, amount, day, description="Test", reference=None):
+def post(engine, env, *, debit_code, credit_code, amount, day, description="Test", reference=None, posted_at=NOW):
     """Post a real journal; return (journal id, ledger line id of the cash GL line, other ledger line)."""
     _counter["n"] += 1
     n = _counter["n"]
@@ -279,7 +279,7 @@ def post(engine, env, *, debit_code, credit_code, amount, day, description="Test
             posted_by="test",
             idempotency_key=f"test-post:{uuid4()}",
             idempotency_expires_at=None,
-            posted_at=NOW,
+            posted_at=posted_at,
         )
         db.commit()
         cash = db.scalar(
@@ -1715,3 +1715,141 @@ def test_unrecorded_charge_in_a_closed_period_needs_a_linked_manual_journal_in_t
     with Session(engine) as db:
         page = recon_queries.workspace(db, tenant_id=env.tenant_id, reconciliation_id=recon.id)
         assert any(i.journal_id == feb_journal for i in page["items"])
+
+
+# --- RR1: pre-baseline-dated lines posted after the baseline approval -----------------------------
+
+
+def test_a_back_dated_posting_after_the_baseline_stays_reconcilable(engine):
+    env = baseline_env(engine)
+    base = open_baseline(engine, env)
+    run(
+        engine,
+        svc.add_items,
+        tenant_id=env.tenant_id,
+        actor=env.parties["opener"],
+        reconciliation_id=base.id,
+        requests=[cheque_item(env)],
+    )
+    run(engine, svc.prepare, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=base.id)
+    run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties["approver"], reconciliation_id=base.id)
+    # a held legacy / back-dated journal: dated 5 days before the baseline date, posted after the approval
+    _, late = post(
+        engine,
+        env,
+        debit_code="1000",
+        credit_code="4000",
+        amount="25",
+        day=date(2026, 1, 26),
+        posted_at=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    feb = statement(engine, env, closing="125.00", start=date(2026, 2, 1), end=date(2026, 2, 28), ref="FEB")
+    credit = bank_line(engine, env, feb, 1, date(2026, 2, 3), "credit", "25.00")
+    recon = run(
+        engine,
+        svc.open_reconciliation,
+        tenant_id=env.tenant_id,
+        actor=env.parties["opener"],
+        account_id=env.bank_id,
+        statement_id=feb,
+    )
+    with Session(engine) as db:
+        row_ = db.get(m.BankReconciliation, recon.id)
+        assert late in {r[0] for r in svc.uncleared_gl_lines(db, env.tenant_id, row_)}  # visible, not stranded
+    # before the match the books and bank cannot tie; the back-dated line can be matched like any other
+    with pytest.raises(ReconRefused):
+        run(engine, svc.prepare, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=recon.id)
+    do_match(engine, env, [credit], [late])
+    run(
+        engine,
+        svc.add_items,
+        tenant_id=env.tenant_id,
+        actor=env.parties["opener"],
+        reconciliation_id=recon.id,
+        requests=[cheque_item(env)],
+    )
+    run(engine, svc.prepare, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=recon.id)
+    done = run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties["approver2"], reconciliation_id=recon.id)
+    assert done.status == m.STATUS_APPROVED and done.difference == 0
+    # the same line without a bank partner is itemizable instead (timing), so it never blocks the account
+    other = baseline_env(engine)
+    b2 = open_baseline(engine, other)
+    run(
+        engine,
+        svc.add_items,
+        tenant_id=other.tenant_id,
+        actor=other.parties["opener"],
+        reconciliation_id=b2.id,
+        requests=[cheque_item(other)],
+    )
+    run(engine, svc.prepare, tenant_id=other.tenant_id, actor=other.parties["preparer"], reconciliation_id=b2.id)
+    run(engine, svc.approve, tenant_id=other.tenant_id, actor=other.parties["approver"], reconciliation_id=b2.id)
+    _, late2 = post(
+        engine,
+        other,
+        debit_code="1000",
+        credit_code="4000",
+        amount="25",
+        day=date(2026, 1, 26),
+        posted_at=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    feb2 = statement(engine, other, closing="100.00", start=date(2026, 2, 1), end=date(2026, 2, 28), ref="FEB")
+    r2 = run(
+        engine,
+        svc.open_reconciliation,
+        tenant_id=other.tenant_id,
+        actor=other.parties["opener"],
+        account_id=other.bank_id,
+        statement_id=feb2,
+    )
+    run(
+        engine,
+        svc.add_items,
+        tenant_id=other.tenant_id,
+        actor=other.parties["opener"],
+        reconciliation_id=r2.id,
+        requests=[cheque_item(other), ItemRequest(m.SIDE_GL, late2, m.ITEM_DEPOSIT_IN_TRANSIT, "not yet banked")],
+    )
+    run(engine, svc.prepare, tenant_id=other.tenant_id, actor=other.parties["preparer"], reconciliation_id=r2.id)
+
+
+def test_a_linked_journal_serves_one_item_only_and_the_shared_gl_check_repeats_at_prepare(engine):
+    env = scenario(engine)
+    c1 = bank_line(engine, env, env.statement, 3, date(2026, 1, 29), "debit", "10.00")
+    c2 = bank_line(engine, env, env.statement, 4, date(2026, 1, 30), "debit", "10.00")
+    recon = open_recon(engine, env)
+    soft_close(engine, env, "P1")
+    j = manual_journal(engine, env, amount="10", day=date(2026, 2, 10))
+    add = dict(tenant_id=env.tenant_id, actor=env.parties["opener"], reconciliation_id=recon.id)
+    with pytest.raises(ReconRefused) as exc:  # one request, one journal, two items
+        run(
+            engine,
+            svc.add_items,
+            requests=[
+                ItemRequest(m.SIDE_BANK, c1, m.ITEM_UNRECORDED_BANK_CHARGE, "a", j),
+                ItemRequest(m.SIDE_BANK, c2, m.ITEM_UNRECORDED_BANK_CHARGE, "b", j),
+            ],
+            **add,
+        )
+    assert exc.value.code == "journal_link_invalid"
+    run(engine, svc.add_items, requests=[ItemRequest(m.SIDE_BANK, c1, m.ITEM_UNRECORDED_BANK_CHARGE, "a", j)], **add)
+    with pytest.raises(ReconRefused) as exc:  # a later request cannot reuse it either
+        run(
+            engine, svc.add_items, requests=[ItemRequest(m.SIDE_BANK, c2, m.ITEM_UNRECORDED_BANK_CHARGE, "b", j)], **add
+        )
+    assert exc.value.code == "journal_link_invalid"
+    # a bank account re-pointed onto a shared cash GL after open is refused at prepare
+    with Session(engine) as db:
+        db.execute(
+            sa.text(
+                "INSERT INTO mod_banking.bank_accounts (id, tenant_id, institution_id, account_code, account_name, "
+                "account_identifier, account_type_code, currency_code, minor_units, cash_account_ref, status, "
+                "created_at, updated_at) VALUES (:id, :t, :i, 'OP9', 'Twin', 'id-9', 'current', 'NGN', 2, :ref, "
+                "'active', now(), now())"
+            ),
+            {"id": uuid4(), "t": env.tenant_id, "i": env.institution_id, "ref": str(env.accounts["1000"])},
+        )
+        db.commit()
+    with pytest.raises(ReconRefused) as exc:
+        run(engine, svc.prepare, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=recon.id)
+    assert exc.value.code == "shared_cash_gl"

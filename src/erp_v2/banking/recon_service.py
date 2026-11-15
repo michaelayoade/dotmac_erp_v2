@@ -237,6 +237,7 @@ class Base:
     date: date
     carried: frozenset[UUID]
     reconciliation_id: UUID
+    approved_at: datetime
 
 
 def approved_baseline(db: Session, tenant_id: UUID, account_id: UUID) -> Base | None:
@@ -260,7 +261,7 @@ def approved_baseline(db: Session, tenant_id: UUID, account_id: UUID) -> Base | 
             )
         )
     )
-    return Base(row.period_end, carried, row.id)
+    return Base(row.period_end, carried, row.id, row.approved_at)
 
 
 def _require_base(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Base:
@@ -289,7 +290,11 @@ def _gl_scope(tenant_id: UUID, recon: BankReconciliation, base: Base | None):
     )
     if base is not None:
         after = PostedLedgerLine.posting_date > base.date
-        cond = and_(cond, or_(after, PostedLedgerLine.id.in_(base.carried)) if base.carried else after)
+        # RR1: a pre-baseline-dated line POSTED after the baseline approval (held legacy journals, back-dated
+        # B2 journals, reversals) is in the cumulative GL balance, so it must be in the working set too.
+        late = PostedLedgerLine.posted_at > base.approved_at
+        parts = [after, late] + ([PostedLedgerLine.id.in_(base.carried)] if base.carried else [])
+        cond = and_(cond, or_(*parts))
     return cond
 
 
@@ -389,7 +394,13 @@ def _period_is_open(db: Session, tenant_id: UUID, day: date) -> bool:
 
 
 def _link_valid(
-    db: Session, tenant_id: UUID, recon: BankReconciliation, journal_id: UUID, line_date: date, effect: Decimal
+    db: Session,
+    tenant_id: UUID,
+    recon: BankReconciliation,
+    journal_id: UUID,
+    line_date: date,
+    effect: Decimal,
+    exclude_item: UUID | None = None,
 ) -> bool:
     """The linked B2 manual journal is live, dated in the first open period, and books exactly the bank
     line's effect on this cash GL, so the next reconciliation can match the bank line to its ledger line."""
@@ -411,6 +422,19 @@ def _link_valid(
     )
     period = _first_open_period(db, tenant_id)
     if journal is None or period is None or not (period.start_date <= journal.posting_date <= period.end_date):
+        return False
+    # The journal must fall after the bank line (an earlier still-open period would put it in the same scope)
+    # and may be linked by only one active item.
+    if journal.posting_date <= line_date:
+        return False
+    other = select(BankReconItem.id).where(
+        BankReconItem.tenant_id == tenant_id,
+        BankReconItem.journal_id == journal_id,
+        BankReconItem.withdrawn_at.is_(None),
+    )
+    if exclude_item is not None:
+        other = other.where(BankReconItem.id != exclude_item)
+    if db.scalar(other.limit(1)) is not None:
         return False
     booked = db.scalar(
         select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0)).where(
@@ -493,7 +517,7 @@ def evaluate(db: Session, tenant_id: UUID, recon: BankReconciliation) -> Evaluat
         if item.item_type in m.UNRECORDED_TYPES:
             if item.journal_id is None:
                 unrecorded.append(item.id)  # open period: needs a journal first, blocks preparation
-            elif not _link_valid(db, tenant_id, recon, item.journal_id, line[1], expected):
+            elif not _link_valid(db, tenant_id, recon, item.journal_id, line[1], expected, item.id):
                 stale.append(item.id)
                 continue
         total += Decimal(item.signed_amount)
@@ -657,6 +681,12 @@ def live_reconciliation_account(db: Session, tenant_id: UUID, reconciliation_id:
     return row.account_id
 
 
+def _recheck_gl(db: Session, tenant_id: UUID, account: BankAccount, recon: BankReconciliation) -> None:
+    """Fail closed if the bank account was re-pointed or now shares its cash GL since the reconciliation opened."""
+    if resolve_gl_account(db, tenant_id, account) != recon.gl_account_id:
+        raise ReconRefused("gl_account_unresolved", "the bank account's cash GL changed since this was opened")
+
+
 def _lock_gl_account(db: Session, tenant_id: UUID, recon: BankReconciliation) -> None:
     """Serialise against postings to the cash GL (accounting a1 post_journal locks each line's Account row).
 
@@ -776,9 +806,10 @@ def prepare(
     try:
         _actor(db, tenant_id, actor)
         with db.begin_nested():
-            _, row = _locked_recon(db, tenant_id, reconciliation_id)
+            bank_account, row = _locked_recon(db, tenant_id, reconciliation_id)
             if row.status != m.STATUS_OPEN:
                 raise ReconRefused("state_refused", f"only an open reconciliation can be prepared, not {row.status}")
+            _recheck_gl(db, tenant_id, bank_account, row)
             _lock_gl_account(db, tenant_id, row)
             result = evaluate(db, tenant_id, row)
             if not result.clean:
@@ -858,9 +889,10 @@ def approve(
     try:
         _actor(db, tenant_id, actor)
         with db.begin_nested():
-            _, row = _locked_recon(db, tenant_id, reconciliation_id)
+            bank_account, row = _locked_recon(db, tenant_id, reconciliation_id)
             if row.status != m.STATUS_PREPARED:
                 raise ReconRefused("state_refused", f"only a prepared reconciliation can be approved, not {row.status}")
+            _recheck_gl(db, tenant_id, bank_account, row)
             if actor == row.prepared_by_party_id:
                 raise ReconRefused("sod_preparer", "the preparer cannot approve their own reconciliation")
             if actor in _participants(db, tenant_id, row):
@@ -1055,6 +1087,7 @@ def match(
                     PostedLedgerLine.debit,
                     PostedLedgerLine.credit,
                     PostedLedgerLine.journal_id,
+                    PostedLedgerLine.posted_at,
                 ).where(
                     PostedLedgerLine.tenant_id == tenant_id,
                     PostedLedgerLine.id.in_(gl_ids),
@@ -1069,7 +1102,7 @@ def match(
             if base is None:
                 raise ReconRefused("baseline_required", "the account needs an approved baseline before matching")
             if any(r[1] <= base.date for r in bank_rows) or any(
-                r[1] <= base.date and r[0] not in base.carried for r in gl_rows
+                r[1] <= base.date and r[0] not in base.carried and r[5] <= base.approved_at for r in gl_rows
             ):
                 raise ReconRefused(
                     "before_baseline", "lines dated on or before the baseline are out of scope for matching"
@@ -1242,6 +1275,7 @@ def add_items(
             gl_open = {r[0]: r for r in uncleared_gl_lines(db, tenant_id, row)}
             existing = {(i.side, i.ref_id): i for i in _items(db, tenant_id, row.id)}
             created: list[BankReconItem] = []
+            used_links: set[UUID] = set()
             for request in requests:
                 note = _text(request.note, "note")
                 if request.item_type not in m.ITEM_TYPES:
@@ -1287,13 +1321,16 @@ def add_items(
                                 "journal_link_required",
                                 "the period is closed: link a manual journal dated in the first open period",
                             )
-                        if not _link_valid(db, tenant_id, row, request.journal_id, line[1], amount):
+                        if request.journal_id in used_links or not _link_valid(
+                            db, tenant_id, row, request.journal_id, line[1], amount
+                        ):
                             raise ReconRefused(
                                 "journal_link_invalid",
                                 "the linked journal is not live, not in the first open period, or does not book "
                                 "exactly the bank line's effect on this cash GL",
                             )
                         link = request.journal_id
+                        used_links.add(link)
                 elif request.journal_id is not None:
                     raise ReconRefused("journal_link_not_allowed", "only unrecorded bank items link a journal")
                 prior = existing.get((request.side, request.ref_id))
