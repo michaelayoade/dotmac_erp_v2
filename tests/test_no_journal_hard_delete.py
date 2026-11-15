@@ -10,7 +10,6 @@ not on the reviewed allowlist, or an HTTP route that deletes or purges.
 from __future__ import annotations
 
 import ast
-import importlib
 import re
 from pathlib import Path
 
@@ -91,47 +90,38 @@ def test_no_cascading_foreign_key_or_relationship_deletes_ledger_rows():
         assert not re.search(r"cascade\s*=\s*['\"][^'\"]*delete", text), path.name
 
 
-ROUTER_MODULES = (
-    "erp_v2.journals.routes",
-    "erp_v2.web.routes",
-    "erp_v2.web.legacy_reentry_routes",
-    "erp_v2.web.payroll_routes",
-    "erp_v2.web.revenue_approval_routes",
-    "erp_v2.web.revenue_routes",
-    "erp_v2.banking.routes",
-    "erp_v2.banking.statement_routes",
-    "erp_v2.payees.routes",
-    "erp_v2.academy_sync.routes",
-    "erp_v2.readiness",
-)
+LEDGER_PATH = re.compile(r"journal|ledger|accounting|posting", re.I)
+PURGE = re.compile(r"delete|purge|remove|truncate|destroy", re.I)
 
 
-def all_routes():
-    for name in ROUTER_MODULES:
-        for route in importlib.import_module(name).router.routes:
-            yield name, route.path, set(route.methods)
+def composed_routes():
+    """Every route the assembly would mount: assembly.modules (ERP_FEATURES + Starter modules)."""
+    from erp_v2.assembly import assembly
+    from erp_v2.features import ERP_FEATURES
+
+    erp = {id(m) for m in ERP_FEATURES}
+    for manifest in assembly.modules:
+        for group in ("routers", "web_routers"):
+            for router in getattr(manifest, group, ()) or ():
+                for route in router.routes:
+                    yield id(manifest) in erp, route.path, set(getattr(route, "methods", None) or ())
 
 
-def test_no_route_deletes_or_purges_and_journals_have_no_draft_removal_path():
-    routes = list(all_routes())
-    assert "/finance/journals" in {path for _, path, _ in routes}  # the real journal facet is covered
-    for _, path, methods in routes:
-        assert "DELETE" not in methods, path
-        assert "PUT" not in methods or "journal" not in path, path
-        if "journal" in path or "/finance/" in path:
-            assert not re.search(r"delete|purge|remove|truncate|destroy", path, re.I), path
+def test_no_composed_route_deletes_or_purges_ledger_paths_and_journals_have_no_removal_path():
+    routes = list(composed_routes())
+    assert "/finance/journals" in {path for _, path, _ in routes}  # the real journal facet is composed
+    assert sum(1 for erp, *_ in routes if erp) > 40
+    for is_erp, path, methods in routes:
+        if is_erp:
+            assert "DELETE" not in methods, path  # ERP v2 routes never delete anything over HTTP
+        if LEDGER_PATH.search(path) or path.startswith("/finance/"):
+            assert "DELETE" not in methods and "PUT" not in methods, path
+            assert not PURGE.search(path), path
     # every mutation of a journal is a POST to a named governed command, never a bare resource verb
-    journal_posts = sorted(path for _, path, methods in routes if "journal" in path and "POST" in methods)
+    journal_posts = sorted(
+        path for is_erp, path, methods in routes if is_erp and "journal" in path and "POST" in methods
+    )
     assert journal_posts and all(
         p == "/finance/journals" or re.search(r"/(request-post|request-reversal|approve|approve-reversal|reject)$", p)
         for p in journal_posts
     )
-
-
-def test_every_router_module_is_listed():
-    declared = {
-        "erp_v2." + ".".join(p.relative_to(SRC).with_suffix("").parts)
-        for p in source_files()
-        if re.search(r"^router\s*=\s*APIRouter\(", p.read_text(), re.M)
-    }
-    assert declared == set(ROUTER_MODULES)

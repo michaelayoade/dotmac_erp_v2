@@ -16,7 +16,7 @@ TENANT, P1, P2 = uuid4(), uuid4(), uuid4()
 
 def doc(grants=None, **over):
     default = [{"party_id": str(P1), "role": "treasury"}]
-    data = {"version": 1, "tenant_id": str(TENANT), "grants": default if grants is None else grants}
+    data = {"version": 1, "tenant_id": str(TENANT), "action": "grant", "grants": default if grants is None else grants}
     data.update(over)
     return json.dumps(data).encode()
 
@@ -269,6 +269,41 @@ def test_inactive_tenant_refuses(monkeypatch):
 # ---- governed revoke -------------------------------------------------------------------------
 
 
+def rdoc(grants=None, **over):
+    return doc(grants, **{"action": "revoke", **over})
+
+
+def test_action_is_required_and_direction_bound():
+    assert cli.parse_allowlist(doc()).grants and cli.parse_allowlist(rdoc(), revoke=True).grants
+    for raw, flag in ((rdoc(), False), (doc(), True)):
+        with pytest.raises(cli.AccessRefusal, match="allowlist_action_mismatch"):
+            cli.parse_allowlist(raw, revoke=flag)
+    for bad in ({"action": "delete"}, {"action": None}):
+        with pytest.raises(cli.AccessRefusal, match="invalid_allowlist_schema"):
+            cli.parse_allowlist(doc(**bad))
+    missing = json.loads(doc())
+    del missing["action"]
+    with pytest.raises(cli.AccessRefusal, match="invalid_allowlist_schema"):
+        cli.parse_allowlist(json.dumps(missing).encode())
+
+
+def test_reviewed_revoke_list_run_with_apply_refuses_before_database(tmp_path, monkeypatch):
+    allow, receipt = tmp_path / "a.json", tmp_path / "r.json"
+    allow.write_bytes(rdoc())
+    monkeypatch.setenv("ERP_ACCESS_APPLY", "1")
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql+psycopg://u:x@127.0.0.1:1/db")
+    sha = hashlib.sha256(allow.read_bytes()).hexdigest()
+    argv = ["--allowlist", str(allow), "--receipt", str(receipt), "--approved-allowlist-sha256", sha]
+    assert cli.main(["apply", *argv, "--operator-ref", "o"]) == 2
+    assert "allowlist_action_mismatch" in receipt.read_text()
+    allow.write_bytes(doc())
+    receipt2 = tmp_path / "r2.json"
+    sha = hashlib.sha256(allow.read_bytes()).hexdigest()
+    argv = ["--allowlist", str(allow), "--receipt", str(receipt2), "--approved-allowlist-sha256", sha]
+    assert cli.main(["revoke-apply", *argv, "--operator-ref", "o"]) == 2
+    assert "allowlist_action_mismatch" in receipt2.read_text()
+
+
 def revoke_store(monkeypatch, parties, held_slugs=()):
     """Store whose grants for P1 are the named roles (plus staff); records remove_grants calls."""
     from contextlib import nullcontext
@@ -296,14 +331,14 @@ def revoke(store, allow, **over):
 def test_revoke_allowlist_refuses_admin_staff_unknown_and_sod_exceptions():
     for role in ("admin", "staff", "nope"):
         with pytest.raises(cli.AccessRefusal):
-            cli.parse_allowlist(doc([{"party_id": str(P1), "role": role}]), revoke=True)
+            cli.parse_allowlist(rdoc([{"party_id": str(P1), "role": role}]), revoke=True)
     with pytest.raises(cli.AccessRefusal, match="invalid_allowlist_schema"):
-        cli.parse_allowlist(doc(sod_exceptions=[]), revoke=True)
+        cli.parse_allowlist(rdoc(sod_exceptions=[]), revoke=True)
 
 
 def test_revoke_plan_writes_nothing_and_apply_removes_and_audits(monkeypatch):
     store = revoke_store(monkeypatch, [party(P1)], held_slugs=("treasury",))
-    allow = cli.parse_allowlist(doc(), revoke=True)
+    allow = cli.parse_allowlist(rdoc(), revoke=True)
     plan = cli.plan_revokes(store.db(), allow)
     assert plan.ready and plan.revokes == 1 and plan.noops == 0
     assert store.removed == [] and store.audited == []
@@ -316,14 +351,14 @@ def test_revoke_plan_writes_nothing_and_apply_removes_and_audits(monkeypatch):
 
 def test_revoke_of_absent_grant_is_a_noop(monkeypatch):
     store = revoke_store(monkeypatch, [party(P1)])
-    applied = revoke(store, cli.parse_allowlist(doc(), revoke=True))
+    applied = revoke(store, cli.parse_allowlist(rdoc(), revoke=True))
     assert applied.ready and applied.revokes == 0 and applied.noops == 1
     assert store.removed == [] and store.audited == []
 
 
 def test_revoke_never_touches_staff_and_inactive_party_is_allowed(monkeypatch):
     store = revoke_store(monkeypatch, [party(P1, active=False)], held_slugs=("treasury",))
-    revoke(store, cli.parse_allowlist(doc(), revoke=True))
+    revoke(store, cli.parse_allowlist(rdoc(), revoke=True))
     removed_ids = {g.id for _, facts in store.removed for g in facts}
     assert STAFF.id not in {g.role_id for _, facts in store.removed for g in facts}
     assert len(removed_ids) == 1
@@ -331,12 +366,12 @@ def test_revoke_never_touches_staff_and_inactive_party_is_allowed(monkeypatch):
 
 def test_revoke_missing_party_and_inactive_tenant_refuse(monkeypatch):
     store = revoke_store(monkeypatch, [])
-    plan = revoke(store, cli.parse_allowlist(doc(), revoke=True))
+    plan = revoke(store, cli.parse_allowlist(rdoc(), revoke=True))
     assert not plan.ready and dict(plan.blockers) == {"party_missing": 1} and store.removed == []
     store = revoke_store(monkeypatch, [party(P1)], held_slugs=("treasury",))
     inactive = SimpleNamespace(scalar=lambda stmt: SimpleNamespace(is_active=False))
     plan = cli.apply_revokes(
-        inactive, cli.parse_allowlist(doc(), revoke=True), allowlist_sha256="d" * 64, operator_ref="ops-1"
+        inactive, cli.parse_allowlist(rdoc(), revoke=True), allowlist_sha256="d" * 64, operator_ref="ops-1"
     )
     assert not plan.ready and store.removed == []
 
@@ -344,12 +379,12 @@ def test_revoke_missing_party_and_inactive_tenant_refuse(monkeypatch):
 def test_revoke_requires_operator_ref(monkeypatch):
     store = revoke_store(monkeypatch, [party(P1)], held_slugs=("treasury",))
     with pytest.raises(cli.AccessRefusal, match="operator_ref_required"):
-        revoke(store, cli.parse_allowlist(doc(), revoke=True), operator_ref=" ")
+        revoke(store, cli.parse_allowlist(rdoc(), revoke=True), operator_ref=" ")
 
 
 def test_revoke_cli_gates(tmp_path, monkeypatch):
     allow = tmp_path / "a.json"
-    allow.write_bytes(doc())
+    allow.write_bytes(rdoc())
     monkeypatch.delenv("ERP_ACCESS_APPLY", raising=False)
     assert cli.main(["revoke-apply", "--allowlist", str(allow), "--receipt", str(tmp_path / "r1.json")]) == 2
     assert not (tmp_path / "r1.json").exists()

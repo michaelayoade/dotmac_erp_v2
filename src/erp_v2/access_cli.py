@@ -19,7 +19,8 @@ inserted grant writes a DB audit event (``erp.access.role_granted``) in the same
 transaction.
 
 Revoke (leavers, wrong grants) uses the same rails: ``revoke-plan`` / ``revoke-apply`` with the
-same sha-bound allowlist format (``sod_exceptions`` is refused: it is meaningless for removal),
+same sha-bound allowlist format but ``"action": "revoke"`` (``sod_exceptions`` is refused; a grant
+list refuses revoke modes and a revoke list refuses grant modes: ``allowlist_action_mismatch``),
 ``ERP_ACCESS_APPLY=1``, ``--operator-ref``, MIGRATION_DATABASE_URL only, and a 0600 receipt with
 counts. Only roles in ``NEW_ROLES`` can be revoked: ``admin``/``staff`` (and so portal access,
 ``erp.web.access``) are never touched. Revoking an absent grant is a no-op; each removed grant
@@ -84,13 +85,18 @@ def parse_allowlist(raw_bytes: bytes, *, revoke: bool = False) -> Allowlist:
         _refuse("invalid_allowlist_json")
     if (
         not isinstance(raw, dict)
-        or not {"version", "tenant_id", "grants"} <= set(raw)
-        or set(raw) - {"version", "tenant_id", "grants", "sod_exceptions"}
+        or not {"version", "tenant_id", "action", "grants"} <= set(raw)
+        or set(raw) - {"version", "tenant_id", "action", "grants", "sod_exceptions"}
         or (revoke and "sod_exceptions" in raw)
         or type(raw["version"]) is not int
         or raw["version"] != 1
     ):
         _refuse("invalid_allowlist_schema")
+    if raw["action"] not in ("grant", "revoke"):
+        _refuse("invalid_allowlist_schema")
+    # Intent is part of the reviewed, sha-bound file: a revoke list can never be applied as grants.
+    if raw["action"] != ("revoke" if revoke else "grant"):
+        _refuse("allowlist_action_mismatch")
     tenant = _uuid(raw["tenant_id"], "invalid_tenant_id")
     rows = raw["grants"]
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_GRANTS:

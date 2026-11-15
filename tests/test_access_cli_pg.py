@@ -105,12 +105,13 @@ class Runner:
         self.engine, self.tmp, self.mp, self.n = engine, tmp_path, monkeypatch, 0
         monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    def run(self, mode, tenant_id, grants, *, apply_env=True, operator="ops-1", sha=None, **extra):
+    def run(self, mode, tenant_id, grants, *, apply_env=True, operator="ops-1", sha=None, action=None, **extra):
         self.n += 1
         allow = self.tmp / f"a{self.n}.json"
         data = {
             "version": 1,
             "tenant_id": str(tenant_id),
+            "action": action or ("revoke" if mode.startswith("revoke") else "grant"),
             "grants": [{"party_id": str(p), "role": r} for p, r in grants],
         }
         data.update(extra)
@@ -286,3 +287,36 @@ def test_revoke_never_leaves_a_forbidden_pair_or_removes_portal_access(engine, r
     assert not any(p <= remaining for p in access.SOD_CONFLICT_PAIRS)
     assert runner.run("revoke-apply", tenant, [(party, "finance_preparer")])[0] == 0
     assert held(engine, tenant, party) == {"staff"}
+
+
+def test_action_mismatch_refuses_in_both_directions_and_writes_nothing(engine, runner):
+    tenant, (party,) = seed(engine)
+    assert runner.run("apply", tenant, [(party, "treasury")], action="revoke")[0] == 2
+    assert held(engine, tenant, party) == {"staff"} and role_count(engine, tenant) == 1
+    assert runner.run("apply", tenant, [(party, "treasury")])[0] == 0
+    # a reviewed GRANT list can never be run as a revoke, and a revoke list never as a grant
+    code, receipt = runner.run("revoke-apply", tenant, [(party, "treasury")], action="grant")
+    assert code == 2 and receipt["refusal"] == "allowlist_action_mismatch"
+    assert runner.run("apply", tenant, [(party, "payroll_approver")], action="revoke")[0] == 2
+    assert held(engine, tenant, party) == {"staff", "treasury"}
+    assert audits(engine, tenant, access.AUDIT_ROLE_REVOKED) == []
+
+
+def test_audit_failure_after_removals_rolls_everything_back_through_run(engine, runner, monkeypatch):
+    tenant, (a, b) = seed(engine, parties=2)
+    assert runner.run("apply", tenant, [(a, "treasury"), (b, "treasury")])[0] == 0
+    audits_before = len(audits(engine, tenant))
+
+    def boom(db, **kw):
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr(access_cli, "_write_revoke_audit", boom)
+    code, receipt = runner.run("revoke-apply", tenant, [(a, "treasury"), (b, "treasury")])
+    assert code == 2 and receipt["refusal"] == "access_command_refused"
+    assert held(engine, tenant, a) == {"staff", "treasury"} and held(engine, tenant, b) == {"staff", "treasury"}
+    assert len(audits(engine, tenant)) == audits_before
+    assert audits(engine, tenant, access.AUDIT_ROLE_REVOKED) == []
+    monkeypatch.undo()
+    # the same revoke succeeds afterwards (nothing was left half-done)
+    assert runner.run("revoke-apply", tenant, [(a, "treasury"), (b, "treasury")])[0] == 0
+    assert held(engine, tenant, a) == {"staff"} and len(audits(engine, tenant, access.AUDIT_ROLE_REVOKED)) == 2
