@@ -204,21 +204,20 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
     )
     if any(line.dimension_refs for line in lines):
         return "dimensions_unsupported"
-    # Payables a5 posts at posting_date = invoice_date (never changed here), so the invoice date
-    # must fall in the FIRST open accounting period: an older open period would be back-posted,
-    # and a later one would skip the earliest open month.
-    first_open = session.scalar(
-        sa.select(FiscalPeriod)
-        .where(
-            FiscalPeriod.tenant_id == tenant,
-            FiscalPeriod.status == PeriodStatus.OPEN,
-            FiscalPeriod.is_adjustment.is_(False),
+    # Payables a5 posts at posting_date = invoice_date (Michael: original invoice date, into its
+    # original period; the date is never changed). The containing period must exist, be OPEN and not
+    # be an adjustment period. The accounting owner re-checks this when posting (backstop).
+    periods = list(
+        session.scalars(
+            sa.select(FiscalPeriod).where(
+                FiscalPeriod.tenant_id == tenant,
+                FiscalPeriod.start_date <= invoice.invoice_date,
+                FiscalPeriod.end_date >= invoice.invoice_date,
+            )
         )
-        .order_by(FiscalPeriod.start_date)
-        .limit(1)
     )
-    if first_open is None or not first_open.start_date <= invoice.invoice_date <= first_open.end_date:
-        return "posting_date_not_first_open_period"
+    if not periods or any(p.status != PeriodStatus.OPEN or p.is_adjustment for p in periods):
+        return "posting_period_not_open"
     refs = [invoice.liability_account_ref]
     for line in lines:
         refs.append(line.posting_account_ref)
@@ -279,6 +278,7 @@ def build_plan(session: Session, scope, verifier, ids, *, evidence_ref: str, bin
 
 def _invoice_amounts(session: Session, tenant: UUID, invoice_id: UUID) -> dict:
     """Date and amounts of an invoice as stored (empty if it does not exist). No names, no PII."""
+    from dotmac_accounting.models import FiscalPeriod as FiscalPeriod_
     from dotmac_payables.models import SupplierInvoice
 
     invoice = session.scalar(
@@ -286,7 +286,20 @@ def _invoice_amounts(session: Session, tenant: UUID, invoice_id: UUID) -> dict:
     )
     if invoice is None:
         return {}
+    periods = sorted(
+        {
+            f"{p.start_date.isoformat()}..{p.end_date.isoformat()}"
+            for p in session.scalars(
+                sa.select(FiscalPeriod_).where(
+                    FiscalPeriod_.tenant_id == tenant,
+                    FiscalPeriod_.start_date <= invoice.invoice_date,
+                    FiscalPeriod_.end_date >= invoice.invoice_date,
+                )
+            )
+        }
+    )
     return dict(
+        period=",".join(periods) or "none",
         invoice_date=invoice.invoice_date.isoformat(),
         subtotal=_money(invoice.subtotal),
         tax=_money(invoice.tax_amount),
@@ -301,6 +314,16 @@ def _totals(rows: list[dict]) -> dict:
 def plan_file_of(plan: dict) -> dict:
     """The private per-invoice plan: ids, dates, amounts and reason codes. Never goes in the receipt."""
     return dict(version=1, plan_digest=plan["digest"], bindings=plan["bindings"], invoices=plan["detail"])
+
+
+def _by_period(rows: list[dict]) -> dict:
+    """Eligible invoices by the accounting period they will post into: count and total only."""
+    result: dict[str, dict] = {}
+    for row in rows:
+        entry = result.setdefault(row["period"], dict(count=0, total=Decimal(0)))
+        entry["count"] += 1
+        entry["total"] += Decimal(row["total"])
+    return {key: dict(count=v["count"], total=_money(v["total"])) for key, v in sorted(result.items())}
 
 
 def receipt_of(plan: dict, *, mode: str, applied: int = 0, posted_total: Decimal | None = None) -> dict:
@@ -318,6 +341,7 @@ def receipt_of(plan: dict, *, mode: str, applied: int = 0, posted_total: Decimal
         ),
         refusals_by_reason=dict(sorted(Counter(item["reason"] for item in plan["refused"]).items())),
         totals=dict(eligible=_totals(plan["eligible"])),
+        by_period=_by_period(plan["eligible"]),
     )
     if mode == "apply":
         payload["applied"] = applied

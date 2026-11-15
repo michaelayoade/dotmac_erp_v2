@@ -113,6 +113,7 @@ def test_receipt_holds_counts_and_totals_only():
     assert receipt["counts"] == dict(requested=4, eligible=2, already_done=1, refused=1)
     assert receipt["totals"]["eligible"] == dict(subtotal="400.00", tax="30.00", total="430.00")
     assert receipt["refusals_by_reason"] == {"not_approved": 1}
+    assert receipt["by_period"] == {"2026-01-01..2026-01-31": dict(count=2, total="430.00")}
     assert receipt["posted_total"] == "430.00" and receipt["applied"] == 2
     text = json.dumps(receipt)
     assert "invoice_id" not in text and not any(str(UUID(int=n)) in text for n in range(10, 14))

@@ -449,8 +449,7 @@ def test_closed_period_refuses_in_plan(engine, setup):
     iid = imported(engine, env)
     legacy.build((iid,))
     soft_close(engine, env)
-    # With no open period left, the date cannot be in the first open one (and posting would also refuse).
-    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"posting_date_not_first_open_period": 1}
+    assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"posting_period_not_open": 1}
 
 
 def test_failure_midway_rolls_back_every_invoice(engine, setup, monkeypatch):
@@ -475,15 +474,13 @@ def test_failure_midway_rolls_back_every_invoice(engine, setup, monkeypatch):
     assert counts(engine, env.tenant_id) == {m.__tablename__: 0 for m in MODELS}
 
 
-def test_invoice_date_outside_the_first_open_period_is_refused(engine, setup):
-    """Payables a5 posts at invoice_date; only the first open period is accepted (date never changed)."""
+def open_february(engine, env):
     from datetime import date
 
     from dotmac_accounting import service as accounting
     from dotmac_accounting.contracts import PeriodStatus
     from dotmac_accounting.models import FiscalPeriod
 
-    env, legacy = setup
     with Session(engine) as db:
         year_id = db.scalar(sa.select(FiscalPeriod.fiscal_year_id).where(FiscalPeriod.id == env.period_id))
         later = FiscalPeriod(
@@ -499,17 +496,42 @@ def test_invoice_date_outside_the_first_open_period_is_refused(engine, setup):
         db.flush()
         accounting.open_period(db, scope=env.scope, period_id=later.id, actor_ref="test", occurred_at=NOW)
         db.commit()
-    in_first = [imported(engine, env, number="AP-1"), imported(engine, env, number="AP-2")]
-    in_later = [
-        imported(engine, env, number=f"AP-F{n}", period_date="2026-02-10") for n in range(3)
-    ]  # census-style cohort: three of five fall after the first open month
-    ids = tuple(sorted(in_first + in_later, key=str))
+
+
+def test_invoices_post_on_their_original_date_into_their_original_open_period(engine, setup):
+    """January and February are open: a February invoice passes and posts dated February."""
+    env, legacy = setup
+    open_february(engine, env)
+    jan = [imported(engine, env, number="AP-1"), imported(engine, env, number="AP-2")]
+    feb = [imported(engine, env, number=f"AP-F{n}", period_date="2026-02-10") for n in range(3)]
+    ids = tuple(sorted(jan + feb, key=str))
     legacy.build(ids)
+    plan, applied = plan_then_apply(engine, legacy, ids)
+    assert plan["counts"] == dict(requested=5, eligible=5, already_done=0, refused=0)
+    assert plan["by_period"] == {
+        "2026-01-01..2026-01-31": dict(count=2, total="430.00"),
+        "2026-02-01..2026-02-28": dict(count=3, total="645.00"),
+    }
+    assert applied["by_period"] == plan["by_period"] and applied["posted_total"] == "1075.00"
+    with Session(engine) as db:
+        dates = {}
+        for iid in ids:
+            receipt = db.scalar(sa.select(AccountingReceipt).where(AccountingReceipt.document_id == iid))
+            dates[iid] = db.get(JournalEntry, UUID(receipt.accounting_reference)).posting_date.isoformat()
+        assert {dates[i] for i in feb} == {"2026-02-10"} and {dates[i] for i in jan} == {"2026-01-10"}
+        assert {db.get(SupplierInvoice, i).invoice_date.isoformat() for i in feb} == {"2026-02-10"}
+
+
+def test_period_missing_closed_or_not_open_is_refused(engine, setup):
+    env, legacy = setup
+    no_period = imported(engine, env, number="AP-M", period_date="2026-03-10")  # no March period exists
+    jan = imported(engine, env, number="AP-J")
+    ids = tuple(sorted([no_period, jan], key=str))
+    legacy.build(ids)
+    assert legacy.run(engine, ids, apply=False)["refusals_by_reason"] == {"posting_period_not_open": 1}
+    soft_close(engine, env)
     plan = legacy.run(engine, ids, apply=False)
-    assert plan["refusals_by_reason"] == {"posting_date_not_first_open_period": 3}
-    assert plan["counts"] == dict(requested=5, eligible=2, already_done=0, refused=3)
-    with Session(engine) as db:  # amounts and dates untouched
-        assert {db.get(SupplierInvoice, i).invoice_date.isoformat() for i in in_later} == {"2026-02-10"}
+    assert plan["refusals_by_reason"] == {"posting_period_not_open": 2} and plan["by_period"] == {}
 
 
 def test_approver_must_hold_finance_approver(engine, tmp_path):
@@ -683,6 +705,7 @@ def test_private_plan_has_per_invoice_detail_and_the_receipt_has_none(engine, se
         invoice_id=str(good),
         outcome="eligible",
         reason=None,
+        period="2026-01-01..2026-01-31",
         invoice_date="2026-01-10",
         subtotal="200.00",
         tax="15.00",
