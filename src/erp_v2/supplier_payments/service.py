@@ -66,7 +66,7 @@ from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import KIND_SUPPLIER_PAYMENT, DisbursementFileReceipt
 from erp_v2.journals import policy as journal_policy
 from erp_v2.payees import service as payee_service
-from erp_v2.payees.models import InstructionStatus, PayeeBankInstruction, PayeeKind
+from erp_v2.payees.models import InstructionOrigin, InstructionStatus, PayeeBankInstruction, PayeeKind
 from erp_v2.posting import rules
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
@@ -320,6 +320,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
     _refuse_wht(payment)
     if _same(payment.prepared_by, actor):
         raise PaymentRefused("sod_approver_is_preparer", "You prepared this payment; another person must approve it")
+    _refuse_approver_instruction_party(db, tenant.id, payment, actor)
     payables.approve_supplier_payment(
         db,
         scope=TenantScope(tenant.id),
@@ -351,6 +352,27 @@ def _current_instruction(db: Session, tenant_id: UUID, supplier_ref: str) -> Pay
             PayeeBankInstruction.status == InstructionStatus.APPROVED.value,
         )
     )
+
+
+def _refuse_approver_instruction_party(
+    db: Session, tenant_id: UUID, payment: SupplierPayment, approver: str | None
+) -> None:
+    """The payment approver must not have proposed or decided the payee's current instruction.
+
+    Instructions migrated from legacy (origin legacy_import, decided by the migration actor) are exempt.
+    """
+    instruction = _current_instruction(db, tenant_id, payment.supplier_ref)
+    if instruction is None or instruction.origin == InstructionOrigin.LEGACY_IMPORT.value or not approver:
+        return
+    if approver.strip().casefold() in {
+        str(instruction.proposed_by_party_id).casefold(),
+        str(instruction.decided_by_party_id).casefold(),
+    }:
+        raise PaymentRefused(
+            "sod_approver_is_instruction_party",
+            "The payment approver proposed or approved the payee's current bank instruction; "
+            "a different person must approve the payment",
+        )
 
 
 def _file_receipts(db: Session, tenant_id: UUID, payment_id: UUID) -> list[DisbursementFileReceipt]:
@@ -475,6 +497,7 @@ def _record(
         raise PaymentRefused("sod_recorder_is_preparer", "You prepared this payment; someone else must record it")
     if _same(payment.approved_by, actor):
         raise PaymentRefused("sod_recorder_is_approver", "You approved this payment; someone else must record it")
+    _refuse_approver_instruction_party(db, tenant.id, payment, payment.approved_by)
     _check_file_destination(db, tenant.id, payment)
     payables.record_supplier_payment(
         db,
@@ -659,6 +682,7 @@ def _generate_file(
                 f"You proposed or approved the bank instruction for payment {payment.number}; "
                 "someone else must generate its bank file",
             )
+        _refuse_approver_instruction_party(db, tenant.id, payment, payment.approved_by)
         instruction_ids.append(destination.instruction_id)
         rows.append(
             bank_file.DisbursementRow(

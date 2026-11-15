@@ -712,7 +712,7 @@ def test_reversal_in_a_closed_period_rolls_back_the_reopening_too(engine):
 # --- bank file: dormant by default ----------------------------------------
 
 
-def seed_payee(engine, env, number=ACCOUNT_NUMBER, proposer="preparer", decider="approver"):
+def seed_payee(engine, env, number=ACCOUNT_NUMBER, proposer="preparer", decider="reverser"):
     with Session(engine) as db:
         proposed = payee_service.propose(
             db,
@@ -834,7 +834,7 @@ def test_a_changed_payee_instruction_after_the_file_refuses_recording(engine):
         )
         second = proposed.id
         payee_service.approve(
-            db, tenant_id=env.tenant_id, instruction_id=second, approver_party_id=env.people["approver"]
+            db, tenant_id=env.tenant_id, instruction_id=second, approver_party_id=env.people["reverser"]
         )
         db.commit()
     assert first != second
@@ -1003,3 +1003,56 @@ def test_bank_file_issuer_is_not_a_payment_or_instruction_party(engine):
     refused(lambda: generate(engine, env, [pid], who="reverser"), "sod_file_issuer_is_instruction_party")  # proposed it
     refused(lambda: generate(engine, env, [pid], who="recorder"), "sod_file_issuer_is_instruction_party")  # approved it
     assert counts(engine, env)["file_receipts"] == 0
+
+
+# --- review round 1: payment approver vs the payee instruction ---------------
+
+
+def test_payment_approver_may_not_be_the_instruction_proposer_or_decider_at_approve(engine):
+    for proposer, decider in (("preparer", "approver"), ("approver", "reverser")):
+        env = world(engine)
+        created = prepare(engine, env, open_obligation(engine, env))
+        seed_payee(engine, env, proposer=proposer, decider=decider)
+        refused(lambda: approve(engine, env, created.payment_id), "sod_approver_is_instruction_party")
+        assert payment(engine, created.payment_id).status == SupplierPaymentStatus.DRAFT
+        approve(engine, env, created.payment_id, who="recorder")  # a different approver is fine
+
+
+def test_legacy_migrated_instruction_does_not_restrict_the_approver(engine):
+    from erp_v2.payees.models import PayeeBankInstruction
+
+    env = world(engine)
+    created = prepare(engine, env, open_obligation(engine, env))
+    with Session(engine) as db:
+        db.add(
+            PayeeBankInstruction(
+                tenant_id=env.tenant_id,
+                payee_kind="supplier",
+                payee_ref="supplier-1",
+                payee_label="Supplier One",
+                bank_code="058",
+                bank_name="Example Bank",
+                account_number=ACCOUNT_NUMBER,
+                account_last4=ACCOUNT_NUMBER[-4:],
+                account_name="SUPPLIER ONE LTD",
+                status="approved",
+                origin="legacy_import",
+                proposed_at=NOW,
+                decided_by_party_id=env.people["approver"],  # the migration actor
+                decided_at=NOW,
+                approved_at=NOW,
+            )
+        )
+        db.commit()
+    assert approve(engine, env, created.payment_id).replayed is False
+
+
+def test_approver_independence_is_rechecked_at_file_and_record(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    seed_payee(engine, env, proposer="preparer", decider="approver")  # instruction approved after the payment
+    enable_file(engine, env)
+    before = counts(engine, env)
+    refused(lambda: generate(engine, env, [pid]), "sod_approver_is_instruction_party")
+    refused(lambda: record(engine, env, pid), "sod_approver_is_instruction_party")
+    assert counts(engine, env) == before
