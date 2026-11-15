@@ -215,7 +215,7 @@ def test_invalid_or_duplicate_run_refused_and_session_reusable(payroll, override
         actions.create_draft(db, tenant=tenant, party=party, **values)
     assert _count(db, PayrollRun) == 1
     values.update(
-        run_ref="VALID", period_start="2026-01-01", period_end="2026-01-31", currency_code="NGN", minor_units="2"
+        run_ref="VALID", period_start="2026-02-01", period_end="2026-02-28", currency_code="NGN", minor_units="2"
     )
     assert actions.create_draft(db, tenant=tenant, party=party, **values).status == "draft"
 
@@ -242,3 +242,21 @@ def test_only_the_run_creator_may_enter_calculations(payroll):
     with pytest.raises(actions.PayrollActionError, match="Only the person who created"):
         _calculate(db, tenant, run, party=stranger)
     assert _count(db, PayrollCalculation) == 0
+
+
+def test_draft_overlapping_a_non_cancelled_run_is_refused_but_cancelled_and_adjacent_are_not(payroll):
+    db, tenant, _, party, run = payroll
+    values = dict(currency_code="NGN", minor_units="2")
+    with pytest.raises(actions.PayrollActionError, match="overlaps existing payroll run"):
+        actions.create_draft(
+            db, tenant=tenant, party=party, run_ref="X", period_start="2026-01-31", period_end="2026-02-15", **values
+        )
+    assert _count(db, PayrollRun) == 1
+    run.status = "cancelled"
+    db.flush()
+    assert actions.create_draft(
+        db, tenant=tenant, party=party, run_ref="X", period_start="2026-01-15", period_end="2026-02-15", **values
+    )
+    actions.create_draft(
+        db, tenant=tenant, party=party, run_ref="Y", period_start="2026-02-16", period_end="2026-02-28", **values
+    )

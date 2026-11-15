@@ -66,6 +66,18 @@ def create_draft(
     code = currency_code.strip().upper()
     if not re.fullmatch(r"[A-Z]{3}", code):
         raise PayrollActionError("Enter a three-letter currency code")
+    overlapping = db.scalars(
+        select(PayrollRun.run_ref).where(
+            PayrollRun.tenant_id == tenant.id,
+            PayrollRun.status != "cancelled",
+            PayrollRun.period_start <= end,
+            PayrollRun.period_end >= start,
+        )
+    ).all()
+    if overlapping:
+        raise PayrollActionError(
+            "The period overlaps existing payroll run(s): " + ", ".join(sorted(overlapping)[:10]),
+        )
     try:
         with db.begin_nested():
             return service.create_payroll_run(
