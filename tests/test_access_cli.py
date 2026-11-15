@@ -180,13 +180,23 @@ def role(slug):
 
 
 def test_sod_pair_in_one_request_refuses_unless_excepted(monkeypatch):
-    pair = [{"party_id": str(P1), "role": "finance_approver"}, {"party_id": str(P1), "role": "treasury"}]
+    pair = [{"party_id": str(P1), "role": "treasury"}, {"party_id": str(P1), "role": "bank_reconciler"}]
     store = Store(monkeypatch, [party(P1)])
     plan = apply(store, cli.parse_allowlist(doc(pair)))
     assert dict(plan.blockers) == {"sod_conflict": 1} and store.ensured == []
-    allowed = doc(pair, sod_exceptions=[{"party_id": str(P1), "roles": ["treasury", "finance_approver"]}])
+    allowed = doc(pair, sod_exceptions=[{"party_id": str(P1), "roles": ["treasury", "bank_reconciler"]}])
     store2 = Store(monkeypatch, [party(P1)])
     assert apply(store2, cli.parse_allowlist(allowed)).ready and len(store2.ensured) == 2
+
+
+def test_approver_treasury_pair_is_never_waivable(monkeypatch):
+    pair = [{"party_id": str(P1), "role": "finance_approver"}, {"party_id": str(P1), "role": "treasury"}]
+    waiver = [{"party_id": str(P1), "roles": ["treasury", "finance_approver"]}]
+    with pytest.raises(cli.AccessRefusal, match="sod_pair_not_waivable"):
+        cli.parse_allowlist(doc(pair, sod_exceptions=waiver))
+    store = Store(monkeypatch, [party(P1)])
+    plan = apply(store, cli.parse_allowlist(doc(pair)))
+    assert dict(plan.blockers) == {"sod_conflict": 1} and store.ensured == []
 
 
 def test_sod_pair_against_existing_role_refuses(monkeypatch):

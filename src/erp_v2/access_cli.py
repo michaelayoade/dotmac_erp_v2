@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from erp_v2.access import AUDIT_ROLE_GRANTED, NEW_ROLES, SOD_CONFLICT_PAIRS
+from erp_v2.access import AUDIT_ROLE_GRANTED, NEW_ROLES, NON_WAIVABLE_SOD_PAIRS, SOD_CONFLICT_PAIRS
 
 MAX_GRANTS = 200
 
@@ -97,6 +97,8 @@ def parse_allowlist(raw_bytes: bytes) -> Allowlist:
         pair = frozenset(row["roles"])
         if pair not in SOD_CONFLICT_PAIRS or len(row["roles"]) != 2:
             _refuse("invalid_sod_exception")
+        if pair in NON_WAIVABLE_SOD_PAIRS:
+            _refuse("sod_pair_not_waivable")
         exceptions.add((_uuid(row["party_id"], "invalid_party_id"), pair))
     return Allowlist(tenant, tuple(sorted(grants, key=lambda g: (str(g[0]), g[1]))), frozenset(exceptions))
 
@@ -183,7 +185,8 @@ def _observe(
             blockers["party_lacks_portal_access"] += 1
         final = held[party_id] | requested[party_id]
         for pair in SOD_CONFLICT_PAIRS:
-            if pair <= final and (party_id, pair) not in allow.sod_exceptions:
+            waived = pair not in NON_WAIVABLE_SOD_PAIRS and (party_id, pair) in allow.sod_exceptions
+            if pair <= final and not waived:
                 blockers["sod_conflict"] += 1
     replays = sum(1 for party, role in allow.grants if role in roles and (party, roles[role].id) in existing)
     inserts = len(allow.grants) - replays
