@@ -405,6 +405,9 @@ def test_recognized_under_another_list_is_refused(engine, setup, monkeypatch):
     [
         (dict(status="POSTED"), "source_status_not_approved"),
         (dict(posting_status="POSTED"), "source_posting_status_posted"),
+        (dict(posting_status="PENDING"), "source_posting_status_not_not_posted"),
+        (dict(posting_status=None), "source_posting_status_not_not_posted"),
+        (dict(posting_status="not_posted"), "source_posting_status_not_not_posted"),
         (dict(journal_entry_id="00000000-0000-0000-0000-0000000000aa"), "source_journal_present"),
         (dict(posted_at="2025-01-02T00:00:00+00:00"), "source_posted_at_present"),
         (dict(amount_paid="10"), "source_paid"),

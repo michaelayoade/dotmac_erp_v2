@@ -56,6 +56,7 @@ from erp_v2.importer.snapshot import SnapshotManifest
 SOURCE_OWNER = "legacy-erp"
 FACTS_DOMAIN = "erp.payables.recognition-facts.v1"
 NOT_POSTED_STATUS = "APPROVED"
+NOT_POSTED_POSTING_STATUS = "NOT_POSTED"
 
 
 def _hex_in(column, values) -> sa.ColumnElement:
@@ -155,6 +156,7 @@ class ApprovedInvoiceVerifier:
         _require(header["invoice_type"] == "STANDARD", "source_type")
         _require(header["status"] == NOT_POSTED_STATUS, "source_status_not_approved")
         _require(header["posting_status"] != "POSTED", "source_posting_status_posted")
+        _require(header["posting_status"] == NOT_POSTED_POSTING_STATUS, "source_posting_status_not_not_posted")
         _require(header["journal_entry_id"] is None, "source_journal_present")
         _require(header["posted_at"] is None, "source_posted_at_present")
         _require(header["amount_paid"] == 0, "source_paid")
