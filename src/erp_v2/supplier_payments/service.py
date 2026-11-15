@@ -66,7 +66,7 @@ from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import KIND_SUPPLIER_PAYMENT, DisbursementFileReceipt
 from erp_v2.journals import policy as journal_policy
 from erp_v2.payees import service as payee_service
-from erp_v2.payees.models import PayeeKind
+from erp_v2.payees.models import InstructionStatus, PayeeBankInstruction, PayeeKind
 from erp_v2.posting import rules
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
@@ -342,6 +342,17 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
     return PaymentOutcome(payment.id, False)
 
 
+def _current_instruction(db: Session, tenant_id: UUID, supplier_ref: str) -> PayeeBankInstruction | None:
+    return db.scalar(
+        select(PayeeBankInstruction).where(
+            PayeeBankInstruction.tenant_id == tenant_id,
+            PayeeBankInstruction.payee_kind == PayeeKind.SUPPLIER.value,
+            PayeeBankInstruction.payee_ref == supplier_ref,
+            PayeeBankInstruction.status == InstructionStatus.APPROVED.value,
+        )
+    )
+
+
 def _file_receipts(db: Session, tenant_id: UUID, payment_id: UUID) -> list[DisbursementFileReceipt]:
     return list(
         db.scalars(
@@ -611,6 +622,7 @@ def _generate_file(
     )
     if bank is None or bank.status != "active":
         raise PaymentRefused("bank_account_inactive", "The paying bank account is not active")
+    actor = str(party.id)
     rows: list[bank_file.DisbursementRow] = []
     instruction_ids: list[UUID] = []
     ordered = sorted(payments, key=lambda p: p.number)
@@ -632,6 +644,21 @@ def _generate_file(
             raise PaymentRefused(
                 "no_approved_payee_instruction", f"Payment {payment.number}: the payee has no approved bank instruction"
             ) from exc
+        if _same(payment.prepared_by, actor) or _same(payment.approved_by, actor):
+            raise PaymentRefused(
+                "sod_file_issuer_is_payment_party",
+                f"You prepared or approved payment {payment.number}; someone else must generate its bank file",
+            )
+        instruction = db.get(PayeeBankInstruction, destination.instruction_id)
+        if instruction is not None and actor in {
+            str(instruction.proposed_by_party_id),
+            str(instruction.decided_by_party_id),
+        }:
+            raise PaymentRefused(
+                "sod_file_issuer_is_instruction_party",
+                f"You proposed or approved the bank instruction for payment {payment.number}; "
+                "someone else must generate its bank file",
+            )
         instruction_ids.append(destination.instruction_id)
         rows.append(
             bank_file.DisbursementRow(

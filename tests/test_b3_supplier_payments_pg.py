@@ -712,12 +712,12 @@ def test_reversal_in_a_closed_period_rolls_back_the_reopening_too(engine):
 # --- bank file: dormant by default ----------------------------------------
 
 
-def seed_payee(engine, env, number=ACCOUNT_NUMBER):
+def seed_payee(engine, env, number=ACCOUNT_NUMBER, proposer="preparer", decider="approver"):
     with Session(engine) as db:
         proposed = payee_service.propose(
             db,
             tenant_id=env.tenant_id,
-            proposer_party_id=env.people["preparer"],
+            proposer_party_id=env.people[proposer],
             payee_kind="supplier",
             payee_ref="supplier-1",
             bank_code="058",
@@ -727,7 +727,7 @@ def seed_payee(engine, env, number=ACCOUNT_NUMBER):
             evidence_ref="letter-1",
         )
         row = payee_service.approve(
-            db, tenant_id=env.tenant_id, instruction_id=proposed.id, approver_party_id=env.people["approver"]
+            db, tenant_id=env.tenant_id, instruction_id=proposed.id, approver_party_id=env.people[decider]
         )
         db.commit()
         return row.id
@@ -991,3 +991,15 @@ def test_cancel_without_a_file_needs_no_recall_reference(engine):
     act(engine, env, "approver", svc.cancel_payment, payment_id=pid, reason="duplicate")
     (event,) = audits(engine, env, svc.AUDIT_CANCELLED)
     assert event.details["recall_reference"] is None
+
+
+def test_bank_file_issuer_is_not_a_payment_or_instruction_party(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    seed_payee(engine, env, proposer="reverser", decider="recorder")
+    enable_file(engine, env)
+    refused(lambda: generate(engine, env, [pid], who="preparer"), "sod_file_issuer_is_payment_party")
+    refused(lambda: generate(engine, env, [pid], who="approver"), "sod_file_issuer_is_payment_party")
+    refused(lambda: generate(engine, env, [pid], who="reverser"), "sod_file_issuer_is_instruction_party")  # proposed it
+    refused(lambda: generate(engine, env, [pid], who="recorder"), "sod_file_issuer_is_instruction_party")  # approved it
+    assert counts(engine, env)["file_receipts"] == 0
