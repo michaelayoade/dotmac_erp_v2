@@ -317,7 +317,7 @@ class Scene:
         pid, aid = uuid4(), uuid4()
         net = payment_amount if payment_amount is not None else str(Decimal(paid) - Decimal(withholding))
         if dest_payment_journal:
-            jpay, _jl, jpay_ledger = seed_journal(
+            jpay, jpay_lines, jpay_ledger = seed_journal(
                 engine,
                 env,
                 number=f"PJ-{number}",
@@ -421,6 +421,7 @@ class Scene:
         )
         if dest_payment_journal:
             self.rows["journal_entry"].append(legacy_journal(env, jpay, "SUPPLIER_PAYMENT", pid))
+            self.rows["journal_entry_line"] += legacy_journal_lines(jpay_lines)
             self.rows["posted_ledger_line"] += legacy_ledger(env, jpay_ledger, "SUPPLIER_PAYMENT", pid)
         else:
             ghost = uuid4()
@@ -755,6 +756,31 @@ def test_debit_note_or_adjustment_on_control_citing_the_invoice_is_refused(engin
     )
     scene.build()
     refused(scene, [iid], "legacy_evidence:invoice_control_other_postings")
+
+
+def _payment_line(scene, iid):
+    return next(r for r in scene.rows["journal_entry_line"] if r["journal_entry_id"] == str(scene.journals[iid]))
+
+
+def test_payment_journal_lines_must_pair_and_be_one_sided_and_nonnegative(engine, setup):
+    _env, scene, iid = one(engine, setup)
+    _payment_line(scene, iid).update(debit_amount="-80", credit_amount="0")
+    scene.build()
+    refused(scene, [iid], "legacy_evidence:payment_journal_line_amounts")
+
+
+def test_payment_journal_line_missing_from_the_legacy_side_is_refused(engine, setup):
+    _env, scene, iid = one(engine, setup)
+    scene.rows["journal_entry_line"].remove(_payment_line(scene, iid))
+    scene.build()
+    refused(scene, [iid], "legacy_evidence:payment_journal_line_count")
+
+
+def test_payment_journal_with_a_wrong_posting_stamp_is_refused(engine, setup):
+    _env, scene, iid = one(engine, setup)
+    scene.edit("journal_entry", "journal_entry_id", scene.journals[iid], posting_date="2026-01-11")
+    scene.build()
+    refused(scene, [iid], "legacy_evidence:payment_journal_posting_date")
 
 
 def test_inventory_transaction_citing_the_invoice_is_refused(engine, setup):

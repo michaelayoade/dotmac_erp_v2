@@ -94,6 +94,18 @@ ALLOCATION_DOMAIN = "erp.payables.legacy-allocation.v1"
 SETTLED_FACTS_DOMAIN = "erp.payables.historical-settled-facts.v1"
 
 
+def _one_sided(row: dict, suffix: str) -> bool:
+    """Non-negative exact money, exactly one of debit/credit positive (as the invoice journal proof)."""
+    debit, credit = row["debit_amount" + suffix], row["credit_amount" + suffix]
+    return (
+        isinstance(debit, Decimal)
+        and isinstance(credit, Decimal)
+        and debit >= 0
+        and credit >= 0
+        and ((debit > 0 and credit == 0) or (credit > 0 and debit == 0))
+    )
+
+
 def _two_places(value: object, reason: str) -> Decimal:
     _require(isinstance(value, Decimal) and value.is_finite() and _at_scale(value, 2), reason)
     return value
@@ -356,6 +368,40 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             "payment_journal_source_document_id",
         )
         self._provenance(target, "payment_journal")
+        # The same posting stamp the invoice journal proof requires.
+        stamp = (
+            f"{SOURCE_JOURNAL_REFERENCE}{target['id']}@{_day(journal['posting_date'], 'payment_journal_posting_date')}"
+        )
+        _require(target["approval_reference"] == stamp, "payment_journal_posting_stamp")
+        originals = _read(src, "journal_entry_line", key="journal_entry_id", value=jid)
+        imported = _read(dest, "journal_lines", schema="mod_accounting", key="journal_id", value=jid)
+        _tenant(imported, tenant, "payment_journal_line")
+        line_map = {key: key for key in ("line_number", "account_id", "description", "created_at")}
+        line_map.update(
+            journal_id="journal_entry_id",
+            debit="debit_amount",
+            credit="credit_amount",
+            debit_functional="debit_amount_functional",
+            credit_functional="credit_amount_functional",
+        )
+        for original, landed in _pair(originals, imported, "line_id", "payment_journal_line"):
+            _require(_one_sided(original, ""), "payment_journal_line_amounts")
+            _match(original, landed, line_map, "payment_journal_line")
+            _require(
+                original["currency_code"] in (None, header["currency_code"])
+                and original["exchange_rate"] in (None, Decimal(1))
+                and original["debit_amount"] == original["debit_amount_functional"]
+                and original["credit_amount"] == original["credit_amount_functional"],
+                "unsupported_currency",
+            )
+        for side in ("debit", "credit"):
+            _require(
+                _sum([row[side + "_amount"] for row in originals])
+                == journal["total_" + side]
+                == journal["total_" + side + "_functional"],
+                "payment_journal_totals",
+            )
+        _require(all(_one_sided(row, "") for row in ledger), "payment_ledger_line_amounts")
         posted = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=jid)
         _tenant(posted, tenant, "payment_destination_ledger")
         ledger_map = {key: key for key in ("account_id", "entry_date", "posting_date", "posted_at")}
