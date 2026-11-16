@@ -18,8 +18,8 @@ def grants(role):
     return {g.permission_code for g in profile().grants if g.role_code == role}
 
 
-def test_profile_is_erp_web_v4():
-    assert (profile().code, profile().version) == ("erp.web", 4)
+def test_profile_is_erp_web_v5():
+    assert (profile().code, profile().version) == ("erp.web", 5)
 
 
 def test_admin_and_staff_get_nothing_new():
@@ -130,3 +130,18 @@ def test_only_approver_sees_unmasked_numbers_and_revokes():
     assert holders_of(access.PAYEE_BANK_READ_UNMASKED) == {"finance_approver"}
     assert holders_of(access.PAYEE_BANK_REVOKE) == {"finance_approver"}
     assert holders_of(access.PAYEE_BANK_READ) == {"finance_preparer", "finance_approver", "treasury"}
+
+
+def test_cash_gl_repoint_uses_the_existing_p0_role_pair_and_is_dormant_for_admin_staff():
+    proposers, approvers = holders_of(access.CASH_GL_REPOINT_PROPOSE), holders_of(access.CASH_GL_REPOINT_APPROVE)
+    assert proposers == {"finance_preparer"} and approvers == {"finance_approver"}
+    assert frozenset({"finance_preparer", "finance_approver"}) in access.SOD_CONFLICT_PAIRS
+    for role in ("admin", "staff", "treasury", "bank_reconciler"):
+        assert not {access.CASH_GL_REPOINT_PROPOSE, access.CASH_GL_REPOINT_APPROVE} & grants(role), role
+
+
+def test_cash_gl_repoint_routes_map_to_declared_permissions():
+    from erp_v2.cash_gl.routes import ROUTE_PERMISSIONS
+
+    assert ROUTE_PERMISSIONS["approve"] == ROUTE_PERMISSIONS["reject"] == access.CASH_GL_REPOINT_APPROVE
+    assert ROUTE_PERMISSIONS["propose"] == access.CASH_GL_REPOINT_PROPOSE
