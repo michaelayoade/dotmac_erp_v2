@@ -44,14 +44,14 @@ from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.idempotency import IdempotencyConflict
 from dotmac_kernel.models import Party, Tenant
 from dotmac_kernel.money import Currency, Money
-from dotmac_payables.models import SupplierPayment
 from dotmac_payroll import service as payroll
 from dotmac_payroll.consequences import build_liability_settlement_consequence
 from dotmac_payroll.models import PayrollLiability, PayrollRun
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import file as bank_file
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import KIND_PAYROLL_PAYOUT, DisbursementFileReceipt
@@ -548,14 +548,17 @@ def _cancel(
 
 
 def _bank_reference(value: str) -> str:
-    raw = value or ""
-    if any(ord(c) < 32 or ord(c) == 127 for c in raw.strip()):
-        raise PayoutRefused("bank_reference_invalid", "The bank reference must not contain control characters")
-    # Trim, collapse inner whitespace, upper-case BEFORE the uniqueness check; the normalised form is stored.
-    text = " ".join(raw.split()).upper()
-    if len(text) < 3 or len(text) > 255:
-        raise PayoutRefused("bank_reference_invalid", "Enter the bank's evidence reference (3 to 255 characters)")
-    return text
+    # Shared rule (erp_v2.disbursement.bank_reference); the normalised form is stored.
+    try:
+        return bank_ref.normalize(value)
+    except bank_ref.BankReferenceInvalid as exc:
+        if exc.reason == "control":
+            raise PayoutRefused(
+                "bank_reference_invalid", "The bank reference must not contain control characters"
+            ) from exc
+        raise PayoutRefused(
+            "bank_reference_invalid", "Enter the bank's evidence reference (3 to 255 characters)"
+        ) from exc
 
 
 def _generate_file(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID, now: datetime) -> BankFile:
@@ -697,23 +700,18 @@ def _record(
             _refuse_instruction_party(
                 db, batch, lines, party.id, code="sod_recorder_is_instruction_party", role="recorder"
             )
-    reused = db.scalar(
-        select(PayrollPayoutBatch.id).where(
-            PayrollPayoutBatch.tenant_id == tenant.id,
-            PayrollPayoutBatch.bank_account_id == batch.bank_account_id,
-            PayrollPayoutBatch.bank_reference == reference,
-            PayrollPayoutBatch.id != batch.id,
+    try:
+        bank_ref.claim(
+            db,
+            tenant_id=tenant.id,
+            bank_account_id=batch.bank_account_id,
+            reference=reference,
+            exclude_payroll_batch_id=batch.id,
         )
-    )
-    supplier_reused = db.scalar(
-        select(SupplierPayment.id).where(
-            SupplierPayment.tenant_id == tenant.id,
-            SupplierPayment.payer_instrument_ref == str(batch.bank_account_id),
-            func.upper(SupplierPayment.bank_reference) == reference,
-        )
-    )
-    if reused is not None or supplier_reused is not None:
-        raise PayoutRefused("bank_reference_reused", "This bank reference was already used on this bank account")
+    except bank_ref.BankReferenceReused as exc:
+        raise PayoutRefused(
+            "bank_reference_reused", "This bank reference was already used on this bank account"
+        ) from exc
     _revalidate(db, batch, lines)
     _refuse_instruction_party(
         db, batch, lines, batch.approved_by_party_id, code="sod_approver_is_instruction_party", role="approver"
