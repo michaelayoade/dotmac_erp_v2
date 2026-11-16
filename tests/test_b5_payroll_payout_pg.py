@@ -33,8 +33,8 @@ from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
 from dotmac_kernel.settings_resolver import SettingChangeContext, upsert_by_key
 from dotmac_payroll import service as payroll
-from dotmac_people.models import Employee
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement
+from dotmac_people.models import Employee
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, soft_close
 
