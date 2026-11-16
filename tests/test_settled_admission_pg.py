@@ -742,6 +742,21 @@ def test_legacy_evidence_failures_refuse_with_named_reasons(engine, setup, table
     assert plan["refusals_by_reason"] == {"legacy_evidence:" + reason: 1}, plan
 
 
+def test_debit_note_or_adjustment_on_control_citing_the_invoice_is_refused(engine, setup):
+    _env, scene, iid = one(engine, setup)
+    inv_lines = [
+        r
+        for r in scene.rows["posted_ledger_line"]
+        if r["source_document_type"] == "SUPPLIER_INVOICE" and r["source_document_id"] == str(iid)
+    ]
+    control = next(r for r in inv_lines if r["credit_amount"] != "0.000000" and r["account_code"] == "2000")
+    scene.rows["posted_ledger_line"].append(
+        control | dict(ledger_line_id=str(uuid4()), journal_entry_id=str(uuid4()), journal_line_id=str(uuid4()))
+    )
+    scene.build()
+    refused(scene, [iid], "legacy_evidence:invoice_control_other_postings")
+
+
 def test_inventory_transaction_citing_the_invoice_is_refused(engine, setup):
     _env, scene, iid = one(engine, setup)
     scene.rows["inventory_transaction"].append(

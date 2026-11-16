@@ -15,6 +15,9 @@ settled ledgers. From the restored legacy snapshot, read-only, it proves for one
 * the payment's allocations sum to its gross amount (net + withholding) and its debit to the AP control
   account equals the allocations posted against that account (the residual cross-check against legacy
   GL 2000: what legacy control still holds for the invoice is exactly total - paid);
+* legacy AP control holds nothing else against the invoice: the posted ledger lines on the control
+  account whose source document is the invoice are exactly the invoice journal's own lines
+  (``invoice_control_other_postings`` otherwise), so the residual is what legacy GL still owes;
 * allocation sums equal the invoice paid amount; the residual open amount is total - paid, exactly, in
   two decimals, and positive;
 * no goods receipt, purchase order, item or inventory link; legacy settlement ids are unique.
@@ -137,6 +140,7 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             == 0,
             "source_inventory_transaction",
         )
+        self._control_postings(tenant, header)
         allocations = _read(src, "payment_allocation", key="invoice_id", value=invoice_id, fields=ALLOCATION_FIELDS)
         _require(bool(allocations), "source_allocations_missing")
         ids = [_id(row["allocation_id"]) for row in allocations]
@@ -194,6 +198,27 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             residual_amount=residual,
             withholding_tax_amount=_sum([item.withholding_amount for item in settlements]),
             **(common | dict(facts_fingerprint=facts)),
+        )
+
+    def _control_postings(self, tenant: UUID, header: dict) -> None:
+        """The residual is only provable if legacy AP control holds nothing else against this invoice:
+        every posted ledger line on the control account citing the invoice must be one of the invoice
+        journal's own lines (a debit note or adjustment citing the invoice refuses)."""
+        src, control = self.source, header["ap_control_account_id"]
+        cited = [
+            r
+            for r in _read(src, "posted_ledger_line", key="source_document_id", value=header["invoice_id"])
+            if _equal(r["account_id"], control)
+        ]
+        _tenant(cited, tenant, "invoice_control_posting", "organization_id")
+        own = {
+            _id(r["ledger_line_id"])
+            for r in _read(src, "posted_ledger_line", key="journal_entry_id", value=header["journal_entry_id"])
+            if _equal(r["account_id"], control)
+        }
+        _require(
+            bool(own) and {_id(r["ledger_line_id"]) for r in cited} == own,
+            "invoice_control_other_postings",
         )
 
     def _payment(self, tenant: UUID, header: dict, payment_id: object, dest: sa.Connection) -> dict:
