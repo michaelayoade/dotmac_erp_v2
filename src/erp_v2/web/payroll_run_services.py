@@ -94,6 +94,9 @@ MAX_REASON_CHARS = 500
 _KINDS_WITH_EXPENSE = ("earning", "employer_liability")
 _KINDS_WITH_LIABILITY = ("deduction", "employer_liability")
 _LISTED = 10
+# Internal recoveries may credit only these account codes (Finance-declared, like 2040): a bank cash GL or a
+# receivables control account must never be credited with no cash moving.
+INTERNAL_RECOVERY_CODES = frozenset({"1410"})
 
 
 class RunRefused(ValueError):
@@ -409,6 +412,12 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
             )
     for ref, who in internal_refs.items():
         account = _resolve(db, tenant_id, ref, label=f"Recovery account of {_listed(sorted(who))}")
+        if account.code not in INTERNAL_RECOVERY_CODES:
+            raise RunRefused(
+                "internal_recovery_account_not_allowed",
+                f"{_listed(sorted(who))}: internal recoveries may credit only "
+                f"{', '.join(sorted(INTERNAL_RECOVERY_CODES))}, not {account.code}",
+            )
         if _account_class(db, account) != AccountClass.ASSET:
             raise RunRefused(
                 "internal_recovery_account_not_asset",

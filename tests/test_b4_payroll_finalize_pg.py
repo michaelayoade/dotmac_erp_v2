@@ -116,6 +116,7 @@ def world(engine, *, paye_liability="2110", net_ref="2040", with_third=True, cur
             ("2110", categories["LIA"], NormalBalance.CREDIT),
             ("2120", categories["LIA"], NormalBalance.CREDIT),
             ("1410", asset, NormalBalance.DEBIT),
+            ("1300", asset, NormalBalance.DEBIT),  # an asset account that is NOT a declared recovery account
         ):
             row = Account(
                 tenant_id=env.tenant_id,
@@ -586,12 +587,14 @@ def test_internal_recovery_maps_to_asset_books_as_recovered_and_is_never_a_payab
         assert sum(d for d, _ in lines.values()) == sum(c for _, c in lines.values())
 
 
-def test_internal_recovery_mapped_to_a_liability_account_is_refused(engine):
-    env = world(engine, paye_mode="internal_recovery")  # 2110 is a LIABILITY account
+@pytest.mark.parametrize("account", ["2110", "1300"])  # a liability account; an undeclared asset account
+def test_internal_recovery_only_credits_a_declared_recovery_account(engine, account):
+    env = world(engine, paye_liability=account, paye_mode="internal_recovery")
     run_id = new_run(engine, env)
     batch(engine, env, run_id)
-    err = refusal(engine, env, svc.approve, run_id, "internal_recovery_account_not_asset", 1)
-    assert "ASSET-class" in str(err)
+    err = refusal(engine, env, svc.approve, run_id, "internal_recovery_account_not_allowed", 1)
+    assert "1410" in str(err)
+    assert counts(engine, env.tenant_id)["payroll_liabilities"] == 0
 
 
 def test_a_deduction_mapped_to_2040_is_refused_so_2040_holds_net_pay_only(engine):
