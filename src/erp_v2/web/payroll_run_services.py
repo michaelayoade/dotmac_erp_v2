@@ -1,6 +1,6 @@
 """Payroll run batch calculate, approve and finalize-and-post (B4).
 
-Three governed commands over the released Starter payroll owner (0.1.0a3); nothing here
+Four governed commands over the released Starter payroll owner (0.1.0a4); nothing here
 changes an amount, creates an account or a mapping, or moves money.
 
 * ``batch_calculate``: calculate EVERY active assignment effective at the run's period end
@@ -22,11 +22,20 @@ resolves to exactly one active postable tenant account. Account setup and mappin
 input and are never created here (see docs/payroll-account-setup.md on PR #42 for the 2133 NHIS
 Payable account and the 1410 Staff Loan reuse; new revisions consume its validated UUIDs).
 
-Loan recovery: a deduction credited to an ASSET-class account (for example 1410 Staff Loan) is
-an internal receivable recovery, but payroll a3 creates an EXTERNAL liability row for every
-deduction, which a later remittance/payout step could pay out. Until the payroll owner
-distinguishes internal recovery, such a run is refused (``internal_recovery_unsupported``)
-rather than risking a cash outflow.
+Loan recovery (payroll a4 ``settlement_mode``): a deduction with ``internal_recovery`` is recovered
+against the employee's own balance and must map to an ASSET-class postable account (for example
+1410 Staff Loan); the owner books it as already recovered, never as an outstanding payable. An
+``external`` deduction (the default) must map to a LIABILITY-class account. A mismatch either way is
+refused, so an internal recovery can never become a payable and an external payable can never
+credit an asset. Payouts independently refuse internal recoveries (B5).
+
+Leavers: an active assignment ending inside the period (no assignment at the period end) is part of
+the roster. The owner calculates it at min(period end, assignment end); the batch never prorates, so
+an uncalculated leaver refuses the batch (``proration_required``) and blocks approval until it is
+calculated with the single-employee form and its proration factor.
+
+Cancel: ``cancel_run`` calls the owner ``cancel_payroll_run`` (draft or approved only, mandatory
+reason, stored on the run) and writes an audit event. It never touches a finalized run.
 
 Replay: finalizing an already finalized run that has its journal returns it unchanged
 (no write, no audit). Finalized without a journal is refused and referred to the exceptions
@@ -78,8 +87,10 @@ PAYROLL_PAYABLE_CODE = "2040"  # Payroll Payable, confirmed by Michael; also the
 AUDIT_BATCH_CALCULATED = "erp.payroll.run.batch_calculated"
 AUDIT_APPROVED = "erp.payroll.run.approved"
 AUDIT_FINALIZED_POSTED = "erp.payroll.run.finalized_posted"
+AUDIT_CANCELLED = "erp.payroll.run.cancelled"
 AUDIT_REFUSED = "erp.payroll.run.command_refused"
-AUDIT_ACTIONS = (AUDIT_BATCH_CALCULATED, AUDIT_APPROVED, AUDIT_FINALIZED_POSTED, AUDIT_REFUSED)
+AUDIT_ACTIONS = (AUDIT_BATCH_CALCULATED, AUDIT_APPROVED, AUDIT_FINALIZED_POSTED, AUDIT_CANCELLED, AUDIT_REFUSED)
+MAX_REASON_CHARS = 500
 _KINDS_WITH_EXPENSE = ("earning", "employer_liability")
 _KINDS_WITH_LIABILITY = ("deduction", "employer_liability")
 _LISTED = 10
@@ -105,6 +116,12 @@ class BatchOutcome:
 
 @dataclass(frozen=True, slots=True)
 class ApproveOutcome:
+    run_id: UUID
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CancelOutcome:
     run_id: UUID
     replayed: bool
 
@@ -202,8 +219,31 @@ def _active_assignments(db: Session, run: PayrollRun) -> list[EmployeePayAssignm
     )
 
 
+def _leavers(db: Session, run: PayrollRun) -> list[EmployeePayAssignment]:
+    """Active assignments ending inside the period for employees with none at the period end.
+
+    Payroll a4 calculates these at min(period end, assignment end); the roster must include them so a
+    leaver is neither silently unpaid nor refused as a calculation without an assignment.
+    """
+    stayers = {a.employee_ref for a in _active_assignments(db, run)}
+    rows = db.scalars(
+        select(EmployeePayAssignment)
+        .where(
+            EmployeePayAssignment.tenant_id == run.tenant_id,
+            EmployeePayAssignment.status == "active",
+            EmployeePayAssignment.effective_from <= run.period_end,
+            EmployeePayAssignment.effective_to.is_not(None),
+            EmployeePayAssignment.effective_to < run.period_end,
+            EmployeePayAssignment.effective_to >= run.period_start,
+        )
+        .order_by(EmployeePayAssignment.employee_ref)
+    )
+    return [a for a in rows if a.employee_ref not in stayers]
+
+
 def check_roster_complete(db: Session, run: PayrollRun) -> None:
     expected = {a.employee_ref for a in _active_assignments(db, run)}
+    expected |= {a.employee_ref for a in _leavers(db, run)}
     calculated = set(
         db.scalars(
             select(PayrollCalculation.employee_ref).where(
@@ -287,6 +327,7 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
         raise RunRefused("no_calculations", "The run has no calculations")
     unmapped: dict[str, set[str]] = {}
     liability_refs: dict[str, set[str]] = {}
+    internal_refs: dict[str, set[str]] = {}
     expense_refs: dict[str, set[str]] = {}
     for line, _revision in lines:
         code = line.component_code
@@ -302,9 +343,22 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
         if line.component_kind in _KINDS_WITH_LIABILITY:
             if not (line.liability_account_ref or "").strip():
                 unmapped.setdefault("liability account", set()).add(code)
-            else:
+            elif line.settlement_mode == "internal_recovery":
+                if line.component_kind != "deduction":
+                    raise RunRefused(
+                        "internal_recovery_not_deduction",
+                        f"Component {code}: only a deduction can be an internal recovery",
+                    )
+                internal_refs.setdefault(line.liability_account_ref, set()).add(code)
+            elif line.settlement_mode == "external":
                 liability_refs.setdefault(line.liability_account_ref, set()).add(code)
-            if line.amount > 0 and not (line.liability_destination_ref or "").strip():
+            else:
+                raise RunRefused("unknown_settlement_mode", f"Component {code} has an unknown settlement mode")
+            if (
+                line.settlement_mode == "external"
+                and line.amount > 0
+                and not (line.liability_destination_ref or "").strip()
+            ):
                 unmapped.setdefault("remittance destination", set()).add(code)
     revision_ids = {revision for _line, revision in lines}
     net_refs: dict[str, set[str]] = {}
@@ -341,22 +395,25 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
     for ref, who in liability_refs.items():
         account = _resolve(db, tenant_id, ref, label=f"Liability account of {_listed(sorted(who))}")
         klass = _account_class(db, account)
-        if klass == AccountClass.ASSET:
-            raise RunRefused(
-                "internal_recovery_unsupported",
-                f"{_listed(sorted(who))} credits asset account {account.code} (internal recovery such as a staff "
-                "loan). Payroll creates an external payable for every deduction, which must never become a "
-                "remittance or payout; refer to the payroll owner change before this component is used",
-            )
         if klass != AccountClass.LIABILITY:
             raise RunRefused(
                 "mapping_account_class_refused",
-                f"{_listed(sorted(who))}: liability mapping {account.code} must be a LIABILITY-class account",
+                f"{_listed(sorted(who))}: an external deduction or employer liability maps to {account.code}, "
+                "which must be a LIABILITY-class account (an asset recovery must be marked internal_recovery "
+                "on the pay structure rule)",
             )
         if account.id == payable.id:
             raise RunRefused(
                 "deduction_mapped_to_net_payable",
                 f"{_listed(sorted(who))} is mapped to {PAYROLL_PAYABLE_CODE}, which holds net pay only",
+            )
+    for ref, who in internal_refs.items():
+        account = _resolve(db, tenant_id, ref, label=f"Recovery account of {_listed(sorted(who))}")
+        if _account_class(db, account) != AccountClass.ASSET:
+            raise RunRefused(
+                "internal_recovery_account_not_asset",
+                f"{_listed(sorted(who))}: an internal recovery maps to {account.code}, which must be an "
+                "ASSET-class account (for example 1410 Staff Loan); it is never a payable",
             )
     return payable.id
 
@@ -413,6 +470,13 @@ def _guarded_batch(
             "proration_required",
             f"{len(partial)} employee(s) joined after the period start and need a proration factor: "
             f"{_listed(partial)}. Calculate them with the single-employee form, then run the batch again",
+        )
+    leavers = sorted(a.employee_ref for a in _leavers(db, run) if a.employee_ref not in calculated)
+    if leavers:
+        raise RunRefused(
+            "proration_required",
+            f"{len(leavers)} employee(s) left before the period end and need a proration factor: "
+            f"{_listed(leavers)}. Calculate them with the single-employee form, then run the batch again",
         )
     stray = sorted(set(parsed.by_employee) - {a.employee_ref for a in todo})
     if stray:
@@ -586,6 +650,55 @@ def approve(db: Session, *, tenant: Tenant, party: Party, run_id: UUID, now: dat
     except (payroll.PayrollNotFound, payroll.PayrollConflict, payroll.PayrollRuleViolation) as exc:
         refusal = RunRefused("payroll_refused", str(exc))
     _refuse(db, tenant=tenant, party=party, run_id=run_id, command="approve", refusal=refusal)
+
+
+# --- cancel --------------------------------------------------------------------------------------
+
+
+def _guarded_cancel(
+    db: Session, *, tenant: Tenant, party: Party, run_id: UUID, reason: str, now: datetime
+) -> CancelOutcome:
+    cleaned = (reason or "").strip()
+    if not cleaned:
+        raise RunRefused("reason_required", "A reason is required to cancel a payroll run")
+    if len(cleaned) > MAX_REASON_CHARS:
+        raise RunRefused("reason_too_long", f"The reason must be at most {MAX_REASON_CHARS} characters")
+    run = _locked_run(db, tenant.id, run_id)
+    if run.status == "cancelled" and run.cancelled_by_id == party.id and run.cancel_reason == cleaned:
+        return CancelOutcome(run.id, True)
+    if run.status not in ("draft", "approved"):
+        raise RunRefused("not_cancellable", f"A {run.status} payroll run cannot be cancelled")
+    previous = run.status
+    payroll.cancel_payroll_run(
+        db, tenant_id=tenant.id, run_id=run.id, cancelled_by_id=party.id, reason=cleaned, cancelled_at=now
+    )
+    _audit(
+        db,
+        tenant=tenant,
+        party=party,
+        run_id=run.id,
+        action=AUDIT_CANCELLED,
+        success=True,
+        details={"previous_status": previous, "reason": cleaned, "created_by": str(run.created_by_id)},
+    )
+    return CancelOutcome(run.id, False)
+
+
+def cancel_run(
+    db: Session, *, tenant: Tenant, party: Party, run_id: UUID, reason: str, now: datetime | None = None
+) -> CancelOutcome:
+    """Cancel a draft or approved run through the owner command; a finalized run is never cancellable."""
+    if party.tenant_id != tenant.id:
+        raise RunRefused("actor_tenant", "The acting party must belong to this tenant")
+    moment = now or datetime.now(UTC)
+    try:
+        with db.begin_nested():
+            return _guarded_cancel(db, tenant=tenant, party=party, run_id=run_id, reason=reason, now=moment)
+    except RunRefused as exc:
+        refusal = exc
+    except (payroll.PayrollNotFound, payroll.PayrollConflict, payroll.PayrollRuleViolation) as exc:
+        refusal = RunRefused("payroll_refused", str(exc))
+    _refuse(db, tenant=tenant, party=party, run_id=run_id, command="cancel", refusal=refusal)
 
 
 # --- finalize + post -----------------------------------------------------------------------------

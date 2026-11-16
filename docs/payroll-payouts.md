@@ -1,6 +1,6 @@
 # Payroll payouts (B5)
 
-Starter payroll 0.1.0a3 owns the liabilities and their settlements; the ERP composes batching,
+Starter payroll 0.1.0a4 owns the liabilities and their settlements; the ERP composes batching,
 approval, the optional bank file, the role gates and the ledger posting. The ERP never calls a bank:
 recording is a named person's assertion, backed by a bank evidence reference, that the money left
 through the bank portal.

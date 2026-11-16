@@ -40,5 +40,16 @@ need rows in the input file (up to {{ max_kib }} KiB, UTF-8 CSV, header
 </form>
 {% elif packet.run.status == 'finalized' %}<p>This run is finalized and posted.</p>
 {% else %}<p>This run is {{ packet.run.status }}; it must be approved before it can be finalized.</p>{% endif %}
+{% elif step == 'cancel' %}
+{% if packet.run.status in ('draft', 'approved') %}
+<form method="post" action="/payroll/runs/{{ packet.run.id }}/cancel">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<p>Cancelling withdraws this {{ packet.run.status }} run; its calculations are kept as evidence and the period is freed.
+A finalized run cannot be cancelled. A reason is required and is recorded in the audit trail.</p>
+<label>Reason <input type="text" name="reason" maxlength="500" required></label>
+<button type="submit">Cancel payroll run</button>
+</form>
+{% elif packet.run.status == 'cancelled' %}<p>This run is cancelled.</p>
+{% else %}<p>This run is {{ packet.run.status }} and cannot be cancelled.</p>{% endif %}
 {% endif %}
 {% endblock %}

@@ -2,7 +2,9 @@
 
 Every route is permission-gated: batch calculation needs ``erp.payroll.manage`` (admin, as for
 draft creation), approval needs ``erp.payroll.runs.approve`` (payroll_approver) and finalize
-needs ``erp.payroll.runs.finalize`` (payroll_finalizer). The two new codes are declared in
+needs ``erp.payroll.runs.finalize`` (payroll_finalizer). Cancel (draft or approved runs, mandatory reason)
+reuses ``erp.payroll.runs.approve`` (payroll_approver): cancelling is the withdrawal counterpart of approving,
+so no new permission or role-profile version is introduced. The two new codes are declared in
 ``erp_v2.access`` and are dormant until a named party is granted the role (access_cli); admin
 and staff hold neither. Refusals render the page again with the reason (HTTP 400); nothing is
 echoed from the uploaded input file.
@@ -31,6 +33,7 @@ from erp_v2.web.payroll_run_input import MAX_FILE_BYTES
 
 APPROVE_PERMISSION: Final = "erp.payroll.runs.approve"
 FINALIZE_PERMISSION: Final = "erp.payroll.runs.finalize"
+CANCEL_PERMISSION: Final = APPROVE_PERMISSION
 FORM_OVERHEAD_BYTES: Final = 64 * 1024
 router = APIRouter(tags=["payroll-run-web"])
 
@@ -166,6 +169,41 @@ def payroll_finalize(
             raise HTTPException(status_code=404, detail="Payroll run not found") from exc
         return _page(request, db, tenant, party, run_id, step="finalize", error=str(exc))
     return RedirectResponse(f"/payroll/runs/{run_id}/finalize", status_code=303)
+
+
+@router.get("/payroll/runs/{run_id}/cancel")
+def payroll_cancel_page(
+    run_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(CANCEL_PERMISSION)),
+) -> HTMLResponse:
+    return _page(request, db, tenant, party, run_id, step="cancel")
+
+
+@router.post("/payroll/runs/{run_id}/cancel", response_model=None)
+async def payroll_cancel(
+    run_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(CANCEL_PERMISSION)),
+) -> HTMLResponse | RedirectResponse:
+    declared = request.headers.get("content-length")
+    if declared is not None and (not declared.isdigit() or int(declared) > FORM_OVERHEAD_BYTES):
+        raise HTTPException(413, "Request is too large")
+    form = await request.form()
+    reason = form.get("reason")
+    try:
+        services.cancel_run(
+            db, tenant=tenant, party=party, run_id=run_id, reason=reason if isinstance(reason, str) else ""
+        )
+    except services.RunRefused as exc:
+        if exc.code == "not_found":
+            raise HTTPException(status_code=404, detail="Payroll run not found") from exc
+        return _page(request, db, tenant, party, run_id, step="cancel", error=str(exc))
+    return RedirectResponse(f"/payroll/runs/{run_id}/cancel", status_code=303)
 
 
 payroll_run_feature = FeatureManifest(
