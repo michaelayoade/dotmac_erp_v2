@@ -65,6 +65,11 @@ _NEW_PERMISSIONS: Final[dict[str, tuple[str, str]]] = {
     ),
     "erp.finance.supplier_payments.approve": ("Approve supplier payment proposals.", "finance_approver"),
     "erp.banking.reconciliation.approve": ("Approve bank reconciliations.", "finance_approver"),
+    "erp.finance.payroll_payouts.prepare": (
+        "Prepare payroll payout batches and statutory remittances.",
+        "finance_preparer",
+    ),
+    "erp.finance.payroll_payouts.approve": ("Approve or cancel payroll payout batches.", "finance_approver"),
     "erp.treasury.supplier_payments.record": ("Record supplier payments as made at the bank.", "treasury"),
     "erp.treasury.disbursement_files.generate": ("Generate bank upload files for payments and payouts.", "treasury"),
     "erp.treasury.payroll_payouts.record": ("Record payroll payouts and statutory remittances.", "treasury"),
