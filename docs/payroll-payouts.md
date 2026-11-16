@@ -1,6 +1,6 @@
 # Payroll payouts (B5)
 
-Starter payroll 0.1.0a3 owns the liabilities and their settlements; the ERP composes batching,
+Starter payroll 0.1.0a5 owns the liabilities and their settlements; the ERP composes batching,
 approval, the optional bank file, the role gates and the ledger posting. The ERP never calls a bank:
 recording is a named person's assertion, backed by a bank evidence reference, that the money left
 through the bank portal.
@@ -55,7 +55,38 @@ count on the batch; a second file is refused (`file_already_issued`). Cancelling
 the bank's rejection or recall reference, audited. Bytes are never logged or stored; `no-store`.
 A cell with a control character, comma, quote or semicolon refuses the whole file (`file_invalid_cell`).
 
+## Returned salary (payroll a5, `e2_0021_payroll_payout_returns`)
+
+When the bank returns one employee's salary credit, an approver records the return on that LINE of the
+RECORDED net-pay batch (`/payroll/payout-approvals/{batch}/lines/{line}/return`; inputs: bank return
+reference, bank return date, reason). Permission: the existing `erp.finance.payroll_payouts.approve`
+(finance_approver; same reuse ruling as cancel/reversal in B3). No new permission, no role profile bump.
+
+- Returner: a finance_approver who is none of the batch's preparer, approver, file issuer or recorder
+  (`sod_returner_is_*`; the owner also refuses the settlement's recorder; a trigger repeats the rule).
+- One savepoint: owner `reverse_liability_settlement` (whole settlement, liability back to outstanding,
+  settlement row never updated), `build_settlement_reversal_consequence` (Dr bank cash GL / Cr 2040,
+  keyed on the reversal id), the bridge, and the line marked RETURNED with `active = false` (so the
+  liability can go into a new batch). Payroll a5 has no accounting-receipt table: the receipt is on the
+  line (reversal id, journal id and number, fingerprint, who, when, reference, reason).
+- Bank account: the cash GL credited by the settlement's ORIGINAL posted journal (rebuilt and checked
+  against the stored consequence fingerprint; `original_journal_mismatch` otherwise), never the bank
+  account's current mapping. If an approved cash GL re-point has since left that GL, the return still
+  debits it (the old GL stays postable; only B7 refuses to reconcile it) and the audit event records
+  `original_cash_gl_retired: true`. Finance moves the amount to the new account with the step-4 B2
+  transfer in `cash-gl-split.md`.
+- Dates: the return date is on or after the settlement's posting date and not in the future.
+- The return reference is a bank evidence reference: unique per bank account across B3, B5 payouts and
+  B5 returns (`bank_reference_reused`).
+- Replay with identical evidence is a no-op returning the same reversal and journal; different evidence
+  is `already_returned`. Concurrent returns serialise on the batch row lock. Audited:
+  `erp.payroll.payout.line_returned` (refusals `erp.payroll.payout.refused`).
+- Re-payment is a new batch for the reopened liability; its settlement reference is new (batch number and
+  line id), and the owner refuses the old one.
+- Statutory lines have no return path (`statutory_no_return`).
+
 ## Not done here
 
-No reversal of a recorded payout (a Finance journal through B2), no WHT, no non-functional currency,
+No reversal of a recorded payout other than the returned-salary path above (a Finance journal through B2),
+no WHT, no non-functional currency,
 no bank-specific layouts (W15), no backfill; amounts are never changed.

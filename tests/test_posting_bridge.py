@@ -218,6 +218,16 @@ def test_payroll_shaped_consequence_posts_with_declared_code(monkeypatch):
     assert acc.calls[0][1]["command"].source.owner == "payroll"
 
 
+def test_payroll_settlement_reversal_posts_with_declared_code(monkeypatch):
+    # Payroll a5: Dr the original bank cash GL / Cr 2040, document kind payroll_settlement_reversal.
+    acc = Accounting(monkeypatch)
+    c = consequence(
+        (entry(A1, debit="100"), entry("2040", credit="100")), owner="payroll", kind="payroll_settlement_reversal"
+    )
+    run(FakeDB([account(A1), account(A3, "2040")]), c)
+    assert acc.calls[0][1]["command"].source.document_kind == "payroll_settlement_reversal"
+
+
 @pytest.mark.parametrize("state", [JournalStatus.REVERSED, JournalStatus.VOID])
 def test_existing_reversed_or_void_refuses(monkeypatch, state):
     acc = Accounting(monkeypatch)

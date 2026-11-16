@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Cash GL re-point — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Cash GL re-point</h1>
+<p><a href="/finance">Finance</a></p>
+<p>Each bank account gets its own cash GL account. A re-point is a proposal; a different person must approve it. It is refused once the bank account has an approved reconciliation, while payments for it are unposted, or when the target is already another bank account's cash GL. Re-pointing moves no balance: Finance reclassifies with B2 journals (see the runbook).</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<h2>Propose a re-point</h2>
+<form method="post" action="/finance/banking/cash-gl-repoints" autocomplete="off">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><label>Bank account <select name="bank_account_id" required>{% for b in banks %}<option value="{{ b.id }}">{{ b.account_code }} — {{ b.account_name }} (now {{ b.cash_account_ref }})</option>{% endfor %}</select></label></p>
+  <p><label>New cash GL account code <input name="target_code" maxlength="40" required></label></p>
+  <p><label>Evidence reference <input name="evidence_ref" maxlength="240" required></label></p>
+  <p><button type="submit">Propose</button></p>
+</form>
+<h2>Requests</h2>
+<table>
+  <thead><tr><th>Bank account</th><th>From</th><th>To account</th><th>Status</th><th>Evidence</th><th>Actions</th></tr></thead>
+  <tbody>{% for r in requests %}
+    <tr><td>{{ r.bank_account_id }}</td><td>{{ r.from_ref }}</td><td>{{ r.to_account_code }}</td><td>{{ r.status }}</td><td>{{ r.evidence_ref }}</td>
+      <td>{% if r.status == 'proposed' %}
+        <form method="post" action="/finance/banking/cash-gl-repoints/{{ r.id }}/approve"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="note" maxlength="500" placeholder="Note"><button type="submit">Approve</button></form>
+        <form method="post" action="/finance/banking/cash-gl-repoints/{{ r.id }}/reject"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="reason" maxlength="500" placeholder="Reason" required><button type="submit">Reject</button></form>
+      {% endif %}</td></tr>
+  {% else %}<tr><td colspan="6">No re-point requests.</td></tr>{% endfor %}</tbody>
+</table>
+{% endblock %}

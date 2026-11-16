@@ -54,12 +54,15 @@ FORM = {
     "value_date": "2026-01-20",
     "reason": "r",
     "bank_reference": "REF-1",
+    "return_reference": "RET-1",
 }
+LINE_ID = uuid4()
 # action -> (path, principals admitted, spied service function)
 ACTIONS = {
     "create": (P, {"preparer"}, "prepare_batch"),
     "approve": (f"{A}/{PID}/approve", {"approver"}, "approve_batch"),
     "cancel": (f"{A}/{PID}/cancel", {"approver"}, "cancel_batch"),
+    "return_line": (f"{A}/{PID}/lines/{LINE_ID}/return", {"approver"}, "return_line"),
     "record": (f"{T}/{PID}/record", {"treasury"}, "record_batch"),
     "bank_file": (f"{T}/{PID}/bank-file", {"treasury"}, "generate_bank_file"),
 }
@@ -391,3 +394,48 @@ def test_route_permission_table_matches_declared_permissions():
 
 def test_payroll_payout_routes_are_not_facet_entry_routes():
     assert "erp_payroll_payouts" not in {r.module for r in assembly.web_facets[0].entry_routes}
+
+
+def test_return_route_passes_typed_values_and_never_a_bank_account_or_amount(browser):
+    token = browser.sign_in("approver")
+    response = _post(
+        browser,
+        f"{A}/{PID}/lines/{LINE_ID}/return",
+        token,
+        cash_account_ref=str(uuid4()),
+        bank_account_id=str(uuid4()),
+        amount="999999",
+    )
+    assert response.status_code == 303
+    kwargs = browser.spies["return_line"].call_args.kwargs
+    assert set(kwargs) == {
+        "tenant",
+        "party",
+        "batch_id",
+        "line_id",
+        "return_reference",
+        "reason",
+        "value_date",
+    }
+    assert kwargs["line_id"] == LINE_ID and kwargs["return_reference"] == "RET-1"
+    assert kwargs["value_date"] == date(2026, 1, 20)
+
+
+def test_return_route_refuses_a_malformed_date_before_the_service(browser):
+    token = browser.sign_in("approver")
+    response = _post(browser, f"{A}/{PID}/lines/{LINE_ID}/return", token, value_date="garbage")
+    assert response.status_code in (400, 404)
+    browser.spies["return_line"].assert_not_called()
+
+
+def test_return_route_refusal_renders_the_code(browser):
+    token = browser.sign_in("approver")
+    browser.spies["return_line"].side_effect = PayoutRefused("original_journal_mismatch", "manual journal")
+    browser.spies["queries.detail"].return_value = {
+        "batch": _batch(status="recorded"),
+        "lines": [],
+        "names": {},
+        "bank": None,
+    }
+    response = _post(browser, f"{A}/{PID}/lines/{LINE_ID}/return", token)
+    assert response.status_code == 400 and "original_journal_mismatch" in response.text

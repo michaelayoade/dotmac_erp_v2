@@ -50,6 +50,10 @@ _EMPTY_TABLE_COUNT_SQL = {
     "historical_settlements": "SELECT count(*) FROM mod_payables.historical_settlements WHERE tenant_id = :tenant",
     "settlement_observations": "SELECT count(*) FROM mod_payables.settlement_observations WHERE tenant_id = :tenant",
 }
+# Settled historical admission (legacy_ap.settled_cli) writes historical_settlements itself, and a re-run of the
+# same list must stay a no-op, so that table is governed by the settled operator (rows only for invoices of its
+# own list); every other payment/settlement table must still be empty.
+SETTLED_PREIMPORT_EMPTY_TABLES = tuple(t for t in PREIMPORT_EMPTY_TABLES if t != "historical_settlements")
 REFERENCED_SQL = "SELECT legacy_invoice_id FROM public.legacy_invoice_references WHERE tenant_id = :tenant"
 
 
@@ -205,8 +209,11 @@ def _expected_schema_heads() -> set[str]:
     return set(EXPECTED_STAMPED_HEADS)
 
 
-def _destination_preflight(session, tenant: UUID) -> None:
-    """Check the actual admission connection, then bind its transaction to scope."""
+def _destination_preflight(session, tenant: UUID, empty_tables: tuple[str, ...] = PREIMPORT_EMPTY_TABLES) -> None:
+    """Check the actual admission connection, then bind its transaction to scope.
+
+    ``empty_tables`` defaults to the full unpaid-import rule; only the settled operator narrows it."""
+    _require(set(empty_tables) <= set(PREIMPORT_EMPTY_TABLES), "preflight_unknown_table")
     posture = (
         session.execute(
             sa.text(
@@ -263,7 +270,7 @@ def _destination_preflight(session, tenant: UUID) -> None:
     _require(selected == str(tenant) and str(observed) == str(tenant), "destination_tenant_binding_mismatch")
     # Tenant-bound (forced RLS) counts: an unpaid-cohort import starts from no payment,
     # settlement or withholding history for this tenant.
-    for table in PREIMPORT_EMPTY_TABLES:
+    for table in empty_tables:
         rows = session.scalar(sa.text(_EMPTY_TABLE_COUNT_SQL[table]), {"tenant": str(tenant)})
         _require(rows == 0, "destination_payables_history_not_empty")
 

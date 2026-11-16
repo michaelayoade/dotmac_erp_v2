@@ -60,7 +60,7 @@ No free items, no auto-posting, no reopening.
 ## Shared cash GL and foreign currency
 * Two bank accounts on one cash GL (census: GL 1210 and 1211 are each shared by two accounts) are REFUSED
   (`shared_cash_gl`) for open, baseline and matching: the GL balance mixes both accounts and no allocation
-  is invented. Finance splits the cash GL (one per bank account) or reconciles that pair outside ERP.
+  is invented. Finance splits the cash GL (one per bank account, `docs/cash-gl-split.md`) or reconciles that pair outside ERP.
 * Non-functional-currency bank accounts (census: one USD account) stay refused; reconcile them outside ERP.
 
 ## Ownership and locking

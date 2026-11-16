@@ -96,6 +96,22 @@ def create_draft(
         raise PayrollActionError("Run reference already exists or conflicts with payroll data") from exc
 
 
+def _calculation_date(db: Session, tenant_id: UUID, employee_ref: str, run: PayrollRun) -> date:
+    """The owner's lookup date (payroll a4): the period end, or for a leaver min(period end, its end date)."""
+    rows = db.execute(
+        select(EmployeePayAssignment.effective_from, EmployeePayAssignment.effective_to).where(
+            EmployeePayAssignment.tenant_id == tenant_id,
+            EmployeePayAssignment.employee_ref == employee_ref,
+            EmployeePayAssignment.status == "active",
+            EmployeePayAssignment.effective_from <= run.period_end,
+        )
+    ).all()
+    if any(end is None or end >= run.period_end for _start, end in rows):
+        return run.period_end
+    ends = [end for _start, end in rows if end is not None and end >= run.period_start]
+    return min(run.period_end, max(ends)) if ends else run.period_end
+
+
 def calculate_employee(
     db: Session,
     *,
@@ -120,6 +136,7 @@ def calculate_employee(
     currency = Currency(run.currency_code, run.minor_units)
     # An explicit input must belong to this employee's effective input rules.
     # The owner still resolves assignment ambiguity and all calculation policy.
+    as_of = _calculation_date(db, tenant.id, employee_ref, run)
     components = dict(
         db.execute(
             select(PayComponent.component_code, PayComponent.id)
@@ -138,8 +155,8 @@ def calculate_employee(
                 EmployeePayAssignment.tenant_id == tenant.id,
                 EmployeePayAssignment.employee_ref == employee_ref,
                 EmployeePayAssignment.status == "active",
-                EmployeePayAssignment.effective_from <= run.period_end,
-                (EmployeePayAssignment.effective_to.is_(None)) | (EmployeePayAssignment.effective_to >= run.period_end),
+                EmployeePayAssignment.effective_from <= as_of,
+                (EmployeePayAssignment.effective_to.is_(None)) | (EmployeePayAssignment.effective_to >= as_of),
                 PayStructureRule.calculation_method == "input",
             )
         ).all()

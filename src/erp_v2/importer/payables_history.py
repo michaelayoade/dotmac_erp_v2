@@ -45,6 +45,11 @@ NUMBERS = frozenset(
         "withholding_tax_amount",
         "prepayment_applied",
         "stamp_duty_amount",
+        "allocated_amount",
+        "discount_taken",
+        "exchange_difference",
+        "gross_amount",
+        "amount",
         "quantity",
         "unit_price",
         "line_amount",
@@ -123,6 +128,7 @@ SOURCE_SCHEMAS = {
     "supplier_invoice": "ap",
     "supplier_invoice_line": "ap",
     "payment_allocation": "ap",
+    "supplier_payment": "ap",
     "journal_entry": "gl",
     "journal_entry_line": "gl",
     "posted_ledger_line": "gl",
@@ -265,14 +271,20 @@ def _readonly(connection: sa.Connection) -> bool:
 
 
 def _read(
-    connection: sa.Connection, name: str, *, schema: str | None = None, key: str | None = None, value: object = None
+    connection: sa.Connection,
+    name: str,
+    *,
+    schema: str | None = None,
+    key: str | None = None,
+    value: object = None,
+    fields: list[str] | None = None,
 ) -> list[dict]:
     if schema is None and connection.dialect.name == "postgresql":
         _require(name in SOURCE_SCHEMAS, "unknown_source_table_contract")
         schema = SOURCE_SCHEMAS[name]
     table = _reflect(connection, name, schema)
     columns = []
-    for field in READ_FIELDS[name]:
+    for field in fields if fields is not None else READ_FIELDS[name]:
         _require(field in table.c, f"missing_column:{name}.{field}")
         col = table.c[field]
         if col.name in NUMBERS or isinstance(col.type, sa.Numeric):
@@ -377,21 +389,40 @@ class HistoricalPayablesVerifier:
                 raise HistoricalEvidenceError(f"missing_required_fact:{exc.args[0]}") from exc
 
     def _evidence(self, tenant: UUID, invoice_id: UUID, dest: sa.Connection) -> HistoricalUnpaidInvoiceEvidence:
+        header, common = self._parts(tenant, invoice_id, dest, settled=False)
+        return HistoricalUnpaidInvoiceEvidence(
+            source_status=header["status"],
+            paid_amount=header["amount_paid"],
+            allocation_count=0,
+            withholding_tax_amount=header["withholding_tax_amount"],
+            **common,
+        )
+
+    def _parts(self, tenant: UUID, invoice_id: UUID, dest: sa.Connection, *, settled: bool) -> tuple[dict, dict]:
+        """Shared invoice, accounting and destination proof. ``settled`` only relaxes the unpaid shape
+        (status PARTIALLY_PAID, amount_paid > 0, allocations present); every other fact is identical."""
         src = self.source
         header = _one(
             _read(src, "supplier_invoice", key="invoice_id", value=invoice_id), "source_invoice_missing_or_duplicate"
         )
         _tenant([header], tenant, "source_invoice", "organization_id")
         _require(header["invoice_type"] == "STANDARD", "source_type")
-        _require(header["status"] == "POSTED" and header["posting_status"] == "POSTED", "source_status")
-        _require(header["amount_paid"] == 0, "source_paid")
+        if settled:
+            _require(
+                header["status"] in ("POSTED", "PARTIALLY_PAID") and header["posting_status"] == "POSTED",
+                "source_status",
+            )
+            _require(header["amount_paid"] > 0, "source_not_paid")
+        else:
+            _require(header["status"] == "POSTED" and header["posting_status"] == "POSTED", "source_status")
+            _require(header["amount_paid"] == 0, "source_paid")
         _require(
             header["withholding_tax_amount"] == 0 and header["withholding_tax_code_id"] is None, "source_withholding"
         )
         _require(header["is_prepayment"] is False and header["prepayment_applied"] == 0, "source_prepayment")
         _require(header["stamp_duty_amount"] == 0, "unsupported_stamp_duty")
-        allocations = _read(src, "payment_allocation", key="invoice_id", value=invoice_id)
-        _require(not allocations, "source_allocations")
+        if not settled:
+            _require(not _read(src, "payment_allocation", key="invoice_id", value=invoice_id), "source_allocations")
         for field in ("subtotal", "tax_amount", "total_amount"):
             amount = header[field]
             # Exact remainder, not quantization: six-place source storage must never round.
@@ -527,17 +558,13 @@ class HistoricalPayablesVerifier:
                 destination_lines=_project_rows(targets, DESTINATION_INVOICE_LINE, "id"),
             ),
         )
-        return HistoricalUnpaidInvoiceEvidence(
+        common = dict(
             tenant_id=tenant,
             source_owner=self.source_owner,
             source_invoice_id=str(invoice_id),
             source_snapshot_sha256=self.manifest.snapshot_sha256,
             invoice_id=invoice_id,
-            source_status=header["status"],
             invoice_type=header["invoice_type"],
-            paid_amount=header["amount_paid"],
-            allocation_count=len(allocations),
-            withholding_tax_amount=header["withholding_tax_amount"],
             prepayment_amount=header["prepayment_applied"],
             number=target["number"],
             supplier_ref=target["supplier_ref"],
@@ -569,6 +596,7 @@ class HistoricalPayablesVerifier:
             accounting_evidence_fingerprint=accounting,
             facts_fingerprint=facts,
         )
+        return header, common
 
     def _accounting(self, tenant: UUID, header: dict, dest: sa.Connection) -> str:
         journal_id = header["journal_entry_id"]

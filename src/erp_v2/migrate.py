@@ -61,7 +61,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "cl_0001_collections",  # collections 0.1.0a1
     "cu_0001_customer_accounts",  # customers 0.1.0a1
     "do_0001_documents",  # documents 0.1.0a1
-    "e2_0019_payroll_payouts",  # assembly e2 head, payroll payouts B5 (after disbursement receipts e2_0018)
+    "e2_0021_payroll_payout_returns",  # assembly e2 head, returned payout lines (after cash GL re-point e2_0020)
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1
     "ex_0001_expenses",  # expenses 0.1.0a1
     "fi_0002_selectable_planes",  # files 0.1.0a7
@@ -77,7 +77,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "pj_0001_projects",  # projects 0.1.0a1
     "pm_0006_cash_qualification",  # payments 0.1.0a3
     "pt_0001_party_context",  # party 0.1.0a1
-    "py_0001_payroll",  # payroll 0.1.0a3
+    "py_0003_settlement_reversal",  # payroll 0.1.0a5
     "sa_0001_sales",  # sales 0.1.0a1
     "tk_0001_tickets",  # ticketing 0.1.0a4
     "tx_0005_tax_dependencies",  # tax 0.1.0a7

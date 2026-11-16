@@ -46,6 +46,7 @@ from sqlalchemy.orm import Session
 
 from erp_v2.banking import recon_models as m
 from erp_v2.banking.recon_models import BankReconciliation, BankReconItem, BankReconMatch, BankReconMatchLine
+from erp_v2.cash_gl.models import CashAccountRepoint
 from erp_v2.journals import models as journal_models
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
 
@@ -170,7 +171,33 @@ def resolve_gl_account(db: Session, tenant_id: UUID, account: BankAccount) -> UU
     if len(rows) != 1:
         raise ReconRefused("gl_account_unresolved", "the cash account reference does not resolve to one account")
     _refuse_shared_gl(db, tenant_id, account, rows[0])
+    _refuse_retired_gl(db, tenant_id, rows[0])
     return rows[0]
+
+
+def _refuse_retired_gl(db: Session, tenant_id: UUID, gl_account_id: UUID) -> None:
+    """A GL that a bank account was re-pointed away from is a half-split shared GL.
+
+    The partner bank left on it (the shared GL's other bank account) would reconcile against a balance that
+    still holds the re-pointed bank's outstanding items. Both banks of a pair must be re-pointed first
+    (docs/cash-gl-split.md); the retired account stays refused here.
+    """
+    code = db.scalar(select(Account.code).where(Account.tenant_id == tenant_id, Account.id == gl_account_id))
+    retired = db.scalar(
+        select(CashAccountRepoint.id)
+        .where(
+            CashAccountRepoint.tenant_id == tenant_id,
+            CashAccountRepoint.status == "approved",
+            CashAccountRepoint.from_ref.in_((str(gl_account_id), code)),
+        )
+        .limit(1)
+    )
+    if retired is not None:
+        raise ReconRefused(
+            "retired_cash_gl",
+            "a bank account was re-pointed away from this cash GL account; re-point every bank account that "
+            "used it before reconciling",
+        )
 
 
 def _refuse_shared_gl(db: Session, tenant_id: UUID, account: BankAccount, gl_account_id: UUID) -> None:

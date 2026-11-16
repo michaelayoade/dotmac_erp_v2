@@ -85,6 +85,8 @@ POLICIES: Final = MappingProxyType(
         ("payables", "supplier_payment_reversal"): RefPolicy(),
         ("payroll", "payroll_run"): RefPolicy(frozenset({"2040"})),
         ("payroll", "payroll_liability_settlement"): RefPolicy(frozenset({"2040"})),
+        # payroll a5: bank-returned salary. Dr the ORIGINAL bank cash GL (Account UUID) / Cr 2040.
+        ("payroll", "payroll_settlement_reversal"): RefPolicy(frozenset({"2040"})),
     }
 )
 

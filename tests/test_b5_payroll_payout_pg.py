@@ -1,6 +1,6 @@
 """B5 payroll payouts against real PostgreSQL (hosted CI; ERP_TEST_POSTGRES_URL).
 
-Real payroll a3, accounting a2 and kernel migrations; real owner commands, the real posting bridge and
+Real payroll a4, accounting a2 and kernel migrations; real owner commands, the real posting bridge and
 real payee instruction rows. Runs are calculated/approved/finalized through the B4 services (reusing
 its seed). Account codes, mappings and amounts are test inputs only.
 
@@ -32,6 +32,7 @@ from dotmac_kernel.setting_domains import SettingDomainRegistry, install_setting
 from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
 from dotmac_kernel.settings_resolver import SettingChangeContext, upsert_by_key
+from dotmac_payables.models import SupplierPayment, SupplierPaymentStatus
 from dotmac_payroll import service as payroll
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement
 from dotmac_people.models import Employee
@@ -39,6 +40,7 @@ from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, soft_close
 
 from erp_v2.assembly import assembly
+from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import DisbursementFileReceipt
 from erp_v2.journals.routes import journals_web_feature
@@ -69,8 +71,8 @@ GOOD_FILE = (
 )
 
 
-def world(engine):
-    env = b4.world(engine)
+def world(engine, **kw):
+    env = b4.world(engine, **kw)
     with Session(engine) as db:
         # Canonical employee UUIDs (as the B8 importer's _canon_ref spells them), with real people rows,
         # so payee resolution works; the b4 seed assigned the placeholders E1..E3.
@@ -623,6 +625,158 @@ def test_bank_reference_is_required_printable_normalised_and_unique_per_bank_acc
     assert record(engine, env, second, "REF TWO").replayed is False
 
 
+def supplier_payment_row(engine, env, ref, *, bank_id=None):
+    """A recorded B3 supplier payment holding `ref` on a bank account (the row B3 itself leaves behind)."""
+    with Session(engine) as db:
+        row = SupplierPayment(
+            tenant_id=env.tenant_id,
+            number=f"SP-{uuid4().hex[:8]}",
+            supplier_ref="supplier-x",
+            supplier_name_snapshot="Supplier X",
+            currency_code="NGN",
+            exchange_rate=Decimal("1"),
+            value_date=VALUE_DATE,
+            cash_account_ref=str(env.accounts["1000"]),
+            payer_instrument_ref=str(bank_id or env.bank_id),
+            gross_amount=Decimal("100"),
+            wht_amount=Decimal("0"),
+            net_amount=Decimal("100"),
+            request_fingerprint="0" * 64,
+            status=SupplierPaymentStatus.DRAFT,
+            prepared_by="p1",
+            prepared_at=NOW,
+        )
+        db.add(row)
+        db.commit()  # the owner's trigger only allows creation as a draft; then walk it forward
+        row.status = SupplierPaymentStatus.APPROVED
+        row.approval_reference = "appr-1"
+        row.approved_by = "p2"
+        row.approved_at = NOW
+        db.commit()
+        row.status = SupplierPaymentStatus.RECORDED
+        row.bank_reference = ref
+        row.recorded_by = "p3"
+        row.recorded_at = NOW
+        db.commit()
+
+
+def test_b5_record_after_b3_with_the_same_reference_on_the_same_account_is_refused(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    supplier_payment_row(engine, env, "SUPPLIER-1")
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, batch_id, "supplier-1"), "bank_reference_reused")
+    assert counts(engine, env) == before
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_a_supplier_reference_on_a_different_bank_account_does_not_block_b5(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    with Session(engine) as db:
+        other = uuid4()
+        db.add(
+            BankAccount(
+                id=other,
+                tenant_id=env.tenant_id,
+                institution_id=db.scalar(
+                    sa.select(BankInstitution.id).where(BankInstitution.tenant_id == env.tenant_id)
+                ),
+                account_code="OP2",
+                account_name="Other",
+                account_identifier="payer-acct-2",
+                account_type_code="current",
+                currency_code="NGN",
+                minor_units=2,
+                cash_account_ref=str(env.accounts["1000"]),
+                status="active",
+            )
+        )
+        db.commit()
+    supplier_payment_row(engine, env, "SUPPLIER-2", bank_id=other)
+    assert record(engine, env, batch_id, "SUPPLIER-2").replayed is False
+
+
+def test_concurrent_b5_records_of_one_reference_second_one_refuses(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    e1 = liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E1"])]
+    first = approved_batch(engine, env, run_id, liability_ids=[e1.id])
+    second = approved_batch(engine, env, run_id)
+    holder = Session(engine)
+    svc.record_batch(
+        holder,
+        tenant=holder.get(Tenant, env.tenant_id),
+        party=holder.get(Party, env.people["recorder"]),
+        batch_id=first,
+        bank_reference="RACE-1",
+        now=NOW,
+    )
+    outcome: dict[str, object] = {}
+
+    def other():
+        try:
+            outcome["result"] = record(engine, env, second, "RACE-1")
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    time.sleep(1.0)
+    assert thread.is_alive()  # waiting on the advisory lock, not on any row lock of its own
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive() and "result" not in outcome, outcome
+    assert isinstance(outcome["error"], PayoutRefused) and outcome["error"].code == "bank_reference_reused"
+    assert batch_row(engine, second).status == "approved"
+
+
+def test_a_concurrent_b3_style_claim_waits_for_the_b5_recorder_then_refuses(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    holder = Session(engine)
+    svc.record_batch(
+        holder,
+        tenant=holder.get(Tenant, env.tenant_id),
+        party=holder.get(Party, env.people["recorder"]),
+        batch_id=batch_id,
+        bank_reference="RACE-2",
+        now=NOW,
+    )
+    outcome: dict[str, object] = {}
+
+    def b3_side():
+        with Session(engine) as db:
+            try:
+                bank_ref.claim(db, tenant_id=env.tenant_id, bank_account_id=env.bank_id, reference="RACE-2")
+                outcome["result"] = "claimed"
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                db.rollback()
+
+    thread = threading.Thread(target=b3_side)
+    thread.start()
+    time.sleep(1.0)
+    assert thread.is_alive()
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive() and "result" not in outcome, outcome
+    assert isinstance(outcome["error"], bank_ref.BankReferenceReused)
+
+
+@pytest.mark.parametrize("bad", ["AB\u0085CD", "AB\u0080CD", "AB\u009fCD"])
+def test_c1_control_characters_in_a_bank_reference_are_refused(engine, bad):
+    env = world(engine)
+    batch_id = approved_batch(engine, env, finalized(engine, env))
+    refused(lambda: record(engine, env, batch_id, bad), "bank_reference_invalid")
+
+
 def test_bank_account_changed_after_approval_refuses_record(engine):
     env = world(engine)
     run_id = finalized(engine, env)
@@ -942,6 +1096,91 @@ def test_a4_internal_recovery_net_pay_or_remittance_is_refused_by_the_selection_
             assert exc.value.code == "internal_recovery_excluded"
             live.settlement_mode = "external"
             svc.check_liability(db, kind=kind, run=run, liability=live, destination_ref=None)
+        db.rollback()
+
+
+# --- real a4: internal recovery is never payable; remittances need an external beneficiary ----
+
+
+def internal_world(engine):
+    """PAYE is a staff-loan style deduction: internal_recovery, mapped to the ASSET account 1410."""
+    return world(engine, paye_liability="1410", paye_mode="internal_recovery")
+
+
+def test_a4_internal_recovery_liability_is_settled_employee_side_and_in_no_payout(engine):
+    env = internal_world(engine)
+    run_id = finalized(engine, env)
+    with Session(engine) as db:
+        recoveries = list(
+            db.scalars(
+                sa.select(PayrollLiability).where(
+                    PayrollLiability.run_id == run_id, PayrollLiability.settlement_mode == "internal_recovery"
+                )
+            )
+        )
+    assert len(recoveries) == 2
+    assert all(
+        r.status == "settled" and r.amount_settled == r.amount and r.beneficiary_type == "employee" for r in recoveries
+    )
+    ids = [r.id for r in recoveries]
+    # never in a net-pay batch (all three: the default selection, and an explicit pick)
+    out = prepare(engine, env, run_id)
+    assert not {line.liability_id for line in lines(engine, out.batch_id)} & set(ids)
+    refused(lambda: prepare(engine, env, run_id, liability_ids=ids), "liability_not_eligible")
+    # never in a remittance: neither by the PAYE destination nor by naming the employee as destination
+    refused(lambda: prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE"), "nothing_to_pay")
+    for recovery in recoveries:
+        refused(
+            lambda r=recovery: prepare(
+                engine,
+                env,
+                run_id,
+                kind="statutory",
+                destination_ref=r.beneficiary_ref,
+                liability_ids=[r.id],
+            ),
+            "liability_not_statutory",
+        )
+    # a settled internal recovery is also refused by the owner for settlement
+    with Session(engine) as db:
+        with pytest.raises(payroll.PayrollRuleViolation):
+            payroll.record_liability_settlement(
+                db,
+                tenant_id=env.tenant_id,
+                liability_id=recoveries[0].id,
+                amount=Money.of(Decimal(1), Currency("NGN", 2)),
+                settlement_ref="x",
+                evidence_ref="y",
+                recorded_by_id=env.people["recorder"],
+                recorded_at=NOW,
+            )
+        db.rollback()
+    assert counts(engine, env)["batches"] == 1  # only the net-pay batch above
+
+
+def test_a4_external_remittance_still_works_beside_an_internal_recovery(engine):
+    env = internal_world(engine)
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER")
+    assert batch_row(engine, out.batch_id).total_amount == Decimal("7500.00")
+
+
+def test_a4_statutory_remittance_requires_beneficiary_type_external(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    from dotmac_payroll.models import PayrollRun
+
+    with Session(engine) as db:
+        run = db.get(PayrollRun, run_id)
+        rows = liabilities(engine, env, run_id)
+        live = db.get(PayrollLiability, rows[("component", "dest:PAYE")].id)
+        assert live.settlement_mode == "external" and live.beneficiary_type == "external"
+        svc.check_liability(db, kind="statutory", run=run, liability=live, destination_ref=None)
+        for beneficiary in ("employee", "supplier", ""):
+            live.beneficiary_type = beneficiary  # simulated on the loaded instance, never flushed
+            with pytest.raises(PayoutRefused) as exc:
+                svc.check_liability(db, kind="statutory", run=run, liability=live, destination_ref=None)
+            assert exc.value.code == "liability_not_statutory"
         db.rollback()
 
 
