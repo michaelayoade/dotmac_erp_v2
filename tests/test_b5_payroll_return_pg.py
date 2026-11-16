@@ -501,3 +501,45 @@ def test_runtime_role_may_write_the_return_columns_once_and_nothing_else(engine,
         with pytest.raises(sa.exc.ProgrammingError) as err:  # amounts stay immutable
             db.execute(sa.text("UPDATE erp_payroll_payout_lines SET amount = amount + 1"))
         assert "permission denied" in str(err.value.orig).lower()
+
+
+# --- the returner may not release the re-payment ----------------------------------------------
+
+
+def _returned_and_rebatched(engine, env):
+    run_id, batch_id = recorded(engine, env)
+    give_back(engine, env, batch_id, line_of(engine, env, batch_id))
+    liability = liability_of(engine, env, run_id)
+    second = prepare(engine, env, run_id, liability_ids=[liability.id]).batch_id
+    return run_id, second
+
+
+def test_the_returner_may_not_approve_or_record_the_repayment(engine):
+    env = world(engine)
+    _run, second = _returned_and_rebatched(engine, env)
+    refused(lambda: approve(engine, env, second, who="canceller"), "sod_approver_is_returner")
+    assert batch_row(engine, second).status == "draft"
+    approve(engine, env, second)
+    refused(lambda: record(engine, env, second, "PAY-REF-2", who="canceller"), "sod_recorder_is_returner")
+    assert batch_row(engine, second).status == "approved"
+    assert record(engine, env, second, "PAY-REF-2").replayed is False
+
+
+def test_the_returner_may_not_issue_the_file_of_the_repayment(engine):
+    env = world(engine)
+    seed_instructions(engine, env)
+    enable_file(engine, env)
+    _run, second = _returned_and_rebatched(engine, env)
+    approve(engine, env, second)
+    refused(lambda: generate(engine, env, second, who="canceller"), "sod_file_issuer_is_returner")
+    assert batch_row(engine, second).status == "approved"
+
+
+def test_the_batch_detail_shows_the_repayment_of_a_return(engine):
+    from erp_v2.payroll_payouts import queries
+
+    env = world(engine)
+    _run, second = _returned_and_rebatched(engine, env)
+    with Session(engine) as db:
+        data = queries.detail(db, tenant_id=env.tenant_id, batch_id=second)
+    assert list(data["repayments"].values()) == ["RET-1"]

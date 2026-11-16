@@ -322,6 +322,28 @@ def _refuse_instruction_party(
             )
 
 
+def _refuse_returner(
+    db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine], person: object, *, code: str, role: str
+) -> None:
+    """A re-payment batch must not be approved, filed or recorded by the person who recorded the bank return
+    of any of its liabilities (they attested the credit failed; they must not also release the money again)."""
+    if person is None:
+        return
+    returners = set(
+        db.scalars(
+            select(PayrollPayoutLine.returned_by_party_id).where(
+                PayrollPayoutLine.tenant_id == batch.tenant_id,
+                PayrollPayoutLine.liability_id.in_([line.liability_id for line in lines]),
+                PayrollPayoutLine.returned_at.is_not(None),
+            )
+        )
+    )
+    if any(_same(person, returner) for returner in returners):
+        raise PayoutRefused(
+            code, f"The {role} recorded the bank return of a liability in this batch; a different person must act"
+        )
+
+
 def _file_receipts(db: Session, tenant_id: UUID, lines: Sequence[PayrollPayoutLine]) -> list[DisbursementFileReceipt]:
     return list(
         db.scalars(
@@ -505,6 +527,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID, now: 
     lines = _lines(db, tenant.id, batch.id)
     _revalidate(db, batch, lines)
     _refuse_instruction_party(db, batch, lines, party.id, code="sod_approver_is_instruction_party", role="approver")
+    _refuse_returner(db, batch, lines, party.id, code="sod_approver_is_returner", role="approver")
     batch.status = APPROVED
     batch.approved_by_party_id = party.id
     batch.approved_at = now
@@ -608,6 +631,7 @@ def _generate_file(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID,
     _refuse_instruction_party(
         db, batch, lines, party.id, code="sod_file_issuer_is_instruction_party", role="file issuer"
     )
+    _refuse_returner(db, batch, lines, party.id, code="sod_file_issuer_is_returner", role="file issuer")
     _refuse_instruction_party(
         db, batch, lines, batch.approved_by_party_id, code="sod_approver_is_instruction_party", role="approver"
     )
@@ -740,6 +764,12 @@ def _record(
     _refuse_instruction_party(
         db, batch, lines, batch.approved_by_party_id, code="sod_approver_is_instruction_party", role="approver"
     )
+    _refuse_returner(db, batch, lines, party.id, code="sod_recorder_is_returner", role="recorder")
+    _refuse_returner(db, batch, lines, batch.approved_by_party_id, code="sod_approver_is_returner", role="approver")
+    if batch.file_issued_by_party_id is not None:
+        _refuse_returner(
+            db, batch, lines, batch.file_issued_by_party_id, code="sod_file_issuer_is_returner", role="file issuer"
+        )
     if batch.status == FILE_ISSUED:
         _refuse_instruction_party(
             db,

@@ -18,7 +18,7 @@
 </dl>
 <h2>Lines</h2>
 <table><thead><tr><th>Beneficiary</th><th>Liability account</th><th>Amount</th><th>Journal</th><th>Return</th></tr></thead><tbody>
-{% for l in lines %}<tr><td>{{ l.beneficiary_ref }}</td><td>{{ l.liability_account_ref }}</td><td>{{ l.amount }}</td><td>{{ l.journal_number or '' }}</td><td>
+{% for l in lines %}<tr><td>{{ l.beneficiary_ref }}{% if repayments and repayments.get(l.id) %} (re-payment of return {{ repayments[l.id] }}){% endif %}</td><td>{{ l.liability_account_ref }}</td><td>{{ l.amount }}</td><td>{{ l.journal_number or '' }}</td><td>
 {% if l.returned_at %}Returned {{ l.return_value_date }} (bank reference {{ l.return_reference }}; reversal journal {{ l.reversal_journal_number or '' }}): {{ l.return_reason }}
 {% elif mode == 'approve' and batch.status == RECORDED and batch.kind == NET_PAY and l.settlement_id %}
 <form method="post" action="{{ bases.approve }}/{{ batch.id }}/lines/{{ l.id }}/return">
