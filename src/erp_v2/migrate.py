@@ -61,7 +61,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "cl_0001_collections",  # collections 0.1.0a1
     "cu_0001_customer_accounts",  # customers 0.1.0a1
     "do_0001_documents",  # documents 0.1.0a1
-    "e2_0019_payroll_payouts",  # assembly e2 head, payroll payouts B5 (after disbursement receipts e2_0018)
+    "e2_0020_cash_account_repoints",  # assembly e2 head, cash GL re-point (after payroll payouts e2_0019)
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1
     "ex_0001_expenses",  # expenses 0.1.0a1
     "fi_0002_selectable_planes",  # files 0.1.0a7

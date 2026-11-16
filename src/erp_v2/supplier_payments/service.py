@@ -189,8 +189,13 @@ def payer_references(db: Session, *, tenant_id: UUID, bank_account_id: UUID, cur
     The cash GL account is whatever the bank account record declares; the payer instrument is the
     bank account's own id. Neither is ever taken from a form field.
     """
+    # FOR SHARE: a cash GL re-point (erp_v2.cash_gl) holds the bank account row FOR UPDATE while it
+    # checks for payments in flight, so a payment cannot be proposed against the old reference
+    # while a re-point commits (lock order: bank account row before GL account rows).
     account = db.scalar(
-        select(BankAccount).where(BankAccount.tenant_id == tenant_id, BankAccount.id == bank_account_id)
+        select(BankAccount)
+        .where(BankAccount.tenant_id == tenant_id, BankAccount.id == bank_account_id)
+        .with_for_update(read=True)
     )
     if account is None:
         raise PaymentRefused("bank_account_unknown", "Select one of the tenant's bank accounts")
