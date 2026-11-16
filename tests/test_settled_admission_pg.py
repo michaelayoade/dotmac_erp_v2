@@ -42,6 +42,7 @@ from erp_v2.legacy_ap.settled_verifier import ALLOCATION_FIELDS, PAYMENT_FIELDS
 
 engine = bridge_pg.engine
 LIST_SHA = "c" * 64
+PREREQS = dict(unpaid_receipt_sha256="1" * 64, b1b_receipt_sha256="2" * 64)
 SNAP = "d" * 64
 REVISION = "e" * 40
 STAMP = "2026-01-10T00:00:00+00:00"
@@ -492,7 +493,9 @@ class Scene:
     def manifest(self):
         return SnapshotManifest(SNAP, "source.db", self.destination_name, REVISION, (str(self.env.tenant_id),))
 
-    def run(self, ids, *, apply, digest=None, actor=None, now=NOW, plan_sink=None, referenced=frozenset()):
+    def run(
+        self, ids, *, apply, digest=None, actor=None, now=NOW, plan_sink=None, referenced=frozenset(), prereqs=True
+    ):
         source = sa.create_engine(f"sqlite:///{self.path}")
         try:
             with source.connect() as src:
@@ -510,7 +513,7 @@ class Scene:
                         actor_party_id=actor or self.env.party_ids[1],
                         apply=apply,
                         reviewed_digest=digest,
-                        bindings=dict(list_sha256=LIST_SHA),
+                        bindings=dict(list_sha256=LIST_SHA) | (PREREQS if prereqs else {}),
                         now=now,
                         plan_sink=plan_sink,
                         referenced=referenced,
@@ -957,6 +960,21 @@ def test_advisory_lock_key_is_the_tenant_not_the_list(engine, setup):
     finally:
         sa.event.remove(engine, "before_cursor_execute", record)
     assert keys and "erp.settled:" + str(env.tenant_id) in str(keys) and LIST_SHA not in str(keys)
+
+
+def test_apply_without_the_prerequisite_receipts_is_refused_and_plan_says_they_are_required(engine, setup):
+    env, scene, iid = one(engine, setup)
+    plan = scene.run([iid], apply=False, prereqs=False)
+    assert plan["prerequisites_required_at_apply"] == ["unpaid_receipt_sha256", "b1b_receipt_sha256"]
+    with pytest.raises(cli.SettledRefusal, match="prerequisite_receipt_missing"):
+        scene.run([iid], apply=True, digest=plan["plan_digest"], prereqs=False)
+    assert counts(engine, env.tenant_id)["historical_settlements"] == 0
+    with_prereqs = scene.run([iid], apply=False)
+    assert "prerequisites_required_at_apply" not in with_prereqs
+    # The reviewed digest binds the receipts: a plan made without them cannot authorise an apply with them.
+    assert with_prereqs["plan_digest"] != plan["plan_digest"]
+    with pytest.raises(cli.SettledRefusal, match="reviewed_plan_changed"):
+        scene.run([iid], apply=True, digest=plan["plan_digest"])
 
 
 def test_receipt_has_no_ids_and_the_private_plan_has_the_detail(engine, setup):

@@ -15,6 +15,13 @@ is the table this command writes, so for this command only it is governed differ
 only for invoices of the list being run (a re-run is a no-op; settlements of any other invoice refuse).
 Supplier payments, allocations, withholdings and settlement observations must still be empty.
 
+Run order is enforced: ``--apply`` needs ``--unpaid-receipt``/``--unpaid-receipt-sha256`` (the wave-3 unpaid
+import apply receipt) and ``--b1b-receipt``/``--b1b-receipt-sha256`` (the B1b apply receipt). Each is checked
+(file, digest, kind, nothing refused, same tenant and snapshot) and its digest is bound into the plan, hence
+into the reviewed-plan digest; ``prerequisite_receipt_missing`` / ``prerequisite_receipt_mismatch`` otherwise.
+Plan mode may run without them and says they will be required (the reviewed plan must then be re-planned with
+them). The apply lock is per tenant.
+
 Input list (JSON, produced from the step-3 census category R3; this command only validates it), pinned
 by ``--list-sha256``: same schema as the B1b list (``recognize_cli.parse_list``).
 
@@ -73,6 +80,56 @@ def _identity_key(invoice_id: UUID, snapshot_sha256: str) -> str:
         separators=(",", ":"),
     )
     return "erp.settled-admission:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
+PREREQUISITES = ("unpaid_receipt_sha256", "b1b_receipt_sha256")
+
+
+def _prerequisite(path, sha, *, kind: str, tenant: UUID, manifest) -> str:
+    """Verify one prerequisite apply receipt (a file the operator holds); return its sha256.
+
+    The unpaid-import receipt is ``payables_history_cli`` apply output, the B1b receipt is
+    ``recognize_cli`` apply output. Each must be an apply receipt of its own kind with nothing refused,
+    for this tenant and this snapshot."""
+    _require(path is not None and bool(re.fullmatch(r"[0-9a-f]{64}", sha or "")), "prerequisite_receipt_missing")
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise RecognizeRefusal("prerequisite_receipt_missing") from exc
+    _require(hashlib.sha256(raw).hexdigest() == sha, "prerequisite_receipt_mismatch")
+    try:
+        data = _json(raw)
+    except RecognizeRefusal as exc:
+        raise RecognizeRefusal("prerequisite_receipt_mismatch") from exc
+    bindings, counts = data.get("bindings"), data.get("counts")
+    own, other = ("admitted", "posted_total") if kind == "unpaid" else ("posted_total", "admitted")
+    ok = (
+        data.get("mode") == "apply"
+        and isinstance(bindings, dict)
+        and isinstance(counts, dict)
+        and own in data
+        and other not in data
+        and counts.get("refused") == 0
+        and bindings.get("tenant_id") == str(tenant)
+        and bindings.get("snapshot_sha256") == manifest.snapshot_sha256
+        and bindings.get("candidate_revision", manifest.candidate_revision) == manifest.candidate_revision
+    )
+    _require(ok, "prerequisite_receipt_mismatch")
+    return sha
+
+
+def verify_prerequisites(args, tenant: UUID, manifest) -> dict:
+    """Digests to bind into the plan. Plan mode may run without them (None; the receipt says they will be
+    required); apply refuses unless both verify."""
+    result = dict.fromkeys(PREREQUISITES)
+    for key, path, sha, kind in (
+        ("unpaid_receipt_sha256", args.unpaid_receipt, args.unpaid_receipt_sha256, "unpaid"),
+        ("b1b_receipt_sha256", args.b1b_receipt, args.b1b_receipt_sha256, "b1b"),
+    ):
+        if path is None and sha is None and not args.apply:
+            continue
+        result[key] = _prerequisite(path, sha, kind=kind, tenant=tenant, manifest=manifest)
+    return result
 
 
 def _legacy_reason(exc: ValueError) -> str | None:
@@ -216,6 +273,8 @@ def receipt_of(plan: dict, *, mode: str, applied: int = 0) -> dict:
         refusals_by_reason=dict(sorted(Counter(item["reason"] for item in plan["refused"]).items())),
         totals=dict(eligible=_totals(plan["eligible"]), already_done=_totals(plan["already_done"])),
     )
+    if mode == "plan" and not all(plan["bindings"].get(key) for key in PREREQUISITES):
+        payload["prerequisites_required_at_apply"] = list(PREREQUISITES)
     if mode == "apply":
         payload["applied"] = applied
     return payload
@@ -332,6 +391,13 @@ def run_cohort(
     from erp_v2.legacy_ap.settled_verifier import SettledInvoiceVerifier
 
     scope = TenantScope(tenant)
+    if apply:
+        # Run order is enforced, not documented: the unpaid import and B1b receipts are bound into the
+        # reviewed plan (``bindings``), so the digest an operator reviews names them.
+        _require(
+            all(re.fullmatch(r"[0-9a-f]{64}", str((bindings or {}).get(key) or "")) for key in PREREQUISITES),
+            "prerequisite_receipt_missing",
+        )
     party = session.scalar(sa.select(Party).where(Party.tenant_id == tenant, Party.id == actor_party_id))
     _require(party is not None and party.is_active, "approver_unknown")
     held = session.scalar(
@@ -431,7 +497,9 @@ def _run(args) -> dict:
     if args.apply:
         _require(bool(re.fullmatch(r"[0-9a-f]{64}", args.reviewed_plan_sha256 or "")), "reviewed_plan_required")
     _require(version("dotmac-payables") == REQUIRED_PAYABLES_VERSION, "released_payables_version_required")
+    prerequisites = verify_prerequisites(args, tenant, manifest)
     bindings = dict(
+        **prerequisites,
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         list_sha256=args.list_sha256,
         snapshot_sha256=snapshot_sha,
@@ -490,6 +558,11 @@ def main(argv=None) -> int:
     parser.add_argument("--approver-party-id", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--reviewed-plan-sha256")
+    # Apply receipts of the two earlier steps (required for --apply; bound into the reviewed plan).
+    parser.add_argument("--unpaid-receipt", type=Path)
+    parser.add_argument("--unpaid-receipt-sha256")
+    parser.add_argument("--b1b-receipt", type=Path)
+    parser.add_argument("--b1b-receipt-sha256")
     args = parser.parse_args(argv)
     try:
         _require(_authorized(args), "explicit_apply_authorization_required")

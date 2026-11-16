@@ -169,3 +169,78 @@ def test_existing_plan_file_is_never_overwritten(tmp_path):
     taken = tmp_path / "plan.json"
     taken.write_text("keep")
     assert cli.main(args_for(tmp_path)) == 2 and taken.read_text() == "keep"
+
+
+# --- prerequisite receipts -----------------------------------------------------------------------------------
+
+SNAP, REV = "b" * 64, "a" * 40
+MANIFEST = SimpleNamespace(snapshot_sha256=SNAP, candidate_revision=REV)
+
+
+def receipt_file(tmp_path, name, **change):
+    kind = name.startswith("unpaid")
+    data = dict(
+        mode="apply",
+        counts=dict(requested=1, eligible=1, refused=0),
+        bindings=dict(tenant_id=TENANT, snapshot_sha256=SNAP, candidate_revision=REV),
+        **({"admitted": 1} if kind else {"applied": 1, "posted_total": "1.00"}),
+    )
+    data.update(change)
+    path = tmp_path / name
+    raw = json.dumps(data).encode()
+    path.write_bytes(raw)
+    import hashlib
+
+    return path, hashlib.sha256(raw).hexdigest()
+
+
+def prereq_args(tmp_path, apply=True, **change):
+    (u, us), (b, bs) = receipt_file(tmp_path, "unpaid.json"), receipt_file(tmp_path, "b1b.json")
+    base = dict(apply=apply, unpaid_receipt=u, unpaid_receipt_sha256=us, b1b_receipt=b, b1b_receipt_sha256=bs)
+    return SimpleNamespace(**(base | change))
+
+
+def test_both_receipts_verify_and_their_digests_are_returned(tmp_path):
+    args = prereq_args(tmp_path)
+    got = cli.verify_prerequisites(args, UUID(TENANT), MANIFEST)
+    assert got == dict(unpaid_receipt_sha256=args.unpaid_receipt_sha256, b1b_receipt_sha256=args.b1b_receipt_sha256)
+
+
+def test_plan_mode_may_omit_them_but_apply_may_not(tmp_path):
+    none = dict(unpaid_receipt=None, unpaid_receipt_sha256=None, b1b_receipt=None, b1b_receipt_sha256=None)
+    assert cli.verify_prerequisites(prereq_args(tmp_path, apply=False, **none), UUID(TENANT), MANIFEST) == {
+        "unpaid_receipt_sha256": None,
+        "b1b_receipt_sha256": None,
+    }
+    for omitted in (none, {"b1b_receipt": None, "b1b_receipt_sha256": None}, {"unpaid_receipt_sha256": None}):
+        with pytest.raises(cli.SettledRefusal, match="prerequisite_receipt_missing"):
+            cli.verify_prerequisites(prereq_args(tmp_path, **omitted), UUID(TENANT), MANIFEST)
+    with pytest.raises(cli.SettledRefusal, match="prerequisite_receipt_missing"):
+        cli.verify_prerequisites(prereq_args(tmp_path, b1b_receipt=tmp_path / "absent.json"), UUID(TENANT), MANIFEST)
+
+
+@pytest.mark.parametrize(
+    "name,change",
+    [
+        ("unpaid.json", dict(mode="plan")),
+        ("unpaid.json", dict(counts=dict(refused=1))),
+        ("unpaid.json", dict(bindings=dict(tenant_id=str(UUID(int=9)), snapshot_sha256=SNAP))),
+        ("unpaid.json", dict(bindings=dict(tenant_id=TENANT, snapshot_sha256="c" * 64))),
+        ("unpaid.json", dict(posted_total="1.00")),  # a B1b-shaped receipt in the unpaid slot
+        ("b1b.json", dict(admitted=1)),  # an unpaid-shaped receipt in the B1b slot
+        ("b1b.json", dict(mode="plan")),
+        ("b1b.json", dict(bindings=dict(tenant_id=TENANT, snapshot_sha256=SNAP, candidate_revision="f" * 40))),
+    ],
+)
+def test_a_receipt_of_the_wrong_kind_tenant_snapshot_or_state_is_refused(tmp_path, name, change):
+    path, sha = receipt_file(tmp_path, name, **change)
+    key = "unpaid" if name.startswith("unpaid") else "b1b"
+    args = prereq_args(tmp_path, **{key + "_receipt": path, key + "_receipt_sha256": sha})
+    with pytest.raises(cli.SettledRefusal, match="prerequisite_receipt_mismatch"):
+        cli.verify_prerequisites(args, UUID(TENANT), MANIFEST)
+
+
+def test_a_receipt_whose_bytes_do_not_match_the_given_digest_is_refused(tmp_path):
+    args = prereq_args(tmp_path, b1b_receipt_sha256="0" * 64)
+    with pytest.raises(cli.SettledRefusal, match="prerequisite_receipt_mismatch"):
+        cli.verify_prerequisites(args, UUID(TENANT), MANIFEST)
