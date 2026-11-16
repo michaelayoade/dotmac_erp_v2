@@ -559,7 +559,7 @@ def test_drift_of_the_bank_reference_is_refused(engine):
     refused("drift", approve, engine, env, req.id)
 
 
-def test_b7_shared_cash_gl_refusal_clears_after_repoint(engine):
+def test_b7_shared_cash_gl_refusal_clears_after_repoint_and_half_split_stays_refused(engine):
     env = shared_env(engine)
     from test_bank_recon_pg import statement
 
@@ -575,10 +575,15 @@ def test_b7_shared_cash_gl_refusal_clears_after_repoint(engine):
         run(engine, recon_svc.open_reconciliation, **open_kwargs)
     assert exc.value.code == "shared_cash_gl"
     approve(engine, env, propose(engine, env, env.twin.id, env.new_b).id)
-    # the bank account that stayed on the old GL is no longer shared and reconciles
+    # half split: the partner left on the retired shared GL is refused until it is re-pointed too
+    with pytest.raises(ReconRefused) as exc:
+        run(engine, recon_svc.open_reconciliation, **open_kwargs)
+    assert exc.value.code == "retired_cash_gl"
+    # the retired account cannot be chosen as a target again
+    refused("target_retired", propose, engine, env, env.bank_id, env.accounts["1000"])
+    approve(engine, env, propose(engine, env, env.bank_id, env.new_a).id)
     recon = run(engine, recon_svc.open_reconciliation, **open_kwargs)
     assert recon.status == "open"
-    # the re-pointed one resolves its own account too
     with Session(engine) as db:
         twin = db.get(BankAccount, env.twin.id)
         assert recon_svc.resolve_gl_account(db, env.tenant_id, twin) == env.new_b

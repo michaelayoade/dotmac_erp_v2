@@ -45,6 +45,11 @@ row, so a payment cannot be proposed against the old reference while an approval
 bank account row, then GL account rows). RECORDED payments keep the account they posted to; a later
 reversal of one posts as its own B3 rules say and shows on the old shared GL, to be cleared by step 4.
 
+Both banks of each shared pair (1210 and 1211) are re-pointed, each to its own new account. B7
+refuses a GL that any approved re-point left (`retired_cash_gl`), so the partner left on a
+half-split GL cannot be reconciled, and a retired GL cannot be chosen as a re-point target
+(`target_retired`).
+
 ## Steps 3 to 5: Finance, at the baseline date (not built here)
 
 3. For each re-pointed bank account, Finance posts one B2 reclassification journal at the baseline date

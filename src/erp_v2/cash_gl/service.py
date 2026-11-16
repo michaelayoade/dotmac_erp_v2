@@ -138,6 +138,16 @@ def _validate(db: Session, tenant_id: UUID, bank: BankAccount, target_id: UUID) 
         raise RepointRefused("target_not_asset", "the target account is not a debit-normal ASSET account")
     if target.currency_code is not None and target.currency_code != bank.currency_code:
         raise RepointRefused("target_currency", "the target account currency differs from the bank account")
+    if db.scalar(
+        select(CashAccountRepoint.id)
+        .where(
+            CashAccountRepoint.tenant_id == tenant_id,
+            CashAccountRepoint.status == RepointStatus.APPROVED.value,
+            CashAccountRepoint.from_ref.in_((str(target.id), target.code)),
+        )
+        .limit(1)
+    ):
+        raise RepointRefused("target_retired", "the target account is the retired shared cash GL of a re-point")
     if _uses_gl(bank.cash_account_ref, target):
         raise RepointRefused("unchanged", "the bank account already uses this cash account")
     for other in db.scalars(select(BankAccount).where(BankAccount.tenant_id == tenant_id)):
