@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Payroll run {{ packet.run.run_ref }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Payroll run {{ packet.run.run_ref }} — {{ packet.run.status }}</h1>
+<p><a href="/payroll/actions">Draft payroll</a></p>
+<p>{{ packet.run.period_start }} — {{ packet.run.period_end }}, {{ packet.run.currency_code }}.
+{{ packet.calculation_count }} calculation(s), {{ packet.line_count }} component line(s).</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if notice %}<p role="status">{{ notice }}</p>{% endif %}
+<table><thead><tr><th>Gross</th><th>Deductions</th><th>Net</th><th>Employer liabilities</th></tr></thead>
+<tbody><tr><td>{{ packet.totals.gross_amount }}</td><td>{{ packet.totals.deduction_amount }}</td>
+<td>{{ packet.totals.net_amount }}</td><td>{{ packet.totals.employer_liability_amount }}</td></tr></tbody></table>
+{% if packet.evidence_blockers %}<ul>{% for b in packet.evidence_blockers %}<li>{{ b }}</li>{% endfor %}</ul>{% endif %}
+{% if step == 'batch' %}
+{% if packet.run.status == 'draft' %}
+<form method="post" action="/payroll/runs/{{ packet.run.id }}/batch-calculate" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<p>Calculates every active assignment that has no calculation yet, all or nothing. Employees whose structure has input rules
+need rows in the input file (up to {{ max_kib }} KiB, UTF-8 CSV, header
+<code>employee_ref,component_code,amount,evidence_ref</code>); every row needs an evidence reference.</p>
+<label>Input file (leave empty when no structure has input rules) <input type="file" name="input_file" accept=".csv"></label>
+<button type="submit">Calculate all active assignments</button>
+</form>
+{% endif %}
+{% elif step == 'approve' %}
+{% if packet.run.status == 'draft' %}
+<form method="post" action="/payroll/runs/{{ packet.run.id }}/approve">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<p>You must not be the person who created this run. Approval re-checks the currency, the period, the evidence and every account mapping.</p>
+<button type="submit">Approve payroll run</button>
+</form>
+{% else %}<p>This run is {{ packet.run.status }}.</p>{% endif %}
+{% elif step == 'finalize' %}
+{% if packet.run.status == 'approved' %}
+<form method="post" action="/payroll/runs/{{ packet.run.id }}/finalize">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<p>You must be neither the creator nor the approver. Finalizing creates the liabilities and posts the journal
+(Dr earnings and employer expense, Cr deduction liabilities, Cr Payroll Payable for total net pay) in one step.</p>
+<button type="submit">Finalize and post payroll run</button>
+</form>
+{% elif packet.run.status == 'finalized' %}<p>This run is finalized and posted.</p>
+{% else %}<p>This run is {{ packet.run.status }}; it must be approved before it can be finalized.</p>{% endif %}
+{% endif %}
+{% endblock %}

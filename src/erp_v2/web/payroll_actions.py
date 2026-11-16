@@ -66,6 +66,18 @@ def create_draft(
     code = currency_code.strip().upper()
     if not re.fullmatch(r"[A-Z]{3}", code):
         raise PayrollActionError("Enter a three-letter currency code")
+    overlapping = db.scalars(
+        select(PayrollRun.run_ref).where(
+            PayrollRun.tenant_id == tenant.id,
+            PayrollRun.status != "cancelled",
+            PayrollRun.period_start <= end,
+            PayrollRun.period_end >= start,
+        )
+    ).all()
+    if overlapping:
+        raise PayrollActionError(
+            "The period overlaps existing payroll run(s): " + ", ".join(sorted(overlapping)[:10]),
+        )
     try:
         with db.begin_nested():
             return service.create_payroll_run(
@@ -88,6 +100,7 @@ def calculate_employee(
     db: Session,
     *,
     tenant: Tenant,
+    party: Party,
     run_id: UUID,
     employee_ref: str,
     proration_factor: str,
@@ -100,6 +113,10 @@ def calculate_employee(
     run = db.scalar(select(PayrollRun).where(PayrollRun.tenant_id == tenant.id, PayrollRun.id == run_id))
     if run is None:
         raise PayrollActionError("Payroll run not found")
+    if run.created_by_id != party.id:
+        raise PayrollActionError(
+            "Only the person who created this run can enter its calculations; they cannot also approve it"
+        )
     currency = Currency(run.currency_code, run.minor_units)
     # An explicit input must belong to this employee's effective input rules.
     # The owner still resolves assignment ambiguity and all calculation policy.

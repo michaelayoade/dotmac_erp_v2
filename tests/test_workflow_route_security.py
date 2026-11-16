@@ -26,13 +26,14 @@ from dotmac_kernel.models import AuthSession, Base, Party, PartyRoleGrant, Party
 from dotmac_kernel.security import hash_token, issue_access_token
 from dotmac_kernel.settings_models import DomainSetting, SettingDomain
 from dotmac_kernel.settings_resolver import get_spec
+from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from erp_v2.assembly import assembly
 from erp_v2.banking import routes as banking_routes
-from erp_v2.web import payroll_actions, revenue_approval_routes, revenue_routes
+from erp_v2.web import payroll_actions, payroll_run_routes, revenue_approval_routes, revenue_routes
 
 DOCUMENT_ID = uuid4()
 WRITE_PATHS = (
@@ -53,6 +54,7 @@ class Browser:
     banking_read: Mock
     supplier_read: Mock
     approve: Mock
+    payroll: dict | None = None
 
     def sign_in(self, role: str | None) -> str:
         self.client.cookies.clear()
@@ -86,7 +88,15 @@ def browser(monkeypatch):
         tokens = {}
         parties = {}
         roles: dict[str, Role] = {}
-        for role_name in ("admin", "staff", "unprivileged", "approver", "admin_approver"):
+        for role_name in (
+            "admin",
+            "staff",
+            "unprivileged",
+            "approver",
+            "admin_approver",
+            "payroll_approver",
+            "payroll_finalizer",
+        ):
             party = Party(
                 id=uuid4(),
                 tenant_id=tenant.id,
@@ -101,6 +111,8 @@ def browser(monkeypatch):
                 "unprivileged": (),
                 "approver": ("staff", "finance_approver"),  # portal entry needs staff/admin (F4)
                 "admin_approver": ("admin", "staff"),  # admin must gain nothing (W14)
+                "payroll_approver": ("staff", "payroll_approver"),
+                "payroll_finalizer": ("staff", "payroll_finalizer"),
             }.get(role_name, (role_name,))
             for slug in slugs:
                 if slug not in roles:
@@ -133,13 +145,25 @@ def browser(monkeypatch):
         monkeypatch.setattr(payroll_actions, "calculate_employee", actions[3])
         approve = Mock(return_value=SimpleNamespace(invoice_id=DOCUMENT_ID, accounting_reference="j", replayed=False))
         monkeypatch.setattr(revenue_approval_routes.services, "approve_and_post", approve)
+        payroll_mocks = {
+            "batch_calculate": Mock(return_value=SimpleNamespace(calculated=3, skipped_existing=0)),
+            "approve": Mock(return_value=SimpleNamespace(run_id=DOCUMENT_ID, replayed=False)),
+            "finalize": Mock(return_value=SimpleNamespace(run_id=DOCUMENT_ID, replayed=False)),
+        }
+        for name, mock in payroll_mocks.items():
+            monkeypatch.setattr(payroll_run_routes.services, name, mock)
+        monkeypatch.setattr(
+            payroll_run_routes, "_page", lambda *a, **k: HTMLResponse(f"page {k.get('step')} {k.get('error')}")
+        )
         banking_read = Mock(return_value={"accounts": [], "statements": [], "bindings": [], "receipts": []})
         supplier_read = Mock(return_value=[])
         monkeypatch.setattr(banking_routes.queries, "workspace", banking_read)
         monkeypatch.setattr(revenue_routes.queries, "posting_accounts", supplier_read)
         client = TestClient(app, base_url="http://acme.erp.test", follow_redirects=False)
         try:
-            yield Browser(client, tenant, parties["admin"], tokens, actions, banking_read, supplier_read, approve)
+            yield Browser(
+                client, tenant, parties["admin"], tokens, actions, banking_read, supplier_read, approve, payroll_mocks
+            )
         finally:
             client.close()
             app.dependency_overrides.clear()
@@ -285,3 +309,58 @@ def test_legacy_reentry_is_admin_write_only_with_csrf(browser: Browser, monkeypa
     assert response.status_code == 303
     create.assert_called_once()
     assert "csrf_token" not in create.call_args.kwargs["values"]
+
+
+PAYROLL_STEPS = (
+    ("batch_calculate", f"/payroll/runs/{DOCUMENT_ID}/batch-calculate", "admin"),
+    ("approve", f"/payroll/runs/{DOCUMENT_ID}/approve", "payroll_approver"),
+    ("finalize", f"/payroll/runs/{DOCUMENT_ID}/finalize", "payroll_finalizer"),
+)
+
+
+@pytest.mark.parametrize(("command", "path", "holder"), PAYROLL_STEPS)
+def test_payroll_step_is_dormant_for_everyone_but_its_named_role(browser: Browser, command, path, holder) -> None:
+    others = ("staff", "approver", "payroll_approver", "payroll_finalizer", "unprivileged")
+    if command != "batch_calculate":  # batch calculation is the admin draft permission; approve/finalize never are
+        others += ("admin", "admin_approver")
+    for role in others:
+        if role == holder:
+            continue
+        token = browser.sign_in(role)
+        assert browser.client.post(path, data={"csrf_token": token}).status_code == 403, role
+        assert browser.client.get(path).status_code == 403, role
+    token = browser.sign_in(None)
+    assert browser.client.post(path, headers={"x-csrf-token": token}, data={}).status_code == 302
+    for mock in browser.payroll.values():
+        mock.assert_not_called()
+
+
+@pytest.mark.parametrize(("command", "path", "holder"), PAYROLL_STEPS)
+def test_payroll_step_reaches_only_its_command_with_csrf(browser: Browser, command, path, holder) -> None:
+    browser.sign_in(holder)
+    bad = browser.client.post(path, data={}, headers={"origin": "https://other.example"})
+    assert bad.status_code == 403
+    for mock in browser.payroll.values():
+        mock.assert_not_called()
+    token = browser.sign_in(holder)
+    response = browser.client.post(path, data={"csrf_token": token})
+    assert response.status_code in (200, 303)
+    browser.payroll[command].assert_called_once()
+    kwargs = browser.payroll[command].call_args.kwargs
+    assert kwargs["tenant"].id == browser.tenant.id and kwargs["run_id"] == DOCUMENT_ID
+    if command != "batch_calculate":
+        assert str(kwargs["party"].id) != str(browser.party.id)  # not the admin party
+    for other, mock in browser.payroll.items():
+        if other != command:
+            mock.assert_not_called()
+
+
+def test_a_refused_command_renders_its_reason_without_redirect(browser: Browser) -> None:
+    from erp_v2.web.payroll_run_services import RunRefused
+
+    browser.payroll["finalize"].side_effect = RunRefused("sod_approver_is_finalizer", "another person must finalize")
+    token = browser.sign_in("payroll_finalizer")
+    response = browser.client.post(PAYROLL_STEPS[2][1], data={"csrf_token": token})
+    assert response.status_code == 200 and "another person must finalize" in response.text
+    browser.payroll["finalize"].side_effect = RunRefused("not_found", "x")
+    assert browser.client.post(PAYROLL_STEPS[2][1], data={"csrf_token": token}).status_code == 404
