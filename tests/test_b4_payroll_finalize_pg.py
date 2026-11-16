@@ -724,13 +724,15 @@ def test_mid_period_joiner_needs_the_single_employee_form_for_proration(engine):
     assert out.calculated == 3 and out.skipped_existing == 1
 
 
-def _leaver(engine, env, *, employee="E6", effective_to=date(2026, 1, 20), effective_from=date(2026, 1, 1)):
+def _leaver(
+    engine, env, *, employee="E6", effective_to=date(2026, 1, 20), effective_from=date(2026, 1, 1), revision_id=None
+):
     with Session(engine) as db:
         payroll.assign_employee_pay_structure(
             db,
             tenant_id=env.tenant_id,
             employee_ref=employee,
-            revision_id=env.fixed_revision_id,
+            revision_id=revision_id or env.fixed_revision_id,
             effective_from=effective_from,
             effective_to=effective_to,
             source_ref="test",
@@ -829,3 +831,30 @@ def test_a_finalized_run_cannot_be_cancelled_and_cancel_by_another_actor_conflic
     with pytest.raises(svc.RunRefused) as exc:
         cancel(engine, env, other, party_index=1)
     assert exc.value.code == "not_cancellable"
+
+
+def test_leaver_on_an_input_structure_goes_through_the_erp_form_batch_approve_and_finalize(engine):
+    from erp_v2.web import payroll_actions as actions
+
+    env = world(engine)
+    _leaver(engine, env, revision_id=env.revision_id)  # E6 has an input rule (BASIC) and left on 20 Jan
+    run_id = new_run(engine, env)
+    refusal(engine, env, svc.batch_calculate, run_id, "proration_required", 0, input_bytes=GOOD_FILE)
+    with Session(engine) as db:  # the ERP single-employee form resolves input components at the owner's date
+        tenant, party = db.get(Tenant, env.tenant_id), db.get(Party, env.party_ids[0])
+        calculation = actions.calculate_employee(
+            db,
+            tenant=tenant,
+            party=party,
+            run_id=run_id,
+            employee_ref="E6",
+            proration_factor="0.60000000",
+            component_inputs="BASIC | 60000.00 | hr:leaver-E6",
+        )
+        assert calculation.employee_ref == "E6"
+        db.commit()
+    out = batch(engine, env, run_id)
+    assert out.calculated == 3 and out.skipped_existing == 1
+    approve(engine, env, run_id)
+    finalize(engine, env, run_id)
+    assert status(engine, run_id) == "finalized"
