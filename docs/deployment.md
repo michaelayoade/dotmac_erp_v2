@@ -323,6 +323,12 @@ this does not authorize adjusting balances or switching traffic.
   finance_approver roles). The e2 head in this section moves to it. No new environment variable;
   the page is dormant until roles are granted.
 
+- Returned salary (payroll a5; `docs/payroll-payouts.md`) pins `dotmac-payroll` 0.1.0a5 (head
+  `py_0003_settlement_reversal`) and adds the head `e2_0021_payroll_payout_returns` (after
+  `e2_0020_cash_account_repoints`; additive: ten nullable columns, two partial unique indexes, one CHECK
+  and a guard trigger on `erp_payroll_payout_lines`). The e2 head in this section moves to it. No new
+  permission, no role profile bump, no new environment variable.
+
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
 depends on `bk_0001_banking`; its stamped head is absorbed by that lineage.

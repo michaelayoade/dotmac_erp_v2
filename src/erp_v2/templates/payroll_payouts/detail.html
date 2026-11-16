@@ -17,8 +17,18 @@
   {% if batch.cancelled_by_party_id %}<dt>Cancelled by</dt><dd>{{ names.get(batch.cancelled_by_party_id|string, batch.cancelled_by_party_id) }}: {{ batch.cancel_reason }}{% if batch.recall_reference %} (recall reference {{ batch.recall_reference }}){% endif %}</dd>{% endif %}
 </dl>
 <h2>Lines</h2>
-<table><thead><tr><th>Beneficiary</th><th>Liability account</th><th>Amount</th><th>Journal</th></tr></thead><tbody>
-{% for l in lines %}<tr><td>{{ l.beneficiary_ref }}</td><td>{{ l.liability_account_ref }}</td><td>{{ l.amount }}</td><td>{{ l.journal_number or '' }}</td></tr>{% endfor %}
+<table><thead><tr><th>Beneficiary</th><th>Liability account</th><th>Amount</th><th>Journal</th><th>Return</th></tr></thead><tbody>
+{% for l in lines %}<tr><td>{{ l.beneficiary_ref }}{% if repayments and repayments.get(l.id) %} (re-payment of return {{ repayments[l.id] }}){% endif %}</td><td>{{ l.liability_account_ref }}</td><td>{{ l.amount }}</td><td>{{ l.journal_number or '' }}</td><td>
+{% if l.returned_at %}Returned {{ l.return_value_date }} (bank reference {{ l.return_reference }}; reversal journal {{ l.reversal_journal_number or '' }}): {{ l.return_reason }}
+{% elif mode == 'approve' and batch.status == RECORDED and batch.kind == NET_PAY and l.settlement_id %}
+<form method="post" action="{{ bases.approve }}/{{ batch.id }}/lines/{{ l.id }}/return">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>Bank return reference <input name="return_reference" maxlength="255" required></label>
+  <label>Bank return date <input name="value_date" type="date" required></label>
+  <label>Reason <input name="reason" maxlength="500" required></label>
+  <button type="submit">Record bank return (not the preparer, approver, file issuer or recorder)</button>
+</form>
+{% endif %}</td></tr>{% endfor %}
 </tbody></table>
 
 {% if mode == 'approve' %}

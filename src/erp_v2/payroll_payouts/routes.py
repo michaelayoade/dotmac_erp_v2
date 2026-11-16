@@ -2,7 +2,8 @@
 holds the role (access_cli); admin and staff hold none of these permissions (W14).
 
 - prepare   (finance_preparer)  /payroll/payouts                 prepare a net-pay batch or statutory remittance
-- approve   (finance_approver)  /payroll/payout-approvals        approve or cancel
+- approve   (finance_approver)  /payroll/payout-approvals        approve or cancel; record a bank RETURN of a
+                                                                 recorded net-pay line (payroll a5; approve permission)
 - treasury  (treasury)          /payroll/payout-treasury         record as paid; optional bank file (net pay only)
 
 None of these are facet entry routes: the facet admission permission also applies. Nothing here calls a bank.
@@ -28,7 +29,15 @@ from erp_v2.disbursement import file as bank_file
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.journals import policy as journal_policy
 from erp_v2.payroll_payouts import queries, service
-from erp_v2.payroll_payouts.models import APPROVED, DRAFT, FILE_ISSUED, KIND_NET_PAY, KIND_STATUTORY, RECORDED
+from erp_v2.payroll_payouts.models import (
+    APPROVED,
+    DRAFT,
+    FILE_ISSUED,
+    KIND_NET_PAY,
+    KIND_STATUTORY,
+    LINE_RETURNED,
+    RECORDED,
+)
 from erp_v2.payroll_payouts.service import PayoutRefused
 
 PREPARE: Final = "erp.finance.payroll_payouts.prepare"
@@ -50,6 +59,7 @@ ROUTE_PERMISSIONS: Final = {
     "approval_detail": APPROVE,
     "approve": APPROVE,
     "cancel": APPROVE,
+    "return_line": APPROVE,
     "treasury_queue": RECORD,
     "treasury_detail": RECORD,
     "record": RECORD,
@@ -139,6 +149,7 @@ def _detail_page(
             APPROVED=APPROVED,
             FILE_ISSUED=FILE_ISSUED,
             RECORDED=RECORDED,
+            LINE_RETURNED=LINE_RETURNED,
             NET_PAY=KIND_NET_PAY,
             error=error,
         ),
@@ -293,9 +304,9 @@ def approval_queue(
         db,
         tenant,
         party,
-        title="Payroll payouts awaiting approval",
+        title="Payroll payouts awaiting approval, and recorded batches (bank returns)",
         detail_base=APPROVE_BASE,
-        statuses=(DRAFT, APPROVED, FILE_ISSUED),
+        statuses=(DRAFT, APPROVED, FILE_ISSUED, RECORDED),
     )
 
 
@@ -344,6 +355,38 @@ async def cancel(
             batch_id=batch_id,
             reason=values.get("reason", ""),
             recall_reference=values.get("recall_reference", ""),
+        )
+    except PayoutRefused as exc:
+        return _detail_page(
+            request, db, tenant, party, batch_id, mode="approve", back=APPROVE_BASE, error=_message(exc)
+        )
+    return _redirect(f"{APPROVE_BASE}/{batch_id}")
+
+
+@router.post(APPROVE_BASE + "/{batch_id}/lines/{line_id}/return", response_model=None)
+async def return_line(
+    batch_id: UUID,
+    line_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(APPROVE)),
+) -> HTMLResponse | RedirectResponse:
+    values = await _values(request)
+    try:
+        try:
+            value_date = date.fromisoformat(values.get("value_date", ""))
+        except ValueError as exc:
+            raise PayoutRefused("invalid_input", "Enter the bank return date as YYYY-MM-DD") from exc
+        service.return_line(
+            db,
+            tenant=tenant,
+            party=party,
+            batch_id=batch_id,
+            line_id=line_id,
+            return_reference=values.get("return_reference", ""),
+            reason=values.get("reason", ""),
+            value_date=value_date,
         )
     except PayoutRefused as exc:
         return _detail_page(

@@ -4,7 +4,8 @@ A batch is a set of whole liabilities of ONE finalized run to be paid in one ban
 ``net_pay`` (employee-net-pay liabilities; may have a bank file) or ``statutory`` (component
 liabilities to one external destination; never a file, W19). Amounts and membership are immutable
 after insert (the runtime role may update lifecycle columns only); the payroll owner stays the
-authority for settlement and the ledger. No bank file bytes are stored anywhere.
+authority for settlement and the ledger. No bank file bytes are stored anywhere. A line of a RECORDED
+net-pay batch can be RETURNED (e2_0021, payroll a5): see ``service.return_line``.
 """
 
 from __future__ import annotations
@@ -63,6 +64,25 @@ BATCH_UPDATE_COLUMNS: Final = (
     "updated_at",
 )
 LINE_UPDATE_COLUMNS: Final = ("active", "settlement_id", "journal_id", "journal_number", "consequence_fingerprint")
+
+# e2_0021 (payroll a5): a RECORDED net-pay line whose bank credit came back. The return columns are
+# written once, in the same savepoint as the owner's reversal and the ledger posting; the runtime role
+# may update them (and ``active``) but a trigger makes them immutable once set. ``LINE_UPDATE_COLUMNS``
+# stays as e2_0019 granted it (a migration must not reference columns that do not exist yet).
+LINE_RETURN_COLUMNS: Final = (
+    "returned_at",
+    "returned_by_party_id",
+    "return_reference",
+    "return_reason",
+    "return_value_date",
+    "return_bank_account_id",
+    "reversal_id",
+    "reversal_journal_id",
+    "reversal_journal_number",
+    "reversal_fingerprint",
+)
+LINE_RETURNED: Final = "returned"
+LINE_PAID: Final = "paid"
 
 _B = "erp_payroll_payout_batches"
 _L = "erp_payroll_payout_lines"
@@ -139,6 +159,31 @@ class PayrollPayoutLine(Base):
         ),
         CheckConstraint("amount > 0", name=f"ck_{_L}_amount"),
         Index(f"ix_{_L}_batch", "tenant_id", "batch_id"),
+        # RETURNED means: the bank credit came back, the owner reversed the settlement, the ledger was posted,
+        # and the line left the live set (active = false) so the liability can go into a new batch.
+        CheckConstraint(
+            "returned_at IS NULL OR (active = false AND settlement_id IS NOT NULL AND journal_id IS NOT NULL "
+            "AND returned_by_party_id IS NOT NULL AND return_reference IS NOT NULL AND return_reason IS NOT NULL "
+            "AND return_value_date IS NOT NULL AND return_bank_account_id IS NOT NULL AND reversal_id IS NOT NULL "
+            "AND reversal_journal_id IS NOT NULL AND reversal_fingerprint IS NOT NULL)",
+            name=f"ck_{_L}_returned",
+        ),
+        # One bank return reference per bank account and one reversal per line.
+        Index(
+            f"uq_{_L}_return_reference",
+            "tenant_id",
+            "return_bank_account_id",
+            "return_reference",
+            unique=True,
+            postgresql_where=text("returned_at IS NOT NULL"),
+        ),
+        Index(
+            f"uq_{_L}_reversal",
+            "tenant_id",
+            "reversal_id",
+            unique=True,
+            postgresql_where=text("returned_at IS NOT NULL"),
+        ),
         # A liability sits in at most one live batch.
         Index(f"uq_{_L}_live_liability", "tenant_id", "liability_id", unique=True, postgresql_where=text("active")),
     )
@@ -155,4 +200,14 @@ class PayrollPayoutLine(Base):
     journal_id: Mapped[UUID | None] = mapped_column(Uuid())
     journal_number: Mapped[str | None] = mapped_column(String(60))
     consequence_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    returned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    returned_by_party_id: Mapped[UUID | None] = mapped_column(Uuid())
+    return_reference: Mapped[str | None] = mapped_column(String(255))
+    return_reason: Mapped[str | None] = mapped_column(String(500))
+    return_value_date: Mapped[date | None] = mapped_column()
+    return_bank_account_id: Mapped[UUID | None] = mapped_column(Uuid())
+    reversal_id: Mapped[UUID | None] = mapped_column(Uuid())
+    reversal_journal_id: Mapped[UUID | None] = mapped_column(Uuid())
+    reversal_journal_number: Mapped[str | None] = mapped_column(String(60))
+    reversal_fingerprint: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

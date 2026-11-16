@@ -49,8 +49,10 @@ unposted, no in-flight record can straddle it, and every new proposal picks up t
 payer lookup takes a FOR SHARE lock on the bank account row, so a payment cannot be proposed against
 the old reference while an approval commits (lock order: bank account row, then GL account rows).
 RECORDED payments keep the account they posted to. The payroll a5 return path (a payout returned by
-the bank) should mirror the ORIGINAL GL of the payout it reverses, not the bank account's current one;
-until that is built, a return of a pre-split payout lands on the old shared GL and is handled by step 4.
+the bank, `docs/payroll-payouts.md`) mirrors the ORIGINAL GL of the payout it reverses, never the bank
+account's current one. A return of a payout posted to a now-retired shared GL still debits that GL (it stays
+postable); the audit event carries `original_cash_gl_retired: true` and Finance moves the amount with
+the step-4 B2 transfer below.
 
 Both banks of each shared pair (1210 and 1211) are re-pointed, each to its own new account. B7
 refuses a GL that any approved re-point left (`retired_cash_gl`), so the partner left on a

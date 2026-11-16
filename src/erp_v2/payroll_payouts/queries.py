@@ -91,4 +91,17 @@ def detail(db: Session, *, tenant_id: UUID, batch_id: UUID) -> dict[str, object]
     bank = db.scalar(
         select(BankAccount).where(BankAccount.tenant_id == tenant_id, BankAccount.id == batch.bank_account_id)
     )
-    return {"batch": batch, "lines": lines, "names": names, "bank": bank}
+    # A line whose liability was returned earlier is a re-payment: show which bank return it follows.
+    prior = {
+        row.liability_id: row.return_reference
+        for row in db.scalars(
+            select(PayrollPayoutLine).where(
+                PayrollPayoutLine.tenant_id == tenant_id,
+                PayrollPayoutLine.liability_id.in_([line.liability_id for line in lines]),
+                PayrollPayoutLine.returned_at.is_not(None),
+                PayrollPayoutLine.id.not_in([line.id for line in lines if line.returned_at is not None]),
+            )
+        )
+    }
+    repayments = {line.id: prior[line.liability_id] for line in lines if line.liability_id in prior}
+    return {"batch": batch, "lines": lines, "names": names, "bank": bank, "repayments": repayments}
