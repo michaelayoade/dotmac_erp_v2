@@ -836,6 +836,16 @@ def test_a_finalized_run_cannot_be_cancelled_and_cancel_by_another_actor_conflic
     assert exc.value.code == "not_cancellable"
 
 
+def test_leaver_with_two_assignments_is_listed_once(engine):
+    env = world(engine)
+    _leaver(engine, env, effective_from=date(2026, 1, 1), effective_to=date(2026, 1, 10))
+    _leaver(engine, env, effective_from=date(2026, 1, 11), effective_to=date(2026, 1, 20))
+    err = refusal(
+        engine, env, svc.batch_calculate, new_run(engine, env), "proration_required", 0, input_bytes=GOOD_FILE
+    )
+    assert "1 employee(s) left" in str(err) and str(err).count("E6") == 1
+
+
 def test_leaver_on_an_input_structure_goes_through_the_erp_form_batch_approve_and_finalize(engine):
     from erp_v2.web import payroll_actions as actions
 

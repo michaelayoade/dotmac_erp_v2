@@ -480,7 +480,7 @@ def _guarded_batch(
             f"{len(partial)} employee(s) joined after the period start and need a proration factor: "
             f"{_listed(partial)}. Calculate them with the single-employee form, then run the batch again",
         )
-    leavers = sorted(a.employee_ref for a in _leavers(db, run) if a.employee_ref not in calculated)
+    leavers = sorted({a.employee_ref for a in _leavers(db, run) if a.employee_ref not in calculated})
     if leavers:
         raise RunRefused(
             "proration_required",
