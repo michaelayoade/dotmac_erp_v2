@@ -683,6 +683,19 @@ def _record(
         raise PayoutRefused("sod_recorder_is_approver", "You approved this batch; someone else must record it")
     if _same(batch.file_issued_by_party_id, party.id):
         raise PayoutRefused("sod_recorder_is_file_issuer", "You issued this batch's file; someone else must record it")
+    if batch.kind == KIND_NET_PAY:
+        if disbursement_policy.bank_file_generation_enabled(db, tenant.id):
+            # Files are on for this tenant: the money must go out by the file that was issued for this batch.
+            if batch.status != FILE_ISSUED:
+                raise PayoutRefused(
+                    "bank_file_required",
+                    "Bank file generation is enabled: issue the batch's bank file before recording it",
+                )
+        else:
+            # No file step: the recorder is the last independent check on the destinations.
+            _refuse_instruction_party(
+                db, batch, lines, party.id, code="sod_recorder_is_instruction_party", role="recorder"
+            )
     reused = db.scalar(
         select(PayrollPayoutBatch.id).where(
             PayrollPayoutBatch.tenant_id == tenant.id,

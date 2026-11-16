@@ -462,6 +462,8 @@ def test_approver_independence_is_rechecked_at_file_and_record(engine):
     batch_id = approved_batch(engine, env, run_id)  # approved while no instruction existed
     seed_instructions(engine, env, decider="approver")  # then the approver approves the destinations
     refused(lambda: generate(engine, env, batch_id), "sod_approver_is_instruction_party")
+    refused(lambda: record(engine, env, batch_id), "bank_file_required")  # files are on: record needs the file
+    enable_file(engine, env, False)
     refused(lambda: record(engine, env, batch_id), "sod_approver_is_instruction_party")
     assert counts(engine, env)["payroll_liability_settlements"] == 0
 
@@ -1026,6 +1028,41 @@ def test_downgrade_refuses_when_batches_exist_and_drops_when_empty(engine):
 
 
 # --- review round 1 -----------------------------------------------------------------
+
+
+def test_with_files_enabled_recording_requires_the_issued_file(engine):
+    env = world(engine)
+    seed_instructions(engine, env)
+    enable_file(engine, env)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, batch_id), "bank_file_required")
+    assert counts(engine, env) == before and batch_row(engine, batch_id).status == "approved"
+    generate(engine, env, batch_id)
+    assert record(engine, env, batch_id).journals == 3
+
+
+def test_statutory_recording_never_needs_a_file_even_when_files_are_enabled(engine):
+    env = world(engine)
+    enable_file(engine, env)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
+    assert record(engine, env, batch_id).journals == 2
+
+
+@pytest.mark.parametrize("role", ["proposer", "decider"])
+def test_without_files_the_recorder_may_not_be_an_instruction_proposer_or_decider(engine, role):
+    env = world(engine)
+    if role == "proposer":
+        seed_instructions(engine, env, proposer="recorder")
+    else:
+        seed_instructions(engine, env, decider="recorder")
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    refused(lambda: record(engine, env, batch_id), "sod_recorder_is_instruction_party")
+    assert counts(engine, env)["payroll_liability_settlements"] == 0
+    assert record(engine, env, batch_id, who="issuer").replayed is False  # someone independent can
 
 
 def test_unknown_employee_beneficiary_is_refused_at_prepare_never_skipped(engine):
