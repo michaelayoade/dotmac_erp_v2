@@ -77,6 +77,7 @@ from erp_v2.migration_bindings import (
     ASSEMBLY_PREREQUISITE_BINDINGS,
 )
 from erp_v2.payees import models as payee_models  # noqa: F401
+from erp_v2.payroll_payouts import models as payroll_payout_models  # noqa: F401
 
 config = context.config
 

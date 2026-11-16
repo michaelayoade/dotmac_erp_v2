@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+{% if new_link %}<p><a href="{{ new_link }}">Prepare a payout or remittance</a></p>{% endif %}
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<table>
+  <thead><tr><th>Number</th><th>Kind</th><th>Lines</th><th>Value date</th><th>Total</th><th>Status</th></tr></thead>
+  <tbody>
+  {% for b in rows %}
+    <tr>
+      <td><a href="{{ detail_base }}/{{ b.id }}">{{ b.number }}</a></td>
+      <td>{{ 'Net pay' if b.kind == 'net_pay' else 'Statutory remittance' }}</td>
+      <td>{{ b.line_count }}</td>
+      <td>{{ b.value_date }}</td>
+      <td>{{ b.currency_code }} {{ b.total_amount }}</td>
+      <td>{{ b.status }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6">None.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

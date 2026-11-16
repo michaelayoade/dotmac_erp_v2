@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Prepare payroll payout — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Prepare payroll payout</h1>
+<p><a href="/payroll/payouts">Back</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if currency_error %}<p role="alert">{{ currency_error }}</p>{% endif %}
+<form method="get" action="/payroll/payouts/new">
+  <p><label>Finalized run
+    <select name="run_id">{% for r in runs %}<option value="{{ r.id }}" {% if run_id == r.id %}selected{% endif %}>{{ r.run_ref }} ({{ r.period_start }} to {{ r.period_end }})</option>{% endfor %}</select></label>
+  <label>Kind <select name="kind"><option value="net_pay" {% if kind == 'net_pay' %}selected{% endif %}>Employee net pay</option><option value="statutory" {% if kind == 'statutory' %}selected{% endif %}>Statutory remittance (no bank file)</option></select></label>
+  <button type="submit">Show liabilities</button></p>
+</form>
+{% if run_id %}
+<form method="post" action="/payroll/payouts" autocomplete="off">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="request_id" value="{{ request_id }}">
+  <input type="hidden" name="run_id" value="{{ run_id }}">
+  <input type="hidden" name="kind" value="{{ kind }}">
+  <p><label>Paying bank account <select name="bank_account_id">{% for a in accounts %}<option value="{{ a.id }}">{{ a.account_code }} — {{ a.account_name }}</option>{% endfor %}</select></label></p>
+  <p><label>Bank value date <input type="date" name="value_date" value="{{ today }}" required></label></p>
+  {% if kind == 'statutory' %}<p><label>Remittance destination (one per batch) <input name="destination_ref" maxlength="240" required></label></p>{% endif %}
+  <table><thead><tr><th></th><th>Beneficiary</th><th>Account</th><th>Amount</th></tr></thead><tbody>
+  {% for l in liabilities %}<tr><td><input type="checkbox" name="liability_id" value="{{ l.id }}" checked aria-label="Include"></td><td>{{ l.beneficiary_ref }}</td><td>{{ l.liability_account_ref }}</td><td>{{ l.currency_code }} {{ l.amount }}</td></tr>
+  {% else %}<tr><td colspan="4">No outstanding liabilities of this kind.</td></tr>{% endfor %}
+  </tbody></table>
+  <p>Whole liabilities only; amounts are never edited here. Deductions that are not net pay never appear in a net-pay payout.</p>
+  <button type="submit">Prepare batch</button>
+</form>
+{% endif %}
+{% endblock %}

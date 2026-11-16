@@ -312,6 +312,11 @@ this does not authorize adjusting balances or switching traffic.
   in this section moves to it; the same exact-wheel CI, image and genesis proof applies. File generation
   is default OFF behind a typed tenant setting and no new environment variable is required.
 
+- Payroll payouts (B5, `docs/payroll-payouts.md`) add the head `e2_0019_payroll_payouts` (after
+  `e2_0018_disbursement_receipts`; additive, two tables, RLS forced, lifecycle-column UPDATE only). The e2
+  head in this section moves to it; the same exact-wheel CI, image and genesis proof applies. No new
+  environment variable. Routes are dormant until roles are granted; file generation stays default OFF.
+
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
 depends on `bk_0001_banking`; its stamped head is absorbed by that lineage.

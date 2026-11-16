@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Payout {{ batch.number }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Payout {{ batch.number }}</h1>
+<p><a href="{{ back }}">Back</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>Status</dt><dd>{{ batch.status }}</dd>
+  <dt>Kind</dt><dd>{{ 'Net pay' if batch.kind == NET_PAY else 'Statutory remittance (no file)' }}{% if batch.destination_ref %} to {{ batch.destination_ref }}{% endif %}</dd>
+  <dt>Value date</dt><dd>{{ batch.value_date }}</dd>
+  <dt>Total</dt><dd>{{ batch.currency_code }} {{ batch.total_amount }} over {{ batch.line_count }} line(s)</dd>
+  <dt>Paying bank account</dt><dd>{% if bank %}{{ bank.account_code }} — {{ bank.account_name }}{% else %}unknown{% endif %}</dd>
+  <dt>Prepared by</dt><dd>{{ names.get(batch.prepared_by_party_id|string, batch.prepared_by_party_id) }} at {{ batch.prepared_at }}</dd>
+  {% if batch.approved_by_party_id %}<dt>Approved by</dt><dd>{{ names.get(batch.approved_by_party_id|string, batch.approved_by_party_id) }} at {{ batch.approved_at }}</dd>{% endif %}
+  {% if batch.file_issued_by_party_id %}<dt>Bank file issued by</dt><dd>{{ names.get(batch.file_issued_by_party_id|string, batch.file_issued_by_party_id) }} at {{ batch.file_issued_at }}; {{ batch.file_row_count }} row(s), sha256 {{ batch.file_sha256 }}</dd>{% endif %}
+  {% if batch.recorded_by_party_id %}<dt>Recorded as paid by</dt><dd>{{ names.get(batch.recorded_by_party_id|string, batch.recorded_by_party_id) }} at {{ batch.recorded_at }}; bank reference {{ batch.bank_reference }}</dd>{% endif %}
+  {% if batch.cancelled_by_party_id %}<dt>Cancelled by</dt><dd>{{ names.get(batch.cancelled_by_party_id|string, batch.cancelled_by_party_id) }}: {{ batch.cancel_reason }}{% if batch.recall_reference %} (recall reference {{ batch.recall_reference }}){% endif %}</dd>{% endif %}
+</dl>
+<h2>Lines</h2>
+<table><thead><tr><th>Beneficiary</th><th>Liability account</th><th>Amount</th><th>Journal</th></tr></thead><tbody>
+{% for l in lines %}<tr><td>{{ l.beneficiary_ref }}</td><td>{{ l.liability_account_ref }}</td><td>{{ l.amount }}</td><td>{{ l.journal_number or '' }}</td></tr>{% endfor %}
+</tbody></table>
+
+{% if mode == 'approve' %}
+  {% if batch.status == DRAFT %}
+  <form method="post" action="{{ bases.approve }}/{{ batch.id }}/approve">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Approve batch (not the preparer)</button>
+  </form>
+  {% endif %}
+  {% if batch.status in (DRAFT, APPROVED, FILE_ISSUED) %}
+  <form method="post" action="{{ bases.approve }}/{{ batch.id }}/cancel">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Reason <input name="reason" maxlength="500" required></label></p>
+    {% if batch.status == FILE_ISSUED %}<p><label>Bank rejection or recall reference (required: a bank file was issued) <input name="recall_reference" maxlength="255" required></label></p>{% endif %}
+    <button type="submit">Cancel batch</button>
+  </form>
+  {% endif %}
+{% elif mode == 'treasury' %}
+  {% if batch.status == APPROVED and batch.kind == NET_PAY and bank_file_enabled %}
+  <form method="post" action="{{ bases.treasury }}/{{ batch.id }}/bank-file">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Generate bank upload file (once; not the preparer or approver)</button> The file is built for download only; the ERP never sends it to a bank.
+  </form>
+  {% endif %}
+  {% if batch.status in (APPROVED, FILE_ISSUED) %}
+  <form method="post" action="{{ bases.treasury }}/{{ batch.id }}/record">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Bank evidence reference <input name="bank_reference" maxlength="255" required></label><br>Recording asserts that the money left through the bank portal under this reference. It settles the liabilities and posts to the ledger (not the preparer, approver or file issuer).</p>
+    <button type="submit">Record as paid</button>
+  </form>
+  {% endif %}
+{% endif %}
+{% endblock %}
