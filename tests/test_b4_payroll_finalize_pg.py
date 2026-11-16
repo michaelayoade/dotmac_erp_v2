@@ -356,7 +356,11 @@ def test_overlap_with_an_existing_run_refuses_and_cancelled_runs_do_not_count(en
     )
     assert "LEGACY-01" in str(err)
     with Session(engine) as db:
-        db.execute(sa.update(PayrollRun).where(PayrollRun.id == legacy).values(status="cancelled"))
+        db.execute(
+            sa.update(PayrollRun)
+            .where(PayrollRun.id == legacy)
+            .values(status="cancelled", cancelled_by_id=env.party_ids[0], cancelled_at=NOW, cancel_reason="test")
+        )
         db.commit()
     assert batch(engine, env, overlapping).calculated == 3
 
@@ -720,14 +724,14 @@ def test_mid_period_joiner_needs_the_single_employee_form_for_proration(engine):
     assert out.calculated == 3 and out.skipped_existing == 1
 
 
-def _leaver(engine, env, *, employee="E6", effective_to=date(2026, 1, 20)):
+def _leaver(engine, env, *, employee="E6", effective_to=date(2026, 1, 20), effective_from=date(2026, 1, 1)):
     with Session(engine) as db:
         payroll.assign_employee_pay_structure(
             db,
             tenant_id=env.tenant_id,
             employee_ref=employee,
             revision_id=env.fixed_revision_id,
-            effective_from=date(2026, 1, 1),
+            effective_from=effective_from,
             effective_to=effective_to,
             source_ref="test",
             source_version="1",
@@ -760,7 +764,9 @@ def test_mid_period_leaver_refuses_in_batch_and_is_part_of_the_roster(engine):
 
 def test_uncalculated_leaver_blocks_approval_and_earlier_leavers_are_ignored(engine):
     env = world(engine)
-    _leaver(engine, env, employee="E7", effective_to=date(2025, 12, 31))  # left before the period
+    _leaver(
+        engine, env, employee="E7", effective_from=date(2025, 6, 1), effective_to=date(2025, 12, 31)
+    )  # left before the period
     run_id = new_run(engine, env)
     batch(engine, env, run_id)
     approve(engine, env, run_id)  # E7 ended before the period: not in the roster
