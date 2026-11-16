@@ -199,7 +199,7 @@ def test_return_then_rebatch_then_repay_with_a_new_settlement_reference(engine):
     # The old settlement reference is refused by the owner (a5): re-payment needs a new reference.
     old_ref = f"{batch_row(engine, batch_id).number}:{line.id.hex[:12]}"
     with Session(engine) as db:
-        with pytest.raises(payroll.PayrollConflict):
+        with pytest.raises(payroll.PayrollConflict, match="settlement was reversed"):
             payroll.record_liability_settlement(
                 db,
                 tenant_id=env.tenant_id,
@@ -269,6 +269,11 @@ def test_database_refuses_a_batch_person_as_the_returner_and_makes_a_return_writ
     with Session(engine) as db:
         with pytest.raises(sa.exc.DBAPIError):
             db.execute(sa.update(PayrollPayoutLine).where(PayrollPayoutLine.id == other.id).values(**values))
+            db.flush()
+        db.rollback()
+        with pytest.raises(sa.exc.DBAPIError):  # a different person but the wrong bank account
+            wrong = {**values, "returned_by_party_id": env.people["proposer"], "return_bank_account_id": uuid4()}
+            db.execute(sa.update(PayrollPayoutLine).where(PayrollPayoutLine.id == other.id).values(**wrong))
             db.flush()
         db.rollback()
         with pytest.raises(sa.exc.DBAPIError):  # a returned line is immutable
