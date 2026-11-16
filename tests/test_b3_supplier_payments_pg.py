@@ -47,11 +47,13 @@ from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, soft_close
 
 from erp_v2.assembly import assembly
+from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import DisbursementFileReceipt
 from erp_v2.journals import policy as journal_policy
 from erp_v2.journals.routes import journals_web_feature
 from erp_v2.payees import service as payee_service
+from erp_v2.payroll_payouts.models import PayrollPayoutBatch
 from erp_v2.supplier_payments import service as svc
 from erp_v2.supplier_payments.routes import supplier_payments_feature
 from erp_v2.supplier_payments.service import AllocationRequest, PaymentRefused
@@ -580,6 +582,119 @@ def test_bank_reference_cannot_be_reused_on_the_same_bank_account(engine):
     refused(lambda: record(engine, env, second, "DUP-1"), "payables_refused")
     assert counts(engine, env) == before
     assert payment(engine, second).status == SupplierPaymentStatus.APPROVED
+
+
+def payroll_payout_row(engine, env, ref, *, bank_id=None):
+    """A recorded B5 payout batch holding `ref` on a bank account (the row B5 itself leaves behind)."""
+    with Session(engine) as db:
+        db.add(
+            PayrollPayoutBatch(
+                tenant_id=env.tenant_id,
+                request_id=uuid4(),
+                number=f"PO-{uuid4().hex[:8]}",
+                run_id=uuid4(),
+                kind="net_pay",
+                status="recorded",
+                bank_account_id=bank_id or env.bank_id,
+                currency_code="NGN",
+                value_date=VALUE_DATE,
+                total_amount=Decimal("100"),
+                line_count=1,
+                prepared_by_party_id=uuid4(),
+                prepared_at=NOW,
+                recorded_by_party_id=uuid4(),
+                recorded_at=NOW,
+                bank_reference=ref,
+            )
+        )
+        db.commit()
+
+
+def test_b3_record_after_b5_with_the_same_reference_on_the_same_account_is_refused(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    payroll_payout_row(engine, env, "PAYROLL-1")
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, pid, "payroll-1"), "bank_reference_reused")  # normalised match
+    assert counts(engine, env) == before
+    assert payment(engine, pid).status == SupplierPaymentStatus.APPROVED
+
+
+def test_a_payroll_reference_on_a_different_bank_account_does_not_block_b3(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    with Session(engine) as db:
+        other = BankAccount(
+            id=uuid4(),
+            tenant_id=env.tenant_id,
+            institution_id=env.institution_id,
+            account_code="OP2",
+            account_name="Other",
+            account_identifier="payer-acct-2",
+            account_type_code="current",
+            currency_code="NGN",
+            minor_units=2,
+            cash_account_ref=str(env.accounts["1000"]),
+            status="active",
+        )
+        db.add(other)
+        db.commit()
+        other_id = other.id
+    payroll_payout_row(engine, env, "PAYROLL-2", bank_id=other_id)
+    assert record(engine, env, pid, "PAYROLL-2").replayed is False
+    assert payment(engine, pid).bank_reference == "PAYROLL-2"
+
+
+def test_b3_record_waits_for_a_concurrent_claim_of_the_same_reference_then_refuses(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    holder = Session(engine)  # a payroll-side recorder mid-transaction: claims the key, has not committed
+    bank_ref.claim(holder, tenant_id=env.tenant_id, bank_account_id=env.bank_id, reference="RACE-1")
+    outcome: dict[str, object] = {}
+
+    def second():
+        try:
+            outcome["result"] = record(engine, env, pid, "RACE-1")
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=second)
+    thread.start()
+    time.sleep(1.0)
+    assert thread.is_alive()  # blocked on the advisory lock, not racing past it
+    holder.add(
+        PayrollPayoutBatch(
+            tenant_id=env.tenant_id,
+            request_id=uuid4(),
+            number="PO-RACE",
+            run_id=uuid4(),
+            kind="net_pay",
+            status="recorded",
+            bank_account_id=env.bank_id,
+            currency_code="NGN",
+            value_date=VALUE_DATE,
+            total_amount=Decimal("100"),
+            line_count=1,
+            prepared_by_party_id=uuid4(),
+            prepared_at=NOW,
+            recorded_by_party_id=uuid4(),
+            recorded_at=NOW,
+            bank_reference="RACE-1",
+        )
+    )
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive() and "result" not in outcome, outcome
+    assert isinstance(outcome["error"], PaymentRefused) and outcome["error"].code == "bank_reference_reused"
+    assert payment(engine, pid).status == SupplierPaymentStatus.APPROVED
+
+
+@pytest.mark.parametrize("bad", ["AB\u0085CD", "AB\u0080CD", "AB\u009fCD"])
+def test_c1_control_characters_in_a_bank_reference_are_refused(engine, bad):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    refused(lambda: record(engine, env, pid, bad), "bank_reference_invalid")
 
 
 def test_bank_reference_is_required_and_printable(engine):

@@ -32,6 +32,7 @@ from dotmac_kernel.setting_domains import SettingDomainRegistry, install_setting
 from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
 from dotmac_kernel.settings_resolver import SettingChangeContext, upsert_by_key
+from dotmac_payables.models import SupplierPayment, SupplierPaymentStatus
 from dotmac_payroll import service as payroll
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement
 from dotmac_people.models import Employee
@@ -39,6 +40,7 @@ from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, soft_close
 
 from erp_v2.assembly import assembly
+from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import DisbursementFileReceipt
 from erp_v2.journals.routes import journals_web_feature
@@ -621,6 +623,158 @@ def test_bank_reference_is_required_printable_normalised_and_unique_per_bank_acc
     second = approved_batch(engine, env, run_id)  # the remaining employees
     refused(lambda: record(engine, env, second, "REF ONE"), "bank_reference_reused")
     assert record(engine, env, second, "REF TWO").replayed is False
+
+
+def supplier_payment_row(engine, env, ref, *, bank_id=None):
+    """A recorded B3 supplier payment holding `ref` on a bank account (the row B3 itself leaves behind)."""
+    with Session(engine) as db:
+        row = SupplierPayment(
+            tenant_id=env.tenant_id,
+            number=f"SP-{uuid4().hex[:8]}",
+            supplier_ref="supplier-x",
+            supplier_name_snapshot="Supplier X",
+            currency_code="NGN",
+            exchange_rate=Decimal("1"),
+            value_date=VALUE_DATE,
+            cash_account_ref=str(env.accounts["1000"]),
+            payer_instrument_ref=str(bank_id or env.bank_id),
+            gross_amount=Decimal("100"),
+            wht_amount=Decimal("0"),
+            net_amount=Decimal("100"),
+            request_fingerprint="0" * 64,
+            status=SupplierPaymentStatus.DRAFT,
+            prepared_by="p1",
+            prepared_at=NOW,
+        )
+        db.add(row)
+        db.commit()  # the owner's trigger only allows creation as a draft; then walk it forward
+        row.status = SupplierPaymentStatus.APPROVED
+        row.approval_reference = "appr-1"
+        row.approved_by = "p2"
+        row.approved_at = NOW
+        db.commit()
+        row.status = SupplierPaymentStatus.RECORDED
+        row.bank_reference = ref
+        row.recorded_by = "p3"
+        row.recorded_at = NOW
+        db.commit()
+
+
+def test_b5_record_after_b3_with_the_same_reference_on_the_same_account_is_refused(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    supplier_payment_row(engine, env, "SUPPLIER-1")
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, batch_id, "supplier-1"), "bank_reference_reused")
+    assert counts(engine, env) == before
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_a_supplier_reference_on_a_different_bank_account_does_not_block_b5(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    with Session(engine) as db:
+        other = uuid4()
+        db.add(
+            BankAccount(
+                id=other,
+                tenant_id=env.tenant_id,
+                institution_id=db.scalar(
+                    sa.select(BankInstitution.id).where(BankInstitution.tenant_id == env.tenant_id)
+                ),
+                account_code="OP2",
+                account_name="Other",
+                account_identifier="payer-acct-2",
+                account_type_code="current",
+                currency_code="NGN",
+                minor_units=2,
+                cash_account_ref=str(env.accounts["1000"]),
+                status="active",
+            )
+        )
+        db.commit()
+    supplier_payment_row(engine, env, "SUPPLIER-2", bank_id=other)
+    assert record(engine, env, batch_id, "SUPPLIER-2").replayed is False
+
+
+def test_concurrent_b5_records_of_one_reference_second_one_refuses(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    e1 = liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E1"])]
+    first = approved_batch(engine, env, run_id, liability_ids=[e1.id])
+    second = approved_batch(engine, env, run_id)
+    holder = Session(engine)
+    svc.record_batch(
+        holder,
+        tenant=holder.get(Tenant, env.tenant_id),
+        party=holder.get(Party, env.people["recorder"]),
+        batch_id=first,
+        bank_reference="RACE-1",
+        now=NOW,
+    )
+    outcome: dict[str, object] = {}
+
+    def other():
+        try:
+            outcome["result"] = record(engine, env, second, "RACE-1")
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    time.sleep(1.0)
+    assert thread.is_alive()  # waiting on the advisory lock, not on any row lock of its own
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive() and "result" not in outcome, outcome
+    assert isinstance(outcome["error"], PayoutRefused) and outcome["error"].code == "bank_reference_reused"
+    assert batch_row(engine, second).status == "approved"
+
+
+def test_a_concurrent_b3_style_claim_waits_for_the_b5_recorder_then_refuses(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    holder = Session(engine)
+    svc.record_batch(
+        holder,
+        tenant=holder.get(Tenant, env.tenant_id),
+        party=holder.get(Party, env.people["recorder"]),
+        batch_id=batch_id,
+        bank_reference="RACE-2",
+        now=NOW,
+    )
+    outcome: dict[str, object] = {}
+
+    def b3_side():
+        with Session(engine) as db:
+            try:
+                bank_ref.claim(db, tenant_id=env.tenant_id, bank_account_id=env.bank_id, reference="RACE-2")
+                outcome["result"] = "claimed"
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                db.rollback()
+
+    thread = threading.Thread(target=b3_side)
+    thread.start()
+    time.sleep(1.0)
+    assert thread.is_alive()
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive() and "result" not in outcome, outcome
+    assert isinstance(outcome["error"], bank_ref.BankReferenceReused)
+
+
+@pytest.mark.parametrize("bad", ["AB\u0085CD", "AB\u0080CD", "AB\u009fCD"])
+def test_c1_control_characters_in_a_bank_reference_are_refused(engine, bad):
+    env = world(engine)
+    batch_id = approved_batch(engine, env, finalized(engine, env))
+    refused(lambda: record(engine, env, batch_id, bad), "bank_reference_invalid")
 
 
 def test_bank_account_changed_after_approval_refuses_record(engine):
