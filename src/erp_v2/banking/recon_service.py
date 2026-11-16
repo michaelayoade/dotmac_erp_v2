@@ -45,8 +45,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from erp_v2.banking import recon_models as m
-from erp_v2.cash_gl.models import CashAccountRepoint
 from erp_v2.banking.recon_models import BankReconciliation, BankReconItem, BankReconMatch, BankReconMatchLine
+from erp_v2.cash_gl.models import CashAccountRepoint
 from erp_v2.journals import models as journal_models
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
 
