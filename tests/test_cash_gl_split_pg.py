@@ -580,6 +580,31 @@ def test_approve_repoints_audits_is_idempotent_and_payers_pick_up_the_new_ref(en
     assert bank_ref(engine, env, env.bank_id) == str(env.accounts["1000"])
 
 
+def test_decided_requests_are_immutable_by_trigger(engine):
+    env = shared_env(engine)
+    req = propose(engine, env, env.twin.id, env.new_b)
+    approve(engine, env, req.id)
+    rejected = propose(engine, env, env.bank_id, env.new_a)
+    run(
+        engine,
+        svc.reject,
+        tenant_id=env.tenant_id,
+        request_id=rejected.id,
+        decider_party_id=env.parties["approver"],
+        reason="no",
+    )
+    for row in (req, rejected):
+        for column in ("decision_note", "status"):
+            with Session(engine) as db:
+                with pytest.raises(DBAPIError) as err:
+                    db.execute(
+                        sa.text(f"UPDATE erp_cash_account_repoints SET {column} = 'proposed' WHERE id = :i"),  # noqa: S608
+                        {"i": row.id},
+                    )
+                assert "immutable" in str(err.value).lower()
+                db.rollback()
+
+
 def test_reject_is_audited_and_changes_nothing(engine):
     env = shared_env(engine)
     req = propose(engine, env, env.twin.id, env.new_b)

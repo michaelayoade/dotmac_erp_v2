@@ -319,7 +319,7 @@ this does not authorize adjusting balances or switching traffic.
 
 - Cash GL split (`docs/cash-gl-split.md`) adds the head `e2_0020_cash_account_repoints` (after
   `e2_0019_payroll_payouts`; additive, one table, RLS forced, decision-column UPDATE only) and the
-  role profile `erp.web` version 5 (two permissions for the existing finance_preparer and
+  role profile `erp.web` version 5 (three permissions for the existing finance_preparer and
   finance_approver roles). The e2 head in this section moves to it. No new environment variable;
   the page is dormant until roles are granted.
 

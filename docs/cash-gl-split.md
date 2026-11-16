@@ -27,7 +27,7 @@ Page `/finance/banking/cash-gl-repoints`. `finance_preparer` proposes (bank acco
 code, evidence reference); a different `finance_approver` approves or rejects. New permissions (the
 only addition, profile `erp.web` 4 to 5, same P0 role pair as journals, SoD pair
 `finance_preparer`/`finance_approver` keeps them two people): `erp.banking.cash_gl_repoint.propose`,
-`erp.banking.cash_gl_repoint.approve`. Dormant until roles are granted (`access_cli`).
+`erp.banking.cash_gl_repoint.approve`, and `erp.banking.cash_gl_repoint.read` (both roles; the list page). Dormant until roles are granted (`access_cli`).
 
 Both steps (and approval again, under locks) refuse unless: the target is an active, postable,
 debit-normal ASSET account in the bank account's currency with no journal line at all, posted or
@@ -38,7 +38,8 @@ file_issued) for that bank account is unposted. Approval also refuses if the ban
 changed since the proposal. Approval writes `mod_banking.bank_accounts.cash_account_ref` as the
 canonical account id and records the request as `approved` in the same transaction; both decisions are
 audited (`erp.banking.cash_gl_repoint.*`). The request table is insert-only for the runtime role
-(decision columns only, no DELETE).
+(decision columns only, no DELETE), and a trigger refuses any UPDATE of a request that is not
+`proposed`.
 
 B3 reads the payer references (`cash_account_ref`) when a payment is PROPOSED and stores the cash
 account on the payment; recording and any later reversal use that stored reference, not the bank

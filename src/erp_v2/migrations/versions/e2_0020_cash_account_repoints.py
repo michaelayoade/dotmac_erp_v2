@@ -70,6 +70,24 @@ def upgrade() -> None:
         "USING (tenant_id = public.app_current_tenant_id()) "
         "WITH CHECK (tenant_id = public.app_current_tenant_id())"
     )
+    # A decided request is final: only a proposed row may be updated (by the decision).
+    op.execute(
+        f"""
+        CREATE FUNCTION public.{TABLE}_final_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF OLD.status <> 'proposed' THEN
+                RAISE EXCEPTION 'a decided cash GL re-point request is immutable'
+                    USING ERRCODE = 'integrity_constraint_violation';
+            END IF;
+            RETURN NEW;
+        END
+        $$
+        """
+    )
+    op.execute(
+        f"CREATE TRIGGER {TABLE}_final_guard BEFORE UPDATE ON public.{TABLE} "
+        f"FOR EACH ROW EXECUTE FUNCTION public.{TABLE}_final_guard()"
+    )
     op.execute(f"GRANT SELECT, INSERT ON public.{TABLE} TO app_user")
     op.execute(f"GRANT UPDATE ({', '.join(DECISION_UPDATE_COLUMNS)}) ON public.{TABLE} TO app_user")
 
@@ -80,3 +98,4 @@ def downgrade() -> None:
     if exists:
         raise RuntimeError(f"refusing to drop {TABLE}: re-point requests exist")
     op.drop_table(TABLE)
+    op.execute(f"DROP FUNCTION IF EXISTS public.{TABLE}_final_guard()")
