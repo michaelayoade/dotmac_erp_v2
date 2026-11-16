@@ -61,6 +61,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import file as bank_file
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import KIND_SUPPLIER_PAYMENT, DisbursementFileReceipt
@@ -445,17 +446,18 @@ def _cancel(
 
 
 def _bank_reference(value: str) -> str:
-    raw = value or ""
-    if any(ord(c) < 32 or ord(c) == 127 for c in raw.strip()):
-        raise PaymentRefused("bank_reference_invalid", "The bank reference must not contain control characters")
-    # Normalised BEFORE the owner's per-instrument uniqueness check: trim, collapse inner whitespace,
-    # upper-case, so "ref  1" and "REF 1" are the same reference. The normalised form is what is stored.
-    text = " ".join(raw.split()).upper()
-    if len(text) < 3 or len(text) > 255:
+    # Shared rule (erp_v2.disbursement.bank_reference): trim, collapse inner whitespace, upper-case,
+    # refuse control characters (C0, DEL, C1). The normalised form is what is stored.
+    try:
+        return bank_ref.normalize(value)
+    except bank_ref.BankReferenceInvalid as exc:
+        if exc.reason == "control":
+            raise PaymentRefused(
+                "bank_reference_invalid", "The bank reference must not contain control characters"
+            ) from exc
         raise PaymentRefused(
             "bank_reference_invalid", "Enter the bank's evidence reference (3 to 255 printable characters)"
-        )
-    return text
+        ) from exc
 
 
 def _check_file_destination(db: Session, tenant_id: UUID, payment: SupplierPayment) -> None:
@@ -513,6 +515,20 @@ def _record(
         raise PaymentRefused("sod_recorder_is_approver", "You approved this payment; someone else must record it")
     _refuse_approver_instruction_party(db, tenant.id, payment, payment.approved_by)
     _check_file_destination(db, tenant.id, payment)
+    try:
+        # Cross-module uniqueness with B5 payroll payouts, under an advisory lock. The supplier-vs-supplier
+        # check stays with the payables owner (its refusal code is unchanged), so it is skipped here.
+        bank_ref.claim(
+            db,
+            tenant_id=tenant.id,
+            bank_account_id=UUID(payment.payer_instrument_ref),
+            reference=reference,
+            check_supplier_payments=False,
+        )
+    except bank_ref.BankReferenceReused as exc:
+        raise PaymentRefused(
+            "bank_reference_reused", "This bank reference was already used on this bank account"
+        ) from exc
     payables.record_supplier_payment(
         db,
         scope=scope,
