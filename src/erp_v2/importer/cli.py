@@ -44,7 +44,7 @@ from erp_v2.importer.sub_origin import (
     sub_tagged_customers_referenced_by_native,
     write_side_file,
 )
-from erp_v2.importer.transitions import run_transitions
+from erp_v2.importer.transitions import VoidGovernance, run_transitions
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
 from erp_v2.importer.wave2 import WAVE2_PAIRINGS, Pairing
 from erp_v2.importer.waves import SOURCE_TABLES
@@ -634,6 +634,26 @@ def _mint_context(args: argparse.Namespace, run_constants: dict[str, object]) ->
     )
 
 
+# Mint steps the execute path runs itself. Every MINT_STEPS entry must be reachable:
+# these two tuples plus the MAP_MINTS values (lazy, before the consuming spec) cover
+# them all, and tests/test_importer_cli.py asserts it.
+EXECUTE_PRE_MINTS = ("kernel_tenants", "functional_currency_settings")  # tenants first; FK parent
+EXECUTE_POST_MINTS = ("pay_rule_bases", "tax_rules", "payee_bank_instructions")
+
+
+def _void_governance(manifest) -> VoidGovernance | None:
+    """Migration actor + stable run reference for the governed legacy-void landing."""
+
+    actor = os.environ.get("ERP_ENROLMENT_ACTOR_ID") or None
+    if not actor:
+        return None
+    return VoidGovernance(
+        migration_actor=str(_uuid.UUID(actor)),
+        approval_reference=f"legacy-migration:{manifest.candidate_revision}:{manifest.snapshot_sha256[:16]}",
+        voided_at=_datetime.now(_timezone.utc),
+    )
+
+
 def cmd_execute(args: argparse.Namespace) -> int:
     manifest = _load_manifest(args)
     if os.environ.get("ERP_IMPORT_APPROVED") != "1":
@@ -670,7 +690,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
         _set_search_path(source_conn, source_schemas)
         enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context)
         if mint_context is not None:
-            enrolment.mint("kernel_tenants")  # FK parent of every tenant-scoped row
+            for step in EXECUTE_PRE_MINTS:  # kernel_tenants: FK parent of every tenant-scoped row
+                enrolment.mint(step)
         result = run_import(
             source_conn,
             dest_conn,
@@ -684,8 +705,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # Non-map-feeding mints run after the specs so every parent
             # row they reference is imported (same caller transaction;
             # dry-run rollback below covers them).
-            post_steps = ("pay_rule_bases", "tax_rules", "payee_bank_instructions")
-            post_mints = tuple(enrolment.mint(step) for step in post_steps)
+            post_mints = tuple(enrolment.mint(step) for step in EXECUTE_POST_MINTS)
         # Lifecycle staging: fiscal periods / journals / payables
         # documents were inserted at their module-mandated initial
         # status; walk them to legacy final states now that every
@@ -696,6 +716,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             tuple(s for s in executable if s.source_row_refusal is None),
             dry_run=not args.apply,
             commit=bool(args.apply),
+            void_governance=_void_governance(manifest),
         )
         if args.apply:
             dest_conn.commit()  # post-mints; specs committed per spec

@@ -11,7 +11,11 @@ state, after every child row has landed:
 - fiscal periods: FUTURE -> OPEN -> SOFT_CLOSED (legacy states)
 - journals: DRAFT -> POSTED (the module trigger verifies balanced
   posted-ledger evidence per journal - a real parity check),
-  DRAFT -> VOID, then POSTED -> REVERSED for reversed originals.
+  DRAFT -> VOID through the accounting owner's governed void path
+  (see ``_void_journals``: JOURNAL_VOID period event, requester =
+  the legacy creator, approver = the migration actor, via
+  ``void_draft_journal``; the owner guard refuses a raw DRAFT->VOID
+  update), then POSTED -> REVERSED for reversed originals.
   Legacy APPROVED/SUBMITTED have no module journal status (approval
   is evidence on a posting, not a state): those rows stay DRAFT
   and are named exceptions for accounting review.
@@ -38,7 +42,9 @@ the row keeps its last legal status.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 import sqlalchemy as sa
 
@@ -86,6 +92,32 @@ _JOURNAL_POSTED_SET = (
 )
 
 
+LEGACY_VOID_REASON = "voided in legacy ERP"
+LEGACY_REQUESTER_PREFIX = "legacy-user:"
+MIGRATION_APPROVER_PREFIX = "migration:"
+_JOURNAL_TABLE = "mod_accounting.journal_entries"
+
+
+@dataclass(frozen=True)
+class VoidGovernance:
+    """Run-level inputs for landing legacy VOID journals through the owner.
+
+    ``migration_actor`` is the migration actor id (approver, recorded as
+    ``migration:<actor>``); ``approval_reference`` is a stable reference of
+    the import run with legacy provenance. Both are part of the owner
+    command fingerprint, so they must be stable across a replay.
+    """
+
+    migration_actor: str
+    approval_reference: str
+    voided_at: datetime
+    reason: str = LEGACY_VOID_REASON
+
+    @property
+    def approver(self) -> str:
+        return f"{MIGRATION_APPROVER_PREFIX}{self.migration_actor}"
+
+
 @dataclass
 class TransitionOutcome:
     destination_table: str
@@ -129,6 +161,147 @@ def _update_batch(
     )
 
 
+def _void_exception(spec: TransformSpec, key: Any, reason: str) -> RowException:
+    return RowException(source_table=spec.source_table, source_key=str(key), column="status", reason=reason)
+
+
+def _void_journals(
+    source: sa.Connection,
+    dest: sa.Connection,
+    spec: TransformSpec,
+    id_source: str,
+    ids: list[Any],
+    governance: VoidGovernance | None,
+    outcome: TransitionOutcome,
+    commit: bool,
+) -> None:
+    """Land legacy VOID journals through the accounting owner's void path.
+
+    Per journal: the owner's ``void_draft_journal`` appends the immutable
+    JOURNAL_VOID period event and flips DRAFT -> VOID in one savepoint, with
+    an idempotency key per legacy journal id (a replay is a no-op: rows
+    already VOID are skipped, and a repeated command returns the first
+    result). Requester = ``legacy-user:<created_by_user_id>`` (legacy
+    provenance), approver = ``migration:<actor>``; the distinct prefixes keep
+    the owner's requester != approver rule true even when both ids are equal.
+    Journal content is untouched (the owner guard freezes everything but
+    status/updated_at). Anything the guard would refuse is a named exception.
+    """
+
+    from dotmac_accounting.contracts import VoidDraftJournal
+    from dotmac_accounting.service import void_draft_journal
+    from dotmac_kernel.cache import TenantScope
+    from sqlalchemy.orm import Session
+
+    if governance is None:
+        for row_id in ids:
+            outcome.exceptions.append(
+                _void_exception(
+                    spec, row_id, "legacy VOID journal needs a migration actor for the governed void; none supplied"
+                )
+            )
+        return
+    creators: dict[Any, Any] = {}
+    for start in range(0, len(ids), 10000):
+        rows = source.execute(
+            sa.text(
+                f"SELECT {id_source} AS jid, created_by_user_id AS creator FROM {spec.source_table} "  # noqa: S608
+                f"WHERE {id_source} IN :ids"
+            ).bindparams(sa.bindparam("ids", expanding=True)),
+            {"ids": ids[start : start + 10000]},
+        )
+        creators.update({r.jid: r.creator for r in rows})
+    moved = 0
+    for start in range(0, len(ids), _BATCH):
+        chunk = ids[start : start + _BATCH]
+        dest_rows = {
+            r.id: r
+            for r in dest.execute(
+                sa.text(
+                    "SELECT je.id, je.tenant_id, je.status, je.posted_at, je.posted_by, je.approval_reference, "
+                    "je.reversal_journal_id, "
+                    "EXISTS (SELECT 1 FROM mod_accounting.posted_ledger_lines pl "
+                    "WHERE pl.tenant_id = je.tenant_id AND pl.journal_id = je.id) AS has_ledger, "
+                    "EXISTS (SELECT 1 FROM mod_accounting.fiscal_periods fp "
+                    "WHERE fp.tenant_id = je.tenant_id AND fp.id = je.fiscal_period_id) AS has_period "
+                    "FROM mod_accounting.journal_entries je WHERE je.id IN :ids"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": chunk},
+            )
+        }
+        for row_id in chunk:
+            row = dest_rows.get(row_id)
+            if row is None:
+                outcome.exceptions.append(_void_exception(spec, row_id, "legacy VOID journal was not imported"))
+                continue
+            if row.status == "VOID":
+                continue  # replay: already landed through the governed path
+            if row.status != "DRAFT":
+                outcome.exceptions.append(
+                    _void_exception(spec, row_id, f"legacy VOID journal is {row.status}, not DRAFT")
+                )
+                continue
+            creator = creators.get(row_id)
+            if creator is None or not str(creator).strip():
+                outcome.exceptions.append(
+                    _void_exception(spec, row_id, "legacy VOID journal has no created_by_user_id")
+                )
+                continue
+            if row.posted_at is not None or row.posted_by is not None or row.approval_reference is not None:
+                outcome.exceptions.append(
+                    _void_exception(
+                        spec, row_id, "legacy VOID journal carries posting evidence; the owner refuses its void"
+                    )
+                )
+                continue
+            if row.reversal_journal_id is not None:
+                outcome.exceptions.append(
+                    _void_exception(
+                        spec, row_id, "legacy VOID journal carries a reversal link; the owner refuses its void"
+                    )
+                )
+                continue
+            if row.has_ledger:
+                outcome.exceptions.append(
+                    _void_exception(
+                        spec, row_id, "legacy VOID journal has posted ledger lines; the owner refuses its void"
+                    )
+                )
+                continue
+            if not row.has_period:
+                outcome.exceptions.append(_void_exception(spec, row_id, "legacy VOID journal has no fiscal period"))
+                continue
+            journal_uuid = UUID(str(row_id))
+            command = VoidDraftJournal(
+                journal_id=journal_uuid,
+                reason=governance.reason,
+                voided_by=f"{LEGACY_REQUESTER_PREFIX}{str(creator).strip().lower()}",
+                approved_by=governance.approver,
+                approval_reference=governance.approval_reference,
+            )
+            try:
+                with Session(bind=dest, join_transaction_mode="create_savepoint") as session:
+                    void_draft_journal(
+                        session,
+                        scope=TenantScope(UUID(str(row.tenant_id))),
+                        command=command,
+                        idempotency_key=f"legacy-journal-void:{journal_uuid}",
+                        idempotency_expires_at=None,
+                        voided_at=governance.voided_at,
+                    )
+                    session.commit()
+            except Exception as exc:  # owner refusal or database error: named, row stays DRAFT
+                detail = str(getattr(exc, "orig", None) or exc).splitlines()[0][:160]
+                outcome.exceptions.append(
+                    _void_exception(spec, row_id, f"governed void rejected ({type(exc).__name__}): {detail}")
+                )
+                continue
+            moved += 1
+        if commit:
+            dest.commit()
+    outcome.transitioned["VOID"] = outcome.transitioned.get("VOID", 0) + moved
+
+
 def _run_family(
     source: sa.Connection,
     dest: sa.Connection,
@@ -136,6 +309,7 @@ def _run_family(
     *,
     dry_run: bool,
     commit: bool = False,
+    void_governance: VoidGovernance | None = None,
 ) -> TransitionOutcome:
     paths = _LIFECYCLES[spec.destination_table]
     outcome = TransitionOutcome(destination_table=spec.destination_table)
@@ -254,6 +428,9 @@ def _run_family(
             if dry_run:
                 outcome.transitioned[target] = outcome.transitioned.get(target, 0) + len(moving)
                 continue
+            if spec.destination_table == _JOURNAL_TABLE and target == "VOID":
+                _void_journals(source, dest, spec, id_source, moving, void_governance, outcome, commit)
+                break  # VOID is terminal: no further steps on this path
             extra = ""
             params_extra: dict[str, Any] = {}
             if spec.destination_table == "mod_accounting.journal_entries" and target == "REVERSED":
@@ -347,6 +524,7 @@ def run_transitions(
     *,
     dry_run: bool = False,
     commit: bool = False,
+    void_governance: VoidGovernance | None = None,
 ) -> tuple[TransitionOutcome, ...]:
     """Walk lifecycle-staged rows to their legacy final states.
 
@@ -388,10 +566,12 @@ def run_transitions(
         spec = by_dest.get(dest_table)
         if spec is None:
             continue
-        outcomes.append(_run_family(source, dest, spec, dry_run=dry_run, commit=commit))
+        outcomes.append(
+            _run_family(source, dest, spec, dry_run=dry_run, commit=commit, void_governance=void_governance)
+        )
         if commit and not dry_run:
             dest.commit()
     return tuple(outcomes)
 
 
-__all__ = ["TransitionOutcome", "run_transitions"]
+__all__ = ["TransitionOutcome", "VoidGovernance", "run_transitions"]

@@ -459,3 +459,16 @@ def test_execute_required_skips_cannot_hide_behind_successful_reports(
     with dest_engine.connect() as destination:
         assert destination.execute(sa.text("SELECT count(*) FROM widgets_out")).scalar_one() == int(apply)
         assert sa.inspect(destination).get_table_names() == ["widgets_out"]
+
+
+def test_every_mint_step_is_invoked_by_the_execute_path() -> None:
+    """A MINT_STEPS entry nobody calls silently never runs (run g: functional_currency_settings)."""
+
+    from erp_v2.importer import cli
+    from erp_v2.importer.minting import MAP_MINTS, MINT_STEPS
+
+    invoked = {*cli.EXECUTE_PRE_MINTS, *cli.EXECUTE_POST_MINTS, *MAP_MINTS.values()}
+    assert {name for name, _fn in MINT_STEPS} == invoked
+    # Tenants first; the functional currency FKs to tenants and precedes every spec.
+    assert cli.EXECUTE_PRE_MINTS[:2] == ("kernel_tenants", "functional_currency_settings")
+    assert not set(cli.EXECUTE_PRE_MINTS) & set(cli.EXECUTE_POST_MINTS)
