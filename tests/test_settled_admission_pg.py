@@ -942,6 +942,23 @@ def test_advisory_lock_is_taken_before_any_invoice_is_read_and_only_for_apply(en
     assert not any("pg_advisory_xact_lock" in text for text in statements)
 
 
+def test_advisory_lock_key_is_the_tenant_not_the_list(engine, setup):
+    env, scene, iid = one(engine, setup)
+    plan = scene.run([iid], apply=False)
+    keys: list = []
+
+    def record(conn, cursor, statement, parameters, *args):
+        if "pg_advisory_xact_lock" in statement:
+            keys.append(parameters)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        scene.run([iid], apply=True, digest=plan["plan_digest"])
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    assert keys and "erp.settled:" + str(env.tenant_id) in str(keys) and LIST_SHA not in str(keys)
+
+
 def test_receipt_has_no_ids_and_the_private_plan_has_the_detail(engine, setup):
     _env, scene = setup
     good, bad = scene.add("AP-1"), scene.add("AP-2")

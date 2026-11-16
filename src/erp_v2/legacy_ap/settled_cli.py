@@ -347,10 +347,10 @@ def run_cohort(
     _require(held is not None, "approver_lacks_finance_approver")
     verifier = SettledInvoiceVerifier(source, manifest)
     if apply:
-        # One apply at a time per list, taken BEFORE anything is read: a concurrent identical apply waits
-        # here and then classifies every invoice as already done, instead of planning from a stale view.
+        # One settled apply at a time per TENANT (not per list: overlapping lists must serialize), taken
+        # BEFORE anything is read: a concurrent apply waits here and then plans from the committed state.
         session.execute(
-            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": "erp.settled:" + list_sha256}
+            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": "erp.settled:" + str(tenant)}
         )
     # The preflight's empty-table rule does not cover historical_settlements for this command: rows may
     # exist only for invoices of THIS list (a re-run). Anything else is another admission's history.
