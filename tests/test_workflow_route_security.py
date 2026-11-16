@@ -149,6 +149,7 @@ def browser(monkeypatch):
             "batch_calculate": Mock(return_value=SimpleNamespace(calculated=3, skipped_existing=0)),
             "approve": Mock(return_value=SimpleNamespace(run_id=DOCUMENT_ID, replayed=False)),
             "finalize": Mock(return_value=SimpleNamespace(run_id=DOCUMENT_ID, replayed=False)),
+            "cancel_run": Mock(return_value=SimpleNamespace(run_id=DOCUMENT_ID, replayed=False)),
         }
         for name, mock in payroll_mocks.items():
             monkeypatch.setattr(payroll_run_routes.services, name, mock)
@@ -315,6 +316,8 @@ PAYROLL_STEPS = (
     ("batch_calculate", f"/payroll/runs/{DOCUMENT_ID}/batch-calculate", "admin"),
     ("approve", f"/payroll/runs/{DOCUMENT_ID}/approve", "payroll_approver"),
     ("finalize", f"/payroll/runs/{DOCUMENT_ID}/finalize", "payroll_finalizer"),
+    # cancel reuses the approve permission (payroll_approver): the withdrawal counterpart of approval
+    ("cancel_run", f"/payroll/runs/{DOCUMENT_ID}/cancel", "payroll_approver"),
 )
 
 

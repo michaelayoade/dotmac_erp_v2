@@ -1,6 +1,6 @@
 """B5 payroll payouts against real PostgreSQL (hosted CI; ERP_TEST_POSTGRES_URL).
 
-Real payroll a3, accounting a2 and kernel migrations; real owner commands, the real posting bridge and
+Real payroll a4, accounting a2 and kernel migrations; real owner commands, the real posting bridge and
 real payee instruction rows. Runs are calculated/approved/finalized through the B4 services (reusing
 its seed). Account codes, mappings and amounts are test inputs only.
 
@@ -71,8 +71,8 @@ GOOD_FILE = (
 )
 
 
-def world(engine):
-    env = b4.world(engine)
+def world(engine, **kw):
+    env = b4.world(engine, **kw)
     with Session(engine) as db:
         # Canonical employee UUIDs (as the B8 importer's _canon_ref spells them), with real people rows,
         # so payee resolution works; the b4 seed assigned the placeholders E1..E3.
@@ -1096,6 +1096,91 @@ def test_a4_internal_recovery_net_pay_or_remittance_is_refused_by_the_selection_
             assert exc.value.code == "internal_recovery_excluded"
             live.settlement_mode = "external"
             svc.check_liability(db, kind=kind, run=run, liability=live, destination_ref=None)
+        db.rollback()
+
+
+# --- real a4: internal recovery is never payable; remittances need an external beneficiary ----
+
+
+def internal_world(engine):
+    """PAYE is a staff-loan style deduction: internal_recovery, mapped to the ASSET account 1410."""
+    return world(engine, paye_liability="1410", paye_mode="internal_recovery")
+
+
+def test_a4_internal_recovery_liability_is_settled_employee_side_and_in_no_payout(engine):
+    env = internal_world(engine)
+    run_id = finalized(engine, env)
+    with Session(engine) as db:
+        recoveries = list(
+            db.scalars(
+                sa.select(PayrollLiability).where(
+                    PayrollLiability.run_id == run_id, PayrollLiability.settlement_mode == "internal_recovery"
+                )
+            )
+        )
+    assert len(recoveries) == 2
+    assert all(
+        r.status == "settled" and r.amount_settled == r.amount and r.beneficiary_type == "employee" for r in recoveries
+    )
+    ids = [r.id for r in recoveries]
+    # never in a net-pay batch (all three: the default selection, and an explicit pick)
+    out = prepare(engine, env, run_id)
+    assert not {line.liability_id for line in lines(engine, out.batch_id)} & set(ids)
+    refused(lambda: prepare(engine, env, run_id, liability_ids=ids), "liability_not_eligible")
+    # never in a remittance: neither by the PAYE destination nor by naming the employee as destination
+    refused(lambda: prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE"), "nothing_to_pay")
+    for recovery in recoveries:
+        refused(
+            lambda r=recovery: prepare(
+                engine,
+                env,
+                run_id,
+                kind="statutory",
+                destination_ref=r.beneficiary_ref,
+                liability_ids=[r.id],
+            ),
+            "liability_not_statutory",
+        )
+    # a settled internal recovery is also refused by the owner for settlement
+    with Session(engine) as db:
+        with pytest.raises(payroll.PayrollRuleViolation):
+            payroll.record_liability_settlement(
+                db,
+                tenant_id=env.tenant_id,
+                liability_id=recoveries[0].id,
+                amount=Money.of(Decimal(1), Currency("NGN", 2)),
+                settlement_ref="x",
+                evidence_ref="y",
+                recorded_by_id=env.people["recorder"],
+                recorded_at=NOW,
+            )
+        db.rollback()
+    assert counts(engine, env)["batches"] == 1  # only the net-pay batch above
+
+
+def test_a4_external_remittance_still_works_beside_an_internal_recovery(engine):
+    env = internal_world(engine)
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER")
+    assert batch_row(engine, out.batch_id).total_amount == Decimal("7500.00")
+
+
+def test_a4_statutory_remittance_requires_beneficiary_type_external(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    from dotmac_payroll.models import PayrollRun
+
+    with Session(engine) as db:
+        run = db.get(PayrollRun, run_id)
+        rows = liabilities(engine, env, run_id)
+        live = db.get(PayrollLiability, rows[("component", "dest:PAYE")].id)
+        assert live.settlement_mode == "external" and live.beneficiary_type == "external"
+        svc.check_liability(db, kind="statutory", run=run, liability=live, destination_ref=None)
+        for beneficiary in ("employee", "supplier", ""):
+            live.beneficiary_type = beneficiary  # simulated on the loaded instance, never flushed
+            with pytest.raises(PayoutRefused) as exc:
+                svc.check_liability(db, kind="statutory", run=run, liability=live, destination_ref=None)
+            assert exc.value.code == "liability_not_statutory"
         db.rollback()
 
 

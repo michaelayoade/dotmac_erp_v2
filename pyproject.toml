@@ -23,7 +23,7 @@ dependencies = [
     "dotmac-files==0.1.0a7",  # wave 1
     "dotmac-imports==0.2.0a1",  # wave 1
     "dotmac-numbering==0.1.0a3",  # wave 1
-    "dotmac-payroll==0.1.0a3",  # wave 2
+    "dotmac-payroll==0.1.0a4",  # wave 2
     "dotmac-people==0.1.0a2",  # wave 2
     "dotmac-tax==0.1.0a7",  # wave 2
     "dotmac-accounting==0.1.0a2",  # wave 3

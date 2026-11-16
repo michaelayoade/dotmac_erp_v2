@@ -253,6 +253,7 @@ def test_draft_overlapping_a_non_cancelled_run_is_refused_but_cancelled_and_adja
         )
     assert _count(db, PayrollRun) == 1
     run.status = "cancelled"
+    run.cancelled_by_id, run.cancelled_at, run.cancel_reason = party.id, datetime(2026, 1, 1, tzinfo=UTC), "test"
     db.flush()
     assert actions.create_draft(
         db, tenant=tenant, party=party, run_ref="X", period_start="2026-01-15", period_end="2026-02-15", **values

@@ -1,6 +1,6 @@
 """B4 payroll batch -> approve -> finalize -> post against real PostgreSQL (hosted CI).
 
-Real payroll a3, accounting a2 and kernel migrations; real owner commands and the real posting
+Real payroll a4, accounting a2 and kernel migrations; real owner commands and the real posting
 bridge. Reuses the disposable-database fixture and tenant/account seed of the bridge test.
 Account codes, mappings and amounts here are test inputs only (Finance owns the real mappings).
 """
@@ -89,7 +89,7 @@ def component(db, env, code, kind, *, expense=None, liability=None):
     )
 
 
-def rule(component_id, sequence, method, *, fixed=None, rate=None, bases=()):
+def rule(component_id, sequence, method, *, fixed=None, rate=None, bases=(), mode="external"):
     return PayRuleInput(
         component_id=component_id,
         sequence=sequence,
@@ -98,10 +98,11 @@ def rule(component_id, sequence, method, *, fixed=None, rate=None, bases=()):
         rate=None if rate is None else Decimal(rate),
         basis_component_ids=tuple(bases),
         prorates=False,
+        settlement_mode=mode,
     )
 
 
-def world(engine, *, paye_liability="2110", net_ref="2040", with_third=True, currency="NGN"):
+def world(engine, *, paye_liability="2110", net_ref="2040", with_third=True, currency="NGN", paye_mode="external"):
     env = seed(engine)
     with Session(engine) as db:
         categories = {
@@ -115,6 +116,7 @@ def world(engine, *, paye_liability="2110", net_ref="2040", with_third=True, cur
             ("2110", categories["LIA"], NormalBalance.CREDIT),
             ("2120", categories["LIA"], NormalBalance.CREDIT),
             ("1410", asset, NormalBalance.DEBIT),
+            ("1300", asset, NormalBalance.DEBIT),  # an asset account that is NOT a declared recovery account
         ):
             row = Account(
                 tenant_id=env.tenant_id,
@@ -155,7 +157,7 @@ def world(engine, *, paye_liability="2110", net_ref="2040", with_third=True, cur
             rules=(
                 rule(basic.id, 1, "input"),
                 rule(housing.id, 2, "fixed", fixed="20000.00"),
-                rule(paye.id, 3, "percentage", rate="0.10", bases=(basic.id,)),
+                rule(paye.id, 3, "percentage", rate="0.10", bases=(basic.id,), mode=paye_mode),
                 rule(pension.id, 4, "percentage", rate="0.05", bases=(basic.id,)),
             ),
             published_by_id=env.party_ids[0],
@@ -355,7 +357,11 @@ def test_overlap_with_an_existing_run_refuses_and_cancelled_runs_do_not_count(en
     )
     assert "LEGACY-01" in str(err)
     with Session(engine) as db:
-        db.execute(sa.update(PayrollRun).where(PayrollRun.id == legacy).values(status="cancelled"))
+        db.execute(
+            sa.update(PayrollRun)
+            .where(PayrollRun.id == legacy)
+            .values(status="cancelled", cancelled_by_id=env.party_ids[0], cancelled_at=NOW, cancel_reason="test")
+        )
         db.commit()
     assert batch(engine, env, overlapping).calculated == 3
 
@@ -541,13 +547,53 @@ def test_mapping_to_an_unknown_or_unusable_account_refuses(engine):
     refusal(engine, env, svc.finalize, run_id, "mapping_account_unusable", 2)
 
 
-def test_loan_recovery_to_an_asset_account_is_refused_and_never_creates_an_external_payable(engine):
-    env = world(engine, paye_liability="1410")  # a staff-loan style asset account on a deduction
+def test_external_deduction_mapped_to_an_asset_account_is_refused_and_creates_no_payable(engine):
+    env = world(engine, paye_liability="1410")  # asset account but the rule is still external
     run_id = new_run(engine, env)
     batch(engine, env, run_id)
-    refusal(engine, env, svc.approve, run_id, "internal_recovery_unsupported", 1)
+    err = refusal(engine, env, svc.approve, run_id, "mapping_account_class_refused", 1)
+    assert "internal_recovery" in str(err)
+    assert counts(engine, env.tenant_id)["payroll_liabilities"] == 0
+
+
+def test_internal_recovery_maps_to_asset_books_as_recovered_and_is_never_a_payable(engine):
+    env = world(engine, paye_liability="1410", paye_mode="internal_recovery")
+    run_id = ready_to_finalize(engine, env)
+    out = finalize(engine, env, run_id)
     with Session(engine) as db:
-        assert db.scalar(sa.select(sa.func.count()).select_from(PayrollLiability)) is not None
+        loan = db.scalars(
+            sa.select(PayrollLiability).where(
+                PayrollLiability.run_id == run_id, PayrollLiability.settlement_mode == "internal_recovery"
+            )
+        ).all()
+        assert len(loan) == 2  # E1 and E2 PAYE recoveries
+        assert all(
+            row.status == "settled" and row.amount_settled == row.amount and row.beneficiary_type == "employee"
+            for row in loan
+        )
+        outstanding = db.scalars(
+            sa.select(PayrollLiability).where(
+                PayrollLiability.run_id == run_id, PayrollLiability.status == "outstanding"
+            )
+        ).all()
+        assert outstanding and all(row.settlement_mode == "external" for row in outstanding)
+        lines = {
+            db.get(Account, r.account_id).code: (r.debit, r.credit)
+            for r in db.scalars(sa.select(PostedLedgerLine).where(PostedLedgerLine.journal_id == out.journal_id))
+        }
+        assert lines["1410"] == (0, Decimal("15000.00"))  # Cr staff loan asset, not a liability
+        assert "2110" not in lines  # no PAYE payable
+        assert lines["2040"] == (0, Decimal("195000.00"))
+        assert sum(d for d, _ in lines.values()) == sum(c for _, c in lines.values())
+
+
+@pytest.mark.parametrize("account", ["2110", "1300"])  # a liability account; an undeclared asset account
+def test_internal_recovery_only_credits_a_declared_recovery_account(engine, account):
+    env = world(engine, paye_liability=account, paye_mode="internal_recovery")
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    err = refusal(engine, env, svc.approve, run_id, "internal_recovery_account_not_allowed", 1)
+    assert "1410" in str(err)
     assert counts(engine, env.tenant_id)["payroll_liabilities"] == 0
 
 
@@ -679,3 +725,149 @@ def test_mid_period_joiner_needs_the_single_employee_form_for_proration(engine):
         db.commit()
     out = batch(engine, env, run_id)
     assert out.calculated == 3 and out.skipped_existing == 1
+
+
+def _leaver(
+    engine, env, *, employee="E6", effective_to=date(2026, 1, 20), effective_from=date(2026, 1, 1), revision_id=None
+):
+    with Session(engine) as db:
+        payroll.assign_employee_pay_structure(
+            db,
+            tenant_id=env.tenant_id,
+            employee_ref=employee,
+            revision_id=revision_id or env.fixed_revision_id,
+            effective_from=effective_from,
+            effective_to=effective_to,
+            source_ref="test",
+            source_version="1",
+        )
+        db.commit()
+
+
+def test_mid_period_leaver_refuses_in_batch_and_is_part_of_the_roster(engine):
+    env = world(engine)
+    _leaver(engine, env)
+    run_id = new_run(engine, env)
+    err = refusal(engine, env, svc.batch_calculate, run_id, "proration_required", 0, input_bytes=GOOD_FILE)
+    assert "E6" in str(err) and "left before the period end" in str(err)
+    with Session(engine) as db:  # the single-employee form calculates the leaver at its end date
+        payroll.calculate_employee_payroll(
+            db,
+            tenant_id=env.tenant_id,
+            run_id=run_id,
+            employee_ref="E6",
+            proration_factor=Decimal("0.6"),
+            inputs=(),
+            calculated_at=NOW,
+        )
+        db.commit()
+    out = batch(engine, env, run_id)
+    assert out.calculated == 3 and out.skipped_existing == 1
+    approve(engine, env, run_id)  # the leaver's calculation is not "without an active assignment"
+    assert status(engine, run_id) == "approved"
+
+
+def test_uncalculated_leaver_blocks_approval_and_earlier_leavers_are_ignored(engine):
+    env = world(engine)
+    _leaver(
+        engine, env, employee="E7", effective_from=date(2025, 6, 1), effective_to=date(2025, 12, 31)
+    )  # left before the period
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    approve(engine, env, run_id)  # E7 ended before the period: not in the roster
+    env2 = world(engine)
+    run2 = new_run(engine, env2)
+    batch(engine, env2, run2)
+    _leaver(engine, env2)  # a leaver recorded after the batch must still be calculated before approval
+    err = refusal(engine, env2, svc.approve, run2, "roster_incomplete", 1)
+    assert "E6" in str(err)
+
+
+def cancel(engine, env, run_id, party_index=0, reason="entered against the wrong period", **kw):
+    return run_command(engine, env, svc.cancel_run, run_id, party_index, reason=reason, **kw)
+
+
+def test_cancel_a_draft_run_records_actor_reason_and_audit_and_frees_the_period(engine):
+    env = world(engine)
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    out = cancel(engine, env, run_id, party_index=3)
+    assert out.replayed is False and status(engine, run_id) == "cancelled"
+    with Session(engine) as db:
+        run = db.get(PayrollRun, run_id)
+        assert run.cancelled_by_id == env.party_ids[3] and run.cancel_reason == "entered against the wrong period"
+    (event,) = audits(engine, env.tenant_id, svc.AUDIT_CANCELLED)
+    assert event.details["previous_status"] == "draft" and event.actor_id == str(env.party_ids[3])
+    assert cancel(engine, env, run_id, party_index=3).replayed is True  # same actor and reason
+    assert len(audits(engine, env.tenant_id, svc.AUDIT_CANCELLED)) == 1
+    new_run(engine, env, ref="RUN-2026-01B")  # the cancelled run no longer blocks the period
+
+
+def test_cancel_an_approved_run_then_nothing_can_finalize_it(engine):
+    env = world(engine)
+    run_id = ready_to_finalize(engine, env)
+    cancel(engine, env, run_id, party_index=1)
+    assert status(engine, run_id) == "cancelled"
+    refusal(engine, env, svc.finalize, run_id, "not_approved", 2)
+    assert counts(engine, env.tenant_id)["journal_entries"] == 0
+
+
+@pytest.mark.parametrize("reason", ["", "   "])
+def test_cancel_requires_a_reason(engine, reason):
+    env = world(engine)
+    run_id = new_run(engine, env)
+    before = status(engine, run_id)
+    with pytest.raises(svc.RunRefused) as exc:
+        cancel(engine, env, run_id, reason=reason)
+    assert exc.value.code == "reason_required" and status(engine, run_id) == before == "draft"
+
+
+def test_a_finalized_run_cannot_be_cancelled_and_cancel_by_another_actor_conflicts(engine):
+    env = world(engine)
+    run_id = ready_to_finalize(engine, env)
+    finalize(engine, env, run_id)
+    with pytest.raises(svc.RunRefused) as exc:
+        cancel(engine, env, run_id)
+    assert exc.value.code == "not_cancellable" and status(engine, run_id) == "finalized"
+    other = new_run(engine, env, ref="RUN-2026-02", start=date(2026, 2, 1), end=date(2026, 2, 28))
+    cancel(engine, env, other, party_index=3)
+    with pytest.raises(svc.RunRefused) as exc:
+        cancel(engine, env, other, party_index=1)
+    assert exc.value.code == "not_cancellable"
+
+
+def test_leaver_with_two_assignments_is_listed_once(engine):
+    env = world(engine)
+    _leaver(engine, env, effective_from=date(2026, 1, 1), effective_to=date(2026, 1, 10))
+    _leaver(engine, env, effective_from=date(2026, 1, 11), effective_to=date(2026, 1, 20))
+    err = refusal(
+        engine, env, svc.batch_calculate, new_run(engine, env), "proration_required", 0, input_bytes=GOOD_FILE
+    )
+    assert "1 employee(s) left" in str(err) and str(err).count("E6") == 1
+
+
+def test_leaver_on_an_input_structure_goes_through_the_erp_form_batch_approve_and_finalize(engine):
+    from erp_v2.web import payroll_actions as actions
+
+    env = world(engine)
+    _leaver(engine, env, revision_id=env.revision_id)  # E6 has an input rule (BASIC) and left on 20 Jan
+    run_id = new_run(engine, env)
+    refusal(engine, env, svc.batch_calculate, run_id, "proration_required", 0, input_bytes=GOOD_FILE)
+    with Session(engine) as db:  # the ERP single-employee form resolves input components at the owner's date
+        tenant, party = db.get(Tenant, env.tenant_id), db.get(Party, env.party_ids[0])
+        calculation = actions.calculate_employee(
+            db,
+            tenant=tenant,
+            party=party,
+            run_id=run_id,
+            employee_ref="E6",
+            proration_factor="0.60000000",
+            component_inputs="BASIC | 60000.00 | hr:leaver-E6",
+        )
+        assert calculation.employee_ref == "E6"
+        db.commit()
+    out = batch(engine, env, run_id)
+    assert out.calculated == 3 and out.skipped_existing == 1
+    approve(engine, env, run_id)
+    finalize(engine, env, run_id)
+    assert status(engine, run_id) == "finalized"

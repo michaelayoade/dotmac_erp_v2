@@ -459,7 +459,7 @@ requires-dist = [
     { name = "dotmac-party", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-payables", specifier = "==0.1.0a5", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-payments", specifier = "==0.1.0a3", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
-    { name = "dotmac-payroll", specifier = "==0.1.0a3", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
+    { name = "dotmac-payroll", specifier = "==0.1.0a4", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-people", specifier = "==0.1.0a2", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-procurement", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-projects", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
@@ -639,15 +639,15 @@ wheels = [
 
 [[package]]
 name = "dotmac-payroll"
-version = "0.1.0a3"
+version = "0.1.0a4"
 source = { registry = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" }
 dependencies = [
     { name = "dotmac-kernel" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a3/dotmac_payroll-0.1.0a3.tar.gz", hash = "sha256:6cadfec03704a78ab98586c4f544128d21b0594ddba9aa4808a8720301e4194c" }
+sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a4/dotmac_payroll-0.1.0a4.tar.gz", hash = "sha256:7007ddcbf214b3ada833fe817ddc2813c5466ba5e59a28c0bac76bfe8c458117" }
 wheels = [
-    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a3/dotmac_payroll-0.1.0a3-py3-none-any.whl", hash = "sha256:60d1bd38ae909e6c3db0845c0fcd84fe0eb2b763fb4de089d2268d6cfa18aa4e" },
+    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-payroll/0.1.0a4/dotmac_payroll-0.1.0a4-py3-none-any.whl", hash = "sha256:de567422bc9239ff0d0c725367ff9b24b8501fb302fd3524527729e51c22bd0c" },
 ]
 
 [[package]]
