@@ -12,7 +12,8 @@ resolves payer references (B3/B5) takes a FOR SHARE lock on the bank account row
 cannot interleave with a payment being proposed against the old reference.
 
 Refused (stable codes): ``same_person``, ``target_not_asset`` / ``target_not_postable`` /
-``target_inactive`` / ``target_currency``, ``already_a_cash_gl`` (some bank account already uses
+``target_inactive`` / ``target_currency``, ``target_has_activity`` (any journal line, posted or draft),
+``target_retired``, ``already_a_cash_gl`` (some bank account already uses
 the target as its cash GL), ``unchanged`` (this bank account already uses it),
 ``baseline_approved`` / ``reconciliation_in_flight`` (B7), ``payments_in_flight`` (B3 DRAFT or
 APPROVED supplier payments, B5 draft/approved/file_issued batches), ``open_request_exists``.
@@ -25,7 +26,7 @@ from typing import Final
 from uuid import UUID, uuid4
 
 from dotmac_accounting.contracts import AccountClass, AccountKind, NormalBalance
-from dotmac_accounting.models import Account, AccountCategory
+from dotmac_accounting.models import Account, AccountCategory, JournalLine
 from dotmac_banking.models import BankAccount
 from dotmac_kernel.audit import write_audit_event
 from dotmac_kernel.models import Party
@@ -155,6 +156,12 @@ def _validate(db: Session, tenant_id: UUID, bank: BankAccount, target_id: UUID) 
             raise RepointRefused(
                 "already_a_cash_gl", f"bank account {other.account_code} already uses this account as its cash GL"
             )
+    # The target must be empty: re-point FIRST, then Finance posts the reclassification journals. Any journal
+    # line, posted or draft, makes it an account with history, not a fresh per-bank cash GL.
+    if db.scalar(
+        select(JournalLine.id).where(JournalLine.tenant_id == tenant_id, JournalLine.account_id == target.id).limit(1)
+    ):
+        raise RepointRefused("target_has_activity", "the target account already has journal lines (posted or draft)")
     # B7: re-point happens BEFORE baselines. Any approved reconciliation fixes the account's GL.
     live = {
         status

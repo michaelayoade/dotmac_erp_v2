@@ -364,6 +364,52 @@ def test_target_account_checks(engine):
     refused("unchanged", propose, engine, env, env.bank_id, env.new_a)
 
 
+def test_target_with_any_journal_line_is_refused_draft_or_posted(engine):
+    from decimal import Decimal as D
+
+    from dotmac_accounting import service as accounting
+    from dotmac_accounting.contracts import CreateJournal, JournalKind, JournalLineInput, SourceIdentity
+    from dotmac_kernel.cache import TenantScope
+    from test_bank_recon_pg import post
+
+    env = shared_env(engine)
+    env.accounts["NEWA"], env.accounts["NEWB"] = env.new_a, env.new_b
+    post(engine, env, debit_code="NEWA", credit_code="4000", amount="5", day=date(2026, 1, 10))
+    refused("target_has_activity", propose, engine, env, env.twin.id, env.new_a)
+    with Session(engine) as db:  # a DRAFT journal line also counts
+        accounting.create_journal(
+            db,
+            scope=TenantScope(env.tenant_id),
+            command=CreateJournal(
+                number=f"D-{uuid4().hex[:8]}",
+                kind=JournalKind.STANDARD,
+                entry_date=date(2026, 1, 11),
+                posting_date=date(2026, 1, 11),
+                currency_code="NGN",
+                exchange_rate=D(1),
+                description="draft",
+                reference=None,
+                source=SourceIdentity("test", "journal", f"d-{uuid4().hex}", "1", "c" * 64),
+                lines=(
+                    JournalLineInput(env.new_b, debit=D("5")),
+                    JournalLineInput(env.accounts["4000"], credit=D("5")),
+                ),
+            ),
+            idempotency_key=f"test:{uuid4()}",
+            idempotency_expires_at=None,
+            recorded_at=NOW,
+        )
+        db.commit()
+    refused("target_has_activity", propose, engine, env, env.twin.id, env.new_b)
+    # activity arriving between proposal and approval is refused at approval too
+    other = shared_env(engine)
+    other.accounts["NEWB"] = other.new_b
+    req = propose(engine, other, other.twin.id, other.new_b)
+    post(engine, other, debit_code="NEWB", credit_code="4000", amount="5", day=date(2026, 1, 10))
+    refused("target_has_activity", approve, engine, other, req.id)
+    assert bank_ref(engine, other, other.twin.id) == "1000"
+
+
 def test_target_must_be_debit_asset_only_when_class_asset(engine):
     env = shared_env(engine)
     # a LIABILITY account with a debit side is still not an ASSET

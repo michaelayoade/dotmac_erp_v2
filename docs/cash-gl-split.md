@@ -30,7 +30,8 @@ only addition, profile `erp.web` 4 to 5, same P0 role pair as journals, SoD pair
 `erp.banking.cash_gl_repoint.approve`. Dormant until roles are granted (`access_cli`).
 
 Both steps (and approval again, under locks) refuse unless: the target is an active, postable,
-debit-normal ASSET account in the bank account's currency; it is not already any bank account's cash
+debit-normal ASSET account in the bank account's currency with no journal line at all, posted or
+draft (`target_has_activity`: re-point FIRST, then post the reclassification journals); it is not already any bank account's cash
 GL; the bank account has no approved or in-flight B7 reconciliation (re-point happens before
 baselines); and no B3 supplier payment (DRAFT, APPROVED) or B5 payout batch (draft, approved,
 file_issued) for that bank account is unposted. Approval also refuses if the bank account's reference
