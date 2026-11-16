@@ -44,7 +44,7 @@ from erp_v2.importer.sub_origin import (
     sub_tagged_customers_referenced_by_native,
     write_side_file,
 )
-from erp_v2.importer.transitions import run_transitions
+from erp_v2.importer.transitions import VoidGovernance, run_transitions
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
 from erp_v2.importer.wave2 import WAVE2_PAIRINGS, Pairing
 from erp_v2.importer.waves import SOURCE_TABLES
@@ -606,7 +606,7 @@ def _execute_run_constants(args: argparse.Namespace, manifest) -> dict[str, obje
         constants["tenant_id"] = _uuid.UUID(str(manifest.tenant_extent[0])).hex
     if args.minor_units is not None:
         constants["minor_units"] = int(args.minor_units)
-    actor = os.environ.get("ERP_ENROLMENT_ACTOR_ID") or None
+    actor = (os.environ.get("ERP_ENROLMENT_ACTOR_ID") or "").strip() or None
     if actor:
         actor_hex = _uuid.UUID(actor).hex
         constants.update(
@@ -626,12 +626,57 @@ def _mint_context(args: argparse.Namespace, run_constants: dict[str, object]) ->
         raise CliRefusal("--mint requires a single-tenant snapshot extent (minting is tenant-scoped)")
     return MintContext(
         tenant_id=tenant,
-        actor_id=os.environ.get("ERP_ENROLMENT_ACTOR_ID") or None,
+        actor_id=(os.environ.get("ERP_ENROLMENT_ACTOR_ID") or "").strip() or None,
         occurred_at=_datetime.now(_timezone.utc),
         payroll_net_payable_account_ref=os.environ.get("ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF") or None,
         tax_rule_policy=_json_arg(args.tax_rule_policy_json, "--tax-rule-policy-json"),
         tax_band_rule_binding=_json_arg(args.tax_band_binding_json, "--tax-band-binding-json"),
     )
+
+
+# Mint steps the execute path runs itself. Every MINT_STEPS entry must be reachable:
+# these two tuples plus the MAP_MINTS values (lazy, before the consuming spec) cover
+# them all, and tests/test_importer_cli.py asserts it.
+EXECUTE_PRE_MINTS = ("kernel_tenants", "functional_currency_settings")  # tenants first; FK parent
+EXECUTE_POST_MINTS = ("pay_rule_bases", "tax_rules", "payee_bank_instructions")
+
+
+def _void_governance(manifest) -> VoidGovernance | None:
+    """Migration actor + stable run reference for the governed legacy-void landing."""
+
+    actor = (os.environ.get("ERP_ENROLMENT_ACTOR_ID") or "").strip() or None
+    if not actor:
+        return None
+    return VoidGovernance(
+        migration_actor=str(_uuid.UUID(actor)),
+        approval_reference=f"legacy-migration:{manifest.candidate_revision}:{manifest.snapshot_sha256[:16]}",
+        voided_at=_datetime.now(_timezone.utc),
+    )
+
+
+LEGACY_VOID_ACTOR_REFUSAL = "legacy_void_requires_migration_actor"
+
+
+LEGACY_VOID_COUNT_REFUSAL = "legacy_void_count_unavailable"
+
+
+def _legacy_void_journal_count(engine: sa.Engine, schemas, specs) -> int | None:
+    """Legacy VOID journals in the source; 0 only when there is no journal spec.
+
+    ``None`` means the count query failed: the caller must fail closed, never assume zero.
+    """
+
+    spec = next((s for s in specs if s.destination_table == "mod_accounting.journal_entries"), None)
+    if spec is None:
+        return 0
+    try:
+        with engine.connect() as conn:
+            _set_search_path(conn, schemas)
+            return int(
+                conn.execute(sa.text(f"SELECT count(*) FROM {spec.source_table} WHERE status = 'VOID'")).scalar_one()  # noqa: S608
+            )
+    except sa.exc.SQLAlchemyError:
+        return None
 
 
 def cmd_execute(args: argparse.Namespace) -> int:
@@ -659,6 +704,17 @@ def cmd_execute(args: argparse.Namespace) -> int:
     executable = order_specs(kept, dest_tables)
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
     non_executable = [s.destination_table for s in specs if s.source_row_refusal is None and not s.executable]
+    # Legacy VOID journals land through the owner's governed void; the approver is the
+    # migration actor. Refuse before ANY write when it is missing (dry-run reports it).
+    void_journals = _legacy_void_journal_count(source_engine, source_schemas, specs)
+    actor_missing = _void_governance(manifest) is None
+    if args.apply and void_journals is None:
+        raise CliRefusal(f"{LEGACY_VOID_COUNT_REFUSAL}: the legacy VOID journal count query failed; nothing written")
+    if args.apply and void_journals and actor_missing:
+        raise CliRefusal(
+            f"{LEGACY_VOID_ACTOR_REFUSAL}: {void_journals} legacy VOID journals need ERP_ENROLMENT_ACTOR_ID "
+            "(the migration actor, approver of the governed void); nothing written"
+        )
     mint_context = _mint_context(args, run_constants) if args.mint else None
     post_mints: tuple[MintResult, ...] = ()
     # connect(), not begin(): --apply commits per spec, and a commit
@@ -670,7 +726,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
         _set_search_path(source_conn, source_schemas)
         enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context)
         if mint_context is not None:
-            enrolment.mint("kernel_tenants")  # FK parent of every tenant-scoped row
+            for step in EXECUTE_PRE_MINTS:  # kernel_tenants: FK parent of every tenant-scoped row
+                enrolment.mint(step)
         result = run_import(
             source_conn,
             dest_conn,
@@ -684,8 +741,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # Non-map-feeding mints run after the specs so every parent
             # row they reference is imported (same caller transaction;
             # dry-run rollback below covers them).
-            post_steps = ("pay_rule_bases", "tax_rules", "payee_bank_instructions")
-            post_mints = tuple(enrolment.mint(step) for step in post_steps)
+            post_mints = tuple(enrolment.mint(step) for step in EXECUTE_POST_MINTS)
         # Lifecycle staging: fiscal periods / journals / payables
         # documents were inserted at their module-mandated initial
         # status; walk them to legacy final states now that every
@@ -696,6 +752,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             tuple(s for s in executable if s.source_row_refusal is None),
             dry_run=not args.apply,
             commit=bool(args.apply),
+            void_governance=_void_governance(manifest),
         )
         if args.apply:
             dest_conn.commit()  # post-mints; specs committed per spec
@@ -732,6 +789,17 @@ def cmd_execute(args: argparse.Namespace) -> int:
             for e in (*result.exceptions, *transition_exceptions)
         ],
         "sub_origin": sub_origin,
+        "legacy_void_governance": {
+            "void_journals": void_journals,
+            "migration_actor_missing": actor_missing,
+            "refusal": (
+                LEGACY_VOID_COUNT_REFUSAL
+                if void_journals is None
+                else LEGACY_VOID_ACTOR_REFUSAL
+                if void_journals and actor_missing
+                else None
+            ),
+        },
         "specs": _spec_report(specs),
         "specs_skipped_non_executable": non_executable,
         "specs_skipped_unsupplied_run_constants": unsupplied,
