@@ -472,3 +472,69 @@ def test_every_mint_step_is_invoked_by_the_execute_path() -> None:
     # Tenants first; the functional currency FKs to tenants and precedes every spec.
     assert cli.EXECUTE_PRE_MINTS[:2] == ("kernel_tenants", "functional_currency_settings")
     assert not set(cli.EXECUTE_PRE_MINTS) & set(cli.EXECUTE_POST_MINTS)
+
+
+@pytest.mark.parametrize("actor", [None, "", "  "])
+def test_apply_refuses_legacy_voids_without_migration_actor_before_any_write(tmp_path, monkeypatch, capsys, actor):
+    import sqlalchemy as sa
+
+    from erp_v2.importer import cli
+    from erp_v2.importer.spec import DestinationColumn, build_spec
+
+    src_path, dst_path = tmp_path / "src.db", tmp_path / "dst.db"
+    src, dst = sa.create_engine(f"sqlite:///{src_path}"), sa.create_engine(f"sqlite:///{dst_path}")
+    with src.begin() as c:
+        c.execute(sa.text("CREATE TABLE journal_entry (journal_entry_id TEXT, status TEXT)"))
+        c.execute(sa.text("INSERT INTO journal_entry VALUES ('j1','VOID'), ('j2','POSTED')"))
+        c.execute(sa.text("CREATE TABLE widgets (widget_id TEXT, name TEXT)"))
+        c.execute(sa.text("INSERT INTO widgets VALUES ('w1','One')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE widgets_out (id TEXT, name TEXT)"))
+    cols = (
+        DestinationColumn("id", nullable=False, has_default=False),
+        DestinationColumn("name", nullable=False, has_default=False),
+    )
+    journal = build_spec(
+        source_table="journal_entry",
+        destination_table="mod_accounting.journal_entries",
+        source_columns=("journal_entry_id", "status"),
+        destination_columns=(cols[0], DestinationColumn("status", nullable=False, has_default=False)),
+        renames={"id": "journal_entry_id"},
+        constants={"status": "DRAFT"},
+    )
+    widgets = build_spec(
+        source_table="widgets",
+        destination_table="widgets_out",
+        source_columns=("widget_id", "name"),
+        destination_columns=cols,
+        renames={"id": "widget_id"},
+    )
+    monkeypatch.setattr(cli, "_resolve_sources", lambda engine, pairings: ({"widgets"}, {}, {}, ()))
+    monkeypatch.setattr(cli, "build_specs", lambda present, cols_, dest: ((widgets, journal), ()))
+    monkeypatch.setenv("ERP_IMPORT_APPROVED", "1")
+    monkeypatch.setenv("ERP_IMPORT_APPLY_OK", "1")
+    monkeypatch.setenv("LEGACY_DATABASE_URL", f"sqlite:///{src_path}")
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", f"sqlite:///{dst_path}")
+    if actor is None:
+        monkeypatch.delenv("ERP_ENROLMENT_ACTOR_ID", raising=False)
+    else:
+        monkeypatch.setenv("ERP_ENROLMENT_ACTOR_ID", actor)
+    receipt = tmp_path / "r.json"
+    argv = ["execute", "--manifest", str(_manifest(tmp_path)), "--receipt", str(receipt)]
+
+    assert main([*argv, "--apply"]) == 2
+    assert "legacy_void_requires_migration_actor" in capsys.readouterr().err
+    assert not receipt.exists()
+    with dst.connect() as c:
+        assert c.execute(sa.text("SELECT count(*) FROM widgets_out")).scalar() == 0
+
+    # Dry-run reports it instead of refusing.
+    monkeypatch.setenv("LEGACY_DATABASE_URL", f"sqlite:///{src_path}")
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", f"sqlite:///{dst_path}")
+    assert main(argv) in (0, 3)
+    report = json.loads(receipt.read_text())["legacy_void_governance"]
+    assert report == {
+        "void_journals": 1,
+        "migration_actor_missing": True,
+        "refusal": "legacy_void_requires_migration_actor",
+    }
