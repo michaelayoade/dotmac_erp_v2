@@ -411,6 +411,12 @@ def _prepare(
         if liability.id in live:
             raise PayoutRefused("liability_in_batch", "A liability is already in another live payout batch")
         check_liability(db, kind=kind, run=run, liability=liability, destination_ref=destination)
+        if (
+            kind == KIND_NET_PAY
+            and payee_service.resolve_payee(db, tenant.id, PayeeKind.EMPLOYEE.value, liability.beneficiary_ref) is None
+        ):
+            # A beneficiary that is not a known employee would be silently skipped by every instruction check.
+            raise PayoutRefused("payee_unresolved", "A net-pay beneficiary is not a known employee of this tenant")
         if liability.currency_code != functional:
             raise PayoutRefused("non_functional_currency", "Payouts are in the tenant functional currency only")
     total = sum((c.amount for c in chosen), Decimal(0))

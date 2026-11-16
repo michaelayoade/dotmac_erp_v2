@@ -26,13 +26,14 @@ from dotmac_banking.models import BankAccount, BankInstitution
 from dotmac_kernel.audit import AuditEvent
 from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
 from dotmac_kernel.features import FeatureManifest
-from dotmac_kernel.models import Party, PartyType, Tenant
+from dotmac_kernel.models import Party, PartyPerson, PartyType, Tenant
 from dotmac_kernel.money import Currency, Money
 from dotmac_kernel.setting_domains import SettingDomainRegistry, install_setting_domains
 from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
 from dotmac_kernel.settings_resolver import SettingChangeContext, upsert_by_key
 from dotmac_payroll import service as payroll
+from dotmac_people.models import Employee
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, soft_close
@@ -62,9 +63,37 @@ def _registries():
     install_scope_kinds(ScopeKindRegistry.from_manifests(manifests))
 
 
+GOOD_FILE = (
+    "employee_ref,component_code,amount,evidence_ref\n{E1},BASIC,100000.00,hr:contract-E1\n"
+    "{E2},BASIC,50000.00,hr:contract-E2\n"
+)
+
+
 def world(engine):
     env = b4.world(engine)
     with Session(engine) as db:
+        # Canonical employee UUIDs (as the B8 importer's _canon_ref spells them), with real people rows,
+        # so payee resolution works; the b4 seed assigned the placeholders E1..E3.
+        env.emp = {}
+        for key in ("E1", "E2", "E3"):
+            party = uuid4()
+            db.add(Party(id=party, tenant_id=env.tenant_id, party_type=PartyType.person, display_name=key))
+            db.flush()
+            db.add(PartyPerson(party_id=party, first_name="Ada", last_name=key))
+            db.flush()
+            employee = Employee(
+                tenant_id=env.tenant_id, party_id=party, employee_code=key, date_of_joining=date(2025, 1, 1)
+            )
+            db.add(employee)
+            db.flush()
+            env.emp[key] = str(employee.id)
+            db.execute(
+                sa.text(
+                    "UPDATE mod_payroll.employee_pay_assignments SET employee_ref = :new "
+                    "WHERE tenant_id = :t AND employee_ref = :old"
+                ),
+                {"new": env.emp[key], "old": key, "t": env.tenant_id},
+            )
         category = db.scalar(
             sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "AST")
         )
@@ -116,14 +145,17 @@ def world(engine):
 
 
 def finalized(engine, env) -> UUID:
-    run_id = b4.ready_to_finalize(engine, env)
+    run_id = b4.new_run(engine, env)
+    b4.batch(engine, env, run_id, data=GOOD_FILE.format(**env.emp).encode())
+    b4.approve(engine, env, run_id)
     b4.finalize(engine, env, run_id)
     return run_id
 
 
 def seed_instructions(engine, env, *, proposer="proposer", decider="decider", origin="manual", name="EMP", refs=None):
     with Session(engine) as db:
-        for i, ref in enumerate(refs or ("E1", "E2", "E3")):
+        for i, key in enumerate(refs or ("E1", "E2", "E3")):
+            ref = env.emp[key]
             manual = origin == "manual"
             db.add(
                 PayeeBankInstruction(
@@ -284,7 +316,7 @@ def test_net_pay_batch_holds_exactly_the_employee_net_pay_liabilities(engine):
     assert batch.prepared_by_party_id == env.people["preparer"] and batch.bank_account_id == env.bank_id
     by_id = {v.id: k for k, v in liabilities(engine, env, run_id).items()}
     assert sorted(by_id[line.liability_id][0] for line in lines(engine, out.batch_id)) == ["employee-net-pay"] * 3
-    assert {line.beneficiary_ref for line in lines(engine, out.batch_id)} == {"E1", "E2", "E3"}
+    assert {line.beneficiary_ref for line in lines(engine, out.batch_id)} == set(env.emp.values())
     assert len(audits(engine, env, svc.AUDIT_PREPARED)) == 1
 
 
@@ -347,7 +379,7 @@ def test_unfinalized_run_and_foreign_bank_account_are_refused(engine):
 def test_a_subset_selection_is_allowed_and_totals_follow_it(engine):
     env = world(engine)
     run_id = finalized(engine, env)
-    e3 = liabilities(engine, env, run_id)[("employee-net-pay", "E3")]
+    e3 = liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E3"])]
     out = prepare(engine, env, run_id, liability_ids=[e3.id])
     batch = batch_row(engine, out.batch_id)
     assert batch.line_count == 1 and batch.total_amount == Decimal("20000")
@@ -461,7 +493,7 @@ def test_record_settles_every_line_and_posts_2040_debit_equal_to_paid_and_bank_c
     assert batch.status == "recorded" and batch.bank_reference == "BANK REF 1"  # normalised and stored
     assert batch.recorded_by_party_id == env.people["recorder"]
     rows = liabilities(engine, env, run_id)
-    for emp in ("E1", "E2", "E3"):
+    for emp in env.emp.values():
         liability = rows[("employee-net-pay", emp)]
         assert liability.status == "settled" and liability.amount_settled == liability.amount
     for key, liability in rows.items():  # components untouched
@@ -525,7 +557,7 @@ def test_partial_batch_is_refused_whole_when_one_liability_was_settled_elsewhere
     env = world(engine)
     run_id = finalized(engine, env)
     batch_id = approved_batch(engine, env, run_id)
-    e3 = liabilities(engine, env, run_id)[("employee-net-pay", "E3")]
+    e3 = liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E3"])]
     with Session(engine) as db:  # an out-of-band settlement of one employee after approval
         payroll.record_liability_settlement(
             db,
@@ -541,7 +573,7 @@ def test_partial_batch_is_refused_whole_when_one_liability_was_settled_elsewhere
     before = counts(engine, env)
     refused(lambda: record(engine, env, batch_id), "liability_not_outstanding")
     assert counts(engine, env) == before and batch_row(engine, batch_id).status == "approved"
-    assert liabilities(engine, env, run_id)[("employee-net-pay", "E1")].status == "outstanding"
+    assert liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E1"])].status == "outstanding"
     assert any(a.details["code"] == "liability_not_outstanding" for a in audits(engine, env, svc.AUDIT_REFUSED))
 
 
@@ -554,7 +586,7 @@ def test_closed_period_refuses_and_rolls_back_every_settlement_and_journal(engin
     refused(lambda: record(engine, env, batch_id), "posting_period_closed")
     assert counts(engine, env) == before
     assert batch_row(engine, batch_id).status == "approved"
-    assert liabilities(engine, env, run_id)[("employee-net-pay", "E1")].amount_settled == 0
+    assert liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E1"])].amount_settled == 0
 
 
 def test_future_value_date_is_refused_and_the_day_itself_is_accepted(engine):
@@ -579,7 +611,7 @@ def test_future_value_date_is_refused_and_the_day_itself_is_accepted(engine):
 def test_bank_reference_is_required_printable_normalised_and_unique_per_bank_account(engine):
     env = world(engine)
     run_id = finalized(engine, env)
-    e1 = liabilities(engine, env, run_id)[("employee-net-pay", "E1")]
+    e1 = liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E1"])]
     first = approved_batch(engine, env, run_id, liability_ids=[e1.id])
     refused(lambda: record(engine, env, first, "x"), "bank_reference_invalid")
     refused(lambda: record(engine, env, first, "AB\ncd"), "bank_reference_invalid")
@@ -729,7 +761,7 @@ def test_record_refuses_if_any_instruction_changed_since_the_file(engine):
     with Session(engine) as db:  # supersede E2's destination with a new approved instruction
         old = db.scalar(
             sa.select(PayeeBankInstruction).where(
-                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == "E2"
+                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == env.emp["E2"]
             )
         )
         old.status = "superseded"
@@ -738,7 +770,7 @@ def test_record_refuses_if_any_instruction_changed_since_the_file(engine):
             PayeeBankInstruction(
                 tenant_id=env.tenant_id,
                 payee_kind="employee",
-                payee_ref="E2",
+                payee_ref=env.emp["E2"],
                 payee_label="Employee E2",
                 bank_code="044",
                 bank_name="Other Bank",
@@ -779,7 +811,7 @@ def test_unsafe_cell_refuses_the_whole_file_and_writes_no_receipt(engine, bad):
     with Session(engine) as db:
         row = db.scalar(
             sa.select(PayeeBankInstruction).where(
-                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == "E2"
+                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == env.emp["E2"]
             )
         )
         db.execute(
@@ -825,7 +857,7 @@ def test_statutory_remittance_is_recorded_without_a_file_dr_liability_cr_bank(en
     assert "2040" not in debits
     rows = liabilities(engine, env, run_id)
     assert rows[("component", "dest:PAYE")].status == "settled"
-    assert rows[("employee-net-pay", "E1")].status == "outstanding"  # net pay untouched
+    assert rows[("employee-net-pay", env.emp["E1"])].status == "outstanding"  # net pay untouched
 
 
 def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
@@ -833,7 +865,7 @@ def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
     run_id = finalized(engine, env)
     refused(lambda: prepare(engine, env, run_id, kind="statutory"), "destination_required")
     refused(lambda: prepare(engine, env, run_id, kind="statutory", destination_ref="dest:NOPE"), "nothing_to_pay")
-    net = liabilities(engine, env, run_id)[("employee-net-pay", "E1")]
+    net = liabilities(engine, env, run_id)[("employee-net-pay", env.emp["E1"])]
     refused(
         lambda: prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE", liability_ids=[net.id]),
         "liability_not_eligible",
@@ -900,7 +932,7 @@ def test_a4_internal_recovery_net_pay_or_remittance_is_refused_by_the_selection_
     with Session(engine) as db:
         run = db.get(__import__("dotmac_payroll.models", fromlist=["PayrollRun"]).PayrollRun, run_id)
         rows = liabilities(engine, env, run_id)
-        for key, kind in ((("employee-net-pay", "E1"), "net_pay"), (("component", "dest:PAYE"), "statutory")):
+        for key, kind in ((("employee-net-pay", env.emp["E1"]), "net_pay"), (("component", "dest:PAYE"), "statutory")):
             live = db.get(PayrollLiability, rows[key].id)
             live.settlement_mode = "internal_recovery"  # a4 column simulated on the loaded instance
             with pytest.raises(PayoutRefused) as exc:
@@ -991,3 +1023,32 @@ def test_downgrade_refuses_when_batches_exist_and_drops_when_empty(engine):
     with pytest.raises(RuntimeError, match="payout batches exist"):
         _run_downgrade(engine, with_batch=True)
     assert _run_downgrade(engine, with_batch=False) is None
+
+
+# --- review round 1 -----------------------------------------------------------------
+
+
+def test_unknown_employee_beneficiary_is_refused_at_prepare_never_skipped(engine):
+    env = world(engine)
+    seed_instructions(engine, env)
+    run_id = finalized(engine, env)
+    ghost = str(uuid4())
+    with Session(engine) as db:  # a liability whose employee is not in people (placeholder-style ref)
+        db.execute(
+            sa.text(
+                "UPDATE mod_payroll.payroll_liabilities SET beneficiary_ref = :g "
+                "WHERE tenant_id = :t AND run_id = :r AND beneficiary_ref = :e"
+            ),
+            {"g": ghost, "t": env.tenant_id, "r": run_id, "e": env.emp["E3"]},
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: prepare(engine, env, run_id), "payee_unresolved")
+    assert counts(engine, env) == before
+    with Session(engine) as db:  # a non-UUID placeholder is unresolved too
+        db.execute(
+            sa.text("UPDATE mod_payroll.payroll_liabilities SET beneficiary_ref = 'E3' WHERE beneficiary_ref = :g"),
+            {"g": ghost},
+        )
+        db.commit()
+    refused(lambda: prepare(engine, env, run_id), "payee_unresolved")
