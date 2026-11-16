@@ -1089,3 +1089,82 @@ def test_unknown_employee_beneficiary_is_refused_at_prepare_never_skipped(engine
         )
         db.commit()
     refused(lambda: prepare(engine, env, run_id), "payee_unresolved")
+
+
+def _recorded_supplier_payment(engine, env, reference):
+    """A real B3 payment (prepare, approve, record) on the same bank account, through the owner commands."""
+    import test_b1_supplier_invoice_post_pg as b1
+    from dotmac_payables.models import PaymentObligation
+
+    from erp_v2.supplier_payments import service as sp
+    from erp_v2.supplier_payments.service import AllocationRequest
+
+    with Session(engine) as db:
+        liability = db.scalar(
+            sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "LIA")
+        )
+        tax = Account(
+            tenant_id=env.tenant_id,
+            category_id=liability.id,
+            code="2100",
+            name="Input VAT",
+            kind=AccountKind.POSTING,
+            normal_balance=NormalBalance.DEBIT,
+        )
+        db.add(tax)
+        db.flush()
+        env.tax_account = tax.id
+        db.commit()
+    invoice_id = b1.invoice(engine, env, number=f"AP-{uuid4().hex[:6]}")
+    b1.approve(engine, env, invoice_id)
+    with Session(engine) as db:
+        obligation = db.scalar(sa.select(PaymentObligation.id).where(PaymentObligation.invoice_id == invoice_id))
+    created = act(
+        engine,
+        env,
+        "preparer",
+        sp.prepare_payment,
+        request_id=uuid4(),
+        bank_account_id=env.bank_id,
+        value_date=VALUE_DATE,
+        allocations=[AllocationRequest(obligation, Decimal("215"))],
+    )
+    act(engine, env, "approver", sp.approve_payment, payment_id=created.payment_id)
+    act(engine, env, "recorder", sp.record_payment, payment_id=created.payment_id, bank_reference=reference)
+
+
+def test_bank_reference_used_by_a_supplier_payment_on_the_same_account_is_refused(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    _recorded_supplier_payment(engine, env, "SHARED REF 7")
+    batch_id = approved_batch(engine, env, run_id)
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, batch_id, "  shared  ref 7 "), "bank_reference_reused")  # normalised match
+    assert counts(engine, env) == before
+    assert record(engine, env, batch_id, "OTHER REF 8").replayed is False
+
+
+def test_a_supplier_reference_on_another_bank_account_does_not_block(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    _recorded_supplier_payment(engine, env, "ELSEWHERE 1")
+    with Session(engine) as db:  # a second bank account: the same reference there is a different bank's reference
+        institution = db.scalar(sa.select(BankInstitution).where(BankInstitution.tenant_id == env.tenant_id))
+        other = BankAccount(
+            id=uuid4(),
+            tenant_id=env.tenant_id,
+            institution_id=institution.id,
+            account_code="OP2",
+            account_name="Second",
+            account_identifier="payer-acct-2",
+            account_type_code="current",
+            currency_code="NGN",
+            minor_units=2,
+            cash_account_ref=str(env.accounts["1000"]),
+            status="active",
+        )
+        db.add(other)
+        other_id = other.id
+        db.commit()
+    batch_id = approved_batch(engine, env, run_id, bank_account_id=other_id)
+    assert record(engine, env, batch_id, "ELSEWHERE 1").replayed is False

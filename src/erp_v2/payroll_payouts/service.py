@@ -44,10 +44,11 @@ from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.idempotency import IdempotencyConflict
 from dotmac_kernel.models import Party, Tenant
 from dotmac_kernel.money import Currency, Money
+from dotmac_payables.models import SupplierPayment
 from dotmac_payroll import service as payroll
 from dotmac_payroll.consequences import build_liability_settlement_consequence
 from dotmac_payroll.models import PayrollLiability, PayrollRun
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -704,7 +705,14 @@ def _record(
             PayrollPayoutBatch.id != batch.id,
         )
     )
-    if reused is not None:
+    supplier_reused = db.scalar(
+        select(SupplierPayment.id).where(
+            SupplierPayment.tenant_id == tenant.id,
+            SupplierPayment.payer_instrument_ref == str(batch.bank_account_id),
+            func.upper(SupplierPayment.bank_reference) == reference,
+        )
+    )
+    if reused is not None or supplier_reused is not None:
         raise PayoutRefused("bank_reference_reused", "This bank reference was already used on this bank account")
     _revalidate(db, batch, lines)
     _refuse_instruction_party(
