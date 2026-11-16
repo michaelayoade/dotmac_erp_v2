@@ -1,12 +1,11 @@
 """Account setup contracts; DB cases use the existing hosted-only PG fixture.
 
-Creation qualification deliberately waits for the released Accounting a2 owner;
-the current a1 dependency must refuse creation before importing its unsafe seam.
+Creation and replay use the adopted released Accounting a2 owner.
+The older a1 refusal remains a regression check.
 """
 
 import hashlib
 import json
-from importlib.metadata import version
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -219,8 +218,6 @@ def test_a1_creation_is_refused_before_owner_import(seeded, monkeypatch):
 
 
 def test_real_owner_creation_replay_and_conflict(seeded):
-    if version("dotmac-accounting") == "0.1.0a1":
-        pytest.skip("real owner creation awaits released Accounting a2 adoption")
     db, parsed = seeded
     first = setup.apply_accounts(db, parsed)
     replay = setup.apply_accounts(db, parsed)
