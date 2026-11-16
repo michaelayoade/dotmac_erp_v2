@@ -52,6 +52,7 @@ PAYEE_BANK_CODES: Final = (
     PAYEE_BANK_READ_UNMASKED,
 )
 
+CASH_GL_REPOINT_READ: Final = "erp.banking.cash_gl_repoint.read"
 CASH_GL_REPOINT_PROPOSE: Final = "erp.banking.cash_gl_repoint.propose"
 CASH_GL_REPOINT_APPROVE: Final = "erp.banking.cash_gl_repoint.approve"
 
@@ -104,10 +105,19 @@ _PAYEE_PERMISSIONS: Final[dict[str, tuple[str, tuple[str, ...]]]] = {
     ),
 }
 
+# Cash GL re-point list page: both roles of the pair may read it (a single guard takes one code).
+_CASH_GL_PERMISSIONS: Final[dict[str, tuple[str, tuple[str, ...]]]] = {
+    CASH_GL_REPOINT_READ: (
+        "View cash GL re-point requests.",
+        ("finance_preparer", "finance_approver"),
+    ),
+}
+
 # Every new permission as (code, description, roles).
 _ALL_NEW: Final = (
     *((code, description, (role,)) for code, (description, role) in _NEW_PERMISSIONS.items()),
     *((code, description, roles) for code, (description, roles) in _PAYEE_PERMISSIONS.items()),
+    *((code, description, roles) for code, (description, roles) in _CASH_GL_PERMISSIONS.items()),
 )
 
 NEW_PERMISSION_CODES: Final = frozenset(code for code, _, _ in _ALL_NEW)

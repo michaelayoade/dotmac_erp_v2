@@ -136,8 +136,10 @@ def test_cash_gl_repoint_uses_the_existing_p0_role_pair_and_is_dormant_for_admin
     proposers, approvers = holders_of(access.CASH_GL_REPOINT_PROPOSE), holders_of(access.CASH_GL_REPOINT_APPROVE)
     assert proposers == {"finance_preparer"} and approvers == {"finance_approver"}
     assert frozenset({"finance_preparer", "finance_approver"}) in access.SOD_CONFLICT_PAIRS
+    assert holders_of(access.CASH_GL_REPOINT_READ) == {"finance_preparer", "finance_approver"}
+    codes = {access.CASH_GL_REPOINT_READ, access.CASH_GL_REPOINT_PROPOSE, access.CASH_GL_REPOINT_APPROVE}
     for role in ("admin", "staff", "treasury", "bank_reconciler"):
-        assert not {access.CASH_GL_REPOINT_PROPOSE, access.CASH_GL_REPOINT_APPROVE} & grants(role), role
+        assert not codes & grants(role), role
 
 
 def test_cash_gl_repoint_routes_map_to_declared_permissions():
@@ -145,3 +147,4 @@ def test_cash_gl_repoint_routes_map_to_declared_permissions():
 
     assert ROUTE_PERMISSIONS["approve"] == ROUTE_PERMISSIONS["reject"] == access.CASH_GL_REPOINT_APPROVE
     assert ROUTE_PERMISSIONS["propose"] == access.CASH_GL_REPOINT_PROPOSE
+    assert ROUTE_PERMISSIONS["list"] == access.CASH_GL_REPOINT_READ

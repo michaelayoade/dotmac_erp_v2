@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from erp_v2 import ui
-from erp_v2.access import CASH_GL_REPOINT_APPROVE, CASH_GL_REPOINT_PROPOSE
+from erp_v2.access import CASH_GL_REPOINT_APPROVE, CASH_GL_REPOINT_PROPOSE, CASH_GL_REPOINT_READ
 from erp_v2.cash_gl import service
 
 router = APIRouter(tags=["cash-gl-repoint-web"])
@@ -29,7 +29,7 @@ BASE = "/finance/banking/cash-gl-repoints"
 
 # route -> permission, asserted against the access profile in tests.
 ROUTE_PERMISSIONS = {
-    "list": CASH_GL_REPOINT_PROPOSE,
+    "list": CASH_GL_REPOINT_READ,
     "propose": CASH_GL_REPOINT_PROPOSE,
     "approve": CASH_GL_REPOINT_APPROVE,
     "reject": CASH_GL_REPOINT_APPROVE,
