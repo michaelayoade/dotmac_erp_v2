@@ -30,8 +30,9 @@ Returned salary (payroll a5, e2_0021): ``return_line`` records that the bank ret
 One savepoint: owner ``reverse_liability_settlement``, ``build_settlement_reversal_consequence`` (Dr the ORIGINAL
 journal's bank cash GL / Cr the liability account), the bridge, and the line marked RETURNED with ``active`` false so
 the liability can be re-batched (under a new settlement reference). The cash GL comes from the settlement's posted
-journal, never the bank account's current mapping; a retired GL refuses (``returned_to_retired_cash_gl``) for a manual
-B2 journal. Statutory lines have no return path. Reuses the approve permission; four batch people are excluded.
+journal, never the bank account's current mapping, even if it was since re-pointed away from (it stays postable; the
+audit event records ``original_cash_gl_retired``). Statutory lines have no return path. Reuses the approve permission;
+the four batch people are excluded.
 """
 
 from __future__ import annotations
@@ -906,8 +907,9 @@ def _original_settlement_journal(
     return journal, bank_gl
 
 
-def _cash_gl_retired(db: Session, tenant_id: UUID, gl: Account) -> bool:
-    """True when an approved cash GL re-point left this account (it is a retired shared cash GL)."""
+def _original_cash_gl_retired(db: Session, tenant_id: UUID, gl: Account) -> bool:
+    """True when an approved cash GL re-point left this account. Audit evidence only: the account stays
+    postable, so the return still debits it (B7 alone refuses to reconcile it)."""
     return (
         db.scalar(
             select(CashAccountRepoint.id)
@@ -999,15 +1001,6 @@ def _return_line(
         raise PayoutRefused(
             "return_date_before_settlement", "The bank return date is before the settlement's posting date"
         )
-    if _cash_gl_retired(db, tenant.id, bank_gl):
-        # The cash GL this salary left from has been re-pointed away from. Mirroring it would post to a retired
-        # account (B7 refuses to reconcile it) and the current mapping is the wrong ledger: Finance posts the
-        # reclassification by hand (B2 manual journal) and the case goes to the manual exceptions review.
-        raise PayoutRefused(
-            "returned_to_retired_cash_gl",
-            "The original cash account was re-pointed away from; refer this return to the exceptions review "
-            "for a Finance journal (B2)",
-        )
     functional = _functional_currency(db, tenant.id)
     if batch.currency_code != functional:
         raise PayoutRefused("non_functional_currency", "Payouts are in the tenant functional currency only")
@@ -1079,6 +1072,7 @@ def _return_line(
             "original_journal_id": str(journal.id),
             "reversal_journal_id": str(posted.journal_id),
             "original_cash_gl": str(bank_gl.id),
+            "original_cash_gl_retired": _original_cash_gl_retired(db, tenant.id, bank_gl),
             "current_cash_ref_differs": (current or "").strip() not in (str(bank_gl.id), bank_gl.code),
             "prepared_by": str(batch.prepared_by_party_id),
             "recorded_by": str(batch.recorded_by_party_id),

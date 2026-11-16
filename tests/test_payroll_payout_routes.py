@@ -430,7 +430,7 @@ def test_return_route_refuses_a_malformed_date_before_the_service(browser):
 
 def test_return_route_refusal_renders_the_code(browser):
     token = browser.sign_in("approver")
-    browser.spies["return_line"].side_effect = PayoutRefused("returned_to_retired_cash_gl", "manual journal")
+    browser.spies["return_line"].side_effect = PayoutRefused("original_journal_mismatch", "manual journal")
     browser.spies["queries.detail"].return_value = {
         "batch": _batch(status="recorded"),
         "lines": [],
@@ -438,4 +438,4 @@ def test_return_route_refusal_renders_the_code(browser):
         "bank": None,
     }
     response = _post(browser, f"{A}/{PID}/lines/{LINE_ID}/return", token)
-    assert response.status_code == 400 and "returned_to_retired_cash_gl" in response.text
+    assert response.status_code == 400 and "original_journal_mismatch" in response.text

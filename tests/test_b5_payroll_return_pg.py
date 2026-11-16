@@ -365,20 +365,24 @@ def test_the_reversal_posts_to_the_original_journal_cash_gl_even_if_the_mapping_
     event = audits(engine, env, svc.AUDIT_LINE_RETURNED)[0]
     assert event.details["original_cash_gl"] == str(env.accounts["1000"])
     assert event.details["current_cash_ref_differs"] is True
+    assert event.details["original_cash_gl_retired"] is False
 
 
-def test_a_retired_original_cash_gl_refuses_and_routes_to_the_manual_exception(engine):
+def test_a_retired_original_cash_gl_is_still_debited_and_the_liability_can_be_rebatched(engine):
     env = world(engine)
     run_id, batch_id = recorded(engine, env)
     line = line_of(engine, env, batch_id)
-    repoint_bank(engine, env, governed=True)  # the #53 re-point retired the shared GL the salary left from
-    before = counts(engine, env)
-    refused(lambda: give_back(engine, env, batch_id, line), "returned_to_retired_cash_gl")
-    assert counts(engine, env) == before and reversal_count(engine, env) == 0
-    assert next(row for row in lines(engine, batch_id) if row.id == line.id).active is True
-    assert liability_of(engine, env, run_id).status == "settled"
-    refusal = [e for e in audits(engine, env, svc.AUDIT_REFUSED) if e.details.get("attempted") == "return"]
-    assert len(refusal) == 1 and refusal[0].details["code"] == "returned_to_retired_cash_gl"
+    target = repoint_bank(engine, env, governed=True)  # the #53 re-point retired the shared GL the salary left from
+    give_back(engine, env, batch_id, line)
+    debits, credits, journals = reversal_posting(engine, env)
+    assert journals == 1 and debits["1000"] == Decimal("110000") and target.code not in debits
+    assert credits["2040"] == Decimal("110000")
+    event = audits(engine, env, svc.AUDIT_LINE_RETURNED)[0]
+    assert event.details["original_cash_gl_retired"] is True and event.details["current_cash_ref_differs"] is True
+    liability = liability_of(engine, env, run_id)
+    assert liability.status == "outstanding" and liability.amount_settled == 0
+    second = prepare(engine, env, run_id, liability_ids=[liability.id]).batch_id
+    assert batch_row(engine, second).status == "draft"
 
 
 # --- replay and concurrency -------------------------------------------------------------------

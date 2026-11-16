@@ -71,9 +71,10 @@ reference, bank return date, reason). Permission: the existing `erp.finance.payr
   line (reversal id, journal id and number, fingerprint, who, when, reference, reason).
 - Bank account: the cash GL credited by the settlement's ORIGINAL posted journal (rebuilt and checked
   against the stored consequence fingerprint; `original_journal_mismatch` otherwise), never the bank
-  account's current mapping. If an approved cash GL re-point left that GL it is retired: refuse with
-  `returned_to_retired_cash_gl`; the case goes to the manual exceptions review and Finance posts the
-  reclassification as a B2 journal (see `cash-gl-split.md`, steps 3 to 5). Nothing is posted or changed.
+  account's current mapping. If an approved cash GL re-point has since left that GL, the return still
+  debits it (the old GL stays postable; only B7 refuses to reconcile it) and the audit event records
+  `original_cash_gl_retired: true`. Finance moves the amount to the new account with the step-4 B2
+  transfer in `cash-gl-split.md`.
 - Dates: the return date is on or after the settlement's posting date and not in the future.
 - The return reference is a bank evidence reference: unique per bank account across B3, B5 payouts and
   B5 returns (`bank_reference_reused`).
