@@ -77,7 +77,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "pj_0001_projects",  # projects 0.1.0a1
     "pm_0006_cash_qualification",  # payments 0.1.0a3
     "pt_0001_party_context",  # party 0.1.0a1
-    "py_0001_payroll",  # payroll 0.1.0a3
+    "py_0002_mode_and_run_cancel",  # payroll 0.1.0a4
     "sa_0001_sales",  # sales 0.1.0a1
     "tk_0001_tickets",  # ticketing 0.1.0a4
     "tx_0005_tax_dependencies",  # tax 0.1.0a7
