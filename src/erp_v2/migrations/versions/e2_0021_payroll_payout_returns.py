@@ -71,8 +71,12 @@ def upgrade() -> None:
             END IF;
             IF NEW.returned_at IS NOT NULL THEN
                 SELECT * INTO b FROM public.{_B} WHERE tenant_id = NEW.tenant_id AND id = NEW.batch_id;
-                IF b.status <> 'recorded' OR b.kind <> 'net_pay' THEN
+                IF NOT FOUND OR b.status IS DISTINCT FROM 'recorded' OR b.kind IS DISTINCT FROM 'net_pay' THEN
                     RAISE EXCEPTION 'only a line of a recorded net-pay batch can be returned'
+                        USING ERRCODE = 'integrity_constraint_violation';
+                END IF;
+                IF NEW.return_bank_account_id IS DISTINCT FROM b.bank_account_id THEN
+                    RAISE EXCEPTION 'the return must name the batch bank account'
                         USING ERRCODE = 'integrity_constraint_violation';
                 END IF;
                 IF NEW.returned_by_party_id IN (
