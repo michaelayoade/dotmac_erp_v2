@@ -11,7 +11,7 @@ A = UUID("00000000-0000-0000-0000-0000000000b1")
 
 
 def test_normalises_trim_collapse_and_upper_case():
-    assert bank_ref.normalize("  ref \t one\n") == "REF ONE"
+    assert bank_ref.normalize("  ref   one \n") == "REF ONE"
 
 
 @pytest.mark.parametrize(

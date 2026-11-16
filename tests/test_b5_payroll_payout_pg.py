@@ -628,32 +628,35 @@ def test_bank_reference_is_required_printable_normalised_and_unique_per_bank_acc
 def supplier_payment_row(engine, env, ref, *, bank_id=None):
     """A recorded B3 supplier payment holding `ref` on a bank account (the row B3 itself leaves behind)."""
     with Session(engine) as db:
-        db.add(
-            SupplierPayment(
-                tenant_id=env.tenant_id,
-                number=f"SP-{uuid4().hex[:8]}",
-                supplier_ref="supplier-x",
-                supplier_name_snapshot="Supplier X",
-                currency_code="NGN",
-                exchange_rate=Decimal("1"),
-                value_date=VALUE_DATE,
-                cash_account_ref=str(env.accounts["1000"]),
-                payer_instrument_ref=str(bank_id or env.bank_id),
-                gross_amount=Decimal("100"),
-                wht_amount=Decimal("0"),
-                net_amount=Decimal("100"),
-                request_fingerprint="0" * 64,
-                status=SupplierPaymentStatus.RECORDED,
-                prepared_by="p1",
-                prepared_at=NOW,
-                approval_reference="appr-1",
-                approved_by="p2",
-                approved_at=NOW,
-                bank_reference=ref,
-                recorded_by="p3",
-                recorded_at=NOW,
-            )
+        row = SupplierPayment(
+            tenant_id=env.tenant_id,
+            number=f"SP-{uuid4().hex[:8]}",
+            supplier_ref="supplier-x",
+            supplier_name_snapshot="Supplier X",
+            currency_code="NGN",
+            exchange_rate=Decimal("1"),
+            value_date=VALUE_DATE,
+            cash_account_ref=str(env.accounts["1000"]),
+            payer_instrument_ref=str(bank_id or env.bank_id),
+            gross_amount=Decimal("100"),
+            wht_amount=Decimal("0"),
+            net_amount=Decimal("100"),
+            request_fingerprint="0" * 64,
+            status=SupplierPaymentStatus.DRAFT,
+            prepared_by="p1",
+            prepared_at=NOW,
         )
+        db.add(row)
+        db.commit()  # the owner's trigger only allows creation as a draft; then walk it forward
+        row.status = SupplierPaymentStatus.APPROVED
+        row.approval_reference = "appr-1"
+        row.approved_by = "p2"
+        row.approved_at = NOW
+        db.commit()
+        row.status = SupplierPaymentStatus.RECORDED
+        row.bank_reference = ref
+        row.recorded_by = "p3"
+        row.recorded_at = NOW
         db.commit()
 
 
