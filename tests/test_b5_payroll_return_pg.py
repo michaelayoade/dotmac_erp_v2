@@ -533,8 +533,8 @@ def test_the_returner_may_not_approve_or_record_the_repayment(engine):
 def test_the_returner_may_not_issue_the_file_of_the_repayment(engine):
     env = world(engine)
     seed_instructions(engine, env)
+    _run, second = _returned_and_rebatched(engine, env)  # files are switched on only after the first payout
     enable_file(engine, env)
-    _run, second = _returned_and_rebatched(engine, env)
     approve(engine, env, second)
     refused(lambda: generate(engine, env, second, who="canceller"), "sod_file_issuer_is_returner")
     assert batch_row(engine, second).status == "approved"
