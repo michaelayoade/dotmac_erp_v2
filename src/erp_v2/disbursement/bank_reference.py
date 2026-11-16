@@ -1,6 +1,7 @@
 """One bank-evidence-reference rule shared by B3 supplier payments and B5 payroll payouts.
 
-A bank reference is used once per (tenant, bank account) across BOTH modules. Each module has its own
+A bank reference is used once per (tenant, bank account) across BOTH modules (a B5 bank
+return reference counts too). Each module has its own
 table (and its own unique constraint), so no single constraint can span them; the cross-module rule is
 enforced here, serialised by a transaction-scoped advisory lock.
 
@@ -23,7 +24,7 @@ from dotmac_payables.models import SupplierPayment
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from erp_v2.payroll_payouts.models import PayrollPayoutBatch
+from erp_v2.payroll_payouts.models import PayrollPayoutBatch, PayrollPayoutLine
 
 MIN_LENGTH = 3
 MAX_LENGTH = 255
@@ -91,6 +92,14 @@ def claim(
     if exclude_payroll_batch_id is not None:
         payroll = payroll.where(PayrollPayoutBatch.id != exclude_payroll_batch_id)
     if db.scalar(payroll.limit(1)) is not None:
+        raise BankReferenceReused
+    # A bank RETURN reference (B5, payroll a5) is also a bank evidence reference on this account.
+    returned = select(PayrollPayoutLine.id).where(
+        PayrollPayoutLine.tenant_id == tenant_id,
+        PayrollPayoutLine.return_bank_account_id == bank_account_id,
+        PayrollPayoutLine.return_reference == reference,
+    )
+    if db.scalar(returned.limit(1)) is not None:
         raise BankReferenceReused
     if check_supplier_payments:
         supplier = select(SupplierPayment.id).where(

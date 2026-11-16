@@ -25,6 +25,13 @@ exempt), re-checked at approve, file and record. Recording refuses if any line's
 since the file, a future value date, a reused bank reference, or if any line is no longer
 outstanding at exactly its amount. One file per batch (receipt per line, UNIQUE), cancel after a file
 needs an audited recall reference. File bytes are never stored or logged; only sha256 and row count.
+
+Returned salary (payroll a5, e2_0021): ``return_line`` records that the bank returned one net-pay line's credit.
+One savepoint: owner ``reverse_liability_settlement``, ``build_settlement_reversal_consequence`` (Dr the ORIGINAL
+journal's bank cash GL / Cr the liability account), the bridge, and the line marked RETURNED with ``active`` false so
+the liability can be re-batched (under a new settlement reference). The cash GL comes from the settlement's posted
+journal, never the bank account's current mapping; a retired GL refuses (``returned_to_retired_cash_gl``) for a manual
+B2 journal. Statutory lines have no return path. Reuses the approve permission; four batch people are excluded.
 """
 
 from __future__ import annotations
@@ -36,8 +43,8 @@ from decimal import Decimal
 from typing import Final
 from uuid import UUID
 
-from dotmac_accounting.contracts import AccountClass
-from dotmac_accounting.models import Account, AccountCategory
+from dotmac_accounting.contracts import AccountClass, JournalStatus
+from dotmac_accounting.models import Account, AccountCategory, JournalEntry, JournalLine
 from dotmac_banking.models import BankAccount
 from dotmac_kernel.audit import write_audit_event
 from dotmac_kernel.cache import TenantScope
@@ -45,12 +52,17 @@ from dotmac_kernel.idempotency import IdempotencyConflict
 from dotmac_kernel.models import Party, Tenant
 from dotmac_kernel.money import Currency, Money
 from dotmac_payroll import service as payroll
-from dotmac_payroll.consequences import build_liability_settlement_consequence
-from dotmac_payroll.models import PayrollLiability, PayrollRun
+from dotmac_payroll.consequences import (
+    SETTLEMENT_DOCUMENT_KIND,
+    build_liability_settlement_consequence,
+    build_settlement_reversal_consequence,
+)
+from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement, PayrollRun
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.cash_gl.models import CashAccountRepoint, RepointStatus
 from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import file as bank_file
 from erp_v2.disbursement import policy as disbursement_policy
@@ -80,7 +92,9 @@ AUDIT_CANCELLED: Final = "erp.payroll.payout.cancelled"
 AUDIT_RECORDED: Final = "erp.payroll.payout.recorded_posted"
 AUDIT_FILE_GENERATED: Final = "erp.payroll.payout.file_generated"
 AUDIT_REFUSED: Final = "erp.payroll.payout.refused"
+AUDIT_LINE_RETURNED: Final = "erp.payroll.payout.line_returned"
 AUDIT_ACTIONS: Final = (
+    AUDIT_LINE_RETURNED,
     AUDIT_PREPARED,
     AUDIT_APPROVED,
     AUDIT_CANCELLED,
@@ -109,6 +123,15 @@ class PayoutOutcome:
     batch_id: UUID
     replayed: bool
     journals: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnOutcome:
+    batch_id: UUID
+    line_id: UUID
+    replayed: bool
+    reversal_id: UUID
+    journal_id: UUID
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,6 +818,275 @@ def _record(
     return PayoutOutcome(batch.id, False, len(lines))
 
 
+# --- returned salary (payroll a5) ------------------------------------------------------------
+
+RETURN_REASON_MAX: Final = 500
+
+
+def _return_reason(value: str | None) -> str:
+    reason = " ".join((value or "").split())
+    if not reason:
+        raise PayoutRefused("reason_required", "Give the reason the bank returned the credit")
+    if len(reason) > RETURN_REASON_MAX or any(ord(c) < 32 or ord(c) == 127 for c in reason):
+        raise PayoutRefused("reason_invalid", f"The reason must be at most {RETURN_REASON_MAX} printable characters")
+    return reason
+
+
+def _resolve_account(db: Session, tenant_id: UUID, ref: str) -> Account | None:
+    try:
+        form, value = rules.classify_ref(_NET_PAYABLE_CODES, ref)
+    except PostingRefused:
+        return None
+    column = Account.id == UUID(value) if form == "uuid" else Account.code == value
+    accounts = list(db.scalars(select(Account).where(Account.tenant_id == tenant_id, column)))
+    return accounts[0] if len(accounts) == 1 else None
+
+
+def _original_settlement_journal(
+    db: Session, *, batch: PayrollPayoutBatch, line: PayrollPayoutLine, settlement: PayrollLiabilitySettlement
+) -> tuple[JournalEntry, Account]:
+    """The journal this line's settlement actually posted, and the bank cash GL it credited.
+
+    The GL is read from the journal lines, never from the bank account's current mapping (a cash GL
+    re-point may have changed it). Refuses unless the journal is exactly the settlement's posted
+    consequence: source identity, status, two lines (Dr liability account / Cr one other account, both for
+    the line amount) and the stored fingerprint rebuilt from the journal's own bank GL.
+    """
+    journal = db.scalar(
+        select(JournalEntry).where(JournalEntry.tenant_id == batch.tenant_id, JournalEntry.id == line.journal_id)
+    )
+    if (
+        journal is None
+        or journal.source_owner != "payroll"
+        or journal.source_document_kind != SETTLEMENT_DOCUMENT_KIND
+        or journal.source_document_id != str(settlement.id)
+    ):
+        raise PayoutRefused("original_journal_mismatch", "The line's journal is not its settlement's posting")
+    if journal.status != JournalStatus.POSTED:
+        raise PayoutRefused(
+            "original_journal_not_posted", "The settlement's journal is no longer posted; use a Finance B2 journal"
+        )
+    rows = list(
+        db.scalars(
+            select(JournalLine)
+            .where(JournalLine.tenant_id == batch.tenant_id, JournalLine.journal_id == journal.id)
+            .order_by(JournalLine.line_number)
+        )
+    )
+    debits = [r for r in rows if r.debit > 0 and r.credit == 0]
+    credits = [r for r in rows if r.credit > 0 and r.debit == 0]
+    if len(rows) != 2 or len(debits) != 1 or len(credits) != 1:
+        raise PayoutRefused("original_journal_mismatch", "The settlement's journal is not a two-line posting")
+    liability_account = _resolve_account(db, batch.tenant_id, line.liability_account_ref)
+    if (
+        liability_account is None
+        or debits[0].account_id != liability_account.id
+        or credits[0].account_id == liability_account.id
+        or debits[0].debit != line.amount
+        or credits[0].credit != line.amount
+        or settlement.amount != line.amount
+    ):
+        raise PayoutRefused("original_journal_mismatch", "The settlement's journal differs from the payout line")
+    bank_gl = db.scalar(
+        select(Account).where(Account.tenant_id == batch.tenant_id, Account.id == credits[0].account_id)
+    )
+    if bank_gl is None:
+        raise PayoutRefused("original_journal_mismatch", "The settlement's cash account no longer resolves")
+    rebuilt = build_liability_settlement_consequence(
+        db,
+        tenant_id=batch.tenant_id,
+        settlement_id=settlement.id,
+        bank_account_ref=str(bank_gl.id),
+        posting_date=journal.posting_date,
+    )
+    if rebuilt.fingerprint != line.consequence_fingerprint:
+        raise PayoutRefused(
+            "original_journal_mismatch", "The settlement's journal does not match its recorded consequence"
+        )
+    return journal, bank_gl
+
+
+def _cash_gl_retired(db: Session, tenant_id: UUID, gl: Account) -> bool:
+    """True when an approved cash GL re-point left this account (it is a retired shared cash GL)."""
+    return (
+        db.scalar(
+            select(CashAccountRepoint.id)
+            .where(
+                CashAccountRepoint.tenant_id == tenant_id,
+                CashAccountRepoint.status == RepointStatus.APPROVED.value,
+                CashAccountRepoint.from_ref.in_((str(gl.id), gl.code)),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def _return_line(
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    batch_id: UUID,
+    line_id: UUID,
+    return_reference: str,
+    reason: str,
+    value_date: date,
+    now: datetime,
+) -> ReturnOutcome:
+    scope = TenantScope(tenant.id)
+    actor = str(party.id)
+    reference = _bank_reference(return_reference)
+    why = _return_reason(reason)
+    batch = _locked_batch(db, tenant.id, batch_id)
+    line = db.scalar(
+        select(PayrollPayoutLine)
+        .where(
+            PayrollPayoutLine.tenant_id == tenant.id,
+            PayrollPayoutLine.batch_id == batch.id,
+            PayrollPayoutLine.id == line_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if line is None:
+        raise PayoutRefused("not_found", "Payout line was not found")
+    if line.returned_at is not None:
+        if (
+            line.return_reference == reference
+            and line.return_reason == why
+            and line.return_value_date == value_date
+            and _same(line.returned_by_party_id, party.id)
+        ):
+            if line.reversal_id is None or line.reversal_journal_id is None:
+                raise PayoutRefused("already_returned", "This line's return record is incomplete; refer it for review")
+            return ReturnOutcome(batch.id, line.id, True, line.reversal_id, line.reversal_journal_id)
+        raise PayoutRefused("already_returned", "This line was already returned with different evidence")
+    if batch.kind != KIND_NET_PAY:
+        # Statutory remittances went to an external authority, not to an employee's bank: no return path here.
+        raise PayoutRefused(
+            "statutory_no_return", "A statutory remittance has no return path; refer it to the exceptions review"
+        )
+    if batch.status != RECORDED:
+        raise PayoutRefused("not_recorded", "Only a line of a recorded payout batch can be returned")
+    if line.settlement_id is None or line.journal_id is None or not line.active:
+        raise PayoutRefused("line_not_recorded", "This line has no live settlement to return")
+    for role, code, member in (
+        ("preparer", "sod_returner_is_preparer", batch.prepared_by_party_id),
+        ("approver", "sod_returner_is_approver", batch.approved_by_party_id),
+        ("file issuer", "sod_returner_is_file_issuer", batch.file_issued_by_party_id),
+        ("recorder", "sod_returner_is_recorder", batch.recorded_by_party_id),
+    ):
+        if _same(member, party.id):
+            raise PayoutRefused(code, f"You were this batch's {role}; someone else must record its return")
+    if value_date > now.astimezone(UTC).date():
+        raise PayoutRefused("return_date_future", "The bank return date is in the future")
+    try:
+        bank_ref.claim(db, tenant_id=tenant.id, bank_account_id=batch.bank_account_id, reference=reference)
+    except bank_ref.BankReferenceReused as exc:
+        raise PayoutRefused(
+            "bank_reference_reused", "This bank reference was already used on this bank account"
+        ) from exc
+    settlement = db.scalar(
+        select(PayrollLiabilitySettlement).where(
+            PayrollLiabilitySettlement.tenant_id == tenant.id, PayrollLiabilitySettlement.id == line.settlement_id
+        )
+    )
+    if settlement is None or settlement.liability_id != line.liability_id:
+        raise PayoutRefused("original_journal_mismatch", "The line's settlement does not match its liability")
+    journal, bank_gl = _original_settlement_journal(db, batch=batch, line=line, settlement=settlement)
+    if value_date < journal.posting_date:
+        raise PayoutRefused(
+            "return_date_before_settlement", "The bank return date is before the settlement's posting date"
+        )
+    if _cash_gl_retired(db, tenant.id, bank_gl):
+        # The cash GL this salary left from has been re-pointed away from. Mirroring it would post to a retired
+        # account (B7 refuses to reconcile it) and the current mapping is the wrong ledger: Finance posts the
+        # reclassification by hand (B2 manual journal) and the case goes to the manual exceptions review.
+        raise PayoutRefused(
+            "returned_to_retired_cash_gl",
+            "The original cash account was re-pointed away from; refer this return to the exceptions review "
+            "for a Finance journal (B2)",
+        )
+    functional = _functional_currency(db, tenant.id)
+    if batch.currency_code != functional:
+        raise PayoutRefused("non_functional_currency", "Payouts are in the tenant functional currency only")
+    # Lock order: bank account row (FOR SHARE, as every payer lookup) before any ledger work.
+    db.scalar(
+        select(BankAccount.id)
+        .where(BankAccount.tenant_id == tenant.id, BankAccount.id == batch.bank_account_id)
+        .with_for_update(read=True)
+    )
+    reversal = payroll.reverse_liability_settlement(
+        db,
+        tenant_id=tenant.id,
+        settlement_id=settlement.id,
+        return_ref=reference,
+        reason=why,
+        reversed_by_id=party.id,
+        reversed_at=now,
+    )
+    consequence = build_settlement_reversal_consequence(
+        db,
+        tenant_id=tenant.id,
+        reversal_id=reversal.id,
+        bank_account_ref=str(bank_gl.id),
+        posting_date=value_date,
+    )
+    posted = post_payroll_consequence(
+        db,
+        scope=scope,
+        consequence=consequence,
+        functional_currency=functional,
+        approval_ref=f"erp.b5:payroll_payout_return:{line.id}:returner:{actor}",
+        actor=actor,
+    )
+    # Payroll a5 has no accounting-receipt table, so the ERP-side receipt is on the line (as for the settlement).
+    line.active = False  # releases the liability for a new batch (a new settlement reference is required)
+    line.returned_at = now
+    line.returned_by_party_id = party.id
+    line.return_reference = reference
+    line.return_reason = why
+    line.return_value_date = value_date
+    line.return_bank_account_id = batch.bank_account_id
+    line.reversal_id = reversal.id
+    line.reversal_journal_id = posted.journal_id
+    line.reversal_journal_number = posted.journal_number
+    line.reversal_fingerprint = consequence.fingerprint
+    db.flush()
+    current = db.scalar(
+        select(BankAccount.cash_account_ref).where(
+            BankAccount.tenant_id == tenant.id, BankAccount.id == batch.bank_account_id
+        )
+    )
+    _audit(
+        db,
+        tenant=tenant,
+        party=party,
+        entity_id=str(batch.id),
+        action=AUDIT_LINE_RETURNED,
+        success=True,
+        details={
+            "number": batch.number,
+            "line_id": str(line.id),
+            "liability_id": str(line.liability_id),
+            "settlement_id": str(settlement.id),
+            "reversal_id": str(reversal.id),
+            "amount": str(line.amount),
+            "return_reference": reference,
+            "reason": why,
+            "return_value_date": value_date.isoformat(),
+            "original_journal_id": str(journal.id),
+            "reversal_journal_id": str(posted.journal_id),
+            "original_cash_gl": str(bank_gl.id),
+            "current_cash_ref_differs": (current or "").strip() not in (str(bank_gl.id), bank_gl.code),
+            "prepared_by": str(batch.prepared_by_party_id),
+            "recorded_by": str(batch.recorded_by_party_id),
+        },
+    )
+    return ReturnOutcome(batch.id, line.id, False, reversal.id, posted.journal_id)
+
+
 def _guard(db: Session, *, tenant: Tenant, party: Party, entity_id: str, action: str, work):
     """Run ``work`` in one savepoint; on refusal roll it back and audit the refusal."""
     if party.tenant_id != tenant.id:
@@ -934,5 +1226,43 @@ def record_batch(
         action="record",
         work=lambda: _record(
             db, tenant=tenant, party=party, batch_id=batch_id, bank_reference=bank_reference, now=moment
+        ),
+    )
+
+
+def return_line(
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    batch_id: UUID,
+    line_id: UUID,
+    return_reference: str,
+    reason: str,
+    value_date: date,
+    now: datetime | None = None,
+) -> ReturnOutcome:
+    """Record that the bank returned one net-pay line's salary credit (payroll a5 governed reversal).
+
+    One savepoint: owner reversal, reversal consequence (Dr the ORIGINAL bank cash GL / Cr the liability
+    account), bridge posting, the line marked returned and inactive. Replay with identical evidence is a no-op.
+    """
+    moment = now or datetime.now(UTC)
+    return _guard(
+        db,
+        tenant=tenant,
+        party=party,
+        entity_id=str(batch_id),
+        action="return",
+        work=lambda: _return_line(
+            db,
+            tenant=tenant,
+            party=party,
+            batch_id=batch_id,
+            line_id=line_id,
+            return_reference=return_reference,
+            reason=reason,
+            value_date=value_date,
+            now=moment,
         ),
     )
