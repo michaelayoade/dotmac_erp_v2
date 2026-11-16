@@ -657,8 +657,14 @@ def _void_governance(manifest) -> VoidGovernance | None:
 LEGACY_VOID_ACTOR_REFUSAL = "legacy_void_requires_migration_actor"
 
 
-def _legacy_void_journal_count(engine: sa.Engine, schemas, specs) -> int:
-    """Legacy VOID journals in the source (0 when the journal source is absent/unreadable)."""
+LEGACY_VOID_COUNT_REFUSAL = "legacy_void_count_unavailable"
+
+
+def _legacy_void_journal_count(engine: sa.Engine, schemas, specs) -> int | None:
+    """Legacy VOID journals in the source; 0 only when there is no journal spec.
+
+    ``None`` means the count query failed: the caller must fail closed, never assume zero.
+    """
 
     spec = next((s for s in specs if s.destination_table == "mod_accounting.journal_entries"), None)
     if spec is None:
@@ -670,7 +676,7 @@ def _legacy_void_journal_count(engine: sa.Engine, schemas, specs) -> int:
                 conn.execute(sa.text(f"SELECT count(*) FROM {spec.source_table} WHERE status = 'VOID'")).scalar_one()  # noqa: S608
             )
     except sa.exc.SQLAlchemyError:
-        return 0
+        return None
 
 
 def cmd_execute(args: argparse.Namespace) -> int:
@@ -702,6 +708,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
     # migration actor. Refuse before ANY write when it is missing (dry-run reports it).
     void_journals = _legacy_void_journal_count(source_engine, source_schemas, specs)
     actor_missing = _void_governance(manifest) is None
+    if args.apply and void_journals is None:
+        raise CliRefusal(f"{LEGACY_VOID_COUNT_REFUSAL}: the legacy VOID journal count query failed; nothing written")
     if args.apply and void_journals and actor_missing:
         raise CliRefusal(
             f"{LEGACY_VOID_ACTOR_REFUSAL}: {void_journals} legacy VOID journals need ERP_ENROLMENT_ACTOR_ID "
@@ -784,7 +792,13 @@ def cmd_execute(args: argparse.Namespace) -> int:
         "legacy_void_governance": {
             "void_journals": void_journals,
             "migration_actor_missing": actor_missing,
-            "refusal": LEGACY_VOID_ACTOR_REFUSAL if void_journals and actor_missing else None,
+            "refusal": (
+                LEGACY_VOID_COUNT_REFUSAL
+                if void_journals is None
+                else LEGACY_VOID_ACTOR_REFUSAL
+                if void_journals and actor_missing
+                else None
+            ),
         },
         "specs": _spec_report(specs),
         "specs_skipped_non_executable": non_executable,

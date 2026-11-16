@@ -538,3 +538,58 @@ def test_apply_refuses_legacy_voids_without_migration_actor_before_any_write(tmp
         "migration_actor_missing": True,
         "refusal": "legacy_void_requires_migration_actor",
     }
+
+
+def test_apply_refuses_when_legacy_void_count_query_fails_before_any_write(tmp_path, monkeypatch, capsys):
+    import sqlalchemy as sa
+
+    from erp_v2.importer import cli
+    from erp_v2.importer.spec import DestinationColumn, build_spec
+
+    src_path, dst_path = tmp_path / "src.db", tmp_path / "dst.db"
+    src, dst = sa.create_engine(f"sqlite:///{src_path}"), sa.create_engine(f"sqlite:///{dst_path}")
+    with src.begin() as c:  # no journal_entry table: the count query errors
+        c.execute(sa.text("CREATE TABLE widgets (widget_id TEXT, name TEXT)"))
+        c.execute(sa.text("INSERT INTO widgets VALUES ('w1','One')"))
+    with dst.begin() as c:
+        c.execute(sa.text("CREATE TABLE widgets_out (id TEXT, name TEXT)"))
+    cols = (
+        DestinationColumn("id", nullable=False, has_default=False),
+        DestinationColumn("name", nullable=False, has_default=False),
+    )
+    journal = build_spec(
+        source_table="journal_entry",
+        destination_table="mod_accounting.journal_entries",
+        source_columns=("journal_entry_id",),
+        destination_columns=(cols[0],),
+        renames={"id": "journal_entry_id"},
+    )
+    widgets = build_spec(
+        source_table="widgets",
+        destination_table="widgets_out",
+        source_columns=("widget_id", "name"),
+        destination_columns=cols,
+        renames={"id": "widget_id"},
+    )
+    monkeypatch.setattr(cli, "_resolve_sources", lambda engine, pairings: ({"widgets"}, {}, {}, ()))
+    monkeypatch.setattr(cli, "build_specs", lambda present, cols_, dest: ((widgets, journal), ()))
+    monkeypatch.setenv("ERP_IMPORT_APPROVED", "1")
+    monkeypatch.setenv("ERP_IMPORT_APPLY_OK", "1")
+    monkeypatch.setenv("ERP_ENROLMENT_ACTOR_ID", "11111111-2222-3333-4444-555555555555")
+    receipt = tmp_path / "r.json"
+    argv = ["execute", "--manifest", str(_manifest(tmp_path)), "--receipt", str(receipt)]
+
+    def env():
+        monkeypatch.setenv("LEGACY_DATABASE_URL", f"sqlite:///{src_path}")
+        monkeypatch.setenv("MIGRATION_DATABASE_URL", f"sqlite:///{dst_path}")
+
+    env()
+    assert main([*argv, "--apply"]) == 2
+    assert "legacy_void_count_unavailable" in capsys.readouterr().err
+    assert not receipt.exists()
+    with dst.connect() as c:
+        assert c.execute(sa.text("SELECT count(*) FROM widgets_out")).scalar() == 0
+
+    # Plan/dry-run report it: the count is None (unavailable), never 0.
+    assert cli._legacy_void_journal_count(src, (), (widgets,)) == 0  # no journal spec: genuinely zero
+    assert cli._legacy_void_journal_count(src, (), (widgets, journal)) is None
