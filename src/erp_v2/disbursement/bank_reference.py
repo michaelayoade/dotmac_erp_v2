@@ -96,6 +96,7 @@ def claim(
     # A bank RETURN reference (B5, payroll a5) is also a bank evidence reference on this account.
     returned = select(PayrollPayoutLine.id).where(
         PayrollPayoutLine.tenant_id == tenant_id,
+        PayrollPayoutLine.returned_at.is_not(None),
         PayrollPayoutLine.return_bank_account_id == bank_account_id,
         PayrollPayoutLine.return_reference == reference,
     )
