@@ -93,6 +93,10 @@ _JOURNAL_POSTED_SET = (
 
 
 LEGACY_VOID_REASON = "voided in legacy ERP"
+# Ruling (Michael, 2026-11-17): a legacy VOID journal with posting stamps but no legacy ledger
+# lines, no reversal link and no approval reference lands without the stamps (evidence stays in
+# the retained legacy snapshot and, by journal id only, in the import receipt).
+LEGACY_VOID_STAMPED_REASON = "voided in legacy ERP after posting; no legacy ledger lines"
 LEGACY_REQUESTER_PREFIX = "legacy-user:"
 MIGRATION_APPROVER_PREFIX = "migration:"
 _JOURNAL_TABLE = "mod_accounting.journal_entries"
@@ -112,6 +116,7 @@ class VoidGovernance:
     approval_reference: str
     voided_at: datetime
     reason: str = LEGACY_VOID_REASON
+    stamped_reason: str = LEGACY_VOID_STAMPED_REASON
 
     @property
     def approver(self) -> str:
@@ -126,6 +131,9 @@ class TransitionOutcome:
     stamped_approval_refs: int = 0
     stamped_posted_by: int = 0
     recomputed_totals: int = 0
+    # Legacy VOID journals landed with their posting stamps nulled: journal id and has-stamp
+    # flags only, never the stamp values.
+    void_stamp_evidence: list[dict[str, Any]] = field(default_factory=list)
     exceptions: list[RowException] = field(default_factory=list)
 
 
@@ -174,6 +182,7 @@ def _void_journals(
     governance: VoidGovernance | None,
     outcome: TransitionOutcome,
     commit: bool,
+    legacy_ledger: tuple[str, str] | None = None,
 ) -> None:
     """Land legacy VOID journals through the accounting owner's void path.
 
@@ -186,6 +195,12 @@ def _void_journals(
     the owner's requester != approver rule true even when both ids are equal.
     Journal content is untouched (the owner guard freezes everything but
     status/updated_at). Anything the guard would refuse is a named exception.
+
+    Stamped VOIDs (posted_at/posted_by set, but no ledger lines, reversal link or approval
+    reference) are the one ruled exception: the stamps are nulled in the same savepoint as the
+    void, the reason is ``stamped_reason``, and the journal id is recorded in
+    ``outcome.void_stamp_evidence``. A VOID with ledger lines, a reversal link or an approval
+    reference is never nulled: it stays a named exception.
     """
 
     from dotmac_accounting.contracts import VoidDraftJournal
@@ -229,6 +244,25 @@ def _void_journals(
                 {"ids": chunk},
             )
         }
+        legacy_ledgered: set[str] = set()
+        stamped_ids = [
+            rid
+            for rid, r in dest_rows.items()
+            if r.status == "DRAFT" and (r.posted_at is not None or r.posted_by is not None)
+        ]
+        if stamped_ids and legacy_ledger is not None:
+            # "No LEGACY ledger lines": read the source, not only the destination (a legacy line
+            # rejected at import leaves the destination empty).
+            table, column = legacy_ledger
+            legacy_ledgered = {
+                str(r.jid)
+                for r in source.execute(
+                    sa.text(f"SELECT DISTINCT {column} AS jid FROM {table} WHERE {column} IN :ids").bindparams(  # noqa: S608
+                        sa.bindparam("ids", expanding=True)
+                    ),
+                    {"ids": stamped_ids},
+                )
+            }
         for row_id in chunk:
             row = dest_rows.get(row_id)
             if row is None:
@@ -247,7 +281,7 @@ def _void_journals(
                     _void_exception(spec, row_id, "legacy VOID journal has no created_by_user_id")
                 )
                 continue
-            if row.posted_at is not None or row.posted_by is not None or row.approval_reference is not None:
+            if row.approval_reference is not None:
                 outcome.exceptions.append(
                     _void_exception(
                         spec, row_id, "legacy VOID journal carries posting evidence; the owner refuses its void"
@@ -271,16 +305,39 @@ def _void_journals(
             if not row.has_period:
                 outcome.exceptions.append(_void_exception(spec, row_id, "legacy VOID journal has no fiscal period"))
                 continue
+            if (row.posted_at is not None or row.posted_by is not None) and (
+                legacy_ledger is None or str(row_id) in legacy_ledgered
+            ):
+                outcome.exceptions.append(
+                    _void_exception(
+                        spec,
+                        row_id,
+                        "legacy VOID journal carries posting stamps and legacy ledger lines"
+                        if legacy_ledger is not None
+                        else "legacy VOID journal carries posting stamps and the legacy ledger source is unavailable",
+                    )
+                )
+                continue
             journal_uuid = UUID(str(row_id))
+            stamped = row.posted_at is not None or row.posted_by is not None
             command = VoidDraftJournal(
                 journal_id=journal_uuid,
-                reason=governance.reason,
+                reason=governance.stamped_reason if stamped else governance.reason,
                 voided_by=f"{LEGACY_REQUESTER_PREFIX}{str(creator).strip().lower()}",
                 approved_by=governance.approver,
                 approval_reference=governance.approval_reference,
             )
             try:
                 with Session(bind=dest, join_transaction_mode="create_savepoint") as session:
+                    if stamped:
+                        # Same savepoint as the void: a refused void restores the stamps.
+                        session.execute(
+                            sa.text(
+                                "UPDATE mod_accounting.journal_entries SET posted_at = NULL, posted_by = NULL "
+                                "WHERE id = :id AND tenant_id = :tenant AND status = 'DRAFT'"
+                            ),
+                            {"id": row_id, "tenant": row.tenant_id},
+                        )
                     void_draft_journal(
                         session,
                         scope=TenantScope(UUID(str(row.tenant_id))),
@@ -297,6 +354,14 @@ def _void_journals(
                 )
                 continue
             moved += 1
+            if stamped:
+                outcome.void_stamp_evidence.append(
+                    {
+                        "journal_id": str(journal_uuid),
+                        "had_posted_at": row.posted_at is not None,
+                        "had_posted_by": row.posted_by is not None,
+                    }
+                )
         if commit:
             dest.commit()
     outcome.transitioned["VOID"] = outcome.transitioned.get("VOID", 0) + moved
@@ -310,6 +375,7 @@ def _run_family(
     dry_run: bool,
     commit: bool = False,
     void_governance: VoidGovernance | None = None,
+    legacy_ledger: tuple[str, str] | None = None,
 ) -> TransitionOutcome:
     paths = _LIFECYCLES[spec.destination_table]
     outcome = TransitionOutcome(destination_table=spec.destination_table)
@@ -429,7 +495,7 @@ def _run_family(
                 outcome.transitioned[target] = outcome.transitioned.get(target, 0) + len(moving)
                 continue
             if spec.destination_table == _JOURNAL_TABLE and target == "VOID":
-                _void_journals(source, dest, spec, id_source, moving, void_governance, outcome, commit)
+                _void_journals(source, dest, spec, id_source, moving, void_governance, outcome, commit, legacy_ledger)
                 break  # VOID is terminal: no further steps on this path
             extra = ""
             params_extra: dict[str, Any] = {}
@@ -525,6 +591,7 @@ def run_transitions(
     dry_run: bool = False,
     commit: bool = False,
     void_governance: VoidGovernance | None = None,
+    legacy_ledger: tuple[str, str] | None = None,
 ) -> tuple[TransitionOutcome, ...]:
     """Walk lifecycle-staged rows to their legacy final states.
 
@@ -557,6 +624,11 @@ def run_transitions(
                 pass
         if commit:
             dest.commit()
+    if legacy_ledger is None:
+        ledger_spec = next((sp for sp in specs if sp.destination_table == "mod_accounting.posted_ledger_lines"), None)
+        journal_column = ledger_spec.column_map.get("journal_id") if ledger_spec is not None else None
+        if ledger_spec is not None and journal_column:
+            legacy_ledger = (ledger_spec.source_table, journal_column)
     outcomes: list[TransitionOutcome] = []
     for dest_table in (
         "mod_accounting.fiscal_periods",
@@ -567,7 +639,15 @@ def run_transitions(
         if spec is None:
             continue
         outcomes.append(
-            _run_family(source, dest, spec, dry_run=dry_run, commit=commit, void_governance=void_governance)
+            _run_family(
+                source,
+                dest,
+                spec,
+                dry_run=dry_run,
+                commit=commit,
+                void_governance=void_governance,
+                legacy_ledger=legacy_ledger,
+            )
         )
         if commit and not dry_run:
             dest.commit()

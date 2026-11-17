@@ -824,6 +824,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
                 "stamped_approval_refs": outcome.stamped_approval_refs,
                 "stamped_posted_by": outcome.stamped_posted_by,
                 "recomputed_totals": outcome.recomputed_totals,
+                "void_stamps_nulled": len(outcome.void_stamp_evidence),
+                "void_stamp_evidence": list(outcome.void_stamp_evidence),
                 "exceptions": len(outcome.exceptions),
             }
             for outcome in transitions
