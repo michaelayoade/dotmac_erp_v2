@@ -13,6 +13,7 @@ from erp_v2.importer.tax_accounts import (
     TaxCodeFacts,
     class_counts,
     classify_invoice,
+    classify_snapshot,
 )
 from erp_v2.importer.waves36 import ALL_WAVE_PAIRINGS
 
@@ -297,3 +298,74 @@ def test_supplier_invoice_lines_pairing_declares_the_lookup():
     pairing = next(p for p in ALL_WAVE_PAIRINGS if p.destination == "mod_payables.supplier_invoice_lines")
     assert pairing.lookups["tax_account_ref"] == ("supplier_line_tax_accounts", "id", "tax_account_ref")
     assert "supplier_line_tax_accounts" in MAP_BUILDERS
+
+
+# ---- NULL expense account: keyed by a sentinel (operator-oracle semantics), never a raise ----
+
+
+def test_legacy_posted_a1_with_a_null_expense_untaxed_line_is_a1_expense_elsewhere():
+    lines = [line(1, tax_code=code()), line(2, tax="0", amount="40", expense=None)]
+    outcome = classify_invoice(ORG, lines, {EXP: D(100), DEFER: D(10), ELSEWHERE: D(40)})
+    assert outcome.klass == "A1" and outcome.expense_elsewhere
+    assert ref(outcome, 1) == ("A1", DEFER) and ref(outcome, 2) == (None, None)
+
+
+def test_folded_invoice_with_a_null_expense_line_is_a3_never_a2():
+    lines = [line(1, expense=None), line(2, amount="50", tax="0", expense=EXP)]
+    outcome = classify_invoice(ORG, lines, {EXP: D(160)})
+    assert outcome.klass == "A3" and outcome.other
+    assert ref(outcome, 1) == ("A3", None)
+
+
+def test_unposted_taxed_null_expense_line_is_b2_with_a_null_ref():
+    outcome = classify_invoice(ORG, [line(1, expense=None)], None)
+    assert outcome.klass == "B" and ref(outcome, 1) == ("B2", None)
+
+
+def _row(invoice, journal, n, amount, tax, expense, tax_code_id=None):
+    return dict(
+        invoice_id=invoice,
+        organization_id=ORG,
+        journal_entry_id=journal,
+        line_id=str(UUID(int=500 + n)),
+        line_amount=amount,
+        tax_amount=tax,
+        expense_account_id=expense,
+        tax_code_id=tax_code_id,
+        code_row=None,
+        code_organization_id=None,
+        tax_type=None,
+        tax_paid_account_id=None,
+        paid_row=None,
+        deferral_pair_account_id=None,
+        deferral_row=None,
+    )
+
+
+def test_snapshot_with_null_expense_lines_classifies_every_invoice():
+    j1, j2 = str(UUID(int=9101)), str(UUID(int=9102))
+    i1, i2, i3, i4 = (str(UUID(int=n)) for n in (1, 2, 3, 4))
+    rows = [
+        _row(i1, j1, 1, "100", "10", None),  # posted, folded, null expense -> A3
+        _row(i2, None, 2, "100", "10", None),  # unposted -> B2, NULL ref
+        _row(i3, j2, 3, "100", "10", EXP),  # normal posted folded -> A2
+        _row(i4, None, 4, "100", "10", EXP),  # normal unposted -> B2
+    ]
+    ledger = [
+        dict(journal_entry_id=j1, account_id=EXP, debit_amount="110"),
+        dict(journal_entry_id=j2, account_id=EXP, debit_amount="110"),
+    ]
+    out = classify_snapshot(rows, ledger)
+    assert {k: v.klass for k, v in out.items()} == {i1: "A3", i2: "B", i3: "A2", i4: "B"}
+    assert out[i2].lines[str(UUID(int=502))].ref is None
+    assert out[i4].lines[str(UUID(int=504))].ref == EXP
+
+
+def test_null_account_ledger_row_is_a_named_raise():
+    with pytest.raises(TaxAccountMappingError, match=r"^ledger_account_missing$"):
+        classify_invoice(ORG, [line(1)], {None: D(110)})
+    j, i = str(UUID(int=9101)), str(UUID(int=1))
+    with pytest.raises(TaxAccountMappingError, match=r"^ledger_account_missing$"):
+        classify_snapshot(
+            [_row(i, j, 1, "100", "10", EXP)], [dict(journal_entry_id=j, account_id=None, debit_amount="110")]
+        )

@@ -33,6 +33,10 @@ Two regimes, per invoice (design RUN-G-TAX-ACCOUNT-DESIGN, revision 3):
   NULL and the invoice is counted, never raised on: payables CHECKs reject negative amounts so such
   a row cannot land, and the verifiers refuse negatives themselves.
 
+A NULL line expense account is keyed by a sentinel that never equals a ledger account (the operator
+oracle's semantics): A1 counts it as expense_elsewhere, A2 cannot match (the invoice is A3), and a taxed
+null-expense line gets a NULL ref. A NULL ledger account is the named refusal ``ledger_account_missing``.
+
 Untaxed lines have no tax account, and an invoice with no taxed line is never sign-checked (a legacy
 credit note with an untaxed negative line is irrelevant to the tax account). Accounts are canonical UUID strings, the
 form ``posting_account_ref`` uses. Nothing here guesses: a missing referenced row is the caller's
@@ -136,9 +140,17 @@ def _nonzero(amounts: Mapping[str, Decimal]) -> dict[str, Decimal]:
 
 
 def _add(target: dict[str, Decimal], account: object, amount: Decimal) -> None:
+    """Add to an expense/tax account map. A NULL account is keyed by ``None`` (the operator oracle's
+    semantics): it never equals a ledger account, so A1 counts expense_elsewhere and A2 cannot match."""
+
+    key = canonical(account)
+    target[key] = target.get(key, Decimal(0)) + amount
+
+
+def _add_ledger(target: dict[str, Decimal], account: object, amount: Decimal) -> None:
     key = canonical(account)
     if key is None:
-        raise TaxAccountMappingError("line_expense_account_missing")
+        raise TaxAccountMappingError("ledger_account_missing")
     target[key] = target.get(key, Decimal(0)) + amount
 
 
@@ -183,7 +195,7 @@ def classify_invoice(
 
     actual: dict[str, Decimal] = {}
     for account, amount in ledger_debits.items():
-        _add(actual, account, _money(amount, "ledger_debit"))
+        _add_ledger(actual, account, _money(amount, "ledger_debit"))
     actual = _nonzero(actual)
 
     tax_accounts = {account for account in splits.values() if account is not None}
@@ -318,6 +330,8 @@ def classify_snapshot(
         journal = canonical(row["journal_entry_id"])
         account = debits.setdefault(journal, {})
         key = canonical(row["account_id"])
+        if key is None:
+            raise TaxAccountMappingError("ledger_account_missing")
         account[key] = account.get(key, Decimal(0)) + _money(row["debit_amount"] or 0, "ledger_debit")
     grouped: dict[str, tuple[object, str | None, list[LineFacts]]] = {}
     for row in rows:
