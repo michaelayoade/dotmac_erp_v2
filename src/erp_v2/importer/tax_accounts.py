@@ -29,8 +29,13 @@ Two regimes, per invoice (design RUN-G-TAX-ACCOUNT-DESIGN, revision 3):
     account): the deferral pair of the tax-paid account when set (D4), else the tax-paid account.
   - B2 folded (everything else taxed): the line's expense account (D1).
 
-Untaxed lines have no tax account. Accounts are canonical UUID strings, the form
-``posting_account_ref`` uses. Nothing here guesses: a missing referenced row is the caller's
+* X (``tax_sign_unsupported``): a taxed invoice with a negative line or tax amount. Every line ref is
+  NULL and the invoice is counted, never raised on: payables CHECKs reject negative amounts so such
+  a row cannot land, and the verifiers refuse negatives themselves.
+
+Untaxed lines have no tax account, and an invoice with no taxed line is never sign-checked (a legacy
+credit note with an untaxed negative line is irrelevant to the tax account). Accounts are canonical UUID strings, the
+form ``posting_account_ref`` uses. Nothing here guesses: a missing referenced row is the caller's
 named refusal, never a silent fold.
 """
 
@@ -43,7 +48,7 @@ from typing import Final
 from uuid import UUID
 
 SPLIT_TAX_TYPES: Final = frozenset({"VAT", "GST"})
-CLASSES: Final = ("A1", "A2", "A3", "B1", "B2")
+CLASSES: Final = ("A1", "A2", "A3", "B1", "B2", "X")
 EXPENSE_ELSEWHERE: Final = "a1_expense_elsewhere"
 LEGACY_POSTED_CLASSES: Final = frozenset({"A1", "A2", "A3"})
 
@@ -82,7 +87,7 @@ class LineFacts:
 
 @dataclass(frozen=True)
 class LineTax:
-    klass: str | None  # A1 A2 A3 B1 B2, None for an untaxed line
+    klass: str | None  # A1 A2 A3 B1 B2 X, None for an untaxed line
     ref: str | None  # canonical account id, None for an untaxed line
 
 
@@ -90,7 +95,9 @@ class LineTax:
 class InvoiceTax:
     legacy_posted: bool
     lines: Mapping[str, LineTax]  # keyed by canonical line id
-    klass: str | None  # invoice class: A1 A2 A3, "B" (unposted taxed), None (no taxed line)
+    klass: (
+        str | None
+    )  # invoice class: A1 A2 A3, "B" (unposted taxed), "X" (taxed with a negative amount), None (no taxed line)
     expense_elsewhere: bool = False  # A1 only: the expense debits are not on the lines' expense accounts
 
     @property
@@ -150,8 +157,6 @@ def classify_invoice(
     """
 
     taxed = [line for line in lines if _money(line.tax_amount, "tax_amount") != 0]
-    if any(_money(line.tax_amount, "tax_amount") < 0 or _money(line.line_amount, "line_amount") < 0 for line in lines):
-        raise TaxAccountMappingError("negative_line_amount")
     result: dict[str, LineTax] = {}
     for line in lines:
         key = canonical(line.line_id)
@@ -160,6 +165,11 @@ def classify_invoice(
         result[key] = LineTax(None, None)
     if not taxed:
         return InvoiceTax(ledger_debits is not None, result, None)
+    if any(_money(line.tax_amount, "tax_amount") < 0 or _money(line.line_amount, "line_amount") < 0 for line in lines):
+        # Taxed invoice with a negative amount: per-invoice class X, every ref NULL, never a raise.
+        for line in taxed:
+            result[canonical(line.line_id)] = LineTax("X", None)
+        return InvoiceTax(ledger_debits is not None, result, "X")
     splits = {canonical(line.line_id): snapshot_split_account(line, organization_id) for line in taxed}
 
     if ledger_debits is None:
