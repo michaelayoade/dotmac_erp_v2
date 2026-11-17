@@ -224,6 +224,15 @@ def invoice_tax(
                 line["line_id"], line["line_amount"], line["tax_amount"], line["expense_account_id"], code
             )
         )
+    # Every tax code's paid/deferral accounts, not only this invoice's codes: a debit on another code's
+    # VAT account must keep the invoice out of A1 and A2.
+    every_tax_account: list = []
+    if any(line["tax_amount"] != 0 for line in lines):
+        pairs = {_id(a["account_id"]): a["deferral_pair_account_id"] for a in _read(src, "account")}
+        for code_row in _read(src, "tax_code"):
+            paid_id = code_row["tax_paid_account_id"]
+            if paid_id is not None:
+                every_tax_account += [paid_id, pairs.get(_id(paid_id))]
     debits = None
     if journal_id is not None:
         ledger = _read(src, "posted_ledger_line", key="journal_entry_id", value=journal_id)
@@ -233,7 +242,7 @@ def invoice_tax(
                 key = _id(row["account_id"])
                 debits[key] = debits.get(key, Decimal(0)) + row["debit_amount"]
     try:
-        outcome = tax_accounts.classify_invoice(organization, facts, debits)
+        outcome = tax_accounts.classify_invoice(organization, facts, debits, every_tax_account)
     except tax_accounts.TaxAccountMappingError as exc:
         raise HistoricalEvidenceError(str(exc)) from exc
     return outcome, sorted(evidence, key=lambda item: item["line_id"])
@@ -637,6 +646,7 @@ class HistoricalPayablesVerifier:
                 destination_lines=_project_rows(targets, DESTINATION_INVOICE_LINE, "id"),
                 tax_accounts=dict(
                     invoice_class=outcome.klass,
+                    a1_expense_elsewhere=outcome.expense_elsewhere,
                     lines=[
                         dict(line_id=line_id, klass=item.klass, ref=item.ref)
                         for line_id, item in sorted(outcome.lines.items())

@@ -269,6 +269,7 @@ class ApprovedInvoiceVerifier:
                 gl=dict(journals=0, ledger_lines=gl_line_count),
                 tax_accounts=dict(
                     invoice_class=outcome.klass,
+                    a1_expense_elsewhere=outcome.expense_elsewhere,
                     lines=[
                         dict(line_id=line_id, klass=item.klass, ref=item.ref)
                         for line_id, item in sorted(outcome.lines.items())

@@ -875,3 +875,44 @@ def test_fingerprint_covers_the_tax_facts_and_the_derived_class(db):
     db[0].exec_driver_sql("PRAGMA query_only=0")
     db[0].execute(tax_code.update().values(tax_type="GST"))
     assert evidence(db).fingerprint() != before
+
+
+def test_debit_on_another_codes_tax_account_keeps_the_invoice_out_of_a1(db):
+    """Global set: the A1 journal also debits a tax account only ANOTHER code owns, offset by less expense."""
+    tax_code, account = taxed(db, "A1", ref=EXP)  # an unrecognised treatment lands the folded form
+    source = db[0]
+    ledger = db[4][True, "posted_ledger_line"]
+    row = dict(source.execute(sa.select(ledger).where(ledger.c.account_id == TAX)).mappings().one())
+    row.update(ledger_line_id=str(UUID(int=34)), account_id=OTHER, debit_amount="15", original_debit_amount="15")
+    source.execute(
+        ledger.update().where(ledger.c.account_id == EXP).values(debit_amount="85", original_debit_amount="85")
+    )
+    source.execute(ledger.insert(), [row])
+    source.execute(
+        tax_code.insert(),
+        [dict(tax_code_id=str(UUID(int=45)), organization_id=T, tax_type="VAT", tax_paid_account_id=OTHER)],
+    )
+    source.execute(account.insert(), [dict(account_id=OTHER, deferral_pair_account_id=None)])
+    with pytest.raises(HistoricalEvidenceError, match="legacy_gl_tax_treatment_unrecognised"):
+        evidence(db)
+
+
+def test_verifier_classification_reports_a1_expense_elsewhere(db):
+    taxed(db, "A1")
+    ledger = db[4][True, "posted_ledger_line"]
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(ledger.update().where(ledger.c.account_id == EXP).values(account_id=OTHER))
+    # The expense debit moved to another account: still A1 (tax side proved), flagged for the receipt/evidence.
+    from erp_v2.importer import payables_history as module
+
+    lines = [
+        dict(
+            line_id=str(UUID(int=11)),
+            line_amount=Decimal(100),
+            tax_amount=Decimal(15),
+            tax_code_id=CODE,
+            expense_account_id=EXP,
+        )
+    ]
+    outcome, _ = module.invoice_tax(db[0], T, J, lines)
+    assert outcome.klass == "A1" and outcome.expense_elsewhere

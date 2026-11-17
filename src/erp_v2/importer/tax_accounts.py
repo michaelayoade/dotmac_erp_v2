@@ -44,6 +44,7 @@ from uuid import UUID
 
 SPLIT_TAX_TYPES: Final = frozenset({"VAT", "GST"})
 CLASSES: Final = ("A1", "A2", "A3", "B1", "B2")
+EXPENSE_ELSEWHERE: Final = "a1_expense_elsewhere"
 LEGACY_POSTED_CLASSES: Final = frozenset({"A1", "A2", "A3"})
 
 
@@ -90,6 +91,7 @@ class InvoiceTax:
     legacy_posted: bool
     lines: Mapping[str, LineTax]  # keyed by canonical line id
     klass: str | None  # invoice class: A1 A2 A3, "B" (unposted taxed), None (no taxed line)
+    expense_elsewhere: bool = False  # A1 only: the expense debits are not on the lines' expense accounts
 
     @property
     def other(self) -> bool:
@@ -137,11 +139,14 @@ def classify_invoice(
     organization_id: object,
     lines: Sequence[LineFacts],
     ledger_debits: Mapping[object, Decimal] | None,
+    global_tax_accounts: Iterable[object] = (),
 ) -> InvoiceTax:
     """Classify one invoice's taxed lines.
 
     ``ledger_debits`` is the per-account sum of the legacy posted ledger debits of the invoice's
-    journal, or None when the invoice is not legacy-posted (no ledger lines).
+    journal, or None when the invoice is not legacy-posted (no ledger lines). ``global_tax_accounts`` is
+    every tax-paid account and deferral pair of EVERY tax code in the snapshot: a debit on another
+    code's VAT account is never an A1 or A2 invoice.
     """
 
     taxed = [line for line in lines if _money(line.tax_amount, "tax_amount") != 0]
@@ -172,6 +177,7 @@ def classify_invoice(
     actual = _nonzero(actual)
 
     tax_accounts = {account for account in splits.values() if account is not None}
+    tax_accounts.update(canonical(a) for a in global_tax_accounts if a is not None)
     for line in taxed:
         if line.tax_code is not None:
             tax_accounts.update(
@@ -193,7 +199,12 @@ def classify_invoice(
         ):
             for line in taxed:
                 result[canonical(line.line_id)] = LineTax("A1", splits[canonical(line.line_id)])
-            return InvoiceTax(True, result, "A1")
+            expected: dict[str, Decimal] = {}
+            for line in lines:
+                _add(expected, line.expense_account_id, line.line_amount)
+            for account, tax in split_tax.items():
+                _add(expected, account, tax)
+            return InvoiceTax(True, result, "A1", _nonzero(expected) != actual)
 
     # A2: no debit on any tax-code paid or deferral account; per expense account the debit equals
     # line amount plus tax.
@@ -214,8 +225,11 @@ def classify_invoice(
 def class_counts(outcomes: Iterable[InvoiceTax]) -> dict[str, dict[str, int]]:
     """Receipt counts only: per class, taxed lines and invoices holding such a line."""
 
-    counts = {name: {"lines": 0, "invoices": 0} for name in CLASSES}
+    counts = {name: {"lines": 0, "invoices": 0} for name in (*CLASSES, EXPENSE_ELSEWHERE)}
     for outcome in outcomes:
+        if outcome.expense_elsewhere:
+            counts[EXPENSE_ELSEWHERE]["invoices"] += 1
+            counts[EXPENSE_ELSEWHERE]["lines"] += sum(1 for item in outcome.lines.values() if item.klass == "A1")
         seen: set[str] = set()
         for line in outcome.lines.values():
             if line.klass is not None:
@@ -241,6 +255,12 @@ JOIN supplier_invoice i ON i.invoice_id = l.invoice_id
 LEFT JOIN tax_code tc ON tc.tax_code_id = l.tax_code_id
 LEFT JOIN account pa ON pa.account_id = tc.tax_paid_account_id
 LEFT JOIN account da ON da.account_id = pa.deferral_pair_account_id
+"""
+
+GLOBAL_TAX_ACCOUNT_SQL: Final = """
+SELECT tc.tax_paid_account_id, pa.deferral_pair_account_id
+FROM tax_code tc
+LEFT JOIN account pa ON pa.account_id = tc.tax_paid_account_id
 """
 
 LEDGER_DEBIT_SQL: Final = """
@@ -274,7 +294,9 @@ def code_facts(
 
 
 def classify_snapshot(
-    rows: Iterable[Mapping[str, object]], ledger: Iterable[Mapping[str, object]]
+    rows: Iterable[Mapping[str, object]],
+    ledger: Iterable[Mapping[str, object]],
+    global_accounts: Iterable[Mapping[str, object]] = (),
 ) -> dict[str, InvoiceTax]:
     """Classify every invoice of ``INVOICE_LINE_SQL`` rows against ``LEDGER_DEBIT_SQL`` rows.
 
@@ -309,14 +331,24 @@ def classify_snapshot(
                 ),
             )
         )
+    every_tax_account = {
+        canonical(value)
+        for row in global_accounts
+        for value in (row["tax_paid_account_id"], row["deferral_pair_account_id"])
+        if value is not None
+    }
     outcomes: dict[str, InvoiceTax] = {}
     for invoice, (organization, journal, lines) in grouped.items():
-        outcomes[invoice] = classify_invoice(organization, lines, debits.get(journal) if journal else None)
+        outcomes[invoice] = classify_invoice(
+            organization, lines, debits.get(journal) if journal else None, every_tax_account
+        )
     return outcomes
 
 
 __all__ = [
     "CLASSES",
+    "EXPENSE_ELSEWHERE",
+    "GLOBAL_TAX_ACCOUNT_SQL",
     "INVOICE_LINE_SQL",
     "LEDGER_DEBIT_SQL",
     "InvoiceTax",

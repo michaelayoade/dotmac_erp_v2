@@ -17,7 +17,7 @@ from erp_v2.importer.tax_accounts import (
 from erp_v2.importer.waves36 import ALL_WAVE_PAIRINGS
 
 ORG, OTHER_ORG = str(UUID(int=1)), str(UUID(int=2))
-EXP, EXP2, PAID, DEFER, TAXACCT, ELSEWHERE = (str(UUID(int=n)) for n in (10, 11, 20, 21, 22, 30))
+EXP, EXP2, PAID, DEFER, TAXACCT, ELSEWHERE, OTHER_VAT = (str(UUID(int=n)) for n in (10, 11, 20, 21, 22, 30, 31))
 D = Decimal
 
 
@@ -70,9 +70,25 @@ def test_a1_split_on_the_gl_maps_the_snapshot_deferral_account():
     assert ref(outcome, 1) == ("A1", DEFER) and ref(outcome, 2) == ("A1", DEFER)
 
 
-def test_a1_does_not_prove_where_the_expense_was_posted():
+def test_a1_does_not_prove_where_the_expense_was_posted_but_counts_it():
     outcome = classify_invoice(ORG, [line(1, tax_code=code())], {ELSEWHERE: D(100), DEFER: D(10)})
-    assert outcome.klass == "A1"
+    assert outcome.klass == "A1" and outcome.expense_elsewhere
+    assert class_counts([outcome])["a1_expense_elsewhere"] == dict(lines=1, invoices=1)
+    on_lines = classify_invoice(ORG, [line(1, tax_code=code())], {EXP: D(100), DEFER: D(10)})
+    assert on_lines.klass == "A1" and not on_lines.expense_elsewhere
+
+
+def test_debit_on_another_codes_tax_account_is_never_a1_or_a2():
+    """The set is global: another code's VAT account, offset by less expense, must not read as A1."""
+    ledger = {EXP: D(90), DEFER: D(10), OTHER_VAT: D(10)}  # totals the invoice (110)
+    own_codes_only = classify_invoice(ORG, [line(1, tax_code=code())], ledger)
+    assert own_codes_only.klass == "A1"  # what a per-invoice code set would wrongly accept
+    outcome = classify_invoice(ORG, [line(1, tax_code=code())], ledger, [OTHER_VAT, None])
+    assert outcome.klass == "A3" and ref(outcome, 1) == ("A3", EXP)
+    folded_with_vat_debit = classify_invoice(
+        ORG, [line(1, tax_code=code())], {EXP: D(100), OTHER_VAT: D(10)}, [OTHER_VAT]
+    )
+    assert folded_with_vat_debit.klass == "A3"
 
 
 def test_a2_folded_on_the_gl_maps_the_line_expense_account_per_line():
@@ -126,6 +142,7 @@ def test_class_counts_report_lines_and_invoices():
     counts = class_counts([one, two])
     assert counts["B1"] == dict(lines=1, invoices=1) and counts["B2"] == dict(lines=1, invoices=1)
     assert counts["A2"] == dict(lines=1, invoices=1) and counts["A1"] == counts["A3"] == dict(lines=0, invoices=0)
+    assert counts["a1_expense_elsewhere"] == dict(lines=0, invoices=0)
 
 
 # ---- the enrolment map over a snapshot ----
@@ -195,9 +212,27 @@ def test_enrolment_map_and_receipt_counts_over_a_snapshot():
     got = [built[str(UUID(int=2000 + i))]["tax_account_ref"] for i in range(5)]
     assert got == expected
     counts = maps.tax_account_classes()
-    assert {k: v["lines"] for k, v in counts.items()} == dict(A1=1, A2=1, A3=1, B1=1, B2=0)
-    assert {k: v["invoices"] for k, v in counts.items()} == dict(A1=1, A2=1, A3=1, B1=1, B2=0)
+    assert {k: v["lines"] for k, v in counts.items()} == dict(A1=1, A2=1, A3=1, B1=1, B2=0, a1_expense_elsewhere=0)
+    assert {k: v["invoices"] for k, v in counts.items()} == dict(A1=1, A2=1, A3=1, B1=1, B2=0, a1_expense_elsewhere=0)
     assert maps.summary()["supplier_line_tax_accounts"] == 5
+
+
+def test_enrolment_map_uses_every_tax_codes_accounts_not_only_the_invoices_own():
+    src = snapshot()
+    # Another code (no line uses it) owns TAXACCT; the A1 invoice's journal also debits it, offset by less expense.
+    src.execute(sa.text("INSERT INTO tax_code VALUES (:a, :b, 'VAT', :d)"), dict(a=str(UUID(int=78)), b=ORG, d=TAXACCT))
+    src.execute(sa.text("INSERT INTO account VALUES (:a, NULL)"), dict(a=TAXACCT))
+    journal = str(UUID(int=9001))
+    src.execute(
+        sa.text("UPDATE posted_ledger_line SET debit_amount = '90' WHERE journal_entry_id = :j AND account_id = :a"),
+        dict(j=journal, a=EXP),
+    )
+    src.execute(sa.text("INSERT INTO posted_ledger_line VALUES (:j, :a, '10')"), dict(j=journal, a=TAXACCT))
+    maps = EnrolmentMaps(src, src)
+    built = maps.get("supplier_line_tax_accounts")
+    assert built[str(UUID(int=2000))]["tax_account_ref"] == EXP  # A3 now: the folded form
+    assert maps.tax_account_classes()["A1"] == dict(lines=0, invoices=0)
+    assert maps.tax_account_classes()["A3"]["invoices"] == 2
 
 
 def test_missing_tax_code_or_account_row_refuses_the_map():

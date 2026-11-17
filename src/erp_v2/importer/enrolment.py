@@ -43,6 +43,7 @@ from erp_v2.importer.minting import MAP_MINTS, MintContext, MintResult, run_mint
 from erp_v2.importer.payroll_formula import convert_rule
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.tax_accounts import (
+    GLOBAL_TAX_ACCOUNT_SQL,
     INVOICE_LINE_SQL,
     LEDGER_DEBIT_SQL,
     canonical,
@@ -624,7 +625,8 @@ def _build_supplier_line_tax_accounts(
 
     rows = [dict(r) for r in source.execute(sa.text(INVOICE_LINE_SQL)).mappings()]
     ledger = [dict(r) for r in source.execute(sa.text(LEDGER_DEBIT_SQL)).mappings()]
-    outcomes = classify_snapshot(rows, ledger)
+    every_code = [dict(r) for r in source.execute(sa.text(GLOBAL_TAX_ACCOUNT_SQL)).mappings()]
+    outcomes = classify_snapshot(rows, ledger, every_code)
     by_line = {canonical(line_id): line for outcome in outcomes.values() for line_id, line in outcome.lines.items()}
     mapping: dict[Any, dict[str, Any]] = {}
     for row in rows:

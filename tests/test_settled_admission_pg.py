@@ -66,6 +66,8 @@ SOURCE_TABLES = {
     "journal_entry": READ_FIELDS["journal_entry"],
     "journal_entry_line": READ_FIELDS["journal_entry_line"],
     "posted_ledger_line": READ_FIELDS["posted_ledger_line"],
+    "tax_code": READ_FIELDS["tax_code"],
+    "account": READ_FIELDS["account"],
     "inventory_transaction": ["source_document_type", "source_document_id", "source_document_line_id"],
 }
 BOOLEANS = {"is_prepayment", "is_reversal"}
@@ -104,9 +106,19 @@ def typed(column, value):
     return norm(value)
 
 
-def imported_invoice(engine, env, number, approved=True):
-    """An imported-style invoice: no tax, APPROVED by direct update, no event/obligation/receipt."""
-    iid = invoice(engine, env, number=number, submit=False, tax="0")
+TAX_CODE = "00000000-0000-0000-0000-0000000000c1"
+OTHER_ACCOUNT = "00000000-0000-0000-0000-0000000000c2"
+# Legacy GL shapes of a taxed (15) settled invoice of 215: split on the tax account, folded, unrecognised.
+TAXED_JOURNALS = {
+    "A1": [("5000", "200", "0"), ("2100", "15", "0"), ("2000", "0", "215")],
+    "A2": [("5000", "215", "0"), ("2000", "0", "215")],
+    "A3": [("5000", "200", "0"), ("2040", "15", "0"), ("2000", "0", "215")],
+}
+
+
+def imported_invoice(engine, env, number, approved=True, tax="0", tax_account=None):
+    """An imported-style invoice: APPROVED by direct update, no event/obligation/receipt (untaxed by default)."""
+    iid = invoice(engine, env, number=number, submit=False, tax=tax, tax_account=tax_account)
     submit(engine, env, iid)
     if not approved:
         return iid
@@ -303,18 +315,53 @@ class Scene:
             self.destination_name = dest.scalar(sa.text("SELECT current_database()"))
         self.rows["organization"].append(dict(organization_id=str(env.tenant_id), functional_currency_code="NGN"))
 
-    def add(self, number, *, paid="80", payment_amount=None, withholding="0", dest_payment_journal=True, approved=True):
-        """One invoice of total 200 partially paid by one cleared payment (net + withholding = paid)."""
+    def add(
+        self,
+        number,
+        *,
+        paid="80",
+        payment_amount=None,
+        withholding="0",
+        dest_payment_journal=True,
+        approved=True,
+        taxed=None,
+        dest_ref=None,
+    ):
+        """One invoice of total 200 (215 when ``taxed``) partially paid by one cleared payment.
+
+        ``taxed`` is the legacy GL shape (A1 split / A2 folded / A3 unrecognised); the destination line
+        carries the ref the importer derives for it unless ``dest_ref`` overrides.
+        """
         env, engine = self.env, self.engine
-        iid = imported_invoice(engine, env, number, approved)
+        env.accounts.setdefault("2100", env.tax_account)
+        if taxed:
+            derived = env.tax_account if taxed == "A1" else env.accounts["5000"]
+            iid = imported_invoice(
+                engine, env, number, approved, tax="15", tax_account=dest_ref if dest_ref else derived
+            )
+        else:
+            iid = imported_invoice(engine, env, number, approved)
         jinv, jinv_lines, jinv_ledger = seed_journal(
             engine,
             env,
             number=f"JE-{number}",
             document_type="SUPPLIER_INVOICE",
             document_id=iid,
-            lines=[("5000", "200", "0"), ("2000", "0", "200")],
+            lines=TAXED_JOURNALS[taxed] if taxed else [("5000", "200", "0"), ("2000", "0", "200")],
         )
+        if taxed:
+            self.rows["tax_code"] = [
+                dict(
+                    tax_code_id=TAX_CODE,
+                    organization_id=str(env.tenant_id),
+                    tax_type="VAT",
+                    tax_paid_account_id=OTHER_ACCOUNT,
+                )
+            ]
+            self.rows["account"] = [
+                dict(account_id=OTHER_ACCOUNT, deferral_pair_account_id=str(env.tax_account)),
+                dict(account_id=str(env.tax_account), deferral_pair_account_id=None),
+            ]
         pid, aid = uuid4(), uuid4()
         net = payment_amount if payment_amount is not None else str(Decimal(paid) - Decimal(withholding))
         if dest_payment_journal:
@@ -378,6 +425,7 @@ class Scene:
         for line in lines:
             row = dict.fromkeys(READ_FIELDS["supplier_invoice_line"]) | {"item_id": None}
             row.update(
+                tax_code_id=TAX_CODE if line.tax_amount != 0 else None,
                 line_id=str(line.id),
                 invoice_id=str(iid),
                 line_number=line.line_number,
@@ -1046,3 +1094,29 @@ def test_preflight_rejects_a_table_outside_the_known_set(hosted_postgres):  # no
     with Session(engines["operator"]) as session, session.begin():
         with pytest.raises(payables_history_cli.OperatorRefusal, match="preflight_unknown_table"):
             payables_history_cli._destination_preflight(session, U(int=1), ("supplier_invoices",))
+
+
+@pytest.mark.parametrize("shape", ["A1", "A2"])
+def test_taxed_settled_invoice_with_a_recognised_legacy_gl_treatment_is_admitted(engine, setup, shape):
+    _env, scene = setup
+    iid = scene.add("AP-1", taxed=shape)
+    scene.build()
+    plan, applied = scene.plan_then_apply([iid])
+    assert plan["counts"]["eligible"] == 1 and applied["applied"] == 1
+    assert applied["totals"]["eligible"]["total"] == "215.00"
+
+
+def test_taxed_settled_invoice_with_an_unrecognised_legacy_gl_treatment_is_refused(engine, setup):
+    _env, scene = setup
+    iid = scene.add("AP-1", taxed="A3")  # folded form on the destination, as the importer lands A3
+    scene.build()
+    plan = scene.run([iid], apply=False)
+    assert plan["refusals_by_reason"] == {"legacy_evidence:legacy_gl_tax_treatment_unrecognised": 1}
+
+
+def test_taxed_settled_invoice_whose_destination_tax_account_differs_is_refused(engine, setup):
+    env, scene = setup
+    iid = scene.add("AP-1", taxed="A1", dest_ref=env.accounts["5000"])  # A1 derives the tax account
+    scene.build()
+    plan = scene.run([iid], apply=False)
+    assert plan["refusals_by_reason"] == {"legacy_evidence:invoice_line_tax_account": 1}
