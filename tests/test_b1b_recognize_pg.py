@@ -38,6 +38,8 @@ LIST_SHA = "c" * 64
 SNAP = "d" * 64
 REVISION = "e" * 40
 STAMP = "2025-01-01T00:00:00+00:00"
+TAX_CODE = "00000000-0000-0000-0000-0000000000c1"
+OTHER_ACCOUNT = "00000000-0000-0000-0000-0000000000c2"
 MODELS = (InvoiceRecognition, LiabilityEvent, PaymentObligation, AccountingReceipt, JournalEntry)
 SOURCE_TABLES = {
     "supplier_invoice": READ_FIELDS["supplier_invoice"],
@@ -46,6 +48,8 @@ SOURCE_TABLES = {
     "journal_entry": READ_FIELDS["journal_entry"],
     "posted_ledger_line": READ_FIELDS["posted_ledger_line"],
     "organization": READ_FIELDS["organization"],
+    "tax_code": READ_FIELDS["tax_code"],
+    "account": READ_FIELDS["account"],
     "inventory_transaction": ["source_document_type", "source_document_id", "source_document_line_id"],
 }
 BOOLEANS = {"is_prepayment", "is_reversal"}
@@ -116,6 +120,12 @@ class Legacy:
         self.allocations: list[dict] = []
         self.inventory: list[dict] = []
         self.line_overrides: dict[UUID, dict] = {}
+        # Legacy tax configuration behind the taxed lines: "paid" (tax-paid account = the destination tax
+        # account, no deferral pair), "deferral" (the destination account is the pair of another paid
+        # account, legacy's deferral rule), "none" (no tax code: folded), "wht" (WITHHOLDING code: folded).
+        self.tax_mode = "paid"
+        self.tax_codes: list[dict] = []
+        self.accounts: list[dict] = []
         with db_engine.connect() as dest:
             self.destination_name = dest.scalar(sa.text("SELECT current_database()"))
 
@@ -181,10 +191,27 @@ class Legacy:
                         expense_account_id=line.posting_account_ref,
                         created_at=STAMP,
                     )
+                    if line.tax_amount != 0 and self.tax_mode != "none":
+                        row["tax_code_id"] = TAX_CODE
                     row.update(self.line_overrides.get(iid, {}))
                     lines.append(row)
+            tax = str(self.env.tax_account)
+            paid, deferral = (OTHER_ACCOUNT, tax) if self.tax_mode == "deferral" else (tax, None)
+            codes = [
+                dict(
+                    tax_code_id=TAX_CODE,
+                    organization_id=str(self.env.tenant_id),
+                    tax_type="WITHHOLDING" if self.tax_mode == "wht" else "VAT",
+                    tax_paid_account_id=paid,
+                )
+            ]
+            accounts = [dict(account_id=paid, deferral_pair_account_id=deferral)]
+            if deferral:
+                accounts.append(dict(account_id=deferral, deferral_pair_account_id=None))
             for name, rows in (
                 ("organization", [dict(organization_id=str(self.env.tenant_id), functional_currency_code="NGN")]),
+                ("tax_code", self.tax_codes or codes),
+                ("account", self.accounts or accounts),
                 ("supplier_invoice", headers),
                 ("supplier_invoice_line", lines),
                 ("payment_allocation", self.allocations),
@@ -717,3 +744,60 @@ def test_private_plan_has_per_invoice_detail_and_the_receipt_has_none(engine, se
     assert "Supplier One" not in flat and "supplier-1" not in flat and "supplier_ref" not in flat
     text = json.dumps(receipt)
     assert str(good) not in text and "invoice_date" not in text and "2026-01-10" not in text
+
+
+def test_split_on_the_deferral_account_posts_dr_expense_dr_deferral_cr_2000(engine, setup):
+    """Legacy deferral rule (D4): the code's paid account has a deferral pair, which is the line's tax account."""
+    env, legacy = setup
+    legacy.tax_mode = "deferral"
+    ids = (imported(engine, env),)
+    legacy.build(ids)
+    plan, applied = plan_then_apply(engine, legacy, ids)
+    assert plan["counts"]["eligible"] == 1 and applied["applied"] == 1
+    with Session(engine) as db:
+        receipt = db.scalar(sa.select(AccountingReceipt).where(AccountingReceipt.document_id == ids[0]))
+        lines = {
+            db.get(Account, r.account_id).code: (r.debit, r.credit)
+            for r in db.scalars(
+                sa.select(PostedLedgerLine).where(PostedLedgerLine.journal_id == UUID(receipt.accounting_reference))
+            )
+        }
+    assert lines == {"5000": (200, 0), "2100": (15, 0), "2000": (0, 215)}
+
+
+@pytest.mark.parametrize("mode", ["none", "wht"])
+def test_folded_taxed_line_is_refused_for_review(engine, setup, mode):
+    """B2: the destination ref is the line's own expense account (D1), yet B1b never posts it."""
+    env, legacy = setup
+    legacy.tax_mode = mode
+    ids = (imported(engine, env, tax_account=env.accounts["5000"]),)
+    legacy.build(ids)
+    before = counts(engine, env.tenant_id)
+    plan = legacy.run(engine, ids, apply=False)
+    assert plan["refusals_by_reason"] == {"legacy_evidence:folded_tax_line_requires_review": 1}
+    assert counts(engine, env.tenant_id) == before
+
+
+def test_folded_derivation_with_the_tax_account_still_on_the_line_is_a_ref_mismatch(engine, setup):
+    env, legacy = setup
+    legacy.tax_mode = "none"
+    ids = (imported(engine, env),)
+    legacy.build(ids)
+    assert legacy.run(engine, ids, apply=False)["refusals_by_reason"] == {"legacy_evidence:invoice_line_tax_account": 1}
+
+
+def test_destination_tax_account_that_differs_from_the_derived_account_is_refused(engine, setup):
+    env, legacy = setup
+    ids = (imported(engine, env),)
+    legacy.tax_mode = "deferral"
+    legacy.tax_codes = [
+        dict(
+            tax_code_id=TAX_CODE,
+            organization_id=str(env.tenant_id),
+            tax_type="VAT",
+            tax_paid_account_id=OTHER_ACCOUNT,
+        )
+    ]
+    legacy.accounts = [dict(account_id=OTHER_ACCOUNT, deferral_pair_account_id=None)]
+    legacy.build(ids)
+    assert legacy.run(engine, ids, apply=False)["refusals_by_reason"] == {"legacy_evidence:invoice_line_tax_account": 1}

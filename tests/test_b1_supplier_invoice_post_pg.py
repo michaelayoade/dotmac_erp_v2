@@ -86,7 +86,7 @@ def world(engine):
     return env
 
 
-def invoice(engine, env, *, number="AP-1", submit=True, tax="15", period_date="2026-01-10"):
+def invoice(engine, env, *, number="AP-1", submit=True, tax="15", period_date="2026-01-10", tax_account=None):
     values = {
         "request_id": str(uuid4()),
         "number": number,
@@ -104,7 +104,7 @@ def invoice(engine, env, *, number="AP-1", submit=True, tax="15", period_date="2
         "exchange_rate": "1",
         "posting_account_id": str(env.accounts["5000"]),
         "liability_account_id": str(env.accounts["2000"]),
-        "tax_account_id": str(env.tax_account),
+        "tax_account_id": str(tax_account or env.tax_account),
     }
     with Session(engine) as db:
         tenant, submitter = db.get(Tenant, env.tenant_id), db.get(Party, env.party_ids[0])

@@ -268,10 +268,19 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_payables.supplier_invoice_lines",
         "public.supplier_invoice_line",
         renames={"posting_account_ref": "expense_account_id"},
-        lookups={"dimension_refs": ("supplier_line_dimensions", "id", "dimension_refs")},
+        lookups={
+            "dimension_refs": ("supplier_line_dimensions", "id", "dimension_refs"),
+            "tax_account_ref": ("supplier_line_tax_accounts", "id", "tax_account_ref"),
+        },
         note="dimension_refs: enrolment-assembled sorted [CODE, value] JSON "
         "from cost_center_id/project_id/segment_id (declared codes "
-        "COST_CENTER/PROJECT/SEGMENT)",
+        "COST_CENTER/PROJECT/SEGMENT). tax_account_ref: enrolment-derived from "
+        "tax_code_id under the two-regime rule (legacy-posted invoices follow the "
+        "posted ledger lines: split -> deferral account, folded -> the line's "
+        "expense account; unposted invoices follow legacy's current posting rule, "
+        "ap/posting/invoice.py + posting/tax.py); NULL on untaxed lines. VAT is "
+        "cash basis; deferred input VAT is released on payment by the B3 extension "
+        "(follow-up)",
     ),
     Pairing(
         "mod_payables.settlement_observations",

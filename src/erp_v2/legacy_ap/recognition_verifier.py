@@ -49,6 +49,8 @@ from erp_v2.importer.payables_history import (
     _readonly,
     _require,
     _tenant,
+    invoice_tax,
+    require_line_tax_account,
 )
 from erp_v2.importer.payables_reconciliation import _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
@@ -244,8 +246,13 @@ class ApprovedInvoiceVerifier:
         )
         line_mapping = {k: k for k in ("invoice_id", "line_number", "description", "line_amount", "tax_amount")}
         line_mapping["posting_account_ref"] = "expense_account_id"
+        # No legacy GL footprint (checked above), so the snapshot rule applies: B1 split / B2 folded.
+        outcome, tax_evidence = invoice_tax(src, tenant, None, lines)
         for original, imported in _pair(lines, targets, "line_id", "invoice_line"):
             _match(original, imported, line_mapping, "invoice_line")
+            derived = require_line_tax_account(outcome, original["line_id"], imported)
+            # A folded taxed line is a WHT line keyed as additive tax; it must never be posted as cost.
+            _require(derived.klass != "B2", "folded_tax_line_requires_review")
         _require(
             _sum([row["line_amount"] for row in lines]) == header["subtotal"]
             and _sum([row["tax_amount"] for row in lines]) == header["tax_amount"],
@@ -260,6 +267,14 @@ class ApprovedInvoiceVerifier:
                 destination_header=_project(target, DESTINATION_HEADER),
                 destination_lines=_project_rows(targets, DESTINATION_INVOICE_LINE, "id"),
                 gl=dict(journals=0, ledger_lines=gl_line_count),
+                tax_accounts=dict(
+                    invoice_class=outcome.klass,
+                    lines=[
+                        dict(line_id=line_id, klass=item.klass, ref=item.ref)
+                        for line_id, item in sorted(outcome.lines.items())
+                    ],
+                    codes=tax_evidence,
+                ),
             ),
         )
         return ApprovedInvoiceRecognitionEvidence(

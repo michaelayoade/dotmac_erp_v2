@@ -70,6 +70,7 @@ def facts():
                 unit_price="35",
                 line_amount="100",
                 tax_amount="0",
+                tax_code_id=None,
                 expense_account_id=EXP,
                 cost_center_id=None,
                 project_id=None,
@@ -714,3 +715,163 @@ def test_consumed_financial_float_metadata_is_still_refused(db, monkeypatch):
     monkeypatch.setattr(module, "_reflect", approximate_money)
     with pytest.raises(HistoricalEvidenceError, match="unsupported_float_numeric"):
         evidence(db)
+
+
+# ---- tax account on imported lines: the two-regime rule against the legacy GL as posted ----------------
+
+TAX, PAID, OTHER, CODE = (str(UUID(int=n)) for n in (41, 42, 43, 44))
+
+
+def taxed(db, mode, *, ref="derived"):
+    """Make the posted invoice carry 15 of tax (total 115) and a GL shaped like ``mode``.
+
+    A1 split: Dr expense 100 + Dr TAX 15 (TAX is the deferral pair of the code's PAID account).
+    A2 folded: Dr expense 115.  A3 other: Dr expense 100 + Dr OTHER 15 (no tax-account debit).
+    The destination ref defaults to the derived one (A1: TAX, else the expense account).
+    """
+
+    source, target, _, _, tables = db
+    sx = lambda name: tables[True, name]  # noqa: E731
+    dx = lambda name: tables[False, name]  # noqa: E731
+    source.execute(
+        sx("supplier_invoice").update().values(tax_amount="15", total_amount="115", functional_currency_amount="115")
+    )
+    source.execute(sx("supplier_invoice_line").update().values(tax_amount="15", tax_code_id=CODE))
+    target.execute(
+        dx("supplier_invoices")
+        .update()
+        .values(tax_amount="15", total_amount="115", payment_schedule=[dict(due_date=DAY, amount="115.000000")])
+    )
+    derived = TAX if mode == "A1" else EXP
+    target.execute(
+        dx("supplier_invoice_lines")
+        .update()
+        .values(tax_amount="15", tax_account_ref=derived if ref == "derived" else ref)
+    )
+    for name in ("journal_entry", "journal_entries"):
+        connection = source if name == "journal_entry" else target
+        table = tables[name == "journal_entry", name]
+        connection.execute(
+            table.update().values(
+                total_debit="115", total_credit="115", total_debit_functional="115", total_credit_functional="115"
+            )
+        )
+    side = {
+        "journal_entry_line": dict(
+            debit=("debit_amount", "debit_amount_functional"), credit=("credit_amount", "credit_amount_functional")
+        ),
+        "journal_lines": dict(debit=("debit", "debit_functional"), credit=("credit", "credit_functional")),
+        "posted_ledger_line": dict(
+            debit=("debit_amount", "original_debit_amount"), credit=("credit_amount", "original_credit_amount")
+        ),
+        "posted_ledger_lines": dict(debit=("debit", "original_debit"), credit=("credit", "original_credit")),
+    }
+    for name, columns in side.items():
+        is_source = name in ("journal_entry_line", "posted_ledger_line")
+        connection, table = (source if is_source else target), tables[is_source, name]
+        connection.execute(
+            table.update().where(table.c.account_id == AP).values(**dict.fromkeys(columns["credit"], "115"))
+        )
+        if mode == "A2":
+            connection.execute(
+                table.update().where(table.c.account_id == EXP).values(**dict.fromkeys(columns["debit"], "115"))
+            )
+        else:
+            row = dict(connection.execute(sa.select(table).where(table.c.account_id == EXP)).mappings().one())
+            new_line, new_ledger = str(UUID(int=23)), str(UUID(int=33))
+            for key, value in dict(line_id=new_line, id=new_ledger if "ledger" in name else new_line).items():
+                if key in row:
+                    row[key] = value
+            if "ledger_line_id" in row:
+                row["ledger_line_id"] = new_ledger
+            if "journal_line_id" in row:
+                row["journal_line_id"] = new_line
+            row["account_id"] = TAX if mode == "A1" else OTHER
+            row.update(dict.fromkeys(columns["debit"], "15"))
+            if "line_number" in row:
+                row["line_number"] = 3
+            if "account_code" in row:
+                row["account_code"] = "9"
+            connection.execute(table.insert(), [row])
+    tax_code = sa.Table(
+        "tax_code",
+        sa.MetaData(),
+        *(sa.Column(c, sa.Text) for c in ("tax_code_id", "organization_id", "tax_type", "tax_paid_account_id")),
+    )
+    account = sa.Table(
+        "account", sa.MetaData(), sa.Column("account_id", sa.Text), sa.Column("deferral_pair_account_id", sa.Text)
+    )
+    tax_code.create(source)
+    account.create(source)
+    source.execute(
+        tax_code.insert(), [dict(tax_code_id=CODE, organization_id=T, tax_type="VAT", tax_paid_account_id=PAID)]
+    )
+    source.execute(
+        account.insert(),
+        [dict(account_id=PAID, deferral_pair_account_id=TAX), dict(account_id=TAX, deferral_pair_account_id=None)],
+    )
+    source.commit()
+    target.commit()
+    return tax_code, account
+
+
+@pytest.mark.parametrize("mode", ["A1", "A2"])
+def test_recognised_legacy_gl_treatments_admit_with_the_derived_tax_account(db, mode):
+    taxed(db, mode)
+    item = evidence(db)
+    assert item.tax_amount == Decimal("15")
+    command = db[3].command(item)
+    assert db[3].verify(scope=SimpleNamespace(tenant_id=UUID(T)), command=command, destination=db[2]) == item
+
+
+@pytest.mark.parametrize(
+    "mode,ref",
+    [("A1", None), ("A1", EXP), ("A1", PAID), ("A2", None), ("A2", TAX)],
+)
+def test_destination_tax_account_must_equal_the_derived_account(db, mode, ref):
+    taxed(db, mode, ref=ref)
+    with pytest.raises(HistoricalEvidenceError, match="invoice_line_tax_account"):
+        evidence(db)
+
+
+def test_legacy_gl_treatment_not_recognised_is_refused_for_finance(db):
+    taxed(db, "A3")  # destination carries the folded form, exactly what the importer lands for A3
+    with pytest.raises(HistoricalEvidenceError, match="legacy_gl_tax_treatment_unrecognised"):
+        evidence(db)
+
+
+def test_split_tax_debit_not_equal_to_the_tax_is_not_recognised(db):
+    taxed(db, "A1", ref=EXP)  # an unrecognised treatment lands the folded form
+    ledger = db[4][True, "posted_ledger_line"]
+    db[0].execute(
+        ledger.update().where(ledger.c.account_id == TAX).values(debit_amount="14", original_debit_amount="14")
+    )
+    with pytest.raises(HistoricalEvidenceError, match="legacy_gl_tax_treatment_unrecognised"):
+        evidence(db)
+
+
+def test_untaxed_line_with_a_tax_account_is_refused(db):
+    db[1].execute(db[4][False, "supplier_invoice_lines"].update().values(tax_account_ref=EXP))
+    with pytest.raises(HistoricalEvidenceError, match="invoice_line_tax_account"):
+        evidence(db)
+
+
+def test_missing_tax_code_or_account_row_is_a_named_refusal(db):
+    tax_code, account = taxed(db, "A1")
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(account.delete().where(account.c.account_id == TAX))
+    with pytest.raises(HistoricalEvidenceError, match="tax_deferral_account_row_missing"):
+        evidence(db)
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(tax_code.delete())
+    with pytest.raises(HistoricalEvidenceError, match="tax_code_row_missing"):
+        evidence(db)
+
+
+def test_fingerprint_covers_the_tax_facts_and_the_derived_class(db):
+    tax_code, _ = taxed(db, "A2")
+    before = evidence(db).fingerprint()
+    # Same derived ref (folded either way), different source tax-code fact: the proof must differ.
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(tax_code.update().values(tax_type="GST"))
+    assert evidence(db).fingerprint() != before
