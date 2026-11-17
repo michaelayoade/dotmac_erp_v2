@@ -83,9 +83,22 @@ def _frozen_content(engine, journal_id):
         )
 
 
-def _run(engine, source_table, governance=GOVERNANCE):
+def _legacy_ledger_table(engine, journal_ids) -> tuple[str, str]:
+    schema = f"legacy_{uuid4().hex[:12]}"
+    with engine.begin() as c:
+        c.exec_driver_sql(f"CREATE SCHEMA {schema}")
+        c.exec_driver_sql(f"CREATE TABLE {schema}.posted_ledger_line (journal_entry_id uuid)")
+        for j in journal_ids:
+            c.execute(sa.text(f"INSERT INTO {schema}.posted_ledger_line VALUES (:j)"), {"j": j})  # noqa: S608
+    return f"{schema}.posted_ledger_line", "journal_entry_id"
+
+
+def _run(engine, source_table, governance=GOVERNANCE, ledger_ids=()):
+    legacy_ledger = _legacy_ledger_table(engine, ledger_ids)
     with engine.connect() as source, engine.connect() as dest:
-        return run_transitions(source, dest, (_spec(source_table),), commit=True, void_governance=governance)
+        return run_transitions(
+            source, dest, (_spec(source_table),), commit=True, void_governance=governance, legacy_ledger=legacy_ledger
+        )
 
 
 def _counts(engine, env):
@@ -332,3 +345,30 @@ def test_void_with_reversal_link_stays_a_named_exception_and_is_not_nulled(engin
     assert "reversal link" in outcome.exceptions[0].reason
     state = _journal_state(engine, journal.id)
     assert state.status == "DRAFT" and state.posted_by == "legacy-user-secret"
+
+
+def test_stamped_void_with_legacy_ledger_line_absent_in_destination_stays_a_named_exception(engine):
+    env = seed(engine)
+    journal, clean = legacy_draft(engine, env, document="ll"), legacy_draft(engine, env, document="lc")
+    _stamp(engine, journal.id)
+    _stamp(engine, clean.id)
+    source_table = _legacy_source(engine, [(journal.id, uuid4()), (clean.id, uuid4())])
+    # The legacy ledger line was rejected at import: the destination has none for this journal.
+    (outcome,) = _run(engine, source_table, ledger_ids=[journal.id])
+    assert [e.source_key for e in outcome.exceptions] == [str(journal.id)]
+    assert "legacy ledger lines" in outcome.exceptions[0].reason
+    state = _journal_state(engine, journal.id)
+    assert state.status == "DRAFT" and state.posted_by == "legacy-user-secret" and state.posted_at is not None
+    assert [e["journal_id"] for e in outcome.void_stamp_evidence] == [str(clean.id)]
+    assert _journal_state(engine, clean.id).status == "VOID"
+
+
+def test_stamped_void_without_a_legacy_ledger_source_is_refused_not_nulled(engine):
+    env = seed(engine)
+    journal = legacy_draft(engine, env, document="nl")
+    _stamp(engine, journal.id)
+    source_table = _legacy_source(engine, [(journal.id, uuid4())])
+    with engine.connect() as source, engine.connect() as dest:
+        (outcome,) = run_transitions(source, dest, (_spec(source_table),), commit=True, void_governance=GOVERNANCE)
+    assert "ledger source is unavailable" in outcome.exceptions[0].reason
+    assert _journal_state(engine, journal.id).posted_by == "legacy-user-secret"

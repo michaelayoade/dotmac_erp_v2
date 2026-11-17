@@ -182,6 +182,7 @@ def _void_journals(
     governance: VoidGovernance | None,
     outcome: TransitionOutcome,
     commit: bool,
+    legacy_ledger: tuple[str, str] | None = None,
 ) -> None:
     """Land legacy VOID journals through the accounting owner's void path.
 
@@ -243,6 +244,25 @@ def _void_journals(
                 {"ids": chunk},
             )
         }
+        legacy_ledgered: set[str] = set()
+        stamped_ids = [
+            rid
+            for rid, r in dest_rows.items()
+            if r.status == "DRAFT" and (r.posted_at is not None or r.posted_by is not None)
+        ]
+        if stamped_ids and legacy_ledger is not None:
+            # "No LEGACY ledger lines": read the source, not only the destination (a legacy line
+            # rejected at import leaves the destination empty).
+            table, column = legacy_ledger
+            legacy_ledgered = {
+                str(r.jid)
+                for r in source.execute(
+                    sa.text(f"SELECT DISTINCT {column} AS jid FROM {table} WHERE {column} IN :ids").bindparams(  # noqa: S608
+                        sa.bindparam("ids", expanding=True)
+                    ),
+                    {"ids": stamped_ids},
+                )
+            }
         for row_id in chunk:
             row = dest_rows.get(row_id)
             if row is None:
@@ -284,6 +304,19 @@ def _void_journals(
                 continue
             if not row.has_period:
                 outcome.exceptions.append(_void_exception(spec, row_id, "legacy VOID journal has no fiscal period"))
+                continue
+            if (row.posted_at is not None or row.posted_by is not None) and (
+                legacy_ledger is None or str(row_id) in legacy_ledgered
+            ):
+                outcome.exceptions.append(
+                    _void_exception(
+                        spec,
+                        row_id,
+                        "legacy VOID journal carries posting stamps and legacy ledger lines"
+                        if legacy_ledger is not None
+                        else "legacy VOID journal carries posting stamps and the legacy ledger source is unavailable",
+                    )
+                )
                 continue
             journal_uuid = UUID(str(row_id))
             stamped = row.posted_at is not None or row.posted_by is not None
@@ -342,6 +375,7 @@ def _run_family(
     dry_run: bool,
     commit: bool = False,
     void_governance: VoidGovernance | None = None,
+    legacy_ledger: tuple[str, str] | None = None,
 ) -> TransitionOutcome:
     paths = _LIFECYCLES[spec.destination_table]
     outcome = TransitionOutcome(destination_table=spec.destination_table)
@@ -461,7 +495,7 @@ def _run_family(
                 outcome.transitioned[target] = outcome.transitioned.get(target, 0) + len(moving)
                 continue
             if spec.destination_table == _JOURNAL_TABLE and target == "VOID":
-                _void_journals(source, dest, spec, id_source, moving, void_governance, outcome, commit)
+                _void_journals(source, dest, spec, id_source, moving, void_governance, outcome, commit, legacy_ledger)
                 break  # VOID is terminal: no further steps on this path
             extra = ""
             params_extra: dict[str, Any] = {}
@@ -557,6 +591,7 @@ def run_transitions(
     dry_run: bool = False,
     commit: bool = False,
     void_governance: VoidGovernance | None = None,
+    legacy_ledger: tuple[str, str] | None = None,
 ) -> tuple[TransitionOutcome, ...]:
     """Walk lifecycle-staged rows to their legacy final states.
 
@@ -589,6 +624,11 @@ def run_transitions(
                 pass
         if commit:
             dest.commit()
+    if legacy_ledger is None:
+        ledger_spec = next((sp for sp in specs if sp.destination_table == "mod_accounting.posted_ledger_lines"), None)
+        journal_column = ledger_spec.column_map.get("journal_id") if ledger_spec is not None else None
+        if ledger_spec is not None and journal_column:
+            legacy_ledger = (ledger_spec.source_table, journal_column)
     outcomes: list[TransitionOutcome] = []
     for dest_table in (
         "mod_accounting.fiscal_periods",
@@ -599,7 +639,15 @@ def run_transitions(
         if spec is None:
             continue
         outcomes.append(
-            _run_family(source, dest, spec, dry_run=dry_run, commit=commit, void_governance=void_governance)
+            _run_family(
+                source,
+                dest,
+                spec,
+                dry_run=dry_run,
+                commit=commit,
+                void_governance=void_governance,
+                legacy_ledger=legacy_ledger,
+            )
         )
         if commit and not dry_run:
             dest.commit()
