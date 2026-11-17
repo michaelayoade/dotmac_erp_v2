@@ -22,6 +22,7 @@ from dotmac_kernel.semantic_encoding import ABSENT, digest_of, encode_fields, en
 from dotmac_payables import HistoricalUnpaidInvoiceCommand, HistoricalUnpaidInvoiceEvidence
 from sqlalchemy.orm import Session
 
+from erp_v2.importer import tax_accounts
 from erp_v2.importer.payables_reconciliation import _money, _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
 
@@ -90,7 +91,8 @@ approved_by_user_id approved_at approval_request_id created_at""".split()
 SOURCE_SUPPLIER = "supplier_id organization_id legal_name trading_name".split()
 SOURCE_ORGANIZATION = "organization_id functional_currency_code".split()
 SOURCE_INVOICE_LINE = """line_id invoice_id line_number description quantity unit_price line_amount tax_amount
-expense_account_id cost_center_id project_id segment_id po_line_id goods_receipt_line_id created_at""".split()
+tax_code_id expense_account_id cost_center_id project_id segment_id po_line_id goods_receipt_line_id
+created_at""".split()
 DESTINATION_HEADER = """id tenant_id number supplier_ref supplier_name_snapshot supplier_document_number invoice_date
 received_date currency_code exchange_rate liability_account_ref subtotal tax_amount total_amount payment_schedule
 procurement_ref receipt_evidence_fingerprint submitted_by submitted_at approved_by approved_at
@@ -132,6 +134,8 @@ SOURCE_SCHEMAS = {
     "journal_entry": "gl",
     "journal_entry_line": "gl",
     "posted_ledger_line": "gl",
+    "tax_code": "tax",
+    "account": "gl",
 }
 
 
@@ -153,6 +157,8 @@ READ_FIELDS = {
     "journal_entry_line": SOURCE_JOURNAL_LINE,
     "journal_lines": DESTINATION_JOURNAL_LINE,
     "posted_ledger_line": SOURCE_LEDGER,
+    "tax_code": ["tax_code_id", "organization_id", "tax_type", "tax_paid_account_id"],
+    "account": ["account_id", "deferral_pair_account_id"],
     "posted_ledger_lines": DESTINATION_LEDGER,
     "payment_allocation": ["invoice_id"],
     "journal_line_dimensions": "id tenant_id journal_line_id dimension_id dimension_value_id".split(),
@@ -174,6 +180,85 @@ def _id(value: object) -> str:
         return str(UUID(str(value)))
     except (ValueError, TypeError, AttributeError):
         return str(value)
+
+
+def invoice_tax(
+    src: sa.Connection, organization: object, journal_id: object, lines: list[dict]
+) -> tuple[tax_accounts.InvoiceTax, list[dict]]:
+    """Tax-account classification of one invoice from the snapshot (the importer's rule, shared).
+
+    ``journal_id`` is the legacy invoice journal, or None for an invoice with no GL footprint. The
+    legacy-posted regime follows the posted ledger debits; a missing tax code or account row is a
+    named refusal. Also returns the tax facts that enter the evidence fingerprint.
+    """
+
+    def one(name: str, key: str, value: object, reason: str) -> dict:
+        return _one(_read(src, name, key=key, value=value), reason)
+
+    facts, evidence = [], []
+    for line in lines:
+        code = None
+        if line["tax_code_id"] is not None and line["tax_amount"] != 0:
+            row = one("tax_code", "tax_code_id", line["tax_code_id"], "tax_code_row_missing")
+            paid = deferral = None
+            if row["tax_paid_account_id"] is not None:
+                paid = one("account", "account_id", row["tax_paid_account_id"], "tax_paid_account_row_missing")
+                if paid["deferral_pair_account_id"] is not None:
+                    one("account", "account_id", paid["deferral_pair_account_id"], "tax_deferral_account_row_missing")
+                    deferral = paid["deferral_pair_account_id"]
+            code = tax_accounts.TaxCodeFacts(
+                row["organization_id"], row["tax_type"], row["tax_paid_account_id"], deferral
+            )
+            evidence.append(
+                dict(
+                    line_id=_id(line["line_id"]),
+                    tax_code_id=_id(row["tax_code_id"]),
+                    organization_id=_id(row["organization_id"]),
+                    tax_type=str(row["tax_type"]),
+                    paid_account_id=None if code.paid_account_id is None else _id(code.paid_account_id),
+                    deferral_account_id=None if deferral is None else _id(deferral),
+                )
+            )
+        facts.append(
+            tax_accounts.LineFacts(
+                line["line_id"], line["line_amount"], line["tax_amount"], line["expense_account_id"], code
+            )
+        )
+    # Every tax code's paid/deferral accounts, not only this invoice's codes: a debit on another code's
+    # VAT account must keep the invoice out of A1 and A2.
+    every_tax_account: list = []
+    if any(line["tax_amount"] != 0 for line in lines):
+        pairs = {_id(a["account_id"]): a["deferral_pair_account_id"] for a in _read(src, "account")}
+        for code_row in _read(src, "tax_code"):
+            paid_id = code_row["tax_paid_account_id"]
+            if paid_id is not None:
+                every_tax_account += [paid_id, pairs.get(_id(paid_id))]
+    debits = None
+    if journal_id is not None:
+        ledger = _read(src, "posted_ledger_line", key="journal_entry_id", value=journal_id)
+        if ledger:
+            debits = {}
+            for row in ledger:
+                key = _id(row["account_id"])
+                debits[key] = debits.get(key, Decimal(0)) + row["debit_amount"]
+    try:
+        outcome = tax_accounts.classify_invoice(organization, facts, debits, every_tax_account)
+    except tax_accounts.TaxAccountMappingError as exc:
+        raise HistoricalEvidenceError(str(exc)) from exc
+    return outcome, sorted(evidence, key=lambda item: item["line_id"])
+
+
+def require_line_tax_account(outcome: tax_accounts.InvoiceTax, line_id: object, imported: dict) -> tax_accounts.LineTax:
+    """The destination ref must equal the derived ref exactly (untaxed lines: NULL)."""
+
+    derived = outcome.lines[tax_accounts.canonical(line_id)]
+    actual = imported["tax_account_ref"]
+    _require(
+        (actual is None and derived.ref is None)
+        or (actual is not None and derived.ref is not None and _id(actual) == derived.ref),
+        "invoice_line_tax_account",
+    )
+    return derived
 
 
 def _equal(a: object, b: object) -> bool:
@@ -499,6 +584,7 @@ class HistoricalPayablesVerifier:
         lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
         targets = _read(dest, "supplier_invoice_lines", schema="mod_payables", key="invoice_id", value=invoice_id)
         _tenant(targets, tenant, "invoice_line")
+        outcome, tax_evidence = invoice_tax(src, tenant, header["journal_entry_id"], lines)
         line_mapping = {
             k: k
             for k in (
@@ -527,7 +613,7 @@ class HistoricalPayablesVerifier:
                 original["po_line_id"] is None and original["goods_receipt_line_id"] is None,
                 "unsupported_procurement_link",
             )
-            _require(imported["tax_account_ref"] is None, "unsupported_tax_account")
+            require_line_tax_account(outcome, original["line_id"], imported)
             dimensions = sorted(
                 [[code, _id(original[col])] for code, col in DIMENSIONS[1:] if original[col] is not None]
             )
@@ -537,6 +623,8 @@ class HistoricalPayablesVerifier:
                 "invoice_line_dimensions",
             )
             _require(sorted([[pair[0], _id(pair[1])] for pair in actual]) == dimensions, "invoice_line_dimensions")
+        # Legacy-posted invoices must show a GL treatment the rule recognises (A1 split / A2 folded).
+        _require(outcome.klass != "A3", "legacy_gl_tax_treatment_unrecognised")
         # Inclusive line prices are evidence; never recompute quantity * unit_price.
         _require(
             _sum([row["line_amount"] for row in lines]) == header["subtotal"]
@@ -556,6 +644,15 @@ class HistoricalPayablesVerifier:
                 source_lines=_project_rows(lines, SOURCE_INVOICE_LINE, "line_id"),
                 destination_header=_project(target, DESTINATION_HEADER),
                 destination_lines=_project_rows(targets, DESTINATION_INVOICE_LINE, "id"),
+                tax_accounts=dict(
+                    invoice_class=outcome.klass,
+                    a1_expense_elsewhere=outcome.expense_elsewhere,
+                    lines=[
+                        dict(line_id=line_id, klass=item.klass, ref=item.ref)
+                        for line_id, item in sorted(outcome.lines.items())
+                    ],
+                    codes=tax_evidence,
+                ),
             ),
         )
         common = dict(

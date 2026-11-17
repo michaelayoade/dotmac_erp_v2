@@ -737,6 +737,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             dry_run=not args.apply,
             commit_per_spec=bool(args.apply),
         )
+        tax_account_classes = enrolment.tax_account_classes()
         if mint_context is not None:
             # Non-map-feeding mints run after the specs so every parent
             # row they reference is imported (same caller transaction;
@@ -816,6 +817,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             if s.source_row_refusal is not None
         ],
         "enrolment_maps_built": dict(result.enrolment_maps),
+        "tax_account_classes": tax_account_classes,
         "mints": [_mint_dict(m) for m in (*result.mints, *post_mints)],
         "transitions": [
             {
