@@ -1,6 +1,7 @@
 """Legacy VOID journals through the accounting owner's governed void path, and the functional
 currency mint, on real PostgreSQL (hosted CI only: ERP_TEST_POSTGRES_URL via the shared fixture)."""
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
@@ -21,6 +22,7 @@ from erp_v2.importer.spec import DestinationColumn, build_spec
 from erp_v2.importer.transitions import (
     LEGACY_REQUESTER_PREFIX,
     LEGACY_VOID_REASON,
+    LEGACY_VOID_STAMPED_REASON,
     MIGRATION_APPROVER_PREFIX,
     VoidGovernance,
     run_transitions,
@@ -115,7 +117,7 @@ def test_legacy_voids_land_via_journal_void_events_and_replay_is_a_noop(engine):
     )
     with engine.begin() as c:
         c.execute(
-            sa.text("UPDATE mod_accounting.journal_entries SET posted_by = 'legacy-system' WHERE id = :j"),
+            sa.text("UPDATE mod_accounting.journal_entries SET approval_reference = 'legacy-approval' WHERE id = :j"),
             {"j": posted_evidence.id},
         )
     creator = uuid4()
@@ -211,3 +213,122 @@ def test_functional_currency_mint_lands_the_policy_row_the_b_preflights_read(eng
     assert (replay.created, replay.existing) == (0, 1)
     with Session(engine) as db:
         assert policy.functional_currency(db, env.tenant_id) == "NGN"
+
+
+def _stamp(engine, journal_id):
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "UPDATE mod_accounting.journal_entries SET posted_by = 'legacy-user-secret', "
+                "posted_at = '2025-03-04T05:06:07+00' WHERE id = :j"
+            ),
+            {"j": journal_id},
+        )
+
+
+def _ledger_line(engine, journal_id):
+    """A legacy posted ledger line for a still-DRAFT journal (the legacy ledger evidence)."""
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "INSERT INTO mod_accounting.posted_ledger_lines (id, tenant_id, journal_id, journal_line_id, "
+                "fiscal_period_id, account_id, account_code, journal_number, entry_date, posting_date, "
+                "currency_code, debit, credit, original_debit, original_credit, exchange_rate, source_owner, "
+                "source_document_kind, source_document_id, source_version, source_fingerprint, posted_by, posted_at) "
+                "SELECT gen_random_uuid(), j.tenant_id, j.id, l.id, j.fiscal_period_id, l.account_id, 'X', j.number, "
+                "j.entry_date, j.posting_date, j.currency_code, l.debit, l.credit, l.debit, l.credit, 1, "
+                "'legacy-erp', 'journal', 'x', '1', repeat('b', 64), 'p', now() "
+                "FROM mod_accounting.journal_entries j JOIN mod_accounting.journal_lines l ON l.journal_id = j.id "
+                "WHERE j.id = :j AND l.debit > 0"
+            ),
+            {"j": journal_id},
+        )
+
+
+def _without_stamps(text):
+    return {k: v for k, v in json.loads(text).items() if k not in ("posted_at", "posted_by")}
+
+
+def _journal_state(engine, journal_id):
+    with engine.connect() as c:
+        return c.execute(
+            sa.text("SELECT status, posted_at, posted_by FROM mod_accounting.journal_entries WHERE id = :j"),
+            {"j": journal_id},
+        ).one()
+
+
+def test_stamped_void_lands_without_stamps_with_new_reason_and_receipt_evidence(engine):
+    env = seed(engine)
+    stamped, plain, with_ledger, plain_two = (
+        legacy_draft(engine, env, document=name) for name in ("st", "pl", "led", "pl2")
+    )
+    for j in (stamped, with_ledger):
+        _stamp(engine, j.id)
+    _ledger_line(engine, with_ledger.id)
+    content_before = {j.id: _frozen_content(engine, j.id) for j in (stamped, plain)}
+    creator = uuid4()
+    source_table = _legacy_source(
+        engine, [(stamped.id, creator), (plain.id, creator), (with_ledger.id, creator), (plain_two.id, creator)]
+    )
+
+    (outcome,) = _run(engine, source_table)
+
+    # Stamped + unstamped VOID land; the VOID with legacy ledger lines stays a named exception, stamps intact.
+    assert outcome.transitioned["VOID"] == 3  # stamped, plain, plain_two
+    assert [e.source_key for e in outcome.exceptions] == [str(with_ledger.id)]
+    assert "posted ledger lines" in outcome.exceptions[0].reason
+    ledger_state = _journal_state(engine, with_ledger.id)
+    assert ledger_state.status == "DRAFT" and ledger_state.posted_by == "legacy-user-secret"
+    assert ledger_state.posted_at is not None
+    # Receipt evidence: id and has-stamp flags only, never the stamp values.
+    assert outcome.void_stamp_evidence == [
+        {"journal_id": str(stamped.id), "had_posted_at": True, "had_posted_by": True}
+    ]
+    assert "legacy-user-secret" not in str(outcome.void_stamp_evidence)
+    after = _journal_state(engine, stamped.id)
+    assert (after.status, after.posted_at, after.posted_by) == ("VOID", None, None)
+    assert _journal_state(engine, plain.id).status == "VOID"
+    with engine.connect() as c:
+        reasons = dict(
+            c.execute(
+                sa.text(
+                    "SELECT evidence->>'journal_id', evidence->>'reason' FROM mod_accounting.period_events "
+                    "WHERE tenant_id = :t AND event_kind = 'JOURNAL_VOID'"
+                ),
+                {"t": env.tenant_id},
+            ).all()
+        )
+    assert reasons[str(stamped.id)] == LEGACY_VOID_STAMPED_REASON
+    assert reasons[str(plain.id)] == LEGACY_VOID_REASON
+    assert LEGACY_VOID_STAMPED_REASON == "voided in legacy ERP after posting; no legacy ledger lines"
+    # Content otherwise unchanged (status/updated_at excluded; posted stamps are the only change).
+    for j in (stamped, plain):
+        before_json, before_lines = content_before[j.id]
+        after_json, after_lines = _frozen_content(engine, j.id)
+        assert after_lines == before_lines
+        assert _without_stamps(after_json) == _without_stamps(before_json)
+    counts = _counts(engine, env)
+
+    # Replay is a no-op: nothing moves, nothing is recorded again, same single exception.
+    (again,) = _run(engine, source_table)
+    assert again.transitioned.get("VOID", 0) == 0
+    assert again.void_stamp_evidence == []
+    assert [e.source_key for e in again.exceptions] == [str(with_ledger.id)]
+    assert _counts(engine, env) == counts
+
+
+def test_void_with_reversal_link_stays_a_named_exception_and_is_not_nulled(engine):
+    env = seed(engine)
+    journal, target = legacy_draft(engine, env, document="rl"), legacy_draft(engine, env, document="rt")
+    _stamp(engine, journal.id)
+    with engine.begin() as c:
+        c.execute(
+            sa.text("UPDATE mod_accounting.journal_entries SET reversal_journal_id = :t WHERE id = :j"),
+            {"t": target.id, "j": journal.id},
+        )
+    source_table = _legacy_source(engine, [(journal.id, uuid4())])
+    (outcome,) = _run(engine, source_table)
+    assert outcome.transitioned.get("VOID", 0) == 0 and outcome.void_stamp_evidence == []
+    assert "reversal link" in outcome.exceptions[0].reason
+    state = _journal_state(engine, journal.id)
+    assert state.status == "DRAFT" and state.posted_by == "legacy-user-secret"

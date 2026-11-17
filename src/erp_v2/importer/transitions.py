@@ -93,6 +93,10 @@ _JOURNAL_POSTED_SET = (
 
 
 LEGACY_VOID_REASON = "voided in legacy ERP"
+# Ruling (Michael, 2026-11-17): a legacy VOID journal with posting stamps but no legacy ledger
+# lines, no reversal link and no approval reference lands without the stamps (evidence stays in
+# the retained legacy snapshot and, by journal id only, in the import receipt).
+LEGACY_VOID_STAMPED_REASON = "voided in legacy ERP after posting; no legacy ledger lines"
 LEGACY_REQUESTER_PREFIX = "legacy-user:"
 MIGRATION_APPROVER_PREFIX = "migration:"
 _JOURNAL_TABLE = "mod_accounting.journal_entries"
@@ -112,6 +116,7 @@ class VoidGovernance:
     approval_reference: str
     voided_at: datetime
     reason: str = LEGACY_VOID_REASON
+    stamped_reason: str = LEGACY_VOID_STAMPED_REASON
 
     @property
     def approver(self) -> str:
@@ -126,6 +131,9 @@ class TransitionOutcome:
     stamped_approval_refs: int = 0
     stamped_posted_by: int = 0
     recomputed_totals: int = 0
+    # Legacy VOID journals landed with their posting stamps nulled: journal id and has-stamp
+    # flags only, never the stamp values.
+    void_stamp_evidence: list[dict[str, Any]] = field(default_factory=list)
     exceptions: list[RowException] = field(default_factory=list)
 
 
@@ -186,6 +194,12 @@ def _void_journals(
     the owner's requester != approver rule true even when both ids are equal.
     Journal content is untouched (the owner guard freezes everything but
     status/updated_at). Anything the guard would refuse is a named exception.
+
+    Stamped VOIDs (posted_at/posted_by set, but no ledger lines, reversal link or approval
+    reference) are the one ruled exception: the stamps are nulled in the same savepoint as the
+    void, the reason is ``stamped_reason``, and the journal id is recorded in
+    ``outcome.void_stamp_evidence``. A VOID with ledger lines, a reversal link or an approval
+    reference is never nulled: it stays a named exception.
     """
 
     from dotmac_accounting.contracts import VoidDraftJournal
@@ -247,7 +261,7 @@ def _void_journals(
                     _void_exception(spec, row_id, "legacy VOID journal has no created_by_user_id")
                 )
                 continue
-            if row.posted_at is not None or row.posted_by is not None or row.approval_reference is not None:
+            if row.approval_reference is not None:
                 outcome.exceptions.append(
                     _void_exception(
                         spec, row_id, "legacy VOID journal carries posting evidence; the owner refuses its void"
@@ -272,15 +286,25 @@ def _void_journals(
                 outcome.exceptions.append(_void_exception(spec, row_id, "legacy VOID journal has no fiscal period"))
                 continue
             journal_uuid = UUID(str(row_id))
+            stamped = row.posted_at is not None or row.posted_by is not None
             command = VoidDraftJournal(
                 journal_id=journal_uuid,
-                reason=governance.reason,
+                reason=governance.stamped_reason if stamped else governance.reason,
                 voided_by=f"{LEGACY_REQUESTER_PREFIX}{str(creator).strip().lower()}",
                 approved_by=governance.approver,
                 approval_reference=governance.approval_reference,
             )
             try:
                 with Session(bind=dest, join_transaction_mode="create_savepoint") as session:
+                    if stamped:
+                        # Same savepoint as the void: a refused void restores the stamps.
+                        session.execute(
+                            sa.text(
+                                "UPDATE mod_accounting.journal_entries SET posted_at = NULL, posted_by = NULL "
+                                "WHERE id = :id AND tenant_id = :tenant AND status = 'DRAFT'"
+                            ),
+                            {"id": row_id, "tenant": row.tenant_id},
+                        )
                     void_draft_journal(
                         session,
                         scope=TenantScope(UUID(str(row.tenant_id))),
@@ -297,6 +321,14 @@ def _void_journals(
                 )
                 continue
             moved += 1
+            if stamped:
+                outcome.void_stamp_evidence.append(
+                    {
+                        "journal_id": str(journal_uuid),
+                        "had_posted_at": row.posted_at is not None,
+                        "had_posted_by": row.posted_by is not None,
+                    }
+                )
         if commit:
             dest.commit()
     outcome.transitioned["VOID"] = outcome.transitioned.get("VOID", 0) + moved
