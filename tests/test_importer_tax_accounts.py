@@ -130,10 +130,32 @@ def test_ledger_regime_is_decided_by_ledger_lines_not_by_the_snapshot_rule():
 
 
 def test_malformed_facts_are_named_refusals():
-    with pytest.raises(TaxAccountMappingError, match="negative_line_amount"):
-        classify_invoice(ORG, [line(1, tax="-1")], None)
     with pytest.raises(TaxAccountMappingError, match="line_id_missing_or_duplicate"):
         classify_invoice(ORG, [line(1), line(1)], None)
+
+
+def test_untaxed_negative_invoice_does_not_raise_and_has_no_class():
+    for debits in (None, {EXP: D(-40)}):
+        outcome = classify_invoice(ORG, [line(1, tax="0", amount="-40")], debits)
+        assert ref(outcome, 1) == (None, None) and outcome.klass is None
+        assert outcome.legacy_posted is (debits is not None)
+
+
+@pytest.mark.parametrize("facts", [dict(tax="10", amount="-100"), dict(tax="-10", amount="100")])
+@pytest.mark.parametrize("debits", [None, {EXP: D(110)}])
+def test_taxed_negative_invoice_is_class_x_with_null_refs(facts, debits):
+    untaxed = line(2, tax="0", amount="5")
+    outcome = classify_invoice(ORG, [line(1, tax_code=code(), **facts), untaxed], debits)
+    assert outcome.klass == "X" and outcome.legacy_posted is (debits is not None) and not outcome.other
+    assert ref(outcome, 1) == ("X", None) and ref(outcome, 2) == (None, None)
+
+
+def test_class_counts_include_x():
+    outcome = classify_invoice(ORG, [line(1, amount="-100", tax_code=code()), line(2, tax_code=code())], None)
+    counts = class_counts([outcome])
+    assert counts["X"] == dict(lines=2, invoices=1)
+    assert counts["B1"] == counts["B2"] == dict(lines=0, invoices=0)
+    assert class_counts([])["X"] == dict(lines=0, invoices=0)
 
 
 def test_class_counts_report_lines_and_invoices():
@@ -212,8 +234,10 @@ def test_enrolment_map_and_receipt_counts_over_a_snapshot():
     got = [built[str(UUID(int=2000 + i))]["tax_account_ref"] for i in range(5)]
     assert got == expected
     counts = maps.tax_account_classes()
-    assert {k: v["lines"] for k, v in counts.items()} == dict(A1=1, A2=1, A3=1, B1=1, B2=0, a1_expense_elsewhere=0)
-    assert {k: v["invoices"] for k, v in counts.items()} == dict(A1=1, A2=1, A3=1, B1=1, B2=0, a1_expense_elsewhere=0)
+    assert {k: v["lines"] for k, v in counts.items()} == dict(A1=1, A2=1, A3=1, B1=1, B2=0, X=0, a1_expense_elsewhere=0)
+    assert {k: v["invoices"] for k, v in counts.items()} == dict(
+        A1=1, A2=1, A3=1, B1=1, B2=0, X=0, a1_expense_elsewhere=0
+    )
     assert maps.summary()["supplier_line_tax_accounts"] == 5
 
 
@@ -233,6 +257,29 @@ def test_enrolment_map_uses_every_tax_codes_accounts_not_only_the_invoices_own()
     assert built[str(UUID(int=2000))]["tax_account_ref"] == EXP  # A3 now: the folded form
     assert maps.tax_account_classes()["A1"] == dict(lines=0, invoices=0)
     assert maps.tax_account_classes()["A3"]["invoices"] == 2
+
+
+def test_one_x_invoice_and_one_untaxed_negative_invoice_do_not_stop_the_others():
+    src = snapshot()
+    tc = str(UUID(int=77))
+    x_inv, credit_note = str(UUID(int=1005)), str(UUID(int=1006))
+    for inv in (x_inv, credit_note):
+        src.execute(sa.text("INSERT INTO supplier_invoice VALUES (:a, :b, NULL)"), dict(a=inv, b=ORG))
+    for n, (inv, amt, tax, code_id) in enumerate(((x_inv, "-100", "10", tc), (credit_note, "-40", "0", None))):
+        src.execute(
+            sa.text("INSERT INTO supplier_invoice_line VALUES (:a, :b, :c, :d, :e, :f)"),
+            dict(a=str(UUID(int=3000 + n)), b=inv, c=amt, d=tax, e=EXP, f=code_id),
+        )
+    maps = EnrolmentMaps(src, src)
+    built = maps.get("supplier_line_tax_accounts")
+    assert [built[str(UUID(int=2000 + i))]["tax_account_ref"] for i in range(5)] == [DEFER, EXP, EXP, DEFER, None]
+    assert built[str(UUID(int=3000))]["tax_account_ref"] is None
+    assert built[str(UUID(int=3001))]["tax_account_ref"] is None
+    counts = maps.tax_account_classes()
+    assert counts["X"] == dict(lines=1, invoices=1)
+    assert {k: v["invoices"] for k, v in counts.items() if k != "X"} == dict(
+        A1=1, A2=1, A3=1, B1=1, B2=0, a1_expense_elsewhere=0
+    )
 
 
 def test_missing_tax_code_or_account_row_refuses_the_map():
