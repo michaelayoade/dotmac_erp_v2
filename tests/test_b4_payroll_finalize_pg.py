@@ -604,6 +604,14 @@ def test_a_deduction_mapped_to_2040_is_refused_so_2040_holds_net_pay_only(engine
     refusal(engine, env, svc.approve, run_id, "deduction_mapped_to_net_payable", 1)
 
 
+def test_a_deduction_mapped_to_ap_control_2000_is_refused(engine):
+    env = world(engine, paye_liability="2000")
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    refusal(engine, env, svc.approve, run_id, "deduction_mapped_to_control", 1)
+    assert counts(engine, env.tenant_id)["payroll_liabilities"] == 0
+
+
 def test_net_payable_account_other_than_2040_is_refused(engine):
     env = world(engine, net_ref="2120")
     run_id = new_run(engine, env)

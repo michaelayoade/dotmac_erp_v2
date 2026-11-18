@@ -347,10 +347,15 @@ def _refuse_returner(
 def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]) -> None:
     """V3: every net-pay line's employee has an approved payee bank instruction, whatever the file setting.
 
-    Statutory remittances are excluded (their destination is chosen on the batch, not a person).
+    A statutory remittance goes to a destination chosen on the batch (``dest:...``), for which no payee
+    instruction exists yet, so it fails closed until statutory payees exist (separate follow-up).
     """
     if batch.kind != KIND_NET_PAY:
-        return
+        raise PayoutRefused(
+            "statutory_payee_instruction_required",
+            "A statutory remittance needs an approved payee instruction for its destination, and statutory "
+            "payees are not available yet; refer it to Finance",
+        )
     for line in lines:
         try:
             payee_service.destination_for_payment(

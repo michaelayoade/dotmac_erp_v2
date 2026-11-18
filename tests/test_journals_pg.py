@@ -1160,7 +1160,9 @@ def ledger_edit(engine, sql, **params):
             connection.execute(sa.text(f"ALTER TABLE {table} ENABLE TRIGGER posted_ledger_lines_immutable"))
 
 
-def fault_source(engine, env, *, document="g6", ledger=FAULT_LEDGER, line=FAULT_LINE, owner="legacy-erp", post=True):
+def fault_source(
+    engine, env, *, document="g6", ledger=FAULT_LEDGER, line=FAULT_LINE, owner="legacy-erp", post=True, rate=Decimal(1)
+):
     """A legacy journal Dr 1000 / Cr 2000 whose ledger amounts differ from its journal lines."""
     with Session(engine) as db:
         journal = accounting.create_journal(
@@ -1171,8 +1173,8 @@ def fault_source(engine, env, *, document="g6", ledger=FAULT_LEDGER, line=FAULT_
                 kind=JournalKind.STANDARD,
                 entry_date=DAY,
                 posting_date=DAY,
-                currency_code="USD",
-                exchange_rate=Decimal(1),
+                currency_code="USD" if rate == 1 else "EUR",
+                exchange_rate=rate,
                 description="Imported legacy AP journal",
                 source=SourceIdentity(owner, "journal", document, "1", "c" * 64),
                 lines=(
@@ -1400,3 +1402,94 @@ def test_held_drafts_are_counted_per_period_for_the_soft_close_screen(engine):
     legacy_draft(engine, env, document="c", owner="finance")
     with Session(engine) as db:
         assert queries.held_counts_by_period(db, tenant_id=env.tenant_id) == {env.periods[1]: 2}
+
+
+def test_v2_a_clean_journal_at_a_rate_other_than_one_shows_no_fault(engine):
+    env = seed(engine)
+    # 98.5 EUR at rate 2 is 197 functional on both the journal lines and the ledger: no fault at all.
+    clean = fault_source(engine, env, document="fx-clean", ledger=FAULT_LINE, rate=Decimal(2))
+    assert ledger_net(engine, env, "2000") == -2 * FAULT_LINE
+    before = counts(engine, env)
+    refused_fix(lambda: prepare_fix(engine, env, clean), "no_ledger_fault")
+    assert counts(engine, env) == before
+
+
+def test_v2_a_real_fault_at_a_rate_other_than_one_is_measured_in_functional_currency(engine):
+    env = seed(engine)
+    source = fault_source(engine, env, document="fx-fault", ledger=Decimal("300"), rate=Decimal(2))  # lines 197
+    outcome = prepare_fix(engine, env, source)
+    with Session(engine) as db:
+        net = db.scalar(
+            sa.select(sa.func.sum(JournalLine.debit_functional - JournalLine.credit_functional)).where(
+                JournalLine.journal_id == outcome.journal_id, JournalLine.account_id == env.accounts["2000"]
+            )
+        )
+    assert net == Decimal("103")  # 300 - 197
+    request(engine, env, outcome)
+    approve(engine, env, outcome)
+    assert ledger_net(engine, env, "2000") == Decimal("-197")
+
+
+def reject_fix(engine, env, outcome):
+    run(
+        engine,
+        env,
+        service.reject,
+        manual_id=outcome.manual_id,
+        actor=env.parties["approver"],
+        reason="wrong offset chosen",
+    )
+
+
+def test_v2_a_live_correction_replays_only_for_the_same_offset(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    first = prepare_fix(engine, env, source)
+    assert prepare_fix(engine, env, source).replayed is True  # same fault, same offset
+    before = counts(engine, env)
+    refused_fix(lambda: prepare_fix(engine, env, source, offset="1400"), "ledger_fault_correction_active")
+    assert counts(engine, env) == before
+    request(engine, env, first)
+    refused_fix(lambda: prepare_fix(engine, env, source, offset="1400"), "ledger_fault_correction_active")
+    approve(engine, env, first)
+    refused_fix(lambda: prepare_fix(engine, env, source, offset="1400"), "ledger_fault_correction_active")
+    assert prepare_fix(engine, env, source).replayed is True  # posted: still the same one
+
+
+def test_v2_after_a_rejection_a_new_version_with_another_offset_can_be_prepared_and_posted(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    first = prepare_fix(engine, env, source)
+    request(engine, env, first)
+    reject_fix(engine, env, first)
+    second = prepare_fix(engine, env, source, offset="1400")
+    assert second.replayed is False and second.manual_id != first.manual_id
+    with Session(engine) as db:
+        assert db.get(JournalEntry, second.journal_id).source_version == "2"
+        assert db.get(JournalEntry, first.journal_id).source_version == "1"
+    request(engine, env, second)
+    approve(engine, env, second)
+    assert ledger_net(engine, env, "2000") == -FAULT_LINE
+
+
+def test_v2_after_a_reversal_a_new_version_can_be_prepared_and_the_fault_is_cleared_again(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    first = prepare_fix(engine, env, source)
+    request(engine, env, first)
+    approve(engine, env, first)
+    run(
+        engine,
+        env,
+        service.request_reversal,
+        manual_id=first.manual_id,
+        actor=env.parties["requester"],
+        reason="wrong offset",
+        posting_date=DAY,
+    )
+    run(engine, env, service.approve_reversal, manual_id=first.manual_id, approver=env.parties["approver2"])
+    second = prepare_fix(engine, env, source, offset="1400")
+    assert second.replayed is False
+    request(engine, env, second)
+    approve(engine, env, second)
+    assert ledger_net(engine, env, "2000") == -FAULT_LINE

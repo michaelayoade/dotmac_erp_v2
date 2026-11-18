@@ -1353,3 +1353,17 @@ def test_v3_with_a_file_the_existing_codes_still_apply(engine):
         db.execute(sa.delete(PayeeBankInstruction).where(PayeeBankInstruction.tenant_id == env.tenant_id))
         db.commit()
     refused(lambda: record(engine, env, pid), "payee_instruction_unavailable")
+
+
+@pytest.mark.parametrize("code", ["2000", "2040"])
+def test_a_bank_whose_cash_gl_is_a_control_account_is_refused(engine, code):
+    env = world(engine)
+    oid = open_obligation(engine, env)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(BankAccount).where(BankAccount.id == env.bank_id).values(cash_account_ref=str(env.accounts[code]))
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: prepare(engine, env, oid), "cash_account_is_control")
+    assert counts(engine, env) == before

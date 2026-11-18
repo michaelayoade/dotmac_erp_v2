@@ -1017,24 +1017,21 @@ def test_missing_instruction_refuses_the_file(engine):
 # --- statutory remittances: recorded the same way, never a file ------------------
 
 
-def test_statutory_remittance_is_recorded_without_a_file_dr_liability_cr_bank(engine):
+def test_statutory_remittance_fails_closed_until_statutory_payees_exist(engine):
+    """Michael (v1531): statutory remittances are NOT exempt from V3. No statutory payee instruction exists
+    yet (a separate follow-up), so a statutory batch can be prepared but never approved or recorded."""
     env = world(engine)
-    enable_file(engine, env)  # even with files enabled a remittance has none
+    enable_file(engine, env)
     run_id = finalized(engine, env)
     out = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
     batch = batch_row(engine, out.batch_id)
     assert batch.kind == "statutory" and batch.line_count == 2 and batch.total_amount == Decimal("15000")
-    approve(engine, env, out.batch_id)
+    before = counts(engine, env)
+    refused(lambda: approve(engine, env, out.batch_id), "statutory_payee_instruction_required")
+    refused(lambda: record(engine, env, out.batch_id), "not_approved")
+    assert counts(engine, env) == before
+    assert batch_row(engine, out.batch_id).status == "draft"
     refused(lambda: generate(engine, env, out.batch_id), "statutory_no_file")
-    assert counts(engine, env)["erp_disbursement_file_receipts"] == 0
-    refused(lambda: record(engine, env, out.batch_id, who="approver"), "sod_recorder_is_approver")
-    assert record(engine, env, out.batch_id, "FIRS-REMIT-1").journals == 2
-    debits, credits, journals = settlement_posting(engine, env)
-    assert journals == 2 and debits["2110"] == Decimal("15000") and credits["1000"] == Decimal("15000")
-    assert "2040" not in debits
-    rows = liabilities(engine, env, run_id)
-    assert rows[("component", "dest:PAYE")].status == "settled"
-    assert rows[("employee-net-pay", env.emp["E1"])].status == "outstanding"  # net pay untouched
 
 
 def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
@@ -1054,14 +1051,12 @@ def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
     )
 
 
-def test_statutory_sod_has_no_instruction_rule_but_keeps_three_distinct_people(engine):
+def test_statutory_batch_keeps_its_sod_check_and_then_fails_closed_at_v3(engine):
     env = world(engine)
     run_id = finalized(engine, env)
     batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
     refused(lambda: approve(engine, env, batch_id, who="preparer"), "sod_approver_is_preparer")
-    approve(engine, env, batch_id)
-    refused(lambda: record(engine, env, batch_id, who="preparer"), "sod_recorder_is_preparer")
-    assert record(engine, env, batch_id).journals == 2
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
 
 
 # --- internal recovery exclusion (a3 explicit kind; a4 settlement_mode) ---------------
@@ -1303,12 +1298,12 @@ def test_with_files_enabled_recording_requires_the_issued_file(engine):
     assert record(engine, env, batch_id).journals == 3
 
 
-def test_statutory_recording_never_needs_a_file_even_when_files_are_enabled(engine):
+def test_statutory_batch_is_refused_even_when_files_are_enabled(engine):
     env = world(engine)
     enable_file(engine, env)
     run_id = finalized(engine, env)
-    batch_id = approved_batch(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
-    assert record(engine, env, batch_id).journals == 2
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
 
 
 @pytest.mark.parametrize("role", ["proposer", "decider"])
@@ -1486,9 +1481,23 @@ def test_v3_record_refuses_when_an_instruction_is_gone_and_no_file_was_issued(en
     assert record(engine, env, batch_id).replayed is False
 
 
-def test_v3_does_not_apply_to_statutory_batches(engine):
-    env = world(engine, payees=False)  # no employee instruction at all
+def test_v3_statutory_batches_fail_closed_with_their_own_code(engine):
+    env = world(engine, payees=False)
     run_id = finalized(engine, env)
     batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
-    approve(engine, env, batch_id)
-    assert record(engine, env, batch_id).journals == 2
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
+    assert batch_row(engine, batch_id).status == "draft"
+
+
+@pytest.mark.parametrize("code", ["2000", "2040"])
+def test_a_bank_whose_cash_gl_is_a_control_account_is_refused_for_payroll_too(engine, code):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(BankAccount).where(BankAccount.id == env.bank_id).values(cash_account_ref=str(env.accounts[code]))
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: prepare(engine, env, run_id), "cash_account_is_control")
+    assert counts(engine, env) == before

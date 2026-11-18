@@ -4,12 +4,15 @@ V1-V3 live in the native workflows (journals, supplier invoices, payments, payou
 admission paths must not be able to reach them, so the rehearsal evidence of the step-3 image stays
 valid. Four mechanical checks, none of which needs a database:
 
-* import graph: nothing under importer/, legacy_ap/, payees/, posting/, migrations/ imports a
-  validated workflow or ``ledger_roles``, except the two named, pinned legacy edges;
+* direct imports: nothing under importer/, legacy_ap/, payees/, posting/, migrations/ imports a
+  validated workflow or ``ledger_roles``, except the two named, pinned legacy edges. This is a check
+  of DIRECT import statements only. ``importer.cli`` reaches ``erp_v2.assembly``, which loads these
+  modules, but loading is not calling: the importer never calls their commands (it is a SQL executor);
 * the two imported names of ``revenue_approval_services`` (B1b) are AST-identical to origin/main;
 * the audit action values and permission codes are unchanged;
 * the delta gate: the changed files are a subset of the allowed set and the protected tests are
-  byte-identical (needs ``origin/main``; skipped, loudly, where the checkout has none).
+  byte-identical. It needs ``origin/main``; locally it skips, loudly, without it, and under CI it FAILS
+  without it (the workflow fetches full history so the ref exists).
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import ast
 import fnmatch
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -153,6 +157,10 @@ ALLOWED_SRC = {
     "src/erp_v2/journals/queries.py",
     "src/erp_v2/supplier_payments/service.py",
     "src/erp_v2/payroll_payouts/service.py",
+    # V2 closes B4's bare-control path (an external deduction mapped to 2000): outside the original
+    # gate, widened explicitly by the architect's review of #61.
+    "src/erp_v2/web/payroll_run_services.py",
+    ".github/workflows/ci.yml",
 }
 ALLOWED_PATTERNS = ("src/erp_v2/templates/*", "tests/*", "docs/*.md")
 PROTECTED_TESTS = (
@@ -199,6 +207,8 @@ def _changed(base: str) -> list[str]:
 
 def test_delta_gate_changed_files_are_inside_the_allowed_set_and_protected_tests_are_untouched():
     base = _base()
+    if base is None and os.environ.get("GITHUB_ACTIONS") == "true" and not os.environ.get("ERP_GATE_OPTIONAL"):
+        pytest.fail("origin/main is missing under CI: fetch full history so the delta gate can run")
     if base is None:
         pytest.skip("origin/main is not available in this checkout; run the gate where it is")
     changed = _changed(base)

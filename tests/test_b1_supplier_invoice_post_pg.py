@@ -617,3 +617,38 @@ def test_v1_refusals_come_after_the_historical_and_receipt_checks(engine):
         db.commit()
     refusal(engine, env, hist, "historical_invoice")
     refusal(engine, env, approved, "approved_without_ledger_receipt")
+
+
+@pytest.mark.parametrize("code", ["1410", "2040", "2000"])
+def test_v2_draft_refuses_a_control_account_as_the_line_account_dr_1410_cr_2000(engine, code):
+    env = world(engine)
+    control = env.accounts[code] if code in env.accounts else add_account(engine, env, code)
+    draft_refused(engine, env, "line_account_is_control", posting_account_id=str(control), tax="0")
+
+
+def test_v2_draft_refuses_a_control_account_as_the_tax_account(engine):
+    env = world(engine)
+    draft_refused(engine, env, "line_account_is_control", tax_account_id=str(env.accounts["2040"]))
+
+
+@pytest.mark.parametrize("code", ["1410", "2040"])
+def test_v2_b1_refuses_an_imported_shape_invoice_whose_line_account_is_a_control_account(engine, code):
+    env = world(engine)
+    control = env.accounts[code] if code in env.accounts else add_account(engine, env, code)
+    iid = invoice(engine, env, submit=False)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(SupplierInvoiceLine)
+            .where(SupplierInvoiceLine.invoice_id == iid)
+            .values(posting_account_ref=str(control))
+        )
+        db.commit()
+    submit(engine, env, iid)
+    refusal(engine, env, iid, "line_account_is_control")
+    assert status(engine, iid) == InvoiceStatus.SUBMITTED
+
+
+def test_v2_b1_refuses_a_control_account_as_the_tax_account(engine):
+    env = world(engine)
+    iid = invoice(engine, env, tax_account=env.accounts["2040"])
+    refusal(engine, env, iid, "line_account_is_control")
