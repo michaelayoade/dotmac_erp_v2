@@ -54,13 +54,31 @@ An allowlist, so a new check is strict by default (`erp_v2/importer/admission_wa
 | `source_amount_scale` | the two-decimal check on header amounts |
 | `legacy_gl_tax_treatment_unrecognised` | the A3 refusal |
 | `deferral_amount_mismatch` | the A3 refusal when its reason is the deferral mismatch |
-| `line_tax_detail` | nothing yet: no verifier reads line-tax detail, so a decision naming it is refused as `waiver_not_needed` |
 
-Never waivable: tenant, snapshot binding, fingerprint, the GL tie (the journal's control credit equals the
+Never waivable: `source_journal_shared` (one legacy journal never backs two invoices: refused when another legacy
+invoice references the journal or a historical invoice/settlement receipt already names it; the decision file
+may not name one journal twice, and the table has a unique index on it), the payment-GL check behind
+`source_allocations` (`allocation_payment_gl_effect` / `allocation_payment_gl_unproven`: the waiver is refused when
+an allocated payment posted to the control account or the snapshot cannot identify the payment), tenant, snapshot binding, fingerprint, the GL tie (the journal's control credit equals the
 invoice total, settled residual against the control account), currency and FX, duplicate admission, the
 destination-equals-source journal and ledger proofs, the V1 tax-account rule. A waiver for a check that does
 not fail is refused (`waiver_not_needed`), so a stale decision cannot linger. The waived name, the review id's
 decision and sha enter the evidence fingerprint, and the audit event of the admission records them.
+
+Admit-with-waiver on a posted invoice carries `legacy_journal_id` in the decision row; the verifier requires it to
+equal the invoice's own journal (`review_journal_mismatch`). One waiver per invoice (D-M3) is enforced in the CLI,
+the verifier and the database. `line_tax_detail` is not in the vocabulary.
+
+Waivers that leave the GL and the subledger disagreeing on tax (`legacy_gl_tax_treatment_unrecognised`,
+`deferral_amount_mismatch`) are flagged `requires_correcting_journal` in the plan/receipt
+(`reviewed_admissions`) and in the audit event, so B-9 cannot close the exception without the E08 correcting
+journal. The audit event and the private plan carry the readable `legacy_header_status` (status/posting status)
+and the waived check name, not only the fingerprint.
+
+Transforms and waivers are distinct. `WaiverGate(review, transform={name: rule_id})` takes the failures an
+approved importer transform (#68 transform manifest) already fixed: such a failure needs no waiver and does not
+trip `waiver_not_needed`; the evidence records `transforms` and `review` separately. The verifiers take the same
+input as `transforms=((name, rule_id), ...)`; it is empty until the #68 manifest is wired in.
 
 ## Verifier integration
 
@@ -88,3 +106,17 @@ owner's consequence:
 A per-tenant policy, default OFF (`erp_v2.governance`). The policy is read when a decision is recorded and
 stamped on the row. ON: the applying operator must differ from the person who decided each row (database CHECK
 and CLI refusal `dual_control_operator_is_decider`). OFF: one person may do both.
+
+## IAS 8: fiscal year, fingerprint, later credit notes
+
+* IAS 8 mode applies only when the invoice's fiscal year is EARLIER than the fiscal year of the first open period
+  (`ias8_same_fiscal_year` otherwise): a soft-closed month of the current year never posts to 3100.
+* Fingerprint relationship: the owner's consequence, its fingerprint and the accounting receipt are the standard
+  ones (the receipt records the owner's consequence fingerprint). The IAS 8 journal has its own request
+  fingerprint (different date and expense account) and is derived deterministically from the owner's
+  consequence, the review id and the decision file; the receipt's accounting evidence fingerprint is that
+  journal's. The two are tied by the document identity (same source owner, kind and document id) and the review
+  id on the journal, not by equal fingerprints.
+* A later credit note against an IAS 8 invoice credits current-year P&L (the credit note posts at its own date to
+  the expense account of its lines); it does not reverse the 3100 charge. A prior-period write-back needs its own
+  IAS 8 decision.

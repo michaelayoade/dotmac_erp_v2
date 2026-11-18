@@ -36,6 +36,7 @@ from erp_v2.importer.payables_history import (
     HistoricalEvidenceError,
     ReviewFacts,
     WaiverGate,
+    _allocations_without_control_effect,
     _amount,
     _at_scale,
     _database,
@@ -106,6 +107,7 @@ class ApprovedInvoiceVerifier:
     manifest: SnapshotManifest
     evidence_reference: str
     source_owner: str = SOURCE_OWNER
+    transforms: tuple[tuple[str, str], ...] = ()
 
     def command(
         self, evidence: ApprovedInvoiceRecognitionEvidence, *, recognized_by: str, approval_reference: str
@@ -151,7 +153,8 @@ class ApprovedInvoiceVerifier:
             connection = destination.connection()
             _require(_database(connection) == manifest.destination_database, "destination_database")
             gate = WaiverGate(
-                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=RECOGNITION_DECISIONS)
+                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=RECOGNITION_DECISIONS),
+                dict(self.transforms),
             )
             try:
                 result = self._evidence(tenant, invoice_id, connection, gate)
@@ -173,6 +176,7 @@ class ApprovedInvoiceVerifier:
     def _evidence(
         self, tenant: UUID, invoice_id: UUID, dest: sa.Connection, gate: WaiverGate
     ) -> ApprovedInvoiceRecognitionEvidence:
+        _require(gate.review is None or gate.review.legacy_journal_id is None, "review_journal_unexpected")
         src = self.source
         header = _one(
             _read(src, "supplier_invoice", key="invoice_id", value=invoice_id), "source_invoice_missing_or_duplicate"
@@ -190,6 +194,8 @@ class ApprovedInvoiceVerifier:
         )
         _require(header["is_prepayment"] is False and header["prepayment_applied"] == 0, "source_prepayment")
         _require(header["stamp_duty_amount"] == 0, "unsupported_stamp_duty")
+        if "source_allocations" in gate.waived and _read(src, "payment_allocation", key="invoice_id", value=invoice_id):
+            _allocations_without_control_effect(src, invoice_id, header["ap_control_account_id"])
         gate.require(
             not _read(src, "payment_allocation", key="invoice_id", value=invoice_id),
             "source_allocations",

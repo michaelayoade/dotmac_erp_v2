@@ -44,11 +44,12 @@ WAIVABLE_CHECKS: Final = {
     "deferral_amount_mismatch": ("legacy_gl_tax_treatment_unrecognised",),
     # E07: header unposted (e.g. APPROVED, NOT_POSTED) but linked to a legacy journal the GL holds POSTED
     "legacy_journal_link_unposted": ("source_status", "source_posted_at"),
-    # E10: line tax detail inconsistent. No verifier check reads line-tax detail today (the GL proof decides),
-    # so this name is accepted in a decision file but no verifier consumes it: it is refused at admission as
-    # ``waiver_not_needed`` rather than silently honoured. Open question for the architect.
-    "line_tax_detail": (),
 }
+
+# An admission that waived one of these is admitted at the residual the GL proves while the GL and the
+# subledger still disagree on the tax: it must be closed by a correcting journal (E08), so the receipt flags it
+# ``requires_correcting_journal`` and B-9 cannot close the exception without that journal.
+REQUIRES_CORRECTING_JOURNAL: Final = frozenset({"legacy_gl_tax_treatment_unrecognised", "deferral_amount_mismatch"})
 
 # Documentation of what must stay mandatory; ``tests`` assert none of these is a waivable name.
 NEVER_WAIVABLE: Final = (
@@ -59,6 +60,7 @@ NEVER_WAIVABLE: Final = (
     "residual_vs_control",
     "currency_fx",  # unsupported_currency
     "duplicate_admission",
+    "source_journal_shared",  # one legacy journal never backs two invoices
 )
 
 # D-M3 says "one named verifier check per invoice".

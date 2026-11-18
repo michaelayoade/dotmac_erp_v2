@@ -66,6 +66,12 @@ class Command:
 
 
 class Verifier:
+    source = None
+
+    @staticmethod
+    def review(**_):
+        return None  # no Finance decision on file
+
     def __init__(self, fail=False):
         self.fail = fail
         self.calls = []

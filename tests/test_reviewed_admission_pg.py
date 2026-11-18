@@ -202,15 +202,30 @@ def insert_sql(env, iid, **change):
         by="Finance Lead",
         at=datetime.now(UTC),
         a=None,
+        j=None,
         op="operator",
         dc=False,
     )
     values.update(change)
     return sa.text(
         "INSERT INTO erp_admission_reviews (id, tenant_id, legacy_invoice_id, decision, waived_checks, evidence_sha, "
-        "decision_file_sha, snapshot_sha256, decided_by, decided_at, ias8_account_id, operator_ref, dual_control) "
-        "VALUES (:id, :t, :i, :d, CAST(:w AS jsonb), :e, :f, :s, :by, :at, :a, :op, :dc)"
+        "decision_file_sha, snapshot_sha256, decided_by, decided_at, ias8_account_id, legacy_journal_id, operator_ref, "
+        "dual_control) VALUES (:id, :t, :i, :d, CAST(:w AS jsonb), :e, :f, :s, :by, :at, :a, :j, :op, :dc)"
     ), values
+
+
+def test_one_legacy_journal_cannot_back_two_invoices_in_the_table_or_the_plan(engine, setup):
+    env, _ = setup
+    a, b = imported(engine, env, number="AP-1"), imported(engine, env, number="AP-2")
+    journal = str(uuid4())
+    record(engine, env, [row(a, legacy_journal_id=journal)])
+    # the plan refuses a second invoice naming the journal an earlier decision bound
+    plan = record(engine, env, [row(b, legacy_journal_id=journal)], apply=False)
+    assert plan["refusals_by_reason"] == {"journal_already_reviewed_for_another_invoice": 1}
+    # and the database refuses it whatever the file said
+    statement, values = insert_sql(env, b, j=journal)
+    with engine.connect() as conn, pytest.raises(sa.exc.IntegrityError, match="uq_erp_admission_reviews_journal"):
+        conn.execute(statement, values)
 
 
 @pytest.mark.parametrize(
@@ -361,15 +376,85 @@ def test_a_waiver_the_invoice_does_not_need_is_refused_and_another_decision_bloc
     assert refusals == {"legacy_evidence:waiver_not_needed": 1, "legacy_evidence:review_decision_not_admission": 1}
 
 
+def test_allocation_waiver_never_hides_a_payment_posted_to_the_control_account(engine, setup):
+    env, legacy = setup
+    iid = imported(engine, env)
+    pay = str(uuid4())
+    legacy.allocations.append(dict(invoice_id=str(iid), payment_id=pay))
+    legacy.ledger.append(
+        dict(
+            ledger_line_id=str(uuid4()),
+            source_document_id=pay,
+            account_id=str(env.accounts["2000"]),
+            debit_amount="10",
+            credit_amount="0",
+        )
+    )
+    legacy.build((iid,))
+    record(engine, env, [row(iid, waived=("source_allocations",))])
+    plan = legacy.run(engine, (iid,), apply=False)
+    assert plan["refusals_by_reason"] == {"legacy_evidence:allocation_payment_gl_effect": 1}
+
+
 # --- IAS 8 posting mode (D-M5) ------------------------------------------------------------------------------------
 
 
+def close_period(engine, env, period_id):
+    from dotmac_accounting import service as accounting
+    from dotmac_accounting.contracts import CloseCheck, PeriodCloseEvidence
+
+    with Session(engine) as db:
+        accounting.soft_close_period(
+            db,
+            scope=env.scope,
+            period_id=period_id,
+            evidence=PeriodCloseEvidence((CloseCheck("CHECK1", True, "evidence-1", "e" * 64),)),
+            actor_ref="test",
+            approval_reference="close-ias8",
+            occurred_at=bridge_pg.NOW,
+        )
+        db.commit()
+
+
+def fy2025_december(engine, env):
+    """FY2025 (December, soft-closed) next to the open FY2026 January: the earlier-year shape."""
+    from datetime import date
+
+    from dotmac_accounting import service as accounting
+    from dotmac_accounting.contracts import PeriodStatus
+    from dotmac_accounting.models import FiscalPeriod, FiscalYear
+
+    with Session(engine) as db:
+        year = FiscalYear(
+            tenant_id=env.tenant_id,
+            code="FY25",
+            name="FY 2025",
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+        )
+        db.add(year)
+        db.flush()
+        period = FiscalPeriod(
+            tenant_id=env.tenant_id,
+            fiscal_year_id=year.id,
+            period_number=12,
+            name="Dec",
+            start_date=date(2025, 12, 1),
+            end_date=date(2025, 12, 31),
+            status=PeriodStatus.FUTURE,
+        )
+        db.add(period)
+        db.flush()
+        accounting.open_period(db, scope=env.scope, period_id=period.id, actor_ref="test", occurred_at=bridge_pg.NOW)
+        db.commit()
+        period_id = period.id
+    close_period(engine, env, period_id)
+
+
 def ias8_world(engine, env, legacy):
-    """January is soft-closed (the prior period), February is open: the FY2025/FY2026 shape in miniature."""
-    open_february(engine, env)
-    iid = imported(engine, env, number="AP-IAS8", period_date="2026-01-10")
+    iid = imported(engine, env, number="AP-IAS8", period_date="2025-12-10")
     legacy.build((iid,))
-    soft_close(engine, env)
+    fy2025_december(engine, env)
     return iid, add_3100(engine, env)
 
 
@@ -394,10 +479,10 @@ def test_ias8_mode_posts_in_the_first_open_period_with_the_expense_side_on_3100(
     review = reviews(engine, env)[0]
     with Session(engine) as db:
         invoice = db.get(SupplierInvoice, iid)
-        assert invoice.invoice_date.isoformat() == "2026-01-10"  # the document is never re-dated
+        assert invoice.invoice_date.isoformat() == "2025-12-10"  # the document is never re-dated
         receipt = db.scalar(sa.select(AccountingReceipt).where(AccountingReceipt.document_id == iid))
         journal = db.get(JournalEntry, UUID(receipt.accounting_reference))
-        assert journal.posting_date.isoformat() == "2026-02-01" and journal.entry_date.isoformat() == "2026-02-01"
+        assert journal.posting_date.isoformat() == "2026-01-01" and journal.entry_date.isoformat() == "2026-01-01"
         assert journal.source_owner == "payables" and journal.source_document_id == str(iid)
         # the review id and decision are the evidence carried on the journal
         assert str(review.id) in journal.description and review.decision_file_sha[:16] in journal.description
@@ -420,21 +505,37 @@ def test_ias8_mode_posts_in_the_first_open_period_with_the_expense_side_on_3100(
                 AuditEvent.entity_id == str(iid),
             )
         )
-    assert event.details["review_id"] == str(review.id) and event.details["ias8_posting_date"] == "2026-02-01"
+    assert event.details["review_id"] == str(review.id) and event.details["ias8_posting_date"] == "2026-01-01"
+    assert event.details["legacy_header_status"] == "APPROVED/NOT_POSTED"
     # replay is a no-op
     again = legacy.run(engine, (iid,), apply=False)
     assert again["counts"] == dict(requested=1, eligible=0, already_done=1, refused=0)
     assert legacy.run(engine, (iid,), apply=True, digest=again["plan_digest"])["applied"] == 0
 
 
-def test_ias8_refuses_when_the_period_is_open_or_no_later_period_is_open(engine, setup):
+def test_a_soft_closed_month_of_the_same_fiscal_year_never_posts_to_3100(engine, setup):
+    """January soft-closed, February open: both FY2026. IAS 8 is for an earlier year only."""
+    env, legacy = setup
+    open_february(engine, env)
+    iid = imported(engine, env, number="AP-SAMEYEAR", period_date="2026-01-10")
+    legacy.build((iid,))
+    soft_close(engine, env)
+    decide_ias8(engine, env, iid, add_3100(engine, env))
+    plan = legacy.run(engine, (iid,), apply=False)
+    assert plan["refusals_by_reason"] == {"ias8_same_fiscal_year": 1} and plan["counts"]["eligible"] == 0
+    before = counts(engine, env.tenant_id)
+    with pytest.raises(cli.RecognizeRefusal, match="list_not_fully_eligible"):
+        legacy.run(engine, (iid,), apply=True, digest=plan["plan_digest"])
+    assert counts(engine, env.tenant_id) == before
+
+
+def test_ias8_refuses_when_the_period_is_open(engine, setup):
     env, legacy = setup
     # the invoice's period is OPEN: this is not a prior-period item, the normal path applies
     iid = imported(engine, env, number="AP-OPEN")
     open_february(engine, env)
     legacy.build((iid,))
-    account = add_3100(engine, env)
-    decide_ias8(engine, env, iid, account)
+    decide_ias8(engine, env, iid, add_3100(engine, env))
     assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"ias8_period_open_use_normal_path": 1}
 
 

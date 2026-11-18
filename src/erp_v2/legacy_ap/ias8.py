@@ -5,6 +5,8 @@ error, not a current-period expense. Under a Finance decision ``ias8_post`` the 
 is kept as it is (the owner still recognises the liability and records its receipt against its own
 consequence) and the journal that actually posts is derived from it:
 
+* the invoice's fiscal year must be EARLIER than the posting period's fiscal year (a soft-closed month of the
+  current year never posts to 3100);
 * the posting date is the first day of the tenant's first OPEN, non-adjustment fiscal period, which must be
   later than the invoice date (otherwise it is not a prior-period item and the decision is refused);
 * the expense-side debits (every debit that is not the line's tax account) go to the decision's account, which
@@ -37,23 +39,30 @@ class Ias8Refused(ValueError):
         super().__init__(reason)
 
 
-def first_open_period_start(session: Session, tenant: UUID) -> date | None:
+def first_open_period(session: Session, tenant: UUID):
     from dotmac_accounting.contracts import PeriodStatus
     from dotmac_accounting.models import FiscalPeriod
 
     return session.scalar(
-        sa.select(sa.func.min(FiscalPeriod.start_date)).where(
+        sa.select(FiscalPeriod)
+        .where(
             FiscalPeriod.tenant_id == tenant,
             FiscalPeriod.status == PeriodStatus.OPEN,
             FiscalPeriod.is_adjustment.is_(False),
         )
+        .order_by(FiscalPeriod.start_date)
+        .limit(1)
     )
 
 
 def posting_date_for(session: Session, tenant: UUID, invoice_date: date) -> date:
-    """The IAS 8 posting date, or a named refusal. The invoice's own period must be genuinely closed to posting."""
+    """The IAS 8 posting date, or a named refusal.
+
+    IAS 8 applies only to an EARLIER fiscal year: the invoice's fiscal year must start before the fiscal year of
+    the first open period. A closed month of the same fiscal year is an ordinary late posting, never 3100.
+    """
     from dotmac_accounting.contracts import PeriodStatus
-    from dotmac_accounting.models import FiscalPeriod
+    from dotmac_accounting.models import FiscalPeriod, FiscalYear
 
     own = list(
         session.scalars(
@@ -68,10 +77,22 @@ def posting_date_for(session: Session, tenant: UUID, invoice_date: date) -> date
         raise Ias8Refused("ias8_invoice_period_missing")
     if own[0].status == PeriodStatus.OPEN and not own[0].is_adjustment:
         raise Ias8Refused("ias8_period_open_use_normal_path")
-    start = first_open_period_start(session, tenant)
-    if start is None or start <= invoice_date:
+    target = first_open_period(session, tenant)
+    if target is None or target.start_date <= invoice_date:
         raise Ias8Refused("ias8_no_later_open_period")
-    return start
+    years = {
+        y.id: y.start_date
+        for y in session.scalars(
+            sa.select(FiscalYear).where(
+                FiscalYear.tenant_id == tenant, FiscalYear.id.in_([own[0].fiscal_year_id, target.fiscal_year_id])
+            )
+        )
+    }
+    if len(years) != len({own[0].fiscal_year_id, target.fiscal_year_id}):
+        raise Ias8Refused("ias8_fiscal_year_missing")
+    if not years[own[0].fiscal_year_id] < years[target.fiscal_year_id]:
+        raise Ias8Refused("ias8_same_fiscal_year")
+    return target.start_date
 
 
 def require_account(session: Session, tenant: UUID, account_id: str | None) -> str:

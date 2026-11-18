@@ -189,6 +189,7 @@ class ReviewFacts:
     evidence_sha: str
     decision_file_sha: str
     ias8_account_id: str | None = None
+    legacy_journal_id: str | None = None
 
 
 class WaiverGate:
@@ -200,15 +201,25 @@ class WaiverGate:
     review row the gate is inert and every verifier behaves as before.
     """
 
-    def __init__(self, review: ReviewFacts | None = None):
+    def __init__(self, review: ReviewFacts | None = None, transform: dict[str, str] | None = None):
+        """``transform`` maps a waivable check name to the id of the approved importer transform that fixes that
+        failure (read from the transform manifest by the caller). A transform-fixed failure needs no waiver and
+        does not trip ``waiver_not_needed``; transforms and waivers are kept distinct in the evidence."""
         self.review = review
         self.waived = frozenset(review.waived) if review else frozenset()
+        self.transform = dict(transform or {})
         self.used: set[str] = set()
+        self.transformed: dict[str, str] = {}
 
     def require(self, ok: bool, reason: str, waiver: str | tuple[str, ...] | None = None, flag: str | None = None):
         if ok:
             return
-        for name in (waiver,) if isinstance(waiver, str) else (waiver or ()):
+        names = (waiver,) if isinstance(waiver, str) else (waiver or ())
+        for name in names:
+            if name in self.transform and reason in admission_waivers.WAIVABLE_CHECKS.get(name, ()):
+                self.transformed[name] = self.transform[name]
+                return
+        for name in names:
             if name in self.waived and reason in admission_waivers.WAIVABLE_CHECKS.get(name, ()):
                 self.used.add(name)
                 return
@@ -222,16 +233,17 @@ class WaiverGate:
 
     def facts(self) -> dict:
         """Fingerprint keys; absent when nothing is waived, so existing fingerprints are unchanged."""
-        if not self.waived or self.review is None:
-            return {}
-        return dict(
-            review=dict(
+        out: dict = {}
+        if self.transformed:
+            out["transforms"] = dict(sorted(self.transformed.items()))
+        if self.waived and self.review is not None:
+            out["review"] = dict(
                 waived=sorted(self.waived),
                 decision=self.review.decision,
                 evidence_sha=self.review.evidence_sha,
                 decision_file_sha=self.review.decision_file_sha,
             )
-        )
+        return out
 
 
 def load_review(
@@ -276,7 +288,67 @@ def load_review(
         evidence_sha=row["evidence_sha"],
         decision_file_sha=row["decision_file_sha"],
         ias8_account_id=None if row["ias8_account_id"] is None else str(row["ias8_account_id"]),
+        legacy_journal_id=None if row["legacy_journal_id"] is None else str(row["legacy_journal_id"]),
     )
+
+
+def admission_notes(src: sa.Connection, invoice_id: UUID, review: ReviewFacts | None) -> dict:
+    """Readable admission evidence for receipts and audit (not only the fingerprint): the legacy header status
+    pair, the waived check name, and whether the admission needs a correcting journal (E08)."""
+    if review is None:
+        return {}
+    header = _one(_read(src, "supplier_invoice", key="invoice_id", value=invoice_id), "source_invoice_missing")
+    return dict(
+        review_id=review.review_id,
+        review_decision=review.decision,
+        waived_checks=list(review.waived),
+        legacy_header_status=f"{header['status']}/{header['posting_status']}",
+        decision_file_sha=review.decision_file_sha,
+        evidence_sha=review.evidence_sha,
+        requires_correcting_journal=bool(set(review.waived) & admission_waivers.REQUIRES_CORRECTING_JOURNAL),
+    )
+
+
+def _allocations_without_control_effect(src: sa.Connection, invoice_id: UUID, control: object) -> None:
+    """Never waivable: waiving ``source_allocations`` must not hide a payment that posted to the AP control
+    account. Every allocation's payment must be identified and have no posted debit to the control account;
+    if the snapshot cannot prove that, the waiver is refused."""
+    table = _reflect(
+        src, "payment_allocation", SOURCE_SCHEMAS["payment_allocation"] if src.dialect.name == "postgresql" else None
+    )
+    _require("payment_id" in table.c, "allocation_payment_gl_unproven")
+    for alloc in _read(src, "payment_allocation", key="invoice_id", value=invoice_id, fields=["payment_id"]):
+        if alloc["payment_id"] is None:
+            continue
+        for line in _read(src, "posted_ledger_line", key="source_document_id", value=alloc["payment_id"]):
+            _require(
+                not (_equal(line["account_id"], control) and line["debit_amount"] != 0), "allocation_payment_gl_effect"
+            )
+
+
+def _journal_not_shared(src: sa.Connection, dest: sa.Connection, journal_id: object, invoice_id: object) -> None:
+    """Never waivable (``source_journal_shared``): one legacy journal never backs two invoices. Refuses when
+    another legacy invoice references the journal, or when a historical invoice or settlement receipt of
+    another document already names it."""
+    others = [
+        r
+        for r in _read(src, "supplier_invoice", key="journal_entry_id", value=journal_id)
+        if not _equal(r["invoice_id"], invoice_id)
+    ]
+    _require(not others, "source_journal_shared")
+    jid = _id(journal_id)
+    inspector = sa.inspect(dest)
+    for table, own in (("historical_invoice_receipts", "invoice_id"), ("historical_settlement_records", None)):
+        if not inspector.has_table(table, schema="mod_payables"):
+            continue
+        statement = (
+            f"SELECT count(*) FROM mod_payables.{table} WHERE (source_journal_ref = :j OR destination_journal_ref = :j)"  # noqa: S608
+        )
+        params: dict = {"j": jid}
+        if own:
+            statement += f" AND {own} <> :i"
+            params["i"] = UUID(str(invoice_id)) if dest.dialect.name == "postgresql" else str(invoice_id)
+        _require(dest.execute(sa.text(statement), params).scalar_one() == 0, "source_journal_shared")
 
 
 def _status_waiver(header: dict, *, settled: bool) -> str:
@@ -594,6 +666,9 @@ class HistoricalPayablesVerifier:
     source: sa.Connection
     manifest: SnapshotManifest
     source_owner: str = "legacy-erp"
+    # (waivable check name, transform rule id) pairs from the importer transform manifest (#68); a failure the
+    # transform fixed needs no waiver. Empty until the transform manifest is wired in.
+    transforms: tuple[tuple[str, str], ...] = ()
 
     @staticmethod
     def command(evidence: HistoricalUnpaidInvoiceEvidence) -> HistoricalUnpaidInvoiceCommand:
@@ -634,7 +709,10 @@ class HistoricalPayablesVerifier:
         with destination.no_autoflush:
             connection = destination.connection()
             _require(_database(connection) == manifest.destination_database, "destination_database")
-            gate = WaiverGate(load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=ADMISSION))
+            gate = WaiverGate(
+                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=ADMISSION),
+                dict(self.transforms),
+            )
             try:
                 result = self._evidence(tenant, invoice_id, connection, gate)
             except KeyError as exc:
@@ -693,6 +771,10 @@ class HistoricalPayablesVerifier:
         _require(header["is_prepayment"] is False and header["prepayment_applied"] == 0, "source_prepayment")
         _require(header["stamp_duty_amount"] == 0, "unsupported_stamp_duty")
         if not settled:
+            if "source_allocations" in gate.waived and _read(
+                src, "payment_allocation", key="invoice_id", value=invoice_id
+            ):
+                _allocations_without_control_effect(src, invoice_id, header["ap_control_account_id"])
             gate.require(
                 not _read(src, "payment_allocation", key="invoice_id", value=invoice_id),
                 "source_allocations",
@@ -918,6 +1000,12 @@ class HistoricalPayablesVerifier:
     def _accounting(self, tenant: UUID, header: dict, dest: sa.Connection, gate: WaiverGate) -> str:
         journal_id = header["journal_entry_id"]
         _require(journal_id is not None, "source_journal_missing")
+        _journal_not_shared(self.source, dest, journal_id, header["invoice_id"])
+        if gate.review is not None and gate.review.decision == "admit_with_waivers":
+            _require(
+                gate.review.legacy_journal_id is not None and _equal(gate.review.legacy_journal_id, journal_id),
+                "review_journal_mismatch",
+            )
         journal = _one(
             _read(self.source, "journal_entry", key="journal_entry_id", value=journal_id), "source_journal_missing"
         )

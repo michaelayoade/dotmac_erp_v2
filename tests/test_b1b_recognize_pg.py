@@ -45,7 +45,7 @@ MODELS = (InvoiceRecognition, LiabilityEvent, PaymentObligation, AccountingRecei
 SOURCE_TABLES = {
     "supplier_invoice": READ_FIELDS["supplier_invoice"],
     "supplier_invoice_line": [*READ_FIELDS["supplier_invoice_line"], "item_id"],
-    "payment_allocation": READ_FIELDS["payment_allocation"],
+    "payment_allocation": [*READ_FIELDS["payment_allocation"], "payment_id"],
     "journal_entry": READ_FIELDS["journal_entry"],
     "posted_ledger_line": READ_FIELDS["posted_ledger_line"],
     "organization": READ_FIELDS["organization"],

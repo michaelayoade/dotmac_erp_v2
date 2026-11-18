@@ -44,6 +44,7 @@ def upgrade() -> None:
         sa.Column("decided_by", sa.String(120), nullable=False),
         sa.Column("decided_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("ias8_account_id", sa.Uuid(), nullable=True),
+        sa.Column("legacy_journal_id", sa.Uuid(), nullable=True),
         sa.Column("operator_ref", sa.String(255), nullable=False),
         sa.Column("dual_control", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
@@ -64,6 +65,14 @@ def upgrade() -> None:
         sa.CheckConstraint("length(btrim(operator_ref)) > 0", name=f"ck_{TABLE}_operator"),
         sa.CheckConstraint("(decision = 'ias8_post') = (ias8_account_id IS NOT NULL)", name=f"ck_{TABLE}_ias8_account"),
         sa.CheckConstraint("NOT dual_control OR operator_ref <> decided_by", name=f"ck_{TABLE}_sod"),
+    )
+    # One legacy journal never backs two invoices, whatever the file said.
+    op.create_index(
+        f"uq_{TABLE}_journal",
+        TABLE,
+        ["tenant_id", "legacy_journal_id"],
+        unique=True,
+        postgresql_where=sa.text("legacy_journal_id IS NOT NULL"),
     )
     op.execute(f"ALTER TABLE public.{TABLE} ENABLE ROW LEVEL SECURITY")
     op.execute(f"ALTER TABLE public.{TABLE} FORCE ROW LEVEL SECURITY")

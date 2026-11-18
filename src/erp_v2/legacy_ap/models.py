@@ -98,5 +98,6 @@ class AdmissionReview(Base, TimestampMixin):
     decided_by: Mapped[str] = mapped_column(String(120), nullable=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ias8_account_id: Mapped[UUID | None] = mapped_column(Uuid(), nullable=True)
+    legacy_journal_id: Mapped[UUID | None] = mapped_column(Uuid(), nullable=True)
     operator_ref: Mapped[str] = mapped_column(String(255), nullable=False)
     dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

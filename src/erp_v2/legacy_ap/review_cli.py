@@ -11,7 +11,9 @@ Decision file (JSON, at most 1000 rows, canonical lower-case UUIDs, duplicate ke
      "rows": [{"legacy_invoice_id": "<uuid>", "decision": "<DECISIONS>", "waived_checks": ["<name>"],
                "evidence_sha": "<64 hex: the Finance decision or third-party document>",
                "decided_by": "<Finance person, <=120>", "decided_at": "<ISO timestamp with offset>",
-               "ias8_account_id": "<uuid of account 3100>"   <- only for ias8_post}]}
+               "ias8_account_id": "<uuid of account 3100>"   <- only for ias8_post,
+               "legacy_journal_id": "<uuid>"  <- the legacy invoice journal (needed to admit with a waiver on a
+                                                 posted invoice; never the same journal for two invoices)}]}
 
 * ``admit_with_waivers`` names exactly ONE check (D-M3) from the allowlist in ``erp_v2.importer.admission_waivers``;
   the GL tie, the integrity checks, tenant, snapshot binding, fingerprint, currency and duplicate admission are not
@@ -91,6 +93,7 @@ class DecisionRow:
     decided_by: str
     decided_at: datetime
     ias8_account_id: UUID | None
+    legacy_journal_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,9 +143,8 @@ def parse_decision_file(raw: bytes, expected_sha256: str, snapshot_sha256: str) 
         _require(isinstance(row, dict), "invalid_row")
         decision = row.get("decision")
         _require(decision in DECISIONS, "unknown_decision")
-        _require(
-            set(row) == _ROW_KEYS | ({"ias8_account_id"} if decision == "ias8_post" else set()), "invalid_row_schema"
-        )
+        required = _ROW_KEYS | ({"ias8_account_id"} if decision == "ias8_post" else set())
+        _require(required <= set(row) <= required | {"legacy_journal_id"}, "invalid_row_schema")
         invoice = _uuid(row["legacy_invoice_id"], "invalid_invoice_id")
         waived = row["waived_checks"]
         _require(isinstance(waived, list) and all(isinstance(name, str) for name in waived), "invalid_waived_checks")
@@ -162,10 +164,14 @@ def parse_decision_file(raw: bytes, expected_sha256: str, snapshot_sha256: str) 
             raise ReviewRefusal("invalid_decided_at") from exc
         _require(decided_at.tzinfo is not None and decided_at.utcoffset() is not None, "invalid_decided_at")
         account = _uuid(row["ias8_account_id"], "invalid_ias8_account_id") if decision == "ias8_post" else None
+        journal = _uuid(row["legacy_journal_id"], "invalid_journal_id") if "legacy_journal_id" in row else None
         parsed.append(
-            DecisionRow(invoice, decision, tuple(waived), row["evidence_sha"], decided_by, decided_at, account)
+            DecisionRow(invoice, decision, tuple(waived), row["evidence_sha"], decided_by, decided_at, account, journal)
         )
     _require(len({row.legacy_invoice_id for row in parsed}) == len(parsed), "duplicate_invoice_id")
+    # One legacy journal never backs two invoices: the same journal named twice refuses the whole file.
+    journals = [row.legacy_journal_id for row in parsed if row.legacy_journal_id is not None]
+    _require(len(set(journals)) == len(journals), "duplicate_journal_id")
     return DecisionFile(
         tenant, snapshot_sha256, ref, expected_sha256, tuple(sorted(parsed, key=lambda r: str(r.legacy_invoice_id)))
     )
@@ -180,6 +186,8 @@ def _same(row: DecisionRow, record, snapshot_sha256: str) -> bool:
         and record.decided_by == row.decided_by
         and (None if record.ias8_account_id is None else str(record.ias8_account_id))
         == (None if row.ias8_account_id is None else str(row.ias8_account_id))
+        and (None if record.legacy_journal_id is None else str(record.legacy_journal_id))
+        == (None if row.legacy_journal_id is None else str(row.legacy_journal_id))
     )
 
 
@@ -210,6 +218,12 @@ def classify(db, file: DecisionFile, *, operator_ref: str, dual: bool) -> tuple[
             outcomes.append(
                 (row, "already_recorded" if _same(row, record, file.snapshot_sha256) else "different_decision_recorded")
             )
+            continue
+        if row.legacy_journal_id is not None and any(
+            r.legacy_journal_id == row.legacy_journal_id and r.legacy_invoice_id != row.legacy_invoice_id
+            for r in existing.values()
+        ):
+            outcomes.append((row, "journal_already_reviewed_for_another_invoice"))
             continue
         if row.legacy_invoice_id not in known:
             outcomes.append((row, "invoice_not_found"))
@@ -278,6 +292,7 @@ def apply_reviews(db, file: DecisionFile, outcomes, *, operator_ref: str, dual: 
             decided_by=row.decided_by,
             decided_at=row.decided_at,
             ias8_account_id=row.ias8_account_id,
+            legacy_journal_id=row.legacy_journal_id,
             operator_ref=operator_ref,
             dual_control=dual,
         )
@@ -302,6 +317,7 @@ def apply_reviews(db, file: DecisionFile, outcomes, *, operator_ref: str, dual: 
                 "decision_file_sha": file.sha256,
                 "snapshot_sha256": file.snapshot_sha256,
                 "decided_by": row.decided_by,
+                "legacy_journal_id": None if row.legacy_journal_id is None else str(row.legacy_journal_id),
                 "dual_control": dual,
             },
         )

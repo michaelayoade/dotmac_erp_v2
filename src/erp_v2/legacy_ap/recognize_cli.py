@@ -404,6 +404,7 @@ def apply_plan(
     from dotmac_payables.contracts import AccountingReceiptInput, PayablesError
     from dotmac_payables.models import SupplierInvoice, SupplierInvoiceLine
 
+    from erp_v2.importer.payables_history import admission_notes
     from erp_v2.legacy_ap import ias8 as ias8_mode
     from erp_v2.legacy_ap.audit import AUDIT_RECOGNIZED_POSTED, SOURCE_APPLICATION
     from erp_v2.posting.bridge import post_consequence
@@ -507,17 +508,7 @@ def apply_plan(
                         "consequence_fingerprint": consequence.fingerprint,
                         "list_sha256": list_sha256,
                         "evidence_fingerprint": command.evidence_fingerprint,
-                        **(
-                            {
-                                "review_id": review.review_id,
-                                "review_decision": review.decision,
-                                "waived_checks": list(review.waived),
-                                "decision_file_sha": review.decision_file_sha,
-                                "evidence_sha": review.evidence_sha,
-                            }
-                            if review is not None
-                            else {}
-                        ),
+                        **admission_notes(verifier.source, invoice_id, review),
                         **({"ias8_posting_date": posting.posting_date.isoformat()} if row.get("ias8") else {}),
                     },
                 )

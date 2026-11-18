@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+from collections import Counter
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -26,6 +27,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from erp_v2.importer.identity_cli import _manifest, _safe_engine, _sha
+from erp_v2.importer.payables_history import admission_notes
 
 # The only owner release whose admission contract this command is qualified for.
 REQUIRED_PAYABLES_VERSION = "0.1.0a5"
@@ -136,7 +138,7 @@ def _command_json(command) -> dict:
 
 
 def _plan(verifier, scope, invoice_ids, session, bindings: dict, referenced: frozenset[str] = frozenset()) -> dict:
-    commands, refusals = [], []
+    commands, refusals, notes = [], [], []
     for invoice_id in invoice_ids:
         if str(invoice_id) in referenced:
             # Re-entered as a NEW ERP invoice with this legacy reference: never also admitted.
@@ -145,6 +147,11 @@ def _plan(verifier, scope, invoice_ids, session, bindings: dict, referenced: fro
         try:
             evidence = verifier.evidence(scope=scope, invoice_id=invoice_id, destination=session)
             commands.append(_command_json(verifier.command(evidence)))
+            note = admission_notes(
+                verifier.source, invoice_id, verifier.review(scope=scope, invoice_id=invoice_id, destination=session)
+            )
+            if note:
+                notes.append(note)
         except ValueError as exc:
             reason = getattr(exc, "reason", None)
             # Only deliberately named evidence failures enter private receipts.
@@ -160,6 +167,12 @@ def _plan(verifier, scope, invoice_ids, session, bindings: dict, referenced: fro
         counts=dict(requested=len(invoice_ids), eligible=len(commands), refused=len(refusals)),
         commands=commands,
         refusals=refusals,
+        # Finance-reviewed admissions: counts only. ``requires_correcting_journal`` admissions (waived A3 treatment)
+        # cannot be closed by B-9 without the correcting journal.
+        reviewed_admissions=dict(
+            waived=dict(sorted(Counter(name for n in notes for name in n["waived_checks"]).items())),
+            requires_correcting_journal=sum(1 for n in notes if n["requires_correcting_journal"]),
+        ),
     )
 
 

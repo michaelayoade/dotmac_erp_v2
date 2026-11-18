@@ -52,6 +52,7 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from erp_v2.importer.payables_history import admission_notes
 from erp_v2.legacy_ap.recognize_cli import (
     FINANCE_APPROVER,
     RecognizeRefusal,
@@ -224,8 +225,16 @@ def build_plan(
             refused.append(dict(invoice_id=str(invoice_id), reason=state))
         else:
             command = verifier.command(evidence)
+            notes = admission_notes(
+                verifier.source, invoice_id, verifier.review(scope=scope, invoice_id=invoice_id, destination=session)
+            )
             eligible.append(
-                dict(invoice_id=str(invoice_id), evidence_fingerprint=command.evidence_fingerprint, **_facts(evidence))
+                dict(
+                    invoice_id=str(invoice_id),
+                    evidence_fingerprint=command.evidence_fingerprint,
+                    **({"admission": notes} if notes else {}),
+                    **_facts(evidence),
+                )
             )
             evidence_of[str(invoice_id)] = [item.source_settlement_id for item in evidence.settlements]
     # A legacy allocation settles exactly one invoice (A5-2): any id presented twice refuses every holder.
@@ -272,6 +281,7 @@ def receipt_of(plan: dict, *, mode: str, applied: int = 0) -> dict:
         ),
         refusals_by_reason=dict(sorted(Counter(item["reason"] for item in plan["refused"]).items())),
         totals=dict(eligible=_totals(plan["eligible"]), already_done=_totals(plan["already_done"])),
+        reviewed_admissions=reviewed_admissions(plan["eligible"]),
     )
     if mode == "plan" and not all(plan["bindings"].get(key) for key in PREREQUISITES):
         payload["prerequisites_required_at_apply"] = list(PREREQUISITES)
@@ -309,17 +319,14 @@ def _assert_landed(session: Session, tenant: UUID, row: dict) -> None:
     )
 
 
-def _review_details(review) -> dict:
-    """Audit detail of a Finance decision honoured by this admission (reviewed admission, B-1)."""
-    if review is None:
-        return {}
-    return {
-        "review_id": review.review_id,
-        "review_decision": review.decision,
-        "waived_checks": list(review.waived),
-        "decision_file_sha": review.decision_file_sha,
-        "evidence_sha": review.evidence_sha,
-    }
+def reviewed_admissions(rows: list[dict]) -> dict:
+    """Counts of Finance-reviewed admissions in a plan: by waived check, and those that still need a correcting
+    journal (``requires_correcting_journal``: B-9 cannot close the exception without it)."""
+    notes = [row["admission"] for row in rows if row.get("admission")]
+    return dict(
+        waived=dict(sorted(Counter(name for note in notes for name in note["waived_checks"]).items())),
+        requires_correcting_journal=sum(1 for note in notes if note["requires_correcting_journal"]),
+    )
 
 
 def apply_plan(
@@ -368,7 +375,11 @@ def apply_plan(
                         "list_sha256": list_sha256,
                         "evidence_fingerprint": command.evidence_fingerprint,
                         "settlements": row["settlements"],
-                        **_review_details(verifier.review(scope=scope, invoice_id=invoice_id, destination=session)),
+                        **admission_notes(
+                            verifier.source,
+                            invoice_id,
+                            verifier.review(scope=scope, invoice_id=invoice_id, destination=session),
+                        ),
                     },
                 )
         except RecognizeRefusal:

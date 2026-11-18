@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from test_payables_history import (  # noqa: F401  (fixtures and helpers of the historical-evidence suite)
     AP,
     DAY,
@@ -80,7 +81,6 @@ def test_the_vocabulary_is_the_closed_one_of_the_spec():
         "legacy_gl_tax_treatment_unrecognised",
         "deferral_amount_mismatch",
         "legacy_journal_link_unposted",
-        "line_tax_detail",
     }
     assert set(vocab.DECISIONS) == {
         "admit_residual",
@@ -306,6 +306,7 @@ def add_review(db, decision="admit_with_waivers", waived=("line_totals",), **cha
         decided_by="Finance Lead",
         decided_at=now,
         ias8_account_id=None,
+        legacy_journal_id=UUID(J) if decision == "admit_with_waivers" else None,
         operator_ref="operator",
         dual_control=False,
         created_at=now,
@@ -414,13 +415,125 @@ def test_unposted_header_without_a_journal_link_is_not_a_link_waiver(db):
         evidence(db)
 
 
-def test_allocation_waiver_admits_a_header_with_a_zero_allocation(db):
+def with_payment_id_column(db):
+    """The allocation table of a snapshot that identifies the payment of each allocation."""
     db[0].exec_driver_sql("PRAGMA query_only=0")
-    db[0].execute(db[4][True, "payment_allocation"].insert().values(invoice_id=INVOICE))
+    db[0].exec_driver_sql("DROP TABLE payment_allocation")
+    db[0].exec_driver_sql("CREATE TABLE payment_allocation (invoice_id TEXT, payment_id TEXT)")
+
+
+def test_allocation_waiver_admits_a_header_with_a_zero_allocation(db):
+    with_payment_id_column(db)
+    db[0].exec_driver_sql("INSERT INTO payment_allocation (invoice_id) VALUES (?)", (INVOICE,))
     with pytest.raises(HistoricalEvidenceError, match="source_allocations"):
         evidence(db)
     add_review(db, waived=("source_allocations",))
     assert evidence(db).allocation_count == 0
+
+
+def test_allocation_waiver_is_refused_when_the_payment_posted_to_the_control_account(db):
+    """The payment-GL check stays mandatory: the waiver never hides a posted effect on 2000."""
+    with_payment_id_column(db)
+    pay = str(UUID(int=77))
+    db[0].exec_driver_sql("INSERT INTO payment_allocation VALUES (?, ?)", (INVOICE, pay))
+    add_review(db, waived=("source_allocations",))
+    ledger = db[4][True, "posted_ledger_line"]
+    row = dict(db[0].execute(sa.select(ledger).where(ledger.c.account_id == AP)).mappings().first())
+    row.update(ledger_line_id=str(UUID(int=78)), source_document_id=pay, debit_amount="40", credit_amount="0")
+    db[0].execute(ledger.insert().values(**row))
+    with pytest.raises(HistoricalEvidenceError, match="allocation_payment_gl_effect"):
+        evidence(db)
+
+
+def test_allocation_waiver_is_refused_when_the_snapshot_cannot_identify_the_payment(db):
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(db[4][True, "payment_allocation"].insert().values(invoice_id=INVOICE))  # no payment_id column
+    add_review(db, waived=("source_allocations",))
+    with pytest.raises(HistoricalEvidenceError, match="allocation_payment_gl_unproven"):
+        evidence(db)
+
+
+def test_one_legacy_journal_never_backs_two_invoices_and_the_check_is_never_waivable(db):
+    """source_journal_shared: another legacy invoice references the same journal."""
+    add_review(db, decision="admit_residual", waived=())
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    header = db[4][True, "supplier_invoice"]
+    row = dict(db[0].execute(sa.select(header)).mappings().one())
+    row.update(invoice_id=INVOICE_2, invoice_number="AP2")
+    db[0].execute(header.insert().values(**row))
+    with pytest.raises(HistoricalEvidenceError, match="source_journal_shared"):
+        evidence(db)
+    # a decision file cannot name it as a waiver: the name is not in the vocabulary, and a row that got into the
+    # table anyway is refused as an invalid waiver
+    assert "source_journal_shared" not in vocab.WAIVABLE_CHECKS
+    db[1].execute(AdmissionReview.__table__.delete())
+    add_review(db, waived=("source_journal_shared",))
+    with pytest.raises(HistoricalEvidenceError, match="review_waivers_invalid"):
+        evidence(db)
+
+
+def test_a_receipt_that_already_names_the_journal_refuses(db):
+    db[1].exec_driver_sql(
+        "CREATE TABLE mod_payables.historical_invoice_receipts "
+        "(invoice_id TEXT, source_journal_ref TEXT, destination_journal_ref TEXT)"
+    )
+    db[1].exec_driver_sql("INSERT INTO mod_payables.historical_invoice_receipts VALUES (?, ?, ?)", (INVOICE_2, J, J))
+    with pytest.raises(HistoricalEvidenceError, match="source_journal_shared"):
+        evidence(db)
+    db[1].exec_driver_sql("DELETE FROM mod_payables.historical_invoice_receipts")
+    db[1].exec_driver_sql(
+        "INSERT INTO mod_payables.historical_invoice_receipts VALUES (?, ?, ?)", (INVOICE, J, J)
+    )  # the invoice's own receipt (replay) is not a clash
+    assert evidence(db).total_amount == Decimal("100")
+
+
+def test_a_waiver_must_name_the_invoices_own_journal(db):
+    break_line_totals(db)
+    add_review(db, waived=("line_totals",), legacy_journal_id=UUID(int=999))
+    with pytest.raises(HistoricalEvidenceError, match="review_journal_mismatch"):
+        evidence(db)
+    db[1].execute(AdmissionReview.__table__.delete())
+    add_review(db, waived=("line_totals",), legacy_journal_id=None)
+    with pytest.raises(HistoricalEvidenceError, match="review_journal_mismatch"):
+        evidence(db)
+
+
+def test_a_transform_fixed_failure_needs_no_waiver_and_is_kept_distinct_in_the_evidence():
+    review = SimpleNamespace(
+        review_id="r", decision="admit_with_waivers", waived=("line_totals",), evidence_sha="a" * 64,
+        decision_file_sha="b" * 64,
+    )  # fmt: skip
+    gate = WaiverGate(None, {"source_amount_scale": "T-ROUND-2DP"})
+    gate.require(False, "source_amount_scale", "source_amount_scale")  # fixed by the transform: no waiver, no refusal
+    gate.finish()
+    assert gate.facts() == {"transforms": {"source_amount_scale": "T-ROUND-2DP"}}
+    both = WaiverGate(review, {"source_amount_scale": "T-ROUND-2DP"})
+    both.require(False, "source_amount_scale", "source_amount_scale")
+    both.require(False, "invoice_line_totals", "line_totals")
+    both.finish()  # the transform did not use up or trip the waiver
+    assert both.facts()["transforms"] == {"source_amount_scale": "T-ROUND-2DP"} and both.facts()["review"][
+        "waived"
+    ] == ["line_totals"]
+    stale = WaiverGate(
+        SimpleNamespace(**(vars(review) | {"waived": ("source_amount_scale",)})), {"source_amount_scale": "T-ROUND-2DP"}
+    )
+    stale.require(False, "source_amount_scale", "source_amount_scale")
+    with pytest.raises(HistoricalEvidenceError, match="waiver_not_needed"):
+        stale.finish()  # a waiver for what a transform already fixed is a stale waiver
+
+
+def test_verifier_notes_carry_the_readable_status_and_the_correcting_journal_flag(db):
+    from erp_v2.importer.payables_history import admission_notes
+
+    taxed(db, "A3")
+    add_review(db, waived=("deferral_amount_mismatch",))
+    review = db[3].review(scope=scope(), invoice_id=UUID(INVOICE), destination=db[2])
+    note = admission_notes(db[0], UUID(INVOICE), review)
+    assert note["legacy_header_status"] == "POSTED/POSTED" and note["waived_checks"] == ["deferral_amount_mismatch"]
+    assert note["requires_correcting_journal"] is True
+    other = admission_notes(db[0], UUID(INVOICE), SimpleNamespace(**(vars(review) | {"waived": ("line_totals",)})))
+    assert other["requires_correcting_journal"] is False
+    assert admission_notes(db[0], UUID(INVOICE), None) == {}
 
 
 def test_a3_deferral_mismatch_is_waived_by_its_specific_or_its_general_name(db):
