@@ -309,6 +309,19 @@ def _assert_landed(session: Session, tenant: UUID, row: dict) -> None:
     )
 
 
+def _review_details(review) -> dict:
+    """Audit detail of a Finance decision honoured by this admission (reviewed admission, B-1)."""
+    if review is None:
+        return {}
+    return {
+        "review_id": review.review_id,
+        "review_decision": review.decision,
+        "waived_checks": list(review.waived),
+        "decision_file_sha": review.decision_file_sha,
+        "evidence_sha": review.evidence_sha,
+    }
+
+
 def apply_plan(
     session: Session, scope, verifier, plan: dict, *, reviewed_digest: str, actor: str, list_sha256: str, now: datetime
 ) -> int:
@@ -355,6 +368,7 @@ def apply_plan(
                         "list_sha256": list_sha256,
                         "evidence_fingerprint": command.evidence_fingerprint,
                         "settlements": row["settlements"],
+                        **_review_details(verifier.review(scope=scope, invoice_id=invoice_id, destination=session)),
                     },
                 )
         except RecognizeRefusal:

@@ -133,8 +133,14 @@ def _money(value) -> str:
     return format(Decimal(value).quantize(Decimal("0.01")), "f")
 
 
-def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: str, actor: UUID) -> str | None:
-    """Destination-side state. None = eligible; 'already_done' = completed under this list."""
+def _classify(
+    session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: str, actor: UUID, review=None
+) -> str | None:
+    """Destination-side state. None = eligible; 'already_done' = completed under this list.
+
+    ``review`` is the Finance decision row (reviewed admission), if any. ``ias8_post`` (D-M5) replaces the
+    "invoice period is open" rule by the IAS 8 rule: the invoice's period is closed to posting and a later
+    OPEN period exists; the journal posts there, expense side on 3100 (``erp_v2.legacy_ap.ias8``)."""
     from dotmac_accounting.contracts import PeriodStatus
     from dotmac_accounting.models import FiscalPeriod
     from dotmac_payables.contracts import InvoiceStatus
@@ -149,6 +155,7 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
     )
 
     from erp_v2.governance.policy import dual_control
+    from erp_v2.legacy_ap import ias8 as ias8_mode
     from erp_v2.posting import bridge, rules
     from erp_v2.posting.rules import PostingRefused
     from erp_v2.web.revenue_approval_services import ApprovalRefused, _submitter_party_id
@@ -213,20 +220,30 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
     # Payables a5 posts at posting_date = invoice_date (Michael: original invoice date, into its
     # original period; the date is never changed). The containing period must exist, be OPEN and not
     # be an adjustment period. The accounting owner re-checks this when posting (backstop).
-    periods = list(
-        session.scalars(
-            sa.select(FiscalPeriod).where(
-                FiscalPeriod.tenant_id == tenant,
-                FiscalPeriod.start_date <= invoice.invoice_date,
-                FiscalPeriod.end_date >= invoice.invoice_date,
+    ias8 = review is not None and review.decision == "ias8_post"
+    posting_date = invoice.invoice_date
+    expense_ref = None
+    if ias8:
+        try:
+            posting_date = ias8_mode.posting_date_for(session, tenant, invoice.invoice_date)
+            expense_ref = ias8_mode.require_account(session, tenant, review.ias8_account_id)
+        except ias8_mode.Ias8Refused as exc:
+            return exc.reason
+    else:
+        periods = list(
+            session.scalars(
+                sa.select(FiscalPeriod).where(
+                    FiscalPeriod.tenant_id == tenant,
+                    FiscalPeriod.start_date <= invoice.invoice_date,
+                    FiscalPeriod.end_date >= invoice.invoice_date,
+                )
             )
         )
-    )
-    if not periods or any(p.status != PeriodStatus.OPEN or p.is_adjustment for p in periods):
-        return "posting_period_not_open"
+        if not periods or any(p.status != PeriodStatus.OPEN or p.is_adjustment for p in periods):
+            return "posting_period_not_open"
     refs = [invoice.liability_account_ref]
     for line in lines:
-        refs.append(line.posting_account_ref)
+        refs.append(expense_ref or line.posting_account_ref)
         if line.tax_amount > 0:
             if not line.tax_account_ref:
                 return "tax_account_missing"
@@ -235,7 +252,7 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
         bridge._resolve_accounts(
             session, tenant, rules.policy_for("payables", "supplier_invoice"), refs, require_open=True
         )
-        bridge._require_open_period(session, tenant, invoice.invoice_date)
+        bridge._require_open_period(session, tenant, posting_date)
     except PostingRefused as exc:
         return f"posting_{exc.code}"
     return None
@@ -248,7 +265,12 @@ def build_plan(session: Session, scope, verifier, ids, *, evidence_ref: str, bin
     tenant = scope.tenant_id
     eligible, done, refused = [], [], []
     for invoice_id in ids:
-        state = _classify(session, tenant, invoice_id, evidence_ref, actor)
+        try:
+            review = verifier.review(scope=scope, invoice_id=invoice_id, destination=session)
+        except HistoricalEvidenceError as exc:
+            refused.append(dict(invoice_id=str(invoice_id), reason="legacy_evidence:" + exc.reason))
+            continue
+        state = _classify(session, tenant, invoice_id, evidence_ref, actor, review)
         if state == "already_done":
             done.append(dict(invoice_id=str(invoice_id)))
             continue
@@ -262,7 +284,14 @@ def build_plan(session: Session, scope, verifier, ids, *, evidence_ref: str, bin
             refused.append(dict(invoice_id=str(invoice_id), reason="legacy_evidence:" + reason))
             continue
         invoice = _invoice_amounts(session, tenant, invoice_id)
-        eligible.append(dict(invoice_id=str(invoice_id), evidence_fingerprint=evidence.fingerprint(), **invoice))
+        extra = {}
+        if review is not None and review.decision == "ias8_post":
+            extra["ias8"] = dict(review_id=review.review_id, decision_file_sha=review.decision_file_sha)
+        elif review is not None and review.waived:
+            extra["waived"] = list(review.waived)
+        eligible.append(
+            dict(invoice_id=str(invoice_id), evidence_fingerprint=evidence.fingerprint(), **invoice, **extra)
+        )
     # Per-invoice detail for the PRIVATE plan file only (never the receipt): id, date, amounts, outcome.
     detail = []
     for outcome, items in (("eligible", eligible), ("already_done", done), ("refused", refused)):
@@ -348,6 +377,8 @@ def receipt_of(plan: dict, *, mode: str, applied: int = 0, posted_total: Decimal
         refusals_by_reason=dict(sorted(Counter(item["reason"] for item in plan["refused"]).items())),
         totals=dict(eligible=_totals(plan["eligible"])),
         by_period=_by_period(plan["eligible"]),
+        ias8_prior_period=sum(1 for item in plan["eligible"] if item.get("ias8")),
+        waived=dict(sorted(Counter(name for item in plan["eligible"] for name in item.get("waived", ())).items())),
     )
     if mode == "apply":
         payload["applied"] = applied
@@ -371,8 +402,9 @@ def apply_plan(
     from dotmac_kernel.idempotency import IdempotencyConflict
     from dotmac_payables import service as payables
     from dotmac_payables.contracts import AccountingReceiptInput, PayablesError
-    from dotmac_payables.models import SupplierInvoice
+    from dotmac_payables.models import SupplierInvoice, SupplierInvoiceLine
 
+    from erp_v2.legacy_ap import ias8 as ias8_mode
     from erp_v2.legacy_ap.audit import AUDIT_RECOGNIZED_POSTED, SOURCE_APPLICATION
     from erp_v2.posting.bridge import post_consequence
     from erp_v2.posting.rules import PostingRefused
@@ -409,8 +441,41 @@ def apply_plan(
                 debit = sum((Decimal(e.debit) for e in consequence.entries), Decimal(0))
                 credit = sum((Decimal(e.credit) for e in consequence.entries), Decimal(0))
                 _require(debit == credit == invoice.total_amount, "consequence_amount_mismatch")
+                review = verifier.review(scope=scope, invoice_id=invoice_id, destination=session)
+                posting, post_ref = consequence, approval_ref
+                if row.get("ias8"):
+                    # D-M5: the owner's consequence (and its receipt) stay as they are; the journal posts in the
+                    # first open period with the expense side on 3100 and carries the review id.
+                    _require(
+                        review is not None
+                        and review.decision == "ias8_post"
+                        and review.review_id == row["ias8"]["review_id"],
+                        "ias8_review_changed",
+                    )
+                    posting_date = ias8_mode.posting_date_for(session, tenant, invoice.invoice_date)
+                    account = ias8_mode.require_account(session, tenant, review.ias8_account_id)
+                    tax_refs = frozenset(
+                        line.tax_account_ref
+                        for line in session.scalars(
+                            sa.select(SupplierInvoiceLine).where(
+                                SupplierInvoiceLine.tenant_id == tenant, SupplierInvoiceLine.invoice_id == invoice_id
+                            )
+                        )
+                        if line.tax_amount > 0
+                    )
+                    posting = ias8_mode.derive(
+                        consequence,
+                        tax_refs=tax_refs,
+                        account_ref=account,
+                        posting_date=posting_date,
+                        review_id=review.review_id,
+                        file_sha=review.decision_file_sha,
+                    )
+                    post_ref = f"{approval_ref}:ias8:{review.review_id}"
+                else:
+                    _require(review is None or review.decision != "ias8_post", "ias8_review_changed")
                 posted = post_consequence(
-                    session, scope=scope, consequence=consequence, approval_ref=approval_ref, actor=actor, now=now
+                    session, scope=scope, consequence=posting, approval_ref=post_ref, actor=actor, now=now
                 )
                 payables.record_accounting_receipt(
                     session,
@@ -442,6 +507,18 @@ def apply_plan(
                         "consequence_fingerprint": consequence.fingerprint,
                         "list_sha256": list_sha256,
                         "evidence_fingerprint": command.evidence_fingerprint,
+                        **(
+                            {
+                                "review_id": review.review_id,
+                                "review_decision": review.decision,
+                                "waived_checks": list(review.waived),
+                                "decision_file_sha": review.decision_file_sha,
+                                "evidence_sha": review.evidence_sha,
+                            }
+                            if review is not None
+                            else {}
+                        ),
+                        **({"ias8_posting_date": posting.posting_date.isoformat()} if row.get("ias8") else {}),
                     },
                 )
                 posted_total += credit
