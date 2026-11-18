@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from erp_v2.governance import cli
 from erp_v2.governance.models import GovernancePolicy
 from erp_v2.governance.policy import dual_control
+from erp_v2.payees.models import PayeeBankInstruction
 
 TENANT = uuid4()
 
@@ -27,10 +28,23 @@ def spec(**over):
     return json.dumps(data).encode()
 
 
+@pytest.fixture(autouse=True)
+def _only_the_sqlite_tables(monkeypatch):
+    # sqlite cannot hold the banking-linked tables; every governed table is counted in the PostgreSQL tests
+    monkeypatch.setattr(cli, "_pending_specs", _specs)
+
+
 @pytest.fixture()
 def db():
     engine = sa.create_engine("sqlite://")
-    Base.metadata.create_all(engine, tables=[Tenant.__table__, GovernancePolicy.__table__])
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            Tenant.__table__,
+            GovernancePolicy.__table__,
+            PayeeBankInstruction.__table__,
+        ],
+    )
     with Session(engine) as session:
         session.add_all([Tenant(id=TENANT, slug="acme", name="Acme"), Tenant(id=uuid4(), slug="b", name="B")])
         session.flush()
@@ -82,7 +96,14 @@ def test_malformed_specs_refuse(raw, code):
 def test_plan_does_not_write_and_apply_writes_once_with_an_audit_callback(db):
     parsed = cli.parse_spec(spec())
     plan = cli.plan_policy(db, parsed)
-    assert plan.receipt() == {"current": "unset", "requested": "on", "changes": True, "blockers": {}, "ready": True}
+    assert plan.receipt() == {
+        "current": "unset",
+        "requested": "on",
+        "changes": True,
+        "blockers": {},
+        "pending_stamped_off": {},
+        "ready": True,
+    }
     assert db.get(GovernancePolicy, TENANT) is None
     seen = []
     applied = cli.apply_policy(
@@ -137,3 +158,41 @@ def test_refusals_land_in_a_0600_receipt_without_secrets(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:x@127.0.0.1:1/db")
     assert run_main(tmp_path, monkeypatch, "plan") == 2
     assert "serving_database_materials_forbidden" in receipt.read_text()
+
+
+def _specs():
+    return (("payee_instructions", PayeeBankInstruction, PayeeBankInstruction.status.in_(("proposed",))),)
+
+
+def _instruction(status, *, dual_control):
+    return PayeeBankInstruction(
+        tenant_id=TENANT,
+        payee_kind="supplier",
+        payee_ref=f"sup-{uuid4().hex[:6]}",
+        payee_label="x",
+        account_number="0123456789",
+        account_last4="6789",
+        status=status,
+        origin="manual",
+        dual_control=dual_control,
+        proposed_by_party_id=uuid4(),
+        proposed_at=sa.func.now(),
+        decided_by_party_id=uuid4() if status == "approved" else None,
+        approved_at=sa.func.now() if status == "approved" else None,
+    )
+
+
+def test_plan_to_turn_the_policy_on_counts_pending_rows_stamped_off(db):
+    db.add_all(
+        [
+            _instruction("proposed", dual_control=False),
+            _instruction("proposed", dual_control=False),
+            _instruction("proposed", dual_control=True),  # strict: not counted
+            _instruction("approved", dual_control=False),  # decided: not counted
+        ]
+    )
+    db.flush()
+    on = cli.plan_policy(db, cli.parse_spec(spec()))
+    assert on.receipt()["pending_stamped_off"] == {"payee_instructions": 2}
+    off = cli.plan_policy(db, cli.parse_spec(spec(dual_control=False)))
+    assert off.receipt()["pending_stamped_off"] == {}  # only relevant when turning the policy on

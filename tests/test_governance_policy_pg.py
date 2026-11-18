@@ -193,7 +193,14 @@ def test_plan_writes_nothing_and_reports_the_change(engine, runner):
     tenant = new_tenant(engine)
     code, receipt = runner.run("plan", tenant, True)
     assert code == 0 and receipt["mode"] == "plan"
-    assert receipt["policy"] == {"current": "unset", "requested": "on", "changes": True, "blockers": {}, "ready": True}
+    assert receipt["policy"] == {
+        "current": "unset",
+        "requested": "on",
+        "changes": True,
+        "blockers": {},
+        "pending_stamped_off": {},
+        "ready": True,
+    }
     assert policy_row(engine, tenant) is None and audits(engine, tenant) == []
 
 
@@ -417,3 +424,68 @@ def test_downgrade_refuses_while_a_row_was_recorded_with_the_policy_off(engine):
     finally:
         with engine.begin() as c:
             c.execute(sa.text("DELETE FROM erp_manual_journals WHERE tenant_id = :t"), {"t": tenant})
+
+
+# --- the session tenant guard ------------------------------------------------------------------------------------
+
+
+def _runtime_policy_read(runtime_engine, tenant, *, setting):
+    with Session(runtime_engine) as db, db.begin():
+        if setting is not None:
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(setting)})
+        return dual_control(db, tenant)
+
+
+def test_the_policy_is_never_read_off_for_a_mismatched_or_missing_session_tenant(engine, runtime_engine):
+    from erp_v2.governance.policy import GovernancePolicyError
+
+    one, two = new_tenant(engine), new_tenant(engine)
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "INSERT INTO erp_governance_policies (tenant_id, dual_control, set_by, evidence_ref) "
+                "VALUES (:t, true, 'ops', 'e')"
+            ),
+            {"t": one},
+        )
+    assert _runtime_policy_read(runtime_engine, one, setting=one) is True
+    with pytest.raises(GovernancePolicyError):  # another tenant's setting: RLS would hide the row and read OFF
+        _runtime_policy_read(runtime_engine, one, setting=two)
+    with pytest.raises(GovernancePolicyError):  # no setting at all
+        _runtime_policy_read(runtime_engine, one, setting=None)
+    assert _runtime_policy_read(runtime_engine, two, setting=two) is False  # a real "no row" is still OFF
+
+
+def test_an_rls_bypassing_role_reads_the_real_row_but_still_refuses_a_differing_setting(engine):
+    from erp_v2.governance.policy import GovernancePolicyError
+
+    one, two = new_tenant(engine), new_tenant(engine)
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "INSERT INTO erp_governance_policies (tenant_id, dual_control, set_by, evidence_ref) "
+                "VALUES (:t, true, 'ops', 'e')"
+            ),
+            {"t": one},
+        )
+    with Session(engine) as db, db.begin():
+        assert dual_control(db, one) is True  # owner session, no setting
+        db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(two)})
+        with pytest.raises(GovernancePolicyError):
+            dual_control(db, one)
+
+
+def test_plan_receipt_lists_pending_rows_stamped_off(engine, runner):
+    tenant = new_tenant(engine)
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "INSERT INTO payee_bank_instructions (id, tenant_id, dual_control, payee_kind, payee_ref, "
+                "payee_label, account_number, account_last4, status, origin, proposed_by_party_id, proposed_at) "
+                "VALUES (:i, :t, false, 'supplier', 'sup-1', 'x', '0123456789', '6789', 'proposed', 'manual', "
+                ":p, now())"
+            ),
+            {"i": uuid4(), "t": tenant, "p": uuid4()},
+        )
+    code, receipt = runner.run("plan", tenant, True)
+    assert code == 0 and receipt["policy"]["pending_stamped_off"] == {"payee_instructions": 1}

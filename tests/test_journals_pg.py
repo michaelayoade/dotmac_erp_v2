@@ -1650,3 +1650,34 @@ def test_check_reversal_sod_is_rewritten_not_dual_control_or_predicate(engine):
             else:
                 db.flush()
             db.rollback()
+
+
+# --- ledger-fault correction with the dual-control policy OFF ---------------------------------------------------
+
+
+def test_policy_off_one_person_prepares_requests_and_approves_a_ledger_fault_correction(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)  # the legacy fault itself is posted before the policy is switched off
+    set_dual_control_engine(engine, env.tenant_id, False)
+    assert ledger_net(engine, env, "2000") == -FAULT_LEDGER
+    outcome = prepare_fix(engine, env, source, who="preparer")
+    assert _stamp(engine, outcome.manual_id) is False  # the correction row takes the tenant policy too
+    request(engine, env, outcome, who="preparer")
+    assert approve(engine, env, outcome, who="preparer").state == m.STATE_POSTED  # the same person approves
+    assert ledger_net(engine, env, "2000") == -FAULT_LINE  # the delta is cleared
+
+
+def test_policy_off_the_fault_reverification_is_unconditional(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    outcome = prepare_fix(engine, env, source, who="preparer")
+    request(engine, env, outcome, who="preparer")
+    ledger_edit(
+        engine,
+        "UPDATE mod_accounting.posted_ledger_lines SET credit = 500 WHERE journal_id = :j AND credit > 0",
+        j=source,
+    )
+    before = counts(engine, env)
+    refused_fix(lambda: approve(engine, env, outcome, who="preparer"), "ledger_fault_changed")
+    assert counts(engine, env) == before

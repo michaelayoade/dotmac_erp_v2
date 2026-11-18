@@ -48,6 +48,15 @@ stamp.
 Consequence worth knowing: a row keeps the stamp it was created with. Switching the policy on later does not
 tighten rows already created off; switching it off does not relax rows created on.
 
+Before turning the policy ON, read the plan receipt: `pending_stamped_off` counts the undecided rows (payee
+instructions, payout batches, manual journals, reconciliations, cash GL re-points) that were created with the
+policy off. They stay lax. To bring them under the policy, **cancel (or reject) and re-propose them** after the
+policy is on. The ledger-fault re-verification is not part of the policy and always runs.
+
+The policy read refuses (`GovernancePolicyError`) rather than reading OFF when, on PostgreSQL, the session's RLS
+tenant setting is missing or differs from the tenant asked for (roles that bypass RLS, such as the operator CLI,
+only refuse on a differing setting).
+
 ## Not covered here
 
 Starter's own checks (payables a5 approve/record/reverse, payroll a5 creator/approver/finalizer/reverser,

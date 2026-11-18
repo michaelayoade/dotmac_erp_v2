@@ -87,6 +87,9 @@ class PolicyPlan:
     current: str  # "unset" | "on" | "off"
     requested: str  # "on" | "off"
     blockers: tuple[tuple[str, int], ...]
+    # Pending (not yet decided) rows stamped OFF, counted when the policy is being turned ON. Their stamp does
+    # not change: cancel and re-propose them to bring them under the policy (docs/dual-control-policy.md).
+    pending_stamped_off: tuple[tuple[str, int], ...] = ()
 
     @property
     def ready(self) -> bool:
@@ -102,6 +105,7 @@ class PolicyPlan:
             "requested": self.requested,
             "changes": self.changes,
             "blockers": dict(self.blockers),
+            "pending_stamped_off": dict(self.pending_stamped_off),
             "ready": self.ready,
         }
 
@@ -135,6 +139,44 @@ def _write_audit(db, *, spec: PolicySpec, previous: str, spec_sha256: str, opera
     )
 
 
+def _pending_specs():
+    """(label, model, undecided-condition) for every governed table that has an undecided state."""
+    from erp_v2.banking.recon_models import BankReconciliation
+    from erp_v2.cash_gl.models import CashAccountRepoint
+    from erp_v2.journals.models import ManualJournal
+    from erp_v2.payees.models import PayeeBankInstruction
+    from erp_v2.payroll_payouts.models import PayrollPayoutBatch
+
+    return (
+        ("payee_instructions", PayeeBankInstruction, PayeeBankInstruction.status.in_(("proposed",))),
+        ("payout_batches", PayrollPayoutBatch, PayrollPayoutBatch.status.in_(("draft", "approved", "file_issued"))),
+        (
+            "manual_journals",
+            ManualJournal,
+            ManualJournal.state.in_(("PREPARED", "POST_REQUESTED", "REVERSAL_REQUESTED")),
+        ),
+        ("bank_reconciliations", BankReconciliation, BankReconciliation.status.in_(("open", "prepared"))),
+        ("cash_gl_repoints", CashAccountRepoint, CashAccountRepoint.status.in_(("proposed",))),
+    )
+
+
+def pending_stamped_off(db, tenant_id: UUID) -> tuple[tuple[str, int], ...]:
+    """Undecided rows of the governed tables that were created with the policy OFF."""
+    from sqlalchemy import func, select
+
+    pending = _pending_specs()
+    counts = []
+    for label, model, undecided in pending:
+        n = db.scalar(
+            select(func.count())
+            .select_from(model)
+            .where(model.tenant_id == tenant_id, model.dual_control.is_(False), undecided)
+        )
+        if n:
+            counts.append((label, int(n)))
+    return tuple(counts)
+
+
 def _observe(
     db, spec: PolicySpec, *, write: bool, spec_sha256: str = "", operator_ref: str = "", audit=None
 ) -> PolicyPlan:
@@ -149,7 +191,8 @@ def _observe(
         return PolicyPlan("unset", requested, (("tenant_missing_or_inactive", 1),))
     row = db.scalar(select(GovernancePolicy).where(GovernancePolicy.tenant_id == spec.tenant_id).with_for_update())
     current = _label(None if row is None else row.dual_control)
-    plan = PolicyPlan(current, requested, ())
+    pending = pending_stamped_off(db, spec.tenant_id) if spec.dual_control else ()
+    plan = PolicyPlan(current, requested, (), pending)
     if write and plan.changes:
         now = datetime.now(UTC)
         if row is None:
