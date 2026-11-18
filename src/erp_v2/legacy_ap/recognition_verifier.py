@@ -54,6 +54,7 @@ from erp_v2.importer.payables_history import (
 )
 from erp_v2.importer.payables_reconciliation import _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
+from erp_v2.importer.tax_accounts import DEFERRAL_DOCUMENT_TYPE
 
 SOURCE_OWNER = "legacy-erp"
 FACTS_DOMAIN = "erp.payables.recognition-facts.v1"
@@ -185,6 +186,17 @@ class ApprovedInvoiceVerifier:
         )
         # No legacy GL footprint of any kind: journals, journal lines, posted ledger lines.
         journals = _read(src, "journal_entry", key="source_document_id", value=invoice_id)
+        # A POSTED legacy VAT-deferral journal is already in the v2 ledger (Dr 1455): posting the invoice under B1
+        # would debit the deferral account a second time. A named refusal, never dropped.
+        _require(
+            not any(
+                str(j["source_module"]) == "AP"
+                and str(j["source_document_type"]) == DEFERRAL_DOCUMENT_TYPE
+                and str(j["status"]).strip().upper() == "POSTED"
+                for j in journals
+            ),
+            "deferral_on_unposted_invoice",
+        )
         _require(not journals, "source_gl_journal_present")
         ledger = _read(src, "posted_ledger_line", key="source_document_id", value=invoice_id)
         _require(not ledger, "source_gl_ledger_present")
