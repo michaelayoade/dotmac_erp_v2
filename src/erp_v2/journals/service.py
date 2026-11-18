@@ -655,6 +655,7 @@ def prepare_ledger_fault_correction(
                 raise JournalRefused("journal_state_refused", journal.status.value.lower())
             row = ManualJournal(
                 tenant_id=tenant_id,
+                dual_control=governance.dual_control(db, tenant_id),
                 journal_id=journal.id,
                 origin=m.ORIGIN_MANUAL,
                 state=m.STATE_PREPARED,

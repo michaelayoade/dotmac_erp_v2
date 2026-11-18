@@ -142,7 +142,7 @@ class Store:
         def scalar(stmt):
             return dual_control if "erp_governance_policies" in str(stmt) else SimpleNamespace(is_active=active)
 
-        return SimpleNamespace(scalar=scalar)
+        return SimpleNamespace(scalar=scalar, get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name="sqlite")))
 
 
 def party(pid, active=True, kind="person"):
