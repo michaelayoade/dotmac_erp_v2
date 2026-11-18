@@ -54,6 +54,7 @@ from erp_v2.disbursement.models import DisbursementFileReceipt
 from erp_v2.journals import policy as journal_policy
 from erp_v2.journals.routes import journals_web_feature
 from erp_v2.payees import service as payee_service
+from erp_v2.payees.models import PayeeBankInstruction
 from erp_v2.payroll_payouts.models import PayrollPayoutBatch
 from erp_v2.supplier_payments import service as svc
 from erp_v2.supplier_payments.routes import supplier_payments_feature
@@ -74,7 +75,43 @@ def registries():
     install_scope_kinds(ScopeKindRegistry.from_manifests(manifests))
 
 
-def world(engine, *, currency="NGN"):
+LEGACY_ACCOUNT_NUMBER = "9999999999"  # differs from ACCOUNT_NUMBER so a later seed_payee supersedes it cleanly
+
+
+def seed_legacy_payee(engine, env, ref="supplier-1", number=LEGACY_ACCOUNT_NUMBER):
+    """An approved instruction as the importer mints it (origin legacy_import): satisfies V3, exempt from SoD."""
+    with Session(engine) as db:
+        db.add(
+            PayeeBankInstruction(
+                tenant_id=env.tenant_id,
+                payee_kind="supplier",
+                payee_ref=ref,
+                payee_label="Supplier One",
+                bank_code="058",
+                bank_name="Example Bank",
+                account_number=number,
+                account_last4=number[-4:],
+                account_name="SUPPLIER ONE LTD",
+                status="approved",
+                origin="legacy_import",
+                proposed_at=NOW,
+                decided_by_party_id=env.people["approver"],  # the migration actor
+                decided_at=NOW,
+                approved_at=NOW,
+            )
+        )
+        db.commit()
+
+
+def world(engine, *, currency="NGN", payee=True):
+    """``payee=False`` leaves supplier-1 without an approved instruction (V3 refuses payment then)."""
+    env = _world(engine, currency=currency)
+    if payee:
+        seed_legacy_payee(engine, env)
+    return env
+
+
+def _world(engine, *, currency="NGN"):
     env = b1.world(engine)
     with Session(engine) as db:
         category = AccountCategory(tenant_id=env.tenant_id, code="AST", name="AST", account_class=AccountClass.ASSET)
@@ -924,6 +961,9 @@ def test_file_refuses_unapproved_payments_missing_payee_instruction_and_mixed_ac
     draft = prepare(engine, env, open_obligation(engine, env, number="AP-D"))
     refused(lambda: generate(engine, env, [draft.payment_id]), "not_approved")
     pid = approved_payment(engine, env, open_obligation(engine, env, number="AP-E"))
+    with Session(engine) as db:  # the instruction is lost after approval (V3 needed it to approve)
+        db.execute(sa.delete(PayeeBankInstruction).where(PayeeBankInstruction.tenant_id == env.tenant_id))
+        db.commit()
     refused(lambda: generate(engine, env, [pid]), "no_approved_payee_instruction")
     refused(lambda: generate(engine, env, []), "no_payments")
     assert counts(engine, env)["file_receipts"] == 0
@@ -1138,31 +1178,9 @@ def test_payment_approver_may_not_be_the_instruction_proposer_or_decider_at_appr
 
 
 def test_legacy_migrated_instruction_does_not_restrict_the_approver(engine):
-    from erp_v2.payees.models import PayeeBankInstruction
-
-    env = world(engine)
+    env = world(engine, payee=False)
     created = prepare(engine, env, open_obligation(engine, env))
-    with Session(engine) as db:
-        db.add(
-            PayeeBankInstruction(
-                tenant_id=env.tenant_id,
-                payee_kind="supplier",
-                payee_ref="supplier-1",
-                payee_label="Supplier One",
-                bank_code="058",
-                bank_name="Example Bank",
-                account_number=ACCOUNT_NUMBER,
-                account_last4=ACCOUNT_NUMBER[-4:],
-                account_name="SUPPLIER ONE LTD",
-                status="approved",
-                origin="legacy_import",
-                proposed_at=NOW,
-                decided_by_party_id=env.people["approver"],  # the migration actor
-                decided_at=NOW,
-                approved_at=NOW,
-            )
-        )
-        db.commit()
+    seed_legacy_payee(engine, env)
     assert approve(engine, env, created.payment_id).replayed is False
 
 
@@ -1254,6 +1272,104 @@ def test_downgrade_refuses_when_receipts_exist(engine):
 
 def test_downgrade_drops_an_empty_table(engine):
     assert _run_downgrade(engine, with_receipt=False) is None
+
+
+# --- V3: an approved payee instruction is required, whatever the bank-file setting (PR-1) -------
+
+
+def payment_status(engine, payment_id):
+    from dotmac_payables.models import SupplierPayment
+
+    with Session(engine) as db:
+        return db.get(SupplierPayment, payment_id).status
+
+
+def test_v3_approve_refuses_without_an_approved_instruction_and_the_payment_stays_a_draft(engine):
+    env = world(engine, payee=False)
+    with Session(engine) as db:
+        assert disbursement_policy.bank_file_generation_enabled(db, env.tenant_id) is False  # files off
+    created = prepare(engine, env, open_obligation(engine, env))
+    before = counts(engine, env)
+    refused(lambda: approve(engine, env, created.payment_id), "payee_instruction_required")
+    assert counts(engine, env) == before
+    assert payment_status(engine, created.payment_id) == SupplierPaymentStatus.DRAFT
+
+
+def test_v3_a_merely_proposed_instruction_does_not_satisfy_it(engine):
+    env = world(engine, payee=False)
+    created = prepare(engine, env, open_obligation(engine, env))
+    with Session(engine) as db:
+        proposed = payee_service.propose(
+            db,
+            tenant_id=env.tenant_id,
+            proposer_party_id=env.people["preparer"],
+            payee_kind="supplier",
+            payee_ref="supplier-1",
+            bank_code="058",
+            bank_name="Example Bank",
+            account_number=ACCOUNT_NUMBER,
+            account_name="SUPPLIER ONE LTD",
+            evidence_ref="letter-1",
+        )
+        proposed_id = proposed.id
+        db.commit()
+    assert proposed_id
+    refused(lambda: approve(engine, env, created.payment_id), "payee_instruction_required")
+
+
+def test_v3_a_human_approved_instruction_satisfies_it(engine):
+    env = world(engine, payee=False)
+    created = prepare(engine, env, open_obligation(engine, env))
+    seed_payee(engine, env)  # proposed by one person, approved by another
+    assert approve(engine, env, created.payment_id).replayed is False
+
+
+def test_v3_a_legacy_import_approved_instruction_satisfies_it(engine):
+    env = world(engine, payee=False)
+    created = prepare(engine, env, open_obligation(engine, env))
+    seed_legacy_payee(engine, env)
+    assert approve(engine, env, created.payment_id).replayed is False
+
+
+def test_v3_record_refuses_when_the_instruction_is_gone_and_no_file_was_issued(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    with Session(engine) as db:
+        db.execute(sa.delete(PayeeBankInstruction).where(PayeeBankInstruction.tenant_id == env.tenant_id))
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, pid), "payee_instruction_required")
+    assert counts(engine, env) == before
+    seed_legacy_payee(engine, env)
+    assert record(engine, env, pid).replayed is False
+
+
+def test_v3_with_a_file_the_existing_codes_still_apply(engine):
+    env = world(engine)
+    pid = approved_payment(engine, env, open_obligation(engine, env))
+    seed_payee(engine, env)  # supersedes the world's instruction
+    enable_file(engine, env)
+    generate(engine, env, [pid])
+    with Session(engine) as db:
+        db.execute(sa.delete(PayeeBankInstruction).where(PayeeBankInstruction.tenant_id == env.tenant_id))
+        db.commit()
+    refused(lambda: record(engine, env, pid), "payee_instruction_unavailable")
+
+
+@pytest.mark.parametrize("code", ["2000", "2040", "1410"])
+def test_a_bank_whose_cash_gl_is_a_control_account_is_refused(engine, code):
+    env = world(engine)
+    if code not in env.accounts:
+        env.accounts[code] = b1.add_account(engine, env, code)
+    oid = open_obligation(engine, env)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(BankAccount).where(BankAccount.id == env.bank_id).values(cash_account_ref=str(env.accounts[code]))
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: prepare(engine, env, oid), "cash_account_is_control")
+    assert counts(engine, env) == before
 
 
 # --- dual-control policy OFF (D-9) ------------------------------------------------------------------------------

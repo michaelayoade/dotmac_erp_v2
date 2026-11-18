@@ -72,7 +72,15 @@ GOOD_FILE = (
 )
 
 
-def world(engine, **kw):
+def world(engine, *, payees=True, **kw):
+    """``payees=False`` leaves every employee without an approved instruction (V3 refuses net-pay then)."""
+    env = _world(engine, **kw)
+    if payees:
+        seed_instructions(engine, env, origin="legacy_import", decider="approver")
+    return env
+
+
+def _world(engine, **kw):
     env = b4.world(engine, **kw)
     with Session(engine) as db:
         # Canonical employee UUIDs (as the B8 importer's _canon_ref spells them), with real people rows,
@@ -162,6 +170,13 @@ def seed_instructions(
         for i, key in enumerate(refs or ("E1", "E2", "E3")):
             ref = env.emp[key]
             manual = origin == "manual"
+            db.execute(  # replace the world's default approved instruction (one approved row per payee)
+                sa.delete(PayeeBankInstruction).where(
+                    PayeeBankInstruction.tenant_id == env.tenant_id,
+                    PayeeBankInstruction.payee_kind == "employee",
+                    PayeeBankInstruction.payee_ref == ref,
+                )
+            )
             db.add(
                 PayeeBankInstruction(
                     tenant_id=env.tenant_id,
@@ -989,10 +1004,16 @@ def test_unsafe_cell_refuses_the_whole_file_and_writes_no_receipt(engine, bad):
 
 def test_missing_instruction_refuses_the_file(engine):
     env = world(engine)
-    seed_instructions(engine, env, refs=("E1", "E2"))
     enable_file(engine, env)
     run_id = finalized(engine, env)
     batch_id = approved_batch(engine, env, run_id)
+    with Session(engine) as db:  # E3 loses its instruction after the approval (V3 needed it to approve)
+        db.execute(
+            sa.delete(PayeeBankInstruction).where(
+                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == env.emp["E3"]
+            )
+        )
+        db.commit()
     refused(lambda: generate(engine, env, batch_id), "no_approved_payee_instruction")
     assert counts(engine, env)["erp_disbursement_file_receipts"] == 0
 
@@ -1000,24 +1021,21 @@ def test_missing_instruction_refuses_the_file(engine):
 # --- statutory remittances: recorded the same way, never a file ------------------
 
 
-def test_statutory_remittance_is_recorded_without_a_file_dr_liability_cr_bank(engine):
+def test_statutory_remittance_fails_closed_until_statutory_payees_exist(engine):
+    """Michael (v1531): statutory remittances are NOT exempt from V3. No statutory payee instruction exists
+    yet (a separate follow-up), so a statutory batch can be prepared but never approved or recorded."""
     env = world(engine)
-    enable_file(engine, env)  # even with files enabled a remittance has none
+    enable_file(engine, env)
     run_id = finalized(engine, env)
     out = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
     batch = batch_row(engine, out.batch_id)
     assert batch.kind == "statutory" and batch.line_count == 2 and batch.total_amount == Decimal("15000")
-    approve(engine, env, out.batch_id)
+    before = counts(engine, env)
+    refused(lambda: approve(engine, env, out.batch_id), "statutory_payee_instruction_required")
+    refused(lambda: record(engine, env, out.batch_id), "not_approved")
+    assert counts(engine, env) == before
+    assert batch_row(engine, out.batch_id).status == "draft"
     refused(lambda: generate(engine, env, out.batch_id), "statutory_no_file")
-    assert counts(engine, env)["erp_disbursement_file_receipts"] == 0
-    refused(lambda: record(engine, env, out.batch_id, who="approver"), "sod_recorder_is_approver")
-    assert record(engine, env, out.batch_id, "FIRS-REMIT-1").journals == 2
-    debits, credits, journals = settlement_posting(engine, env)
-    assert journals == 2 and debits["2110"] == Decimal("15000") and credits["1000"] == Decimal("15000")
-    assert "2040" not in debits
-    rows = liabilities(engine, env, run_id)
-    assert rows[("component", "dest:PAYE")].status == "settled"
-    assert rows[("employee-net-pay", env.emp["E1"])].status == "outstanding"  # net pay untouched
 
 
 def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
@@ -1037,14 +1055,12 @@ def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
     )
 
 
-def test_statutory_sod_has_no_instruction_rule_but_keeps_three_distinct_people(engine):
+def test_statutory_batch_keeps_its_sod_check_and_then_fails_closed_at_v3(engine):
     env = world(engine)
     run_id = finalized(engine, env)
     batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
     refused(lambda: approve(engine, env, batch_id, who="preparer"), "sod_approver_is_preparer")
-    approve(engine, env, batch_id)
-    refused(lambda: record(engine, env, batch_id, who="preparer"), "sod_recorder_is_preparer")
-    assert record(engine, env, batch_id).journals == 2
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
 
 
 # --- internal recovery exclusion (a3 explicit kind; a4 settlement_mode) ---------------
@@ -1286,12 +1302,12 @@ def test_with_files_enabled_recording_requires_the_issued_file(engine):
     assert record(engine, env, batch_id).journals == 3
 
 
-def test_statutory_recording_never_needs_a_file_even_when_files_are_enabled(engine):
+def test_statutory_batch_is_refused_even_when_files_are_enabled(engine):
     env = world(engine)
     enable_file(engine, env)
     run_id = finalized(engine, env)
-    batch_id = approved_batch(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
-    assert record(engine, env, batch_id).journals == 2
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
 
 
 @pytest.mark.parametrize("role", ["proposer", "decider"])
@@ -1349,7 +1365,7 @@ def _recorded_supplier_payment(engine, env, reference):
         tax = Account(
             tenant_id=env.tenant_id,
             category_id=liability.id,
-            code="2100",
+            code="1455",
             name="Input VAT",
             kind=AccountKind.POSTING,
             normal_balance=NormalBalance.DEBIT,
@@ -1362,6 +1378,9 @@ def _recorded_supplier_payment(engine, env, reference):
     b1.approve(engine, env, invoice_id)
     with Session(engine) as db:
         obligation = db.scalar(sa.select(PaymentObligation.id).where(PaymentObligation.invoice_id == invoice_id))
+    import test_b3_supplier_payments_pg as b3
+
+    b3.seed_legacy_payee(engine, env)  # V3: the supplier needs an approved instruction to be paid
     created = act(
         engine,
         env,
@@ -1411,6 +1430,81 @@ def test_a_supplier_reference_on_another_bank_account_does_not_block(engine):
         db.commit()
     batch_id = approved_batch(engine, env, run_id, bank_account_id=other_id)
     assert record(engine, env, batch_id, "ELSEWHERE 1").replayed is False
+
+
+# --- V3: an approved payee instruction is required for net pay, whatever the file setting (PR-1) ---
+
+
+def test_v3_approve_refuses_a_net_pay_batch_without_an_instruction_and_it_stays_a_draft(engine):
+    env = world(engine, payees=False)
+    with Session(engine) as db:
+        assert disbursement_policy.bank_file_generation_enabled(db, env.tenant_id) is False  # files off
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    before = counts(engine, env)
+    refused(lambda: approve(engine, env, batch_id), "payee_instruction_required")
+    assert counts(engine, env) == before
+    assert batch_row(engine, batch_id).status == "draft"
+
+
+def test_v3_one_missing_employee_instruction_is_enough_to_refuse(engine):
+    env = world(engine, payees=False)
+    seed_instructions(engine, env, refs=("E1", "E2"))  # E3 has none
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    refused(lambda: approve(engine, env, batch_id), "payee_instruction_required")
+    seed_instructions(engine, env, refs=("E3",))
+    approve(engine, env, batch_id)
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_v3_legacy_import_approved_instructions_satisfy_it(engine):
+    env = world(engine, payees=False)
+    seed_instructions(engine, env, origin="legacy_import", decider="approver")
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_v3_record_refuses_when_an_instruction_is_gone_and_no_file_was_issued(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    with Session(engine) as db:
+        db.execute(
+            sa.delete(PayeeBankInstruction).where(
+                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == env.emp["E2"]
+            )
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_required")
+    assert counts(engine, env) == before
+    seed_instructions(engine, env, refs=("E2",), origin="legacy_import", decider="approver")
+    assert record(engine, env, batch_id).replayed is False
+
+
+def test_v3_statutory_batches_fail_closed_with_their_own_code(engine):
+    env = world(engine, payees=False)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
+    assert batch_row(engine, batch_id).status == "draft"
+
+
+@pytest.mark.parametrize("code", ["2000", "2040"])
+def test_a_bank_whose_cash_gl_is_a_control_account_is_refused_for_payroll_too(engine, code):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(BankAccount).where(BankAccount.id == env.bank_id).values(cash_account_ref=str(env.accounts[code]))
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: prepare(engine, env, run_id), "cash_account_is_control")
+    assert counts(engine, env) == before
 
 
 # --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------

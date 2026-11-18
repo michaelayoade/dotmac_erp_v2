@@ -35,6 +35,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from erp_v2.governance import policy as governance
+from erp_v2.ledger_roles import invoice_account_violation
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
 
@@ -154,6 +155,14 @@ def _guarded(db: Session, *, tenant: Tenant, party: Party, invoice_id: UUID, now
             "Lines " + ", ".join(map(str, with_dimensions)) + " carry cost-centre/project/segment dimensions, "
             "which cannot be posted yet; refer this invoice to the exceptions review",
         )
+    violation = invoice_account_violation(
+        db,
+        tenant.id,
+        liability_ref=invoice.liability_account_ref,
+        lines=((line.posting_account_ref, line.tax_amount, line.tax_account_ref) for line in lines),
+    )
+    if violation is not None:
+        raise ApprovalRefused(violation[0], violation[1])
     approval_ref = f"erp.b1:supplier_invoice:{invoice.id}:approver:{actor}"
     payables.approve_invoice(
         db,

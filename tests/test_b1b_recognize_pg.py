@@ -303,7 +303,7 @@ def test_apply_recognizes_and_posts_dr_expense_cr_2000(engine, setup):
                 db.get(Account, r.account_id).code: (r.debit, r.credit)
                 for r in db.scalars(sa.select(PostedLedgerLine).where(PostedLedgerLine.journal_id == journal.id))
             }
-            assert lines["5000"] == (200, 0) and lines["2100"] == (15, 0) and lines["2000"] == (0, 215)
+            assert lines["5000"] == (200, 0) and lines["1455"] == (15, 0) and lines["2000"] == (0, 215)
             assert sum(d for d, _ in lines.values()) == sum(c for _, c in lines.values()) == 215
             assert (
                 db.scalar(sa.select(PaymentObligation.original_amount).where(PaymentObligation.invoice_id == iid))
@@ -780,7 +780,7 @@ def test_split_on_the_deferral_account_posts_dr_expense_dr_deferral_cr_2000(engi
                 sa.select(PostedLedgerLine).where(PostedLedgerLine.journal_id == UUID(receipt.accounting_reference))
             )
         }
-    assert lines == {"5000": (200, 0), "2100": (15, 0), "2000": (0, 215)}
+    assert lines == {"5000": (200, 0), "1455": (15, 0), "2000": (0, 215)}
 
 
 @pytest.mark.parametrize("mode", ["none", "wht"])

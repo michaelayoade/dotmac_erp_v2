@@ -29,12 +29,18 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.ledger_roles import invoice_account_violation
+
 _QUANTUM = Decimal("0.000001")
 _MAXIMUM = Decimal("99999999999999.999999")
 
 
 class RevenueActionError(ValueError):
-    """A safe, user-facing document refusal."""
+    """A safe, user-facing document refusal with a stable ``code`` (default ``invalid_input``)."""
+
+    def __init__(self, message: str, code: str = "invalid_input") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _decimal(values: Mapping[str, str], name: str) -> Decimal:
@@ -105,6 +111,9 @@ def create_supplier_draft(
     tax_account = None
     if tax > 0:
         tax_account = _account(db, tenant.id, values.get("tax_account_id", ""), "tax account")
+    violation = invoice_account_violation(db, tenant.id, liability_ref=liability, lines=((posting, tax, tax_account),))
+    if violation is not None:
+        raise RevenueActionError(violation[1], violation[0])
     command = CreateSupplierInvoice(
         number=values.get("number", ""),
         supplier_ref=values.get("supplier_ref", ""),

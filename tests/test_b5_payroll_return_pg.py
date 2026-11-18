@@ -289,12 +289,11 @@ def test_database_refuses_a_batch_person_as_the_returner_and_makes_a_return_writ
 # --- refusals ------------------------------------------------------------------------------
 
 
-def test_statutory_lines_have_no_return_path(engine):
+def test_statutory_batches_fail_closed_so_they_have_no_recorded_line_to_return(engine):
     env = world(engine)
     run_id = finalized(engine, env)
     batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
-    approve(engine, env, batch_id)
-    record(engine, env, batch_id, "REMIT-1")
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
     line = lines(engine, batch_id)[0]
     refused(lambda: give_back(engine, env, batch_id, line), "statutory_no_return")
     assert reversal_count(engine, env) == 0

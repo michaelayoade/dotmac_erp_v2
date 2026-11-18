@@ -50,3 +50,9 @@ library (`erp_v2.disbursement`) is shared with B5.
   payment that has any.
 - Payments not in the tenant functional currency at rate 1 (`fx_unsupported`): realised FX is not modelled.
 - Open legacy invoices outside the admitted cohort have no obligation and cannot be paid here.
+
+## Pre-flip validations (V1-V3)
+
+- V3: a supplier payment needs an approved payee bank instruction at approval and at recording, whether or not bank files are enabled (`payee_instruction_required`). With a file issued, the existing `payee_instruction_unavailable` / `payee_instruction_changed` codes apply. Legacy-import approved instructions satisfy it.
+- A bank account whose cash GL is a control account (2000/2040/1410) is refused (`cash_account_is_control`).
+- V1/V2 apply to the supplier invoice that creates the obligation: a taxed line's tax account must be the input-tax account 1455 and not the line's own account, and the liability must be AP control 2000. No invoice line or tax account may be a control account (`line_account_is_control`), so `Dr 1410 / Cr 2000` cannot be entered as an invoice.

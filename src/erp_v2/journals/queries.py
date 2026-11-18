@@ -14,10 +14,11 @@ from sqlalchemy.orm import Session
 from erp_v2.journals import models as m
 from erp_v2.journals.models import ManualJournal
 from erp_v2.journals.service import LEGACY_OWNER
+from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
 
-# Subledger control accounts (AP control, payroll payable): a manual posting here is allowed but
-# breaks subledger-to-GL parity unless deliberate, so approval screens warn (never block).
-CONTROL_ACCOUNT_CODES = frozenset({"2000", "2040"})
+# Subledger control accounts (AP control, payroll payable, staff loans): refused except through the
+# owning subledger or a ledger-fault correction. The screens still flag any such journal they find
+# (a held legacy draft, or a system-built ledger-fault correction).
 PAGE_SIZE = 50
 MAX_PAGE = 1000
 REGISTER_LIMIT = 200

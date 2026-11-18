@@ -78,6 +78,7 @@ from sqlalchemy.orm import Session
 
 from erp_v2.governance import policy as governance
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
+from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
 from erp_v2.posting import rules
 from erp_v2.posting.payroll import post_payroll_consequence
 from erp_v2.posting.rules import PostingRefused
@@ -405,6 +406,12 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
                 f"{_listed(sorted(who))}: an external deduction or employer liability maps to {account.code}, "
                 "which must be a LIABILITY-class account (an asset recovery must be marked internal_recovery "
                 "on the pay structure rule)",
+            )
+        if account.code in CONTROL_ACCOUNT_CODES and account.id != payable.id:
+            raise RunRefused(
+                "deduction_mapped_to_control",
+                f"{_listed(sorted(who))} is mapped to {account.code}, a subledger control account; "
+                "an external deduction maps to its own liability account",
             )
         if account.id == payable.id:
             raise RunRefused(
