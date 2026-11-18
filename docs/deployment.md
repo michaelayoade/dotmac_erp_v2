@@ -336,6 +336,12 @@ this does not authorize adjusting balances or switching traffic.
   this section moves to it. No new permission, role profile bump or environment variable; the policy is set only
   by `python -m erp_v2.governance.cli`.
 
+- Held drafts (B-2; `docs/held-drafts.md`) adds the head `e2_0027_held_draft_decisions` (chained after
+  `e2_0023_staff_loan_entries` on main; the coordinator re-chains it after `e2_0026` at merge): one table
+  `erp_held_draft_decisions` (RLS forced, runtime SELECT only, a trigger refuses UPDATE and DELETE; the downgrade
+  refuses while rows exist). Written only by `python -m erp_v2.held_drafts.cli`. No new permission, role profile
+  bump or environment variable for the serving runtime.
+
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
 depends on `bk_0001_banking`; its stamped head is absorbed by that lineage.
