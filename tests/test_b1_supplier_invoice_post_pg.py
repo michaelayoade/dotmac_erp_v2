@@ -652,3 +652,20 @@ def test_v2_b1_refuses_a_control_account_as_the_tax_account(engine):
     env = world(engine)
     iid = invoice(engine, env, tax_account=env.accounts["2040"])
     refusal(engine, env, iid, "line_account_is_control")
+
+
+@pytest.mark.parametrize("code", ["1455", "1440"])
+def test_an_input_tax_or_release_account_is_never_an_invoice_lines_own_posting_account(engine, code):
+    env = world(engine)
+    target = env.tax_account if code == "1455" else add_account(engine, env, "1440")
+    draft_refused(engine, env, "line_account_is_tax_account", posting_account_id=str(target), tax="0")  # untaxed
+    iid = invoice(engine, env, submit=False, tax="0")
+    with Session(engine) as db:
+        db.execute(
+            sa.update(SupplierInvoiceLine)
+            .where(SupplierInvoiceLine.invoice_id == iid)
+            .values(posting_account_ref=str(target))
+        )
+        db.commit()
+    submit(engine, env, iid)
+    refusal(engine, env, iid, "line_account_is_tax_account")
