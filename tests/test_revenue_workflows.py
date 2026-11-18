@@ -81,6 +81,32 @@ def data():
             db.add(account)
             db.flush()
             accounts.append(account)
+        input_tax = Account(
+            tenant_id=tenant.id,
+            category_id=accounts[0].category_id,
+            code="1455",
+            name="Deferred input VAT",
+            kind=AccountKind.POSTING,
+            normal_balance=NormalBalance.DEBIT,
+            is_active=True,
+            posting_allowed=True,
+        )
+        db.add(input_tax)
+        db.flush()
+        expense = Account(
+            tenant_id=tenant.id,
+            category_id=accounts[0].category_id,
+            code="5000",
+            name="Expense",
+            kind=AccountKind.POSTING,
+            normal_balance=NormalBalance.DEBIT,
+            is_active=True,
+            posting_allowed=True,
+        )
+        db.add(expense)
+        db.flush()
+        accounts.append(input_tax)  # accounts[2]: tenant A's input-tax account (V1)
+        accounts.append(expense)  # accounts[3]: a non-control line account (V2)
         values = {
             "request_id": str(uuid4()),
             "number": "AP-001",
@@ -96,7 +122,7 @@ def data():
             "unit_price": "100",
             "tax_amount": "0",
             "exchange_rate": "1",
-            "posting_account_id": str(accounts[0].id),
+            "posting_account_id": str(accounts[3].id),
             "liability_account_id": str(accounts[0].id),
         }
         yield db, tenant, other, party, accounts, values
@@ -170,7 +196,7 @@ def test_duplicate_number_failure_keeps_session_usable(data):
 def test_document_tax_and_owner_obligation_evidence(data):
     db, tenant, other, party, accounts, values = data
     invoice = services.create_supplier_draft(
-        db, tenant=tenant, party=party, values={**values, "tax_amount": "15", "tax_account_id": str(accounts[0].id)}
+        db, tenant=tenant, party=party, values={**values, "tax_amount": "15", "tax_account_id": str(accounts[2].id)}
     )
     assert invoice.total_amount == Decimal("215") and invoice.tax_amount == Decimal("15")
     now = datetime.now(timezone.utc)
