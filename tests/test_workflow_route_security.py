@@ -33,7 +33,13 @@ from sqlalchemy.pool import StaticPool
 
 from erp_v2.assembly import assembly
 from erp_v2.banking import routes as banking_routes
-from erp_v2.web import payroll_actions, payroll_run_routes, revenue_approval_routes, revenue_routes
+from erp_v2.web import (
+    credit_note_routes,
+    payroll_actions,
+    payroll_run_routes,
+    revenue_approval_routes,
+    revenue_routes,
+)
 
 DOCUMENT_ID = uuid4()
 WRITE_PATHS = (
@@ -41,6 +47,8 @@ WRITE_PATHS = (
     f"/finance/supplier-invoices/{DOCUMENT_ID}/submit",
     "/payroll/runs",
     f"/payroll/runs/{DOCUMENT_ID}/calculate",
+    "/finance/supplier-credit-notes",
+    f"/finance/supplier-credit-notes/{DOCUMENT_ID}/submit",
 )
 
 
@@ -54,6 +62,7 @@ class Browser:
     banking_read: Mock
     supplier_read: Mock
     approve: Mock
+    credit_approve: Mock
     payroll: dict | None = None
 
     def sign_in(self, role: str | None) -> str:
@@ -143,6 +152,12 @@ def browser(monkeypatch):
         monkeypatch.setattr(revenue_routes.services, "submit_supplier_draft", actions[1])
         monkeypatch.setattr(payroll_actions, "create_draft", actions[2])
         monkeypatch.setattr(payroll_actions, "calculate_employee", actions[3])
+        monkeypatch.setattr(credit_note_routes.services, "create_credit_note_draft", actions[4])
+        monkeypatch.setattr(credit_note_routes.services, "submit_credit_note_draft", actions[5])
+        credit_approve = Mock(
+            return_value=SimpleNamespace(credit_note_id=DOCUMENT_ID, accounting_reference="j", replayed=False)
+        )
+        monkeypatch.setattr(credit_note_routes.services, "approve_and_post", credit_approve)
         approve = Mock(return_value=SimpleNamespace(invoice_id=DOCUMENT_ID, accounting_reference="j", replayed=False))
         monkeypatch.setattr(revenue_approval_routes.services, "approve_and_post", approve)
         payroll_mocks = {
@@ -163,7 +178,16 @@ def browser(monkeypatch):
         client = TestClient(app, base_url="http://acme.erp.test", follow_redirects=False)
         try:
             yield Browser(
-                client, tenant, parties["admin"], tokens, actions, banking_read, supplier_read, approve, payroll_mocks
+                client,
+                tenant,
+                parties["admin"],
+                tokens,
+                actions,
+                banking_read,
+                supplier_read,
+                approve,
+                credit_approve,
+                payroll_mocks,
             )
         finally:
             client.close()
@@ -185,10 +209,10 @@ def test_authorized_workflow_reaches_only_its_financial_action(browser: Browser,
                 assert action.call_args.kwargs["party"].id == browser.party.id
         else:
             action.assert_not_called()
-    if selected == 0:
-        assert "csrf_token" not in browser.actions[0].call_args.kwargs["values"]
-    if selected in (1, 3):
-        key = "invoice_id" if selected == 1 else "run_id"
+    if selected in (0, 4):
+        assert "csrf_token" not in browser.actions[selected].call_args.kwargs["values"]
+    if selected in (1, 3, 5):
+        key = {1: "invoice_id", 3: "run_id", 5: "credit_note_id"}[selected]
         assert browser.actions[selected].call_args.kwargs[key] == DOCUMENT_ID
 
 
@@ -236,6 +260,11 @@ def test_workflow_refuses_invalid_csrf_before_financial_action(browser: Browser,
         ("/finance/supplier-invoices/new", "admin", 200),
         ("/finance/supplier-invoices/new", None, 302),
         ("/finance/supplier-invoices/new", "staff", 403),
+        ("/finance/supplier-credit-notes/new", "admin", 200),
+        ("/finance/supplier-credit-notes/new", None, 302),
+        ("/finance/supplier-credit-notes/new", "staff", 403),
+        (f"/finance/supplier-credit-notes/{DOCUMENT_ID}", None, 302),
+        (f"/finance/supplier-credit-notes/{DOCUMENT_ID}", "unprivileged", 403),
     ],
 )
 def test_mounted_read_pages_enforce_their_permission(browser: Browser, path, role, expected) -> None:
@@ -288,6 +317,37 @@ def test_approve_refuses_invalid_csrf(browser: Browser) -> None:
     response = browser.client.post(APPROVE_PATH, data={}, headers={"origin": "https://other.example"})
     assert response.status_code == 403
     browser.approve.assert_not_called()
+
+
+CREDIT_APPROVE_PATH = f"/finance/supplier-credit-notes/{DOCUMENT_ID}/approve"
+
+
+def test_only_finance_approver_reaches_credit_note_approve_and_post(browser: Browser) -> None:
+    token = browser.sign_in("approver")
+    response = browser.client.post(
+        CREDIT_APPROVE_PATH, data={"csrf_token": token, "evidence_ref": "FIN-EXC-1", "apply_amount": ""}
+    )
+    assert response.status_code == 303
+    browser.credit_approve.assert_called_once()
+    kwargs = browser.credit_approve.call_args.kwargs
+    assert kwargs["tenant"].id == browser.tenant.id and kwargs["credit_note_id"] == DOCUMENT_ID
+    assert kwargs["evidence_ref"] == "FIN-EXC-1" and kwargs["obligation_id"] is None
+    browser.approve.assert_not_called()  # the invoice approver is a different route
+
+
+@pytest.mark.parametrize("role,expected", [(None, 302), ("admin", 403), ("staff", 403), ("admin_approver", 403)])
+def test_credit_note_approve_refused_for_admin_staff_and_anonymous(browser: Browser, role, expected) -> None:
+    token = browser.sign_in(role)
+    response = browser.client.post(CREDIT_APPROVE_PATH, data={"csrf_token": token, "evidence_ref": "x"})
+    assert response.status_code == expected
+    browser.credit_approve.assert_not_called()
+
+
+def test_credit_note_approve_refuses_invalid_csrf(browser: Browser) -> None:
+    browser.sign_in("approver")
+    response = browser.client.post(CREDIT_APPROVE_PATH, data={}, headers={"origin": "https://other.example"})
+    assert response.status_code == 403
+    browser.credit_approve.assert_not_called()
 
 
 REENTRY_PATH = "/finance/supplier-invoices/legacy-reentry"

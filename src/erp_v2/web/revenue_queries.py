@@ -6,7 +6,15 @@ from uuid import UUID
 
 from dotmac_accounting.models import Account
 from dotmac_billing.models import BillingAccount, BillingDocument, ConfirmedSettlement
-from dotmac_payables.models import PaymentObligation, SettlementObservation, SupplierInvoice, SupplierInvoiceLine
+from dotmac_payables.models import (
+    CreditApplication,
+    CreditNote,
+    CreditNoteLine,
+    PaymentObligation,
+    SettlementObservation,
+    SupplierInvoice,
+    SupplierInvoiceLine,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -97,3 +105,28 @@ def supplier_detail(db: Session, *, tenant_id: UUID, invoice_id: UUID) -> dict[s
         "observations": observations,
         "legacy_reference": legacy_reference,
     }
+
+
+def credit_note_detail(db: Session, *, tenant_id: UUID, credit_note_id: UUID) -> dict[str, object] | None:
+    """One supplier credit note with its lines, applications and the original invoice's open obligations."""
+    credit = db.scalar(select(CreditNote).where(CreditNote.tenant_id == tenant_id, CreditNote.id == credit_note_id))
+    if credit is None:
+        return None
+    lines = db.scalars(
+        select(CreditNoteLine)
+        .where(CreditNoteLine.tenant_id == tenant_id, CreditNoteLine.credit_note_id == credit_note_id)
+        .order_by(CreditNoteLine.line_number)
+    ).all()
+    applications = db.scalars(
+        select(CreditApplication)
+        .where(CreditApplication.tenant_id == tenant_id, CreditApplication.credit_note_id == credit_note_id)
+        .order_by(CreditApplication.applied_at)
+    ).all()
+    obligations = []
+    if credit.original_invoice_id is not None:
+        obligations = db.scalars(
+            select(PaymentObligation)
+            .where(PaymentObligation.tenant_id == tenant_id, PaymentObligation.invoice_id == credit.original_invoice_id)
+            .order_by(PaymentObligation.sequence)
+        ).all()
+    return {"credit": credit, "lines": lines, "applications": applications, "obligations": obligations}

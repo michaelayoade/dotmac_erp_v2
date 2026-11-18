@@ -161,6 +161,11 @@ ALLOWED_SRC = {
     # gate, widened explicitly by the architect's review of #61.
     "src/erp_v2/web/payroll_run_services.py",
     ".github/workflows/ci.yml",
+    # PR-2 (B1c supplier credit notes), stacked on PR-1: new modules, the read model and the feature list
+    "src/erp_v2/web/credit_note_services.py",
+    "src/erp_v2/web/credit_note_routes.py",
+    "src/erp_v2/web/revenue_queries.py",
+    "src/erp_v2/features.py",
 }
 ALLOWED_PATTERNS = ("src/erp_v2/templates/*", "tests/*", "docs/*.md")
 PROTECTED_TESTS = (
