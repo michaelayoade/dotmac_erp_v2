@@ -46,6 +46,7 @@ from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import DisbursementFileReceipt
 from erp_v2.journals.routes import journals_web_feature
+from erp_v2.payees import service as payee_service
 from erp_v2.payees.models import PayeeBankInstruction
 from erp_v2.payroll_payouts import service as svc
 from erp_v2.payroll_payouts.models import PayrollPayoutBatch, PayrollPayoutLine
@@ -200,6 +201,26 @@ def seed_instructions(
                 )
             )
         db.commit()
+
+
+def seed_statutory_instruction(engine, env, ref, *, proposer="proposer", decider="decider"):
+    """A real statutory payee instruction: proposed and approved through the payee service."""
+    with Session(engine) as db:
+        row = payee_service.propose(
+            db,
+            tenant_id=env.tenant_id,
+            proposer_party_id=env.people[proposer],
+            payee_kind="statutory",
+            payee_ref=ref,
+            bank_code="058",
+            bank_name="Example Bank",
+            account_number="0123456789",
+            account_name="Example Authority",
+            evidence_ref="letter-1",
+        )
+        payee_service.approve(db, tenant_id=env.tenant_id, instruction_id=row.id, approver_party_id=env.people[decider])
+        db.commit()
+        return row.id
 
 
 def act(engine, env, who, fn, **kw):
@@ -1022,9 +1043,9 @@ def test_missing_instruction_refuses_the_file(engine):
 # --- statutory remittances: recorded the same way, never a file ------------------
 
 
-def test_statutory_remittance_fails_closed_until_statutory_payees_exist(engine):
-    """Michael (v1531): statutory remittances are NOT exempt from V3. No statutory payee instruction exists
-    yet (a separate follow-up), so a statutory batch can be prepared but never approved or recorded."""
+def test_statutory_remittance_fails_closed_without_an_approved_statutory_instruction(engine):
+    """Michael (v1531): statutory remittances are NOT exempt from V3. Without an approved statutory payee
+    instruction a statutory batch can be prepared but never approved or recorded."""
     env = world(engine)
     enable_file(engine, env)
     run_id = finalized(engine, env)
@@ -1037,6 +1058,43 @@ def test_statutory_remittance_fails_closed_until_statutory_payees_exist(engine):
     assert counts(engine, env) == before
     assert batch_row(engine, out.batch_id).status == "draft"
     refused(lambda: generate(engine, env, out.batch_id), "statutory_no_file")
+
+
+def test_statutory_batch_passes_with_an_approved_instruction_and_records_its_evidence(engine):
+    env = world(engine)
+    enable_file(engine, env)
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
+    refused(lambda: approve(engine, env, out.batch_id), "statutory_payee_instruction_required")
+    instruction_id = seed_statutory_instruction(engine, env, "dest:PAYE")
+    approve(engine, env, out.batch_id)
+    assert batch_row(engine, out.batch_id).status == "approved"
+    refused(lambda: generate(engine, env, out.batch_id), "statutory_no_file")
+    assert record(engine, env, out.batch_id).replayed is False
+    assert batch_row(engine, out.batch_id).status == "recorded"
+    details = audits(engine, env, svc.AUDIT_RECORDED)[-1].details
+    assert details["payee_instruction_id"] == str(instruction_id)
+    assert details["account_last4"] == "6789" and details["destination_ref"] == "dest:PAYE"
+    assert "0123456789" not in str(details)
+
+
+def test_statutory_instruction_is_per_destination_and_record_refuses_once_it_is_revoked(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    seed_statutory_instruction(engine, env, "dest:PAYE")
+    other = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
+    refused(lambda: approve(engine, env, other), "statutory_payee_instruction_required")  # other authority: none
+    paye = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    approve(engine, env, paye)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(PayeeBankInstruction)
+            .where(PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_kind == "statutory")
+            .values(status="revoked", revoked_at=NOW, revoked_by_party_id=env.people["decider"])
+        )
+        db.commit()
+    refused(lambda: record(engine, env, paye), "statutory_payee_instruction_required")
+    assert batch_row(engine, paye).status == "approved"
 
 
 def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):

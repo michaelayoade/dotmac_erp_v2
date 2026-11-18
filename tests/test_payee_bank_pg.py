@@ -19,6 +19,7 @@ from dotmac_kernel.audit import AuditEvent
 from dotmac_kernel.audit_actions import AuditActionRegistry
 from dotmac_kernel.models import Party, PartyPerson, PartyType, Tenant
 from dotmac_payables.models import SupplierInvoice
+from dotmac_payroll.models import PayComponent
 from dotmac_people.models import Employee
 from dual_control_support import set_dual_control, set_dual_control_engine
 from sqlalchemy.orm import Session
@@ -570,3 +571,85 @@ def test_runtime_has_no_update_on_the_dual_control_column(engine, runtime_engine
             sa.text("SELECT has_column_privilege('app_user', 'payee_bank_instructions', 'dual_control', 'UPDATE')")
         ).scalar()
     assert allowed is False
+
+
+# --- statutory payees (PR-4b): keyed by the payroll external beneficiary ref ----------------------------------------
+
+
+def add_component(db, tenant_id, ref, name="Pension employer", code="PEN_ER"):
+    db.add(
+        PayComponent(
+            tenant_id=tenant_id,
+            component_code=code,
+            name=name,
+            kind="employer_liability",
+            liability_destination_ref=ref,
+            status="active",
+        )
+    )
+    db.flush()
+
+
+def test_statutory_instruction_propose_and_approve_with_a_server_derived_label(engine):
+    tenant = new_tenant(engine)
+    with Session(engine) as db:
+        add_component(db, tenant, "dest:PENSION_ER")
+        row = propose(db, tenant, ref="dest:PENSION_ER", kind="statutory")
+        assert row.payee_kind == "statutory" and row.payee_label == "Pension employer"
+        approved = service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
+        db.commit()
+        assert approved.status == "approved" and approved.dual_control is True
+        dest = service.destination_for_payment(
+            db, tenant_id=tenant, payee_kind="statutory", payee_ref="dest:PENSION_ER"
+        )
+        assert dest.payee_kind == "statutory" and dest.account_number == NUMBER
+
+
+def test_statutory_follows_the_tenant_two_person_policy(engine):
+    tenant = new_tenant(engine)  # policy ON
+    with Session(engine) as db:
+        add_component(db, tenant, "dest:PAYE", name="PAYE", code="PAYE")
+        row = propose(db, tenant, ref="dest:PAYE", kind="statutory")
+        with pytest.raises(PayeeBankError) as err:
+            service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=PREPARER)
+        assert err.value.code == "same_person"
+        db.rollback()
+    off = new_tenant(engine)
+    set_dual_control_engine(engine, off, False)
+    with Session(engine) as db:
+        add_component(db, off, "dest:PAYE", name="PAYE", code="PAYE")
+        row = propose(db, off, ref="dest:PAYE", kind="statutory")
+        approved = service.approve(db, tenant_id=off, instruction_id=row.id, approver_party_id=PREPARER)
+        db.commit()
+        assert approved.status == "approved" and approved.dual_control is False
+
+
+def test_unknown_or_foreign_statutory_refs_are_refused(engine):
+    tenant, other = new_tenant(engine), new_tenant(engine)
+    with Session(engine) as db:
+        add_component(db, other, "dest:FOREIGN")
+        add_component(db, tenant, "dest:PAYE", name="PAYE", code="PAYE")
+        db.commit()
+    with Session(engine) as db:
+        for ref in ("dest:NOPE", "dest:FOREIGN", "dest:paye", ""):
+            with pytest.raises(PayeeBankError) as err:
+                propose(db, tenant, ref=ref, kind="statutory")
+            assert err.value.code in {"unknown_payee", "invalid_input"}
+            db.rollback()
+
+
+def test_the_kind_check_accepts_statutory_and_still_refuses_other_kinds(engine):
+    tenant = new_tenant(engine)
+    with Session(engine) as db:
+        add_component(db, tenant, "dest:PAYE", name="PAYE", code="PAYE")
+        db.commit()
+    with engine.connect() as c:
+        definition = c.execute(
+            sa.text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = :n"),
+            {"n": "ck_payee_bank_instructions_kind"},
+        ).scalar()
+    assert "statutory" in definition and "supplier" in definition and "employee" in definition
+    with Session(engine) as db:
+        with pytest.raises(PayeeBankError) as err:
+            propose(db, tenant, ref="dest:PAYE", kind="vendor")
+        assert err.value.code == "invalid_input"

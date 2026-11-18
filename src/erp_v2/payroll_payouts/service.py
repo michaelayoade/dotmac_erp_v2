@@ -345,18 +345,29 @@ def _refuse_returner(
         )
 
 
-def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]) -> None:
-    """V3: every net-pay line's employee has an approved payee bank instruction, whatever the file setting.
-
-    A statutory remittance goes to a destination chosen on the batch (``dest:...``), for which no payee
-    instruction exists yet, so it fails closed until statutory payees exist (separate follow-up).
-    """
-    if batch.kind != KIND_NET_PAY:
+def _statutory_destination(db: Session, batch: PayrollPayoutBatch) -> payee_service.PaymentDestination:
+    """V3 for a statutory remittance: its single destination (``dest:...``) needs an APPROVED statutory instruction."""
+    try:
+        return payee_service.destination_for_payment(
+            db, tenant_id=batch.tenant_id, payee_kind=PayeeKind.STATUTORY.value, payee_ref=batch.destination_ref or ""
+        )
+    except payee_service.PayeeBankError as exc:
         raise PayoutRefused(
             "statutory_payee_instruction_required",
-            "A statutory remittance needs an approved payee instruction for its destination, and statutory "
-            "payees are not available yet; refer it to Finance",
-        )
+            "A statutory remittance needs an approved payee instruction for its destination; "
+            "propose and approve one first",
+        ) from exc
+
+
+def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]) -> None:
+    """V3: every net-pay line's employee, or a statutory batch's destination, has an approved payee instruction.
+
+    Net pay is checked whatever the file setting. A statutory remittance goes to the single destination
+    chosen on the batch (``dest:...``), which must have an approved ``statutory`` instruction.
+    """
+    if batch.kind != KIND_NET_PAY:
+        _statutory_destination(db, batch)
+        return
     for line in lines:
         try:
             payee_service.destination_for_payment(
@@ -861,6 +872,14 @@ def _record(
     batch.bank_reference = reference
     batch.updated_at = now
     db.flush()
+    evidence: dict[str, object] = {}
+    if batch.kind == KIND_STATUTORY:  # V3 binds the destination's account to the record (never the full number)
+        destination = _statutory_destination(db, batch)
+        evidence = {
+            "payee_instruction_id": str(destination.instruction_id),
+            "destination_ref": batch.destination_ref,
+            "account_last4": destination.account_number[-4:],
+        }
     _audit(
         db,
         tenant=tenant,
@@ -869,6 +888,7 @@ def _record(
         action=AUDIT_RECORDED,
         success=True,
         details={
+            **evidence,
             "number": batch.number,
             "kind": batch.kind,
             "bank_reference": reference,
