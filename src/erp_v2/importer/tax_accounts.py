@@ -63,7 +63,7 @@ named refusal, never a silent fold.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Final
 from uuid import UUID
@@ -139,6 +139,9 @@ class InvoiceTax:
     deferral_journals: int = 0  # POSTED legacy VAT-deferral journals linked to the invoice
     deferral_not_posted: int = 0  # linked deferral journals in another status (ignored)
     deferral_journal_ids: tuple[str, ...] = ()  # POSTED deferral journals (evidence; the admission checks them)
+    # A1 / A1D only: the legacy expense-side debits as posted (per account, non-zero, split accounts removed). Read by
+    # T-EXP-LEGACY (importer/transforms.py) to name the legacy account an expense posted elsewhere sits on.
+    expense_debits: Mapping[str, Decimal] = field(default_factory=dict)
 
     @property
     def other(self) -> bool:
@@ -327,7 +330,13 @@ def _classify(
                 _add(expected, line.expense_account_id, line.line_amount)
             for account, tax in split_tax.items():
                 _add(expected, account, tax)
-            return InvoiceTax(True, result, "A1", _nonzero(expected) != actual)
+            return InvoiceTax(
+                True,
+                result,
+                "A1",
+                _nonzero(expected) != actual,
+                expense_debits={a: v for a, v in actual.items() if a not in split_tax},
+            )
 
     if n_deferral >= 2:
         return _a3(result, taxed, "deferral_journal_multiple")  # never summed
@@ -364,7 +373,13 @@ def _classify(
                 _add(expected, line.expense_account_id, line.line_amount)
             for account, tax in split_tax.items():
                 _add(expected, account, tax)
-            return InvoiceTax(True, result, "A1D", _nonzero(expected) != net)
+            return InvoiceTax(
+                True,
+                result,
+                "A1D",
+                _nonzero(expected) != net,
+                expense_debits={a: v for a, v in net.items() if a not in split_tax},
+            )
         if mismatch:
             return _a3(result, taxed, "deferral_amount_mismatch")
         # The ledger agrees with the header total but the lines sum to more than the header subtotal: a header/line
@@ -516,39 +531,14 @@ def code_facts(
     return TaxCodeFacts(organization_id, tax_type, paid_account_id, deferral_account_id)
 
 
-def classify_snapshot(
+def group_invoice_rows(
     rows: Iterable[Mapping[str, object]],
-    ledger: Iterable[Mapping[str, object]],
-    global_accounts: Iterable[Mapping[str, object]] = (),
-    deferral_journals: Iterable[Mapping[str, object]] = (),
-) -> dict[str, InvoiceTax]:
-    """Classify every invoice of ``INVOICE_LINE_SQL`` rows against ``LEDGER_DEBIT_SQL`` rows.
+) -> tuple[dict[str, tuple[object, str | None, list[LineFacts]]], dict[str, object], dict[str, tuple[object, object]]]:
+    """Group ``INVOICE_LINE_SQL`` rows per canonical invoice id: ``(organization, journal id, lines)``, the AP control
+    account, and the header ``(subtotal, total)``. Shared by the classifier and the importer transforms."""
 
-    ``deferral_journals`` are ``DEFERRAL_JOURNAL_SQL`` rows. Keyed by canonical invoice id. Pure over already-read rows.
-    """
-
-    debits: dict[str, dict[str, Decimal]] = {}
-    nets: dict[str, dict[str, Decimal]] = {}
-    for row in ledger:
-        journal = canonical(row["journal_entry_id"])
-        account = debits.setdefault(journal, {})
-        key = canonical(row["account_id"])
-        if key is None:
-            raise TaxAccountMappingError("ledger_account_missing")
-        debit = _money(row["debit_amount"] or 0, "ledger_debit")
-        account[key] = account.get(key, Decimal(0)) + debit
-        net = nets.setdefault(journal, {})
-        net[key] = net.get(key, Decimal(0)) + debit - _money(row.get("credit_amount") or 0, "ledger_credit")
-    posted_deferral: dict[str, list[str]] = {}
-    headers: dict[str, tuple[object, object]] = {}
-    not_posted: dict[str, int] = {}
-    for row in deferral_journals:
-        invoice = canonical(row["source_document_id"])
-        if str(row["status"]).strip().upper() == "POSTED":
-            posted_deferral.setdefault(invoice, []).append(canonical(row["journal_entry_id"]))
-        else:
-            not_posted[invoice] = not_posted.get(invoice, 0) + 1
     controls: dict[str, object] = {}
+    headers: dict[str, tuple[object, object]] = {}
     grouped: dict[str, tuple[object, str | None, list[LineFacts]]] = {}
     for row in rows:
         invoice = canonical(row["invoice_id"])
@@ -573,6 +563,41 @@ def classify_snapshot(
                 ),
             )
         )
+    return grouped, controls, headers
+
+
+def classify_snapshot(
+    rows: Iterable[Mapping[str, object]],
+    ledger: Iterable[Mapping[str, object]],
+    global_accounts: Iterable[Mapping[str, object]] = (),
+    deferral_journals: Iterable[Mapping[str, object]] = (),
+) -> dict[str, InvoiceTax]:
+    """Classify every invoice of ``INVOICE_LINE_SQL`` rows against ``LEDGER_DEBIT_SQL`` rows.
+
+    ``deferral_journals`` are ``DEFERRAL_JOURNAL_SQL`` rows. Keyed by canonical invoice id. Pure over already-read rows.
+    """
+
+    debits: dict[str, dict[str, Decimal]] = {}
+    nets: dict[str, dict[str, Decimal]] = {}
+    for row in ledger:
+        journal = canonical(row["journal_entry_id"])
+        account = debits.setdefault(journal, {})
+        key = canonical(row["account_id"])
+        if key is None:
+            raise TaxAccountMappingError("ledger_account_missing")
+        debit = _money(row["debit_amount"] or 0, "ledger_debit")
+        account[key] = account.get(key, Decimal(0)) + debit
+        net = nets.setdefault(journal, {})
+        net[key] = net.get(key, Decimal(0)) + debit - _money(row.get("credit_amount") or 0, "ledger_credit")
+    posted_deferral: dict[str, list[str]] = {}
+    not_posted: dict[str, int] = {}
+    for row in deferral_journals:
+        invoice = canonical(row["source_document_id"])
+        if str(row["status"]).strip().upper() == "POSTED":
+            posted_deferral.setdefault(invoice, []).append(canonical(row["journal_entry_id"]))
+        else:
+            not_posted[invoice] = not_posted.get(invoice, 0) + 1
+    grouped, controls, headers = group_invoice_rows(rows)
     every_tax_account = {
         canonical(value)
         for row in global_accounts
@@ -621,5 +646,6 @@ __all__ = [
     "classify_invoice",
     "classify_snapshot",
     "code_facts",
+    "group_invoice_rows",
     "snapshot_split_account",
 ]

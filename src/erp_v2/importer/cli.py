@@ -44,6 +44,7 @@ from erp_v2.importer.sub_origin import (
     sub_tagged_customers_referenced_by_native,
     write_side_file,
 )
+from erp_v2.importer.transforms import TransformParams, TransformParamsError
 from erp_v2.importer.transitions import VoidGovernance, run_transitions
 from erp_v2.importer.wave1 import WAVE1_MAPPINGS
 from erp_v2.importer.wave2 import WAVE2_PAIRINGS, Pairing
@@ -453,6 +454,8 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
 
 
 SIDE_FILE_SUFFIX = ".sub-origin-keys.json"
+TRANSFORMS_FILE_SUFFIX = ".transforms.json"
+TRANSFORM_MAP_NAMES = frozenset({"supplier_line_transforms", "supplier_invoice_transforms"})
 
 
 def _sub_origin_receipt(source_engine: sa.Engine, source_schemas, reports, receipt_path: Path) -> dict[str, object]:
@@ -529,6 +532,36 @@ def _sub_origin_receipt(source_engine: sa.Engine, source_schemas, reports, recei
             incomplete.append(f"side file could not be written ({type(exc).__name__})")
     section["incomplete"] = incomplete
     return section
+
+
+PARAMS_HINT = (
+    "declare import.fallback_expense_account (the Finance-named account for lines legacy left without an expense "
+    "account) in the --import-params-json file"
+)
+
+
+def _transforms_receipt(enrolment: EnrolmentMaps, receipt_path: Path) -> tuple[dict[str, object], list[str]]:
+    """Counts, per-rule amounts, the legacy = carried + transformed + queued partition and the declared parity delta of
+    the supplier-invoice transforms. The itemised bridge goes to a mode-600 side file (sha256 in the receipt)."""
+
+    ledger = enrolment.transform_ledger()
+    if ledger is None:
+        return {"ran": False}, []
+    section: dict[str, object] = {"ran": True, **ledger.summary()}
+    incomplete: list[str] = []
+    side_path = receipt_path.with_name(receipt_path.name + TRANSFORMS_FILE_SUFFIX)
+    try:
+        ledger.write_itemised(side_path)
+        section["itemised_file"] = side_path.name
+    except OSError as exc:
+        section["itemised_file_error"] = type(exc).__name__
+        incomplete.append(f"itemised bridge file could not be written ({type(exc).__name__})")
+    if not section["partition"]["balanced"]:  # type: ignore[index]
+        incomplete.append("transform partition does not balance")
+    if section["queue"]["invoices"]:  # type: ignore[index]
+        incomplete.append("transform queue is not empty")
+    section["incomplete"] = incomplete
+    return section, incomplete
 
 
 def cmd_census(args: argparse.Namespace) -> int:
@@ -717,6 +750,11 @@ def cmd_execute(args: argparse.Namespace) -> int:
         )
     mint_context = _mint_context(args, run_constants) if args.mint else None
     post_mints: tuple[MintResult, ...] = ()
+    needs_transforms = bool(required_maps(executable) & TRANSFORM_MAP_NAMES)
+    try:
+        transform_params = TransformParams.from_mapping(_json_arg(args.import_params_json, "--import-params-json"))
+    except TransformParamsError as exc:
+        raise CliRefusal(f"{exc.code}: {PARAMS_HINT}; nothing written") from exc
     # connect(), not begin(): --apply commits per spec, and a commit
     # inside a begin() context closes it ('Can't operate on closed
     # transaction inside context manager'). Boundaries are explicit:
@@ -724,7 +762,14 @@ def cmd_execute(args: argparse.Namespace) -> int:
     # rollback on dry-run.
     with source_engine.connect() as source_conn, dest_engine.connect() as dest_conn:
         _set_search_path(source_conn, source_schemas)
-        enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context)
+        enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context, transform_params=transform_params)
+        if needs_transforms:
+            # Refuse BEFORE any write: the Finance-named fallback expense account is a required declared input,
+            # and the snapshot-wide transform build is read-only (apply commits per spec).
+            try:
+                enrolment.transforms()
+            except TransformParamsError as exc:
+                raise CliRefusal(f"{exc.code}: {PARAMS_HINT}; nothing written") from exc
         if mint_context is not None:
             for step in EXECUTE_PRE_MINTS:  # kernel_tenants: FK parent of every tenant-scoped row
                 enrolment.mint(step)
@@ -760,6 +805,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         else:
             dest_conn.rollback()
     transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
+    transforms_section, transforms_incomplete = _transforms_receipt(enrolment, Path(args.receipt))
     sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports, Path(args.receipt))
     complete = (
         result.complete
@@ -770,6 +816,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         and not parent_blocked
         and not transition_exceptions
         and not sub_origin["incomplete"]
+        and not transforms_incomplete
         and not resolution.get("refusal_sources_incomplete")
     )
     payload: dict[str, object] = {
@@ -818,6 +865,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         ],
         "enrolment_maps_built": dict(result.enrolment_maps),
         "tax_account_classes": tax_account_classes,
+        "transforms": transforms_section,
         "mints": [_mint_dict(m) for m in (*result.mints, *post_mints)],
         "transitions": [
             {
@@ -879,6 +927,11 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="mint GENERATED enrolment rows (revisions, authorities, sourcing lines, "
                 "leads, document types) in the same transaction",
+            )
+            cmd.add_argument(
+                "--import-params-json",
+                help='declared import params, a JSON object: {"import.fallback_expense_account": "<account uuid>"} '
+                "(REQUIRED when supplier invoices are imported; the run refuses without it)",
             )
             cmd.add_argument("--tax-rule-policy-json", help="legacy tax_type -> ruled module codes")
             cmd.add_argument("--tax-band-binding-json", help="legacy tax band name -> legacy tax_code")

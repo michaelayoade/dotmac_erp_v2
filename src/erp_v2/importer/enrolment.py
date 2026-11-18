@@ -51,6 +51,7 @@ from erp_v2.importer.tax_accounts import (
     class_counts,
     classify_snapshot,
 )
+from erp_v2.importer.transforms import TransformBuild, TransformParams, TransformParamsError, read_and_build
 
 
 class MapConflict(ValueError):
@@ -645,6 +646,16 @@ def _supplier_line_tax_accounts(source: sa.Connection, dest: sa.Connection) -> d
     return _build_supplier_line_tax_accounts(source)[0]
 
 
+TRANSFORM_MAPS: Final = ("supplier_line_transforms", "supplier_invoice_transforms")
+
+
+def _transform_map_needs_run_inputs(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
+    """Registered so the map names are known; the build needs the declared params, so it runs only through
+    ``EnrolmentMaps`` (``transform_params``). Called directly it refuses."""
+
+    raise TransformParamsError("fallback_expense_account_missing")
+
+
 def _receipt_lines(source: sa.Connection, dest: sa.Connection) -> dict[Any, dict[str, Any]]:
     """lines_json in the module's canonical form (sorted-keys compact JSON
     of [{order_line_id, quantity_received}], dashed UUID spellings)."""
@@ -1058,6 +1069,8 @@ MAP_BUILDERS: Final[Mapping[str, Any]] = {
     "supplier": _supplier,
     "supplier_line_dimensions": _supplier_line_dimensions,
     "supplier_line_tax_accounts": _supplier_line_tax_accounts,
+    "supplier_line_transforms": _transform_map_needs_run_inputs,
+    "supplier_invoice_transforms": _transform_map_needs_run_inputs,
     "supplier_payment_schedule": _supplier_payment_schedule,
     "tax_authority_by_level": _tax_authority_by_level,
     "tenant_currency": _tenant_currency,
@@ -1118,7 +1131,10 @@ class EnrolmentMaps:
         destination_connection: sa.Connection,
         *,
         mint_context: MintContext | None = None,
+        transform_params: TransformParams | None = None,
     ) -> None:
+        self._transform_params = transform_params
+        self._transforms: TransformBuild | None = None
         self._source = source_connection
         self._dest = destination_connection
         self._mint_context = mint_context
@@ -1130,6 +1146,21 @@ class EnrolmentMaps:
         """Per-class counts (lines, invoices) of the tax-account map, once it has been built."""
 
         return self._tax_account_classes
+
+    def transforms(self) -> TransformBuild:
+        """The supplier-invoice transforms (B-3), built once from the legacy snapshot. Refuses, before any row is
+        read, when the Finance-named fallback expense account was not declared (``TransformParamsError``)."""
+
+        if self._transforms is None:
+            if self._transform_params is None:
+                raise TransformParamsError("fallback_expense_account_missing")
+            self._transforms = read_and_build(self._source, self._transform_params)
+        return self._transforms
+
+    def transform_ledger(self):
+        """The itemised ledger once built, else None (receipt evidence)."""
+
+        return self._transforms.ledger if self._transforms is not None else None
 
     def mint(self, step: str) -> MintResult:
         """Run a mint step once (recorded even when refused)."""
@@ -1147,7 +1178,12 @@ class EnrolmentMaps:
                 raise KeyError(f"no enrolment builder for map {name!r}")
             if self._mint_context is not None and name in MAP_MINTS:
                 self.mint(MAP_MINTS[name])
-            if name == "supplier_line_tax_accounts":
+            if name in TRANSFORM_MAPS:
+                build = self.transforms()
+                self._cache["supplier_line_transforms"] = build.line_map
+                self._cache["supplier_invoice_transforms"] = build.header_map
+                self._tax_account_classes = build.classes
+            elif name == "supplier_line_tax_accounts":
                 self._cache[name], self._tax_account_classes = _build_supplier_line_tax_accounts(self._source)
             else:
                 self._cache[name] = builder(self._source, self._dest)
