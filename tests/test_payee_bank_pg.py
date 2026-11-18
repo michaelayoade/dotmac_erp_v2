@@ -653,3 +653,35 @@ def test_the_kind_check_accepts_statutory_and_still_refuses_other_kinds(engine):
         with pytest.raises(PayeeBankError) as err:
             propose(db, tenant, ref="dest:PAYE", kind="vendor")
         assert err.value.code == "invalid_input"
+
+
+def test_the_e2_0024_downgrade_refuses_while_a_statutory_row_exists(engine):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from erp_v2.migrations.versions import e2_0024_statutory_payees as migration
+
+    tenant = new_tenant(engine)
+    with Session(engine) as db:
+        add_component(db, tenant, "dest:PAYE", name="PAYE", code="PAYE")
+        row = propose(db, tenant, ref="dest:PAYE", kind="statutory")
+        service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=APPROVER)
+        db.commit()
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            with Operations.context(MigrationContext.configure(connection)):
+                with pytest.raises(RuntimeError, match="refusing to downgrade"):
+                    migration.downgrade()
+        finally:
+            transaction.rollback()
+    with engine.connect() as c:  # nothing was dropped
+        assert (
+            c.execute(
+                sa.text(
+                    "SELECT count(*) FROM information_schema.columns WHERE column_name='payee_instruction_id' "
+                    "AND table_name='erp_payroll_payout_lines'"
+                )
+            ).scalar()
+            == 1
+        )

@@ -393,6 +393,30 @@ def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: S
             ) from exc
 
 
+def _current_instruction_ids(
+    db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]
+) -> dict[UUID, UUID]:
+    """Line id -> the CURRENT approved payee instruction id (statutory: the destination's, for every line)."""
+    out: dict[UUID, UUID] = {}
+    statutory = None
+    for line in lines:
+        try:
+            if batch.kind == KIND_NET_PAY:
+                destination = payee_service.destination_for_payment(
+                    db, tenant_id=batch.tenant_id, payee_kind=PayeeKind.EMPLOYEE.value, payee_ref=line.beneficiary_ref
+                )
+            else:
+                statutory = statutory or _statutory_destination(db, batch)
+                destination = statutory
+        except payee_service.PayeeBankError as exc:
+            raise PayoutRefused(
+                "payee_instruction_unavailable",
+                "A payee has no approved bank instruction any more; cancel the batch and prepare it again",
+            ) from exc
+        out[line.id] = destination.instruction_id
+    return out
+
+
 def _file_receipts(db: Session, tenant_id: UUID, lines: Sequence[PayrollPayoutLine]) -> list[DisbursementFileReceipt]:
     return list(
         db.scalars(
@@ -581,6 +605,8 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID, now: 
     _require_payee_instructions(db, batch, lines)
     _refuse_instruction_party(db, batch, lines, party.id, code="sod_approver_is_instruction_party", role="approver")
     _refuse_returner(db, batch, lines, party.id, code="sod_approver_is_returner", role="approver")
+    for line_id, instruction_id in _current_instruction_ids(db, batch, lines).items():
+        next(line for line in lines if line.id == line_id).payee_instruction_id = instruction_id
     batch.status = APPROVED
     batch.approved_by_party_id = party.id
     batch.approved_at = now
@@ -839,6 +865,13 @@ def _record(
             role="file issuer",
         )
         _check_file_destinations(db, batch, lines)
+    for line_id, instruction_id in _current_instruction_ids(db, batch, lines).items():
+        approved_against = next(line for line in lines if line.id == line_id).payee_instruction_id
+        if approved_against != instruction_id:
+            raise PayoutRefused(
+                "payee_instruction_changed",
+                "A payee's bank instruction changed after the batch was approved; cancel and prepare it again",
+            )
     functional = _functional_currency(db, tenant.id)
     if batch.currency_code != functional:
         raise PayoutRefused("non_functional_currency", "Payouts are in the tenant functional currency only")

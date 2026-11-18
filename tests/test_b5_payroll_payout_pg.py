@@ -1544,7 +1544,9 @@ def test_v3_record_refuses_when_an_instruction_is_gone_and_no_file_was_issued(en
     refused(lambda: record(engine, env, batch_id), "payee_instruction_required")
     assert counts(engine, env) == before
     seed_instructions(engine, env, refs=("E2",), origin="legacy_import", decider="approver")
-    assert record(engine, env, batch_id).replayed is False
+    # a re-created instruction is a different one from the one the batch was approved against
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_changed")
+    assert counts(engine, env) == before
 
 
 def test_v3_statutory_batches_fail_closed_with_their_own_code(engine):
@@ -1640,3 +1642,90 @@ def test_policy_off_statutory_instruction_parties_may_approve_and_record(engine)
     assert batch_row(engine, batch_id).dual_control is False
     approve(engine, env, batch_id)
     assert record(engine, env, batch_id, who="approver").replayed is False
+
+
+# --- the approved instruction is pinned on the line at approve (net pay and statutory) ---------------------------
+
+
+def _replace_current_instruction(engine, env, kind, ref):
+    """A new approved instruction supersedes the current one (as a real approve would)."""
+    with Session(engine) as db:
+        old = db.scalar(
+            sa.select(PayeeBankInstruction).where(
+                PayeeBankInstruction.tenant_id == env.tenant_id,
+                PayeeBankInstruction.payee_kind == kind,
+                PayeeBankInstruction.payee_ref == ref,
+                PayeeBankInstruction.status == "approved",
+            )
+        )
+        old.status = "superseded"
+        db.flush()
+        db.add(
+            PayeeBankInstruction(
+                tenant_id=env.tenant_id,
+                payee_kind=kind,
+                payee_ref=ref,
+                payee_label="relabelled",
+                bank_code="058",
+                bank_name="Other Bank",
+                account_number="9876543210",
+                account_last4="3210",
+                account_name="Other",
+                status="approved",
+                origin="legacy_import",
+                dual_control=False,
+                proposed_at=NOW,
+                decided_by_party_id=env.people["decider"],
+                decided_at=NOW,
+                approved_at=NOW,
+            )
+        )
+        db.commit()
+
+
+def test_approve_pins_the_instruction_id_on_every_net_pay_line_and_record_refuses_a_change(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    with Session(engine) as db:
+        pinned = {ln.beneficiary_ref: ln.payee_instruction_id for ln in lines(engine, batch_id)}
+        current = {
+            r.payee_ref: r.id
+            for r in db.scalars(
+                sa.select(PayeeBankInstruction).where(
+                    PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.status == "approved"
+                )
+            )
+        }
+    assert all(pinned[ref] == current[ref] for ref in pinned) and len(pinned) == 3
+    _replace_current_instruction(engine, env, "employee", env.emp["E1"])
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_changed")
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_statutory_record_refuses_when_the_instruction_was_replaced_after_approval(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    instruction_id = seed_statutory_instruction(engine, env, "dest:PAYE")
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    approve(engine, env, batch_id)
+    assert {ln.payee_instruction_id for ln in lines(engine, batch_id)} == {instruction_id}
+    _replace_current_instruction(engine, env, "statutory", "dest:PAYE")
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_changed")
+
+
+def test_the_pinned_instruction_is_write_once_in_the_database(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    with Session(engine) as db:
+        with pytest.raises(sa.exc.DBAPIError):
+            db.execute(
+                sa.update(PayrollPayoutLine)
+                .where(PayrollPayoutLine.batch_id == batch_id)
+                .values(payee_instruction_id=uuid4())
+            )
+            db.flush()
+        db.rollback()

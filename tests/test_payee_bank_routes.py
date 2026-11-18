@@ -247,3 +247,30 @@ def test_finance_role_without_portal_access_is_refused_everywhere(browser, who):
 def test_payee_routes_are_not_facet_entry_routes():
     refs = {r.module for r in assembly.web_facets[0].entry_routes}
     assert "erp_payee_bank" not in refs
+
+
+def test_the_form_offers_the_statutory_kind_with_a_dest_reference_hint(browser):
+    browser.sign_in("preparer")
+    html = browser.client.get(BASE).text
+    assert '<option value="statutory">' in html and "dest:PENSION_ER" in html and "dest:PAYE" in html
+
+
+def test_finance_can_propose_a_statutory_instruction_through_the_form(browser):
+    token = browser.sign_in("preparer")
+    response = _post(
+        browser,
+        BASE,
+        token,
+        payee_kind="statutory",
+        payee_ref="dest:PENSION_ER",
+        bank_code="058",
+        bank_name="Example Bank",
+        account_number="0123456789",
+        account_name="Example Authority",
+        evidence_ref="letter-1",
+    )
+    assert response.status_code == 303
+    kwargs = browser.spies["propose"].call_args.kwargs
+    assert kwargs["payee_kind"] == "statutory" and kwargs["payee_ref"] == "dest:PENSION_ER"
+    assert kwargs["proposer_party_id"] == browser.parties["preparer"].id
+    assert kwargs["tenant_id"] == browser.tenant.id
