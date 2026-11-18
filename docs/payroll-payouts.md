@@ -90,3 +90,7 @@ reference, bank return date, reason). Permission: the existing `erp.finance.payr
 No reversal of a recorded payout other than the returned-salary path above (a Finance journal through B2),
 no WHT, no non-functional currency,
 no bank-specific layouts (W15), no backfill; amounts are never changed.
+
+## Pre-flip validation V3
+
+A net-pay batch needs an approved payee bank instruction for every employee line at approval, and at recording unless a bank file was issued (`payee_instruction_required`), whether or not bank files are enabled. Statutory remittances are excluded: their destination is chosen on the batch, not a person. Legacy-import approved instructions satisfy it.

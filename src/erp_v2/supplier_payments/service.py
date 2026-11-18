@@ -324,6 +324,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
     if payment.status != SupplierPaymentStatus.DRAFT:
         raise PaymentRefused("not_draft", "Only a draft supplier payment can be approved")
     _refuse_wht(payment)
+    _require_payee_instruction(db, tenant.id, payment)
     if _same(payment.prepared_by, actor):
         raise PaymentRefused("sod_approver_is_preparer", "You prepared this payment; another person must approve it")
     _refuse_approver_instruction_party(db, tenant.id, payment, actor)
@@ -347,6 +348,19 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
         details={"number": payment.number, "prepared_by": payment.prepared_by},
     )
     return PaymentOutcome(payment.id, False)
+
+
+def _require_payee_instruction(db: Session, tenant_id: UUID, payment: SupplierPayment) -> None:
+    """V3: the supplier must have an approved payee bank instruction, whatever the bank-file setting."""
+    try:
+        payee_service.destination_for_payment(
+            db, tenant_id=tenant_id, payee_kind=PayeeKind.SUPPLIER.value, payee_ref=payment.supplier_ref
+        )
+    except payee_service.PayeeBankError as exc:
+        raise PaymentRefused(
+            "payee_instruction_required",
+            "The supplier has no approved bank instruction; propose and approve one before paying",
+        ) from exc
 
 
 def _current_instruction(db: Session, tenant_id: UUID, supplier_ref: str) -> PayeeBankInstruction | None:
@@ -467,6 +481,7 @@ def _check_file_destination(db: Session, tenant_id: UUID, payment: SupplierPayme
         raise PaymentRefused("file_receipt_ambiguous", "More than one bank file receipt exists for this payment")
     latest = receipts[0] if receipts else None
     if latest is None:
+        _require_payee_instruction(db, tenant_id, payment)  # V3: required even when no file was issued
         return
     try:
         destination = payee_service.destination_for_payment(

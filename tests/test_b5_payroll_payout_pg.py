@@ -71,7 +71,15 @@ GOOD_FILE = (
 )
 
 
-def world(engine, **kw):
+def world(engine, *, payees=True, **kw):
+    """``payees=False`` leaves every employee without an approved instruction (V3 refuses net-pay then)."""
+    env = _world(engine, **kw)
+    if payees:
+        seed_instructions(engine, env, origin="legacy_import", decider="approver")
+    return env
+
+
+def _world(engine, **kw):
     env = b4.world(engine, **kw)
     with Session(engine) as db:
         # Canonical employee UUIDs (as the B8 importer's _canon_ref spells them), with real people rows,
@@ -159,6 +167,13 @@ def seed_instructions(engine, env, *, proposer="proposer", decider="decider", or
         for i, key in enumerate(refs or ("E1", "E2", "E3")):
             ref = env.emp[key]
             manual = origin == "manual"
+            db.execute(  # replace the world's default approved instruction (one approved row per payee)
+                sa.delete(PayeeBankInstruction).where(
+                    PayeeBankInstruction.tenant_id == env.tenant_id,
+                    PayeeBankInstruction.payee_kind == "employee",
+                    PayeeBankInstruction.payee_ref == ref,
+                )
+            )
             db.add(
                 PayeeBankInstruction(
                     tenant_id=env.tenant_id,
@@ -985,10 +1000,16 @@ def test_unsafe_cell_refuses_the_whole_file_and_writes_no_receipt(engine, bad):
 
 def test_missing_instruction_refuses_the_file(engine):
     env = world(engine)
-    seed_instructions(engine, env, refs=("E1", "E2"))
     enable_file(engine, env)
     run_id = finalized(engine, env)
     batch_id = approved_batch(engine, env, run_id)
+    with Session(engine) as db:  # E3 loses its instruction after the approval (V3 needed it to approve)
+        db.execute(
+            sa.delete(PayeeBankInstruction).where(
+                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == env.emp["E3"]
+            )
+        )
+        db.commit()
     refused(lambda: generate(engine, env, batch_id), "no_approved_payee_instruction")
     assert counts(engine, env)["erp_disbursement_file_receipts"] == 0
 
@@ -1345,7 +1366,7 @@ def _recorded_supplier_payment(engine, env, reference):
         tax = Account(
             tenant_id=env.tenant_id,
             category_id=liability.id,
-            code="2100",
+            code="1455",
             name="Input VAT",
             kind=AccountKind.POSTING,
             normal_balance=NormalBalance.DEBIT,
@@ -1358,6 +1379,9 @@ def _recorded_supplier_payment(engine, env, reference):
     b1.approve(engine, env, invoice_id)
     with Session(engine) as db:
         obligation = db.scalar(sa.select(PaymentObligation.id).where(PaymentObligation.invoice_id == invoice_id))
+    import test_b3_supplier_payments_pg as b3
+
+    b3.seed_legacy_payee(engine, env)  # V3: the supplier needs an approved instruction to be paid
     created = act(
         engine,
         env,
@@ -1407,3 +1431,64 @@ def test_a_supplier_reference_on_another_bank_account_does_not_block(engine):
         db.commit()
     batch_id = approved_batch(engine, env, run_id, bank_account_id=other_id)
     assert record(engine, env, batch_id, "ELSEWHERE 1").replayed is False
+
+
+# --- V3: an approved payee instruction is required for net pay, whatever the file setting (PR-1) ---
+
+
+def test_v3_approve_refuses_a_net_pay_batch_without_an_instruction_and_it_stays_a_draft(engine):
+    env = world(engine, payees=False)
+    with Session(engine) as db:
+        assert disbursement_policy.bank_file_generation_enabled(db, env.tenant_id) is False  # files off
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    before = counts(engine, env)
+    refused(lambda: approve(engine, env, batch_id), "payee_instruction_required")
+    assert counts(engine, env) == before
+    assert batch_row(engine, batch_id).status == "draft"
+
+
+def test_v3_one_missing_employee_instruction_is_enough_to_refuse(engine):
+    env = world(engine, payees=False)
+    seed_instructions(engine, env, refs=("E1", "E2"))  # E3 has none
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    refused(lambda: approve(engine, env, batch_id), "payee_instruction_required")
+    seed_instructions(engine, env, refs=("E3",))
+    approve(engine, env, batch_id)
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_v3_legacy_import_approved_instructions_satisfy_it(engine):
+    env = world(engine, payees=False)
+    seed_instructions(engine, env, origin="legacy_import", decider="approver")
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_v3_record_refuses_when_an_instruction_is_gone_and_no_file_was_issued(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = approved_batch(engine, env, run_id)
+    with Session(engine) as db:
+        db.execute(
+            sa.delete(PayeeBankInstruction).where(
+                PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_ref == env.emp["E2"]
+            )
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_required")
+    assert counts(engine, env) == before
+    seed_instructions(engine, env, refs=("E2",), origin="legacy_import", decider="approver")
+    assert record(engine, env, batch_id).replayed is False
+
+
+def test_v3_does_not_apply_to_statutory_batches(engine):
+    env = world(engine, payees=False)  # no employee instruction at all
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
+    approve(engine, env, batch_id)
+    assert record(engine, env, batch_id).journals == 2

@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Final
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from dotmac_accounting import service as accounting
 from dotmac_accounting.contracts import (
@@ -44,7 +44,7 @@ from dotmac_accounting.contracts import (
     ReverseJournal,
     SourceIdentity,
 )
-from dotmac_accounting.models import FiscalPeriod, JournalEntry
+from dotmac_accounting.models import FiscalPeriod, JournalEntry, JournalLine, PostedLedgerLine
 from dotmac_kernel.audit import write_audit_event
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.exceptions import BadRequestError
@@ -57,6 +57,14 @@ from sqlalchemy.orm import Session
 from erp_v2.journals import models as m
 from erp_v2.journals.models import ManualJournal
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
+from erp_v2.ledger_roles import (
+    AP_CONTROL_CODE,
+    CONTROL_ACCOUNT_CODES,
+    PAYROLL_PAYABLE_CODE,
+    STAFF_LOAN_CODE,
+    account_id_for_code,
+    control_codes_among,
+)
 
 MANUAL_OWNER: Final = "erp.manual"
 MANUAL_KIND: Final = "manual_journal"
@@ -64,6 +72,17 @@ MANUAL_KIND: Final = "manual_journal"
 # DRAFT journals may enter the held-journal path; another module's draft is never ours to post.
 LEGACY_OWNER: Final = "legacy-erp"
 SOURCE_APPLICATION: Final = "dotmac_erp"
+# The one system-built GL-only correction of a proven legacy posting fault (section 3c). Its source
+# identity is the only thing the control-account guard admits control lines for, and only after the
+# fault is re-verified.
+LEDGER_FAULT_KIND: Final = "ledger_fault_correction"
+LEDGER_FAULT_VERSION: Final = "1"
+_LEDGER_FAULT_NAMESPACE: Final = UUID("5f0b6d2e-7c1a-4b43-9d58-3a9c2e61f0a7")
+CONTROL_ROUTES: Final = {
+    AP_CONTROL_CODE: "a supplier invoice (adjustment invoice) or supplier credit note",
+    PAYROLL_PAYABLE_CODE: "a payroll run, an adjustment component in the next run, or a payout return",
+    STAFF_LOAN_CODE: "a staff-loan entry or payroll internal recovery",
+}
 ALLOWED_KINDS: Final = (JournalKind.STANDARD, JournalKind.ADJUSTMENT)
 MAX_LINES: Final = 200
 QUANTUM: Final = Decimal("0.000001")
@@ -120,6 +139,18 @@ class PrepareJournal:
     description: str
     evidence_ref: str
     lines: tuple[LineInput, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerFaultCorrection:
+    """Finance's choices for a system-built correction; amounts and sides are never typed."""
+
+    source_journal_id: UUID
+    control_code: str
+    offset_account_id: UUID
+    posting_date: date
+    evidence_ref: str
+    description: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +278,126 @@ def _outcome(row: ManualJournal, *, replayed: bool = False) -> Outcome:
     return Outcome(row.id, row.journal_id, row.state, replayed)
 
 
+# --- control-account guard (V2) --------------------------------------------
+
+
+def _journal_account_ids(db: Session, tenant_id: UUID, journal_id: UUID) -> set[UUID]:
+    return set(
+        db.scalars(
+            select(JournalLine.account_id).where(
+                JournalLine.tenant_id == tenant_id, JournalLine.journal_id == journal_id
+            )
+        )
+    )
+
+
+def _refuse_control(codes: set[str]) -> None:
+    code = sorted(codes)[0]
+    raise JournalRefused(
+        "control_account_requires_subledger_document",
+        f"{', '.join(sorted(codes))} is a control account and is never posted bare; "
+        f"correct it through {CONTROL_ROUTES[code]}",
+    )
+
+
+def _control_net(db: Session, tenant_id: UUID, journal_id: UUID, account_id: UUID) -> Decimal:
+    return db.scalar(
+        select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0)).where(
+            JournalLine.tenant_id == tenant_id,
+            JournalLine.journal_id == journal_id,
+            JournalLine.account_id == account_id,
+        )
+    )
+
+
+def _fault_key(source_journal_id: UUID, control_code: str) -> str:
+    return f"{source_journal_id}:{control_code}"
+
+
+def _source_ledger_delta(db: Session, tenant_id: UUID, source_journal_id: UUID, account_id: UUID) -> Decimal:
+    """Σ(ledger debit - credit) minus Σ(journal line debit - credit) for one journal and account."""
+    ledger = db.scalar(
+        select(func.coalesce(func.sum(PostedLedgerLine.debit - PostedLedgerLine.credit), 0)).where(
+            PostedLedgerLine.tenant_id == tenant_id,
+            PostedLedgerLine.journal_id == source_journal_id,
+            PostedLedgerLine.account_id == account_id,
+        )
+    )
+    return Decimal(ledger) - Decimal(_control_net(db, tenant_id, source_journal_id, account_id))
+
+
+def _other_posted_corrections(db: Session, tenant_id: UUID, key: str, exclude: UUID | None) -> list[UUID]:
+    query = select(JournalEntry.id).where(
+        JournalEntry.tenant_id == tenant_id,
+        JournalEntry.source_owner == MANUAL_OWNER,
+        JournalEntry.source_document_kind == LEDGER_FAULT_KIND,
+        JournalEntry.source_document_id == key,
+        JournalEntry.status == JournalStatus.POSTED,
+    )
+    if exclude is not None:
+        query = query.where(JournalEntry.id != exclude)
+    return list(db.scalars(query))
+
+
+def _residual_fault(db: Session, tenant_id: UUID, source_journal_id: UUID, code: str, account_id: UUID) -> Decimal:
+    """The source journal's ledger-vs-line delta net of POSTED corrections: 0 once corrected."""
+    residual = _source_ledger_delta(db, tenant_id, source_journal_id, account_id)
+    for posted_id in _other_posted_corrections(db, tenant_id, _fault_key(source_journal_id, code), None):
+        residual += Decimal(_control_net(db, tenant_id, posted_id, account_id))
+    return residual
+
+
+def _verify_ledger_fault(db: Session, tenant_id: UUID, journal: JournalEntry) -> None:
+    """Re-prove that this system-built correction still corrects exactly the proven fault."""
+    try:
+        source_text, control_code = (journal.source_document_id or "").rsplit(":", 1)
+        source_id = UUID(source_text)
+    except ValueError as exc:
+        raise JournalRefused("ledger_fault_source_invalid", "the correction's source identity is malformed") from exc
+    control_id = account_id_for_code(db, tenant_id, control_code) if control_code in CONTROL_ACCOUNT_CODES else None
+    if control_id is None:
+        raise JournalRefused("ledger_fault_source_invalid", "the correction's control account is not valid")
+    source = db.scalar(select(JournalEntry).where(JournalEntry.tenant_id == tenant_id, JournalEntry.id == source_id))
+    if source is None or source.source_owner != LEGACY_OWNER or source.status != JournalStatus.POSTED:
+        raise JournalRefused(
+            "ledger_fault_source_invalid", "the faulty source journal is no longer a posted legacy journal"
+        )
+    if _other_posted_corrections(db, tenant_id, _fault_key(source_id, control_code), journal.id):
+        raise JournalRefused("ledger_fault_changed", "another correction for this fault has been posted")
+    correction = Decimal(_control_net(db, tenant_id, journal.id, control_id))
+    if _source_ledger_delta(db, tenant_id, source_id, control_id) + correction != 0:
+        raise JournalRefused("ledger_fault_changed", "the ledger fault no longer matches this correction")
+
+
+def _is_ledger_fault_journal(journal: JournalEntry) -> bool:
+    return journal.source_owner == MANUAL_OWNER and journal.source_document_kind == LEDGER_FAULT_KIND
+
+
+def _control_guard(
+    db: Session,
+    tenant_id: UUID,
+    *,
+    journal: JournalEntry | None = None,
+    account_ids: set[UUID] | None = None,
+    reversal: bool = False,
+) -> None:
+    """Refuse any control-account line (2000/2040/1410) not carried by its subledger document.
+
+    A typed line set (prepare) is never admitted: the only door is the system-built ledger-fault
+    correction, recognised by its source identity and re-verified here (not on a reversal, which
+    simply re-creates the original fault). No window, no setting and no override flag.
+    """
+    ids = set(account_ids or ()) if journal is None else _journal_account_ids(db, tenant_id, journal.id)
+    codes = control_codes_among(db, tenant_id, ids)
+    if not codes:
+        return
+    if journal is not None and _is_ledger_fault_journal(journal):
+        if not reversal:
+            _verify_ledger_fault(db, tenant_id, journal)
+        return
+    _refuse_control(codes)
+
+
 # --- prepare ---------------------------------------------------------------
 
 
@@ -279,6 +430,7 @@ def prepare_journal(
         with db.begin_nested():
             currency = functional_currency(db, tenant_id)
             _require_open_period(db, tenant_id, command.posting_date, command.kind)
+            _control_guard(db, tenant_id, account_ids={line.account_id for line in lines})
             fingerprint = _fingerprint(
                 {
                     "request_id": str(command.request_id),
@@ -351,6 +503,147 @@ def prepare_journal(
         raise _map(exc) from exc
 
 
+# --- ledger-fault correction (V2, section 3c) -------------------------------
+
+
+def prepare_ledger_fault_correction(
+    db: Session, *, tenant_id: UUID, actor: UUID, command: LedgerFaultCorrection, now: datetime | None = None
+) -> Outcome:
+    """Prepare the GL-only reversal of a PROVEN erroneous posting on a control account (preparer step).
+
+    The source must be a POSTED legacy-erp journal whose ledger lines on the control account differ
+    from its journal lines by a non-zero delta. The lines are built here (the delta on the control
+    account, the opposite side on Finance's offset account), never typed. The correction exists at
+    most once per (source journal, control code): a repeat replays. It then follows the normal
+    request / approve / post path with its preparer != approver rule; the control guard re-verifies
+    the fault at request and at approval.
+    """
+    moment = _now(now)
+    evidence = _text(command.evidence_ref, "evidence reference", 255)
+    description = _text(command.description, "description", 2000)
+    if command.control_code not in CONTROL_ACCOUNT_CODES:
+        raise JournalRefused("invalid_input", "the control account must be 2000, 2040 or 1410")
+    key = _fault_key(command.source_journal_id, command.control_code)
+    request_id = uuid5(_LEDGER_FAULT_NAMESPACE, key)
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            source = db.scalar(
+                select(JournalEntry)
+                .where(JournalEntry.tenant_id == tenant_id, JournalEntry.id == command.source_journal_id)
+                .with_for_update()
+            )
+            if source is None or source.source_owner != LEGACY_OWNER or source.status != JournalStatus.POSTED:
+                raise JournalRefused(
+                    "ledger_fault_source_invalid", "the source must be a posted journal from the legacy import"
+                )
+            existing = db.scalar(
+                select(ManualJournal)
+                .join(
+                    JournalEntry,
+                    (JournalEntry.tenant_id == ManualJournal.tenant_id) & (JournalEntry.id == ManualJournal.journal_id),
+                )
+                .where(
+                    ManualJournal.tenant_id == tenant_id,
+                    JournalEntry.source_owner == MANUAL_OWNER,
+                    JournalEntry.source_document_kind == LEDGER_FAULT_KIND,
+                    JournalEntry.source_document_id == key,
+                    JournalEntry.source_version == LEDGER_FAULT_VERSION,
+                )
+            )
+            if existing is not None:
+                return _outcome(existing, replayed=True)
+            control_id = account_id_for_code(db, tenant_id, command.control_code)
+            if control_id is None:
+                raise JournalRefused("invalid_input", "the control account does not exist for this tenant")
+            offset = control_codes_among(db, tenant_id, {command.offset_account_id})
+            if offset or command.offset_account_id == control_id:
+                raise JournalRefused("offset_is_control_account", "the offset must not be a control account")
+            delta = _residual_fault(db, tenant_id, source.id, command.control_code, control_id)
+            if delta == 0:
+                raise JournalRefused("no_ledger_fault", "the ledger agrees with the journal lines on this account")
+            amount = abs(delta)
+            # delta < 0: the ledger holds extra credit, so debit the control account (and the reverse).
+            control_debit = delta < 0
+            lines = (
+                JournalLineInput(
+                    control_id, amount if control_debit else Decimal(0), Decimal(0) if control_debit else amount, None
+                ),
+                JournalLineInput(
+                    command.offset_account_id,
+                    Decimal(0) if control_debit else amount,
+                    amount if control_debit else Decimal(0),
+                    None,
+                ),
+            )
+            currency = functional_currency(db, tenant_id)
+            _require_open_period(db, tenant_id, command.posting_date, JournalKind.STANDARD)
+            fingerprint = _fingerprint(
+                {
+                    "key": key,
+                    "posting_date": command.posting_date.isoformat(),
+                    "description": description,
+                    "evidence_ref": evidence,
+                    "currency": currency,
+                    "lines": [[str(x.account_id), str(x.debit), str(x.credit)] for x in lines],
+                }
+            )
+            journal = accounting.create_journal(
+                db,
+                scope=_scope(tenant_id),
+                command=CreateJournal(
+                    number="LF-" + request_id.hex[:24].upper(),
+                    kind=JournalKind.STANDARD,
+                    entry_date=command.posting_date,
+                    posting_date=command.posting_date,
+                    currency_code=currency,
+                    exchange_rate=Decimal(1),
+                    description=description,
+                    reference=evidence,
+                    source=SourceIdentity(
+                        owner=MANUAL_OWNER,
+                        document_kind=LEDGER_FAULT_KIND,
+                        document_id=key,
+                        version=LEDGER_FAULT_VERSION,
+                        fingerprint=fingerprint,
+                    ),
+                    lines=lines,
+                ),
+                idempotency_key=f"erp.manual:{request_id}:create",
+                idempotency_expires_at=None,
+                recorded_at=moment,
+            )
+            if journal.status != JournalStatus.DRAFT:
+                raise JournalRefused("journal_state_refused", journal.status.value.lower())
+            row = ManualJournal(
+                tenant_id=tenant_id,
+                journal_id=journal.id,
+                origin=m.ORIGIN_MANUAL,
+                state=m.STATE_PREPARED,
+                evidence_ref=evidence,
+                prepared_by_party_id=actor,
+                prepared_at=moment,
+            )
+            db.add(row)
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_PREPARED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=journal.id,
+                number=journal.number,
+                evidence_ref=evidence,
+                ledger_fault_source=source.id,
+                control_code=command.control_code,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
 # --- request post ----------------------------------------------------------
 
 
@@ -369,6 +662,7 @@ def request_post(db: Session, *, tenant_id: UUID, manual_id: UUID, actor: UUID, 
             if journal.status != JournalStatus.DRAFT:
                 raise JournalRefused("journal_state_refused", journal.status.value.lower())
             _require_open_period(db, tenant_id, journal.posting_date, journal.kind)
+            _control_guard(db, tenant_id, journal=journal)
             row.state = m.STATE_POST_REQUESTED
             row.requested_by_party_id = actor
             row.requested_at = moment
@@ -418,6 +712,7 @@ def request_legacy_post(
             if journal.status != JournalStatus.DRAFT:
                 raise JournalRefused("journal_state_refused", journal.status.value.lower())
             _require_open_period(db, tenant_id, journal.posting_date, journal.kind)
+            _control_guard(db, tenant_id, journal=journal)
             if existing is not None:  # re-request after rejection
                 prior = (existing.rejected_by_party_id, existing.rejection_reason, existing.evidence_ref)
                 existing.state = m.STATE_POST_REQUESTED
@@ -501,6 +796,7 @@ def approve_and_post(
             if journal.status != JournalStatus.DRAFT:
                 raise JournalRefused("journal_state_refused", journal.status.value.lower())
             _require_open_period(db, tenant_id, journal.posting_date, journal.kind)
+            _control_guard(db, tenant_id, journal=journal)
             posted = accounting.post_journal(
                 db,
                 scope=_scope(tenant_id),
@@ -606,6 +902,7 @@ def request_reversal(
             if row.state != m.STATE_POSTED:
                 raise JournalRefused("state_refused", f"cannot request reversal from state {row.state}")
             _require_open_period(db, tenant_id, posting_date, JournalKind.REVERSAL)
+            _control_guard(db, tenant_id, journal=_journal(db, tenant_id, row.journal_id), reversal=True)
             row.state = m.STATE_REVERSAL_REQUESTED
             row.reversal_requested_by_party_id = actor
             row.reversal_requested_at = moment
@@ -649,6 +946,7 @@ def approve_reversal(
                 raise JournalRefused("state_refused", "the reversal request is incomplete")
             _require_open_period(db, tenant_id, row.reversal_posting_date, JournalKind.REVERSAL)
             original = _journal(db, tenant_id, row.journal_id)
+            _control_guard(db, tenant_id, journal=original, reversal=True)
             reversal = accounting.reverse_journal(
                 db,
                 scope=_scope(tenant_id),

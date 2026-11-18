@@ -95,6 +95,8 @@ def seed(engine, *, currency: str | None = "USD", adjustment: bool = False) -> S
             ("1400", "AST", NormalBalance.DEBIT),
             ("4000", "REV", NormalBalance.CREDIT),
             ("2000", "LIA", NormalBalance.CREDIT),
+            ("2040", "LIA", NormalBalance.CREDIT),
+            ("1410", "AST", NormalBalance.DEBIT),
         ):
             row = Account(
                 tenant_id=tenant_id,
@@ -655,7 +657,9 @@ def test_withdrawn_reversal_returns_to_posted(engine):
 # --- held legacy journals --------------------------------------------------
 
 
-def legacy_draft(engine, env, *, document="legacy-1", amount="75", owner="legacy-erp") -> SimpleNamespace:
+def legacy_draft(
+    engine, env, *, document="legacy-1", amount="75", owner="legacy-erp", debit_code="1000"
+) -> SimpleNamespace:
     with Session(engine) as db:
         journal = accounting.create_journal(
             db,
@@ -670,7 +674,7 @@ def legacy_draft(engine, env, *, document="legacy-1", amount="75", owner="legacy
                 description="Imported legacy journal",
                 source=SourceIdentity(owner, "journal", document, "1", "b" * 64),
                 lines=(
-                    JournalLineInput(env.accounts["1000"], debit=Decimal(amount)),
+                    JournalLineInput(env.accounts[debit_code], debit=Decimal(amount)),
                     JournalLineInput(env.accounts["4000"], credit=Decimal(amount)),
                 ),
             ),
@@ -984,24 +988,409 @@ def test_downgrade_refuses_while_the_table_holds_evidence(engine):
         )
 
 
-def test_control_account_journal_is_flagged_not_blocked(engine):
-    env = seed(engine)
-    cmd = PrepareJournal(
+def control_command(env, code, *, amount="10"):
+    return PrepareJournal(
         uuid4(),
         DAY,
         JournalKind.STANDARD,
-        "AP correction",
+        "Control correction",
         "RECON-ITEM-9",
-        (LineInput(env.accounts["2000"], debit=Decimal(10)), LineInput(env.accounts["1000"], credit=Decimal(10))),
+        (
+            LineInput(env.accounts[code], debit=Decimal(amount)),
+            LineInput(env.accounts["4000"], credit=Decimal(amount)),
+        ),
     )
-    outcome = run(engine, env, service.prepare_journal, actor=env.parties["preparer"], command=cmd)
+
+
+def refused_control(call):
+    with pytest.raises(JournalRefused) as exc:
+        call()
+    assert exc.value.code == "control_account_requires_subledger_document", exc.value.code
+    return exc.value
+
+
+def held_row(engine, env, journal_id, *, state, origin=m.ORIGIN_LEGACY_HELD):
+    """A workflow row as it could exist for a journal that has control lines (requested before V2)."""
     with Session(engine) as db:
-        assert queries.detail(db, tenant_id=env.tenant_id, manual_id=outcome.manual_id)["control_accounts"] == ["2000"]
+        row = ManualJournal(
+            tenant_id=env.tenant_id,
+            journal_id=journal_id,
+            origin=origin,
+            state=state,
+            evidence_ref="FIN-REVIEW-1",
+            legacy_source_key="legacy-erp:journal:x:1" if origin == m.ORIGIN_LEGACY_HELD else None,
+            prepared_by_party_id=env.parties["preparer"],
+            prepared_at=NOW,
+        )
+        if state != m.STATE_PREPARED:
+            row.requested_by_party_id, row.requested_at = env.parties["preparer"], NOW
+        if state in (m.STATE_POSTED, m.STATE_REVERSAL_REQUESTED):
+            row.approved_by_party_id, row.approved_at = env.parties["approver"], NOW
+        if state == m.STATE_REVERSAL_REQUESTED:
+            row.reversal_requested_by_party_id = env.parties["requester"]
+            row.reversal_requested_at = NOW
+            row.reversal_reason = "undo"
+            row.reversal_posting_date = DAY
+        db.add(row)
+        db.commit()
+        return row.id
+
+
+@pytest.mark.parametrize("code", ["2000", "2040", "1410"])
+def test_v2_prepare_on_a_control_account_refuses_and_writes_nothing(engine, code):
+    env = seed(engine)
+    before = counts(engine, env)
+    error = refused_control(
+        lambda: run(
+            engine, env, service.prepare_journal, actor=env.parties["preparer"], command=control_command(env, code)
+        )
+    )
+    assert code in error.detail and "never posted bare" in error.detail
+    assert counts(engine, env) == before
+
+
+def test_v2_a_non_control_journal_is_unaffected_and_flags_no_control_account(engine):
+    env = seed(engine)
+    outcome = posted_flow(engine, env)
+    with Session(engine) as db:
+        assert queries.detail(db, tenant_id=env.tenant_id, manual_id=outcome.manual_id)["control_accounts"] == []
+
+
+def test_v2_a_held_legacy_draft_on_a_control_account_refuses_at_request(engine):
+    env = seed(engine)
+    held = legacy_draft(engine, env, debit_code="2000")
+    before = counts(engine, env)
+    refused_control(
+        lambda: run(
+            engine,
+            env,
+            service.request_legacy_post,
+            journal_id=held.id,
+            actor=env.parties["preparer"],
+            review_ref="R-1",
+        )
+    )
+    assert counts(engine, env) == before
+
+
+def test_v2_the_detail_screen_still_flags_a_journal_on_1410(engine):
+    env = seed(engine)
+    held = legacy_draft(engine, env, debit_code="1410")
+    row_id = held_row(engine, env, held.id, state=m.STATE_POST_REQUESTED)
+    with Session(engine) as db:
+        assert queries.detail(db, tenant_id=env.tenant_id, manual_id=row_id)["control_accounts"] == ["1410"]
+
+
+def test_v2_approve_refuses_a_control_journal_that_was_requested_before_the_rule(engine):
+    env = seed(engine)
+    held = legacy_draft(engine, env, debit_code="2000")
+    row_id = held_row(engine, env, held.id, state=m.STATE_POST_REQUESTED)
+    before = counts(engine, env)
+    refused_control(
+        lambda: run(engine, env, service.approve_and_post, manual_id=row_id, approver=env.parties["approver"])
+    )
+    assert counts(engine, env) == before
+
+
+def test_v2_request_post_refuses_a_control_journal_prepared_before_the_rule(engine):
+    env = seed(engine)
+    held = legacy_draft(engine, env, debit_code="2040")
+    row_id = held_row(engine, env, held.id, state=m.STATE_PREPARED, origin=m.ORIGIN_MANUAL)
+    refused_control(lambda: run(engine, env, service.request_post, manual_id=row_id, actor=env.parties["preparer"]))
+
+
+def posted_control_journal(engine, env, *, document, code="2000"):
+    """A legacy journal on a control account that is already POSTED (as the importer lands them)."""
+    held = legacy_draft(engine, env, document=document, debit_code=code)
+    with Session(engine) as db:
+        accounting.post_journal(
+            db,
+            scope=TenantScope(env.tenant_id),
+            journal_id=held.id,
+            approval_reference=f"legacy:{document}",
+            posted_by="legacy",
+            idempotency_key=f"legacy-post:{document}",
+            idempotency_expires_at=None,
+            posted_at=NOW,
+        )
+        db.commit()
+    return held
+
+
+def test_v2_reversal_of_an_imported_posted_control_journal_refuses_at_request_and_approval(engine):
+    env = seed(engine)
+    held = posted_control_journal(engine, env, document="posted-ctl")
+    row_id = held_row(engine, env, held.id, state=m.STATE_POSTED)
+    refused_control(
+        lambda: run(
+            engine,
+            env,
+            service.request_reversal,
+            manual_id=row_id,
+            actor=env.parties["requester"],
+            reason="undo",
+            posting_date=DAY,
+        )
+    )
+    other = posted_control_journal(engine, env, document="posted-ctl-2")
+    requested = held_row(engine, env, other.id, state=m.STATE_REVERSAL_REQUESTED)
+    before = counts(engine, env)
+    refused_control(
+        lambda: run(engine, env, service.approve_reversal, manual_id=requested, approver=env.parties["approver2"])
+    )
+    assert counts(engine, env) == before
+
+
+# --- V2: the system-built ledger-fault correction (section 3c) --------------------------------
+
+
+FAULT_LINE = Decimal("98.5")
+FAULT_LEDGER = Decimal("985")
+FAULT = FAULT_LEDGER - FAULT_LINE  # 886.5, the G6 shape
+
+
+def ledger_edit(engine, sql, **params):
+    """Edit evidence rows the way a legacy import produced a fault (the table is immutable by trigger)."""
+    table = "mod_accounting.posted_ledger_lines"
+    with engine.begin() as connection:
+        connection.execute(sa.text(f"ALTER TABLE {table} DISABLE TRIGGER posted_ledger_lines_immutable"))
+        try:
+            connection.execute(sa.text(sql), params)
+        finally:
+            connection.execute(sa.text(f"ALTER TABLE {table} ENABLE TRIGGER posted_ledger_lines_immutable"))
+
+
+def fault_source(engine, env, *, document="g6", ledger=FAULT_LEDGER, line=FAULT_LINE, owner="legacy-erp", post=True):
+    """A legacy journal Dr 1000 / Cr 2000 whose ledger amounts differ from its journal lines."""
+    with Session(engine) as db:
+        journal = accounting.create_journal(
+            db,
+            scope=TenantScope(env.tenant_id),
+            command=CreateJournal(
+                number=f"FLT-{document}".upper(),
+                kind=JournalKind.STANDARD,
+                entry_date=DAY,
+                posting_date=DAY,
+                currency_code="USD",
+                exchange_rate=Decimal(1),
+                description="Imported legacy AP journal",
+                source=SourceIdentity(owner, "journal", document, "1", "c" * 64),
+                lines=(
+                    JournalLineInput(env.accounts["1000"], debit=line),
+                    JournalLineInput(env.accounts["2000"], credit=line),
+                ),
+            ),
+            idempotency_key=f"fault:{document}",
+            idempotency_expires_at=None,
+            recorded_at=NOW,
+        )
+        journal_id = journal.id
+        if post:
+            accounting.post_journal(
+                db,
+                scope=TenantScope(env.tenant_id),
+                journal_id=journal_id,
+                approval_reference=f"fault:{document}",
+                posted_by="legacy",
+                idempotency_key=f"fault-post:{document}",
+                idempotency_expires_at=None,
+                posted_at=NOW,
+            )
+        db.commit()
+    if post and ledger != line:
+        ledger_edit(
+            engine,
+            "UPDATE mod_accounting.posted_ledger_lines SET debit = CASE WHEN debit > 0 THEN :v ELSE debit END, "
+            "credit = CASE WHEN credit > 0 THEN :v ELSE credit END WHERE journal_id = :j",
+            v=ledger,
+            j=journal_id,
+        )
+    return journal_id
+
+
+def correction(env, source_id, *, code="2000", offset="1000", evidence="FIN-EXC-1"):
+    return service.LedgerFaultCorrection(
+        source_journal_id=source_id,
+        control_code=code,
+        offset_account_id=env.accounts[offset],
+        posting_date=DAY,
+        evidence_ref=evidence,
+        description="Reverse the proven legacy posting fault",
+    )
+
+
+def prepare_fix(engine, env, source_id, who="preparer", **kw):
+    return run(
+        engine,
+        env,
+        service.prepare_ledger_fault_correction,
+        actor=env.parties[who],
+        command=correction(env, source_id, **kw),
+    )
+
+
+def refused_fix(call, code):
+    with pytest.raises(JournalRefused) as exc:
+        call()
+    assert exc.value.code == code, exc.value.code
+
+
+def ledger_net(engine, env, account_code):
+    with Session(engine) as db:
+        return db.scalar(
+            sa.select(sa.func.coalesce(sa.func.sum(PostedLedgerLine.debit - PostedLedgerLine.credit), 0)).where(
+                PostedLedgerLine.tenant_id == env.tenant_id, PostedLedgerLine.account_id == env.accounts[account_code]
+            )
+        )
+
+
+def test_v2_fault_correction_is_system_built_posts_and_clears_the_delta(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    assert ledger_net(engine, env, "2000") == -FAULT_LEDGER  # the ledger holds 985 against a 98.5 journal line
+    outcome = prepare_fix(engine, env, source)
+    assert outcome.state == m.STATE_PREPARED and outcome.replayed is False
+    with Session(engine) as db:
+        journal = db.get(JournalEntry, outcome.journal_id)
+        assert (journal.source_owner, journal.source_document_kind) == ("erp.manual", "ledger_fault_correction")
+        assert journal.source_document_id == f"{source}:2000" and journal.source_version == "1"
+        lines = {
+            db.get(Account, line.account_id).code: (line.debit, line.credit)
+            for line in db.scalars(sa.select(JournalLine).where(JournalLine.journal_id == journal.id))
+        }
+        assert lines == {"2000": (FAULT, 0), "1000": (0, FAULT)}  # Dr 2000 886.5 / Cr the offset
     request(engine, env, outcome)
-    approve(engine, env, outcome)  # warning only: it still posts
-    plain = prepare(engine, env)
-    with Session(engine) as db:
-        assert queries.detail(db, tenant_id=env.tenant_id, manual_id=plain.manual_id)["control_accounts"] == []
+    refused_fix(lambda: approve(engine, env, outcome, who="preparer"), "sod_preparer_cannot_approve")
+    approve(engine, env, outcome)
+    assert ledger_net(engine, env, "2000") == -FAULT_LINE  # only the journal's own 98.5 remains: delta is 0
+    again = prepare_fix(engine, env, source)  # a second prepare replays, even though the delta is now cleared
+    assert again.replayed is True and again.manual_id == outcome.manual_id
+
+
+def test_v2_fault_correction_needs_a_fault(engine):
+    env = seed(engine)
+    clean = fault_source(engine, env, document="clean", ledger=FAULT_LINE)
+    before = counts(engine, env)
+    refused_fix(lambda: prepare_fix(engine, env, clean), "no_ledger_fault")
+    assert counts(engine, env) == before
+
+
+def test_v2_fault_correction_source_must_be_a_posted_legacy_journal(engine):
+    env = seed(engine)
+    foreign = fault_source(engine, env, document="foreign", owner="finance")
+    draft = fault_source(engine, env, document="draft", post=False)
+    refused_fix(lambda: prepare_fix(engine, env, foreign), "ledger_fault_source_invalid")
+    refused_fix(lambda: prepare_fix(engine, env, draft), "ledger_fault_source_invalid")
+    refused_fix(lambda: prepare_fix(engine, env, uuid4()), "ledger_fault_source_invalid")
+
+
+def test_v2_fault_correction_offset_may_not_be_a_control_account(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    for offset in ("2040", "1410", "2000"):
+        refused_fix(lambda offset=offset: prepare_fix(engine, env, source, offset=offset), "offset_is_control_account")
+    refused_fix(lambda: prepare_fix(engine, env, source, code="1000"), "invalid_input")
+
+
+def test_v2_typed_control_lines_with_a_forged_kind_are_refused(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    forged = PrepareJournal(
+        uuid4(),
+        DAY,
+        JournalKind.STANDARD,
+        "ledger_fault_correction",
+        f"{source}:2000",
+        (LineInput(env.accounts["2000"], debit=FAULT), LineInput(env.accounts["1000"], credit=FAULT)),
+    )
+    refused_control(lambda: run(engine, env, service.prepare_journal, actor=env.parties["preparer"], command=forged))
+
+
+def test_v2_fault_correction_refuses_when_the_fault_changed_after_it_was_prepared(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    outcome = prepare_fix(engine, env, source)
+    ledger_edit(
+        engine,
+        "UPDATE mod_accounting.posted_ledger_lines SET credit = 500 WHERE journal_id = :j AND credit > 0",
+        j=source,
+    )
+    refused_fix(lambda: request(engine, env, outcome), "ledger_fault_changed")
+
+
+def test_v2_fault_correction_refuses_at_approval_when_the_fault_changed_after_the_request(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    outcome = prepare_fix(engine, env, source)
+    request(engine, env, outcome)
+    ledger_edit(
+        engine,
+        "UPDATE mod_accounting.posted_ledger_lines SET credit = 500 WHERE journal_id = :j AND credit > 0",
+        j=source,
+    )
+    before = counts(engine, env)
+    refused_fix(lambda: approve(engine, env, outcome), "ledger_fault_changed")
+    assert counts(engine, env) == before
+
+
+def test_v2_fault_correction_refuses_when_another_correction_for_it_is_already_posted(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    outcome = prepare_fix(engine, env, source)
+    request(engine, env, outcome)
+    with Session(engine) as db:  # a concurrent second correction: same source identity, another version, posted
+        other = accounting.create_journal(
+            db,
+            scope=TenantScope(env.tenant_id),
+            command=CreateJournal(
+                number="LF-OTHER",
+                kind=JournalKind.STANDARD,
+                entry_date=DAY,
+                posting_date=DAY,
+                currency_code="USD",
+                exchange_rate=Decimal(1),
+                description="Concurrent correction",
+                source=SourceIdentity("erp.manual", "ledger_fault_correction", f"{source}:2000", "2", "d" * 64),
+                lines=(
+                    JournalLineInput(env.accounts["2000"], debit=FAULT),
+                    JournalLineInput(env.accounts["1000"], credit=FAULT),
+                ),
+            ),
+            idempotency_key="lf-other",
+            idempotency_expires_at=None,
+            recorded_at=NOW,
+        )
+        accounting.post_journal(
+            db,
+            scope=TenantScope(env.tenant_id),
+            journal_id=other.id,
+            approval_reference="lf-other",
+            posted_by="x",
+            idempotency_key="lf-other-post",
+            idempotency_expires_at=None,
+            posted_at=NOW,
+        )
+        db.commit()
+    refused_fix(lambda: approve(engine, env, outcome), "ledger_fault_changed")
+
+
+def test_v2_a_posted_fault_correction_can_be_reversed_which_recreates_the_fault(engine):
+    env = seed(engine)
+    source = fault_source(engine, env)
+    outcome = prepare_fix(engine, env, source)
+    request(engine, env, outcome)
+    approve(engine, env, outcome)
+    run(
+        engine,
+        env,
+        service.request_reversal,
+        manual_id=outcome.manual_id,
+        actor=env.parties["requester"],
+        reason="Finance chose another offset",
+        posting_date=DAY,
+    )
+    run(engine, env, service.approve_reversal, manual_id=outcome.manual_id, approver=env.parties["approver2"])
+    assert ledger_net(engine, env, "2000") == -FAULT_LEDGER  # the original fault is back
 
 
 def test_held_drafts_are_counted_per_period_for_the_soft_close_screen(engine):

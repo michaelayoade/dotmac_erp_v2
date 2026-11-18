@@ -344,6 +344,25 @@ def _refuse_returner(
         )
 
 
+def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]) -> None:
+    """V3: every net-pay line's employee has an approved payee bank instruction, whatever the file setting.
+
+    Statutory remittances are excluded (their destination is chosen on the batch, not a person).
+    """
+    if batch.kind != KIND_NET_PAY:
+        return
+    for line in lines:
+        try:
+            payee_service.destination_for_payment(
+                db, tenant_id=batch.tenant_id, payee_kind=PayeeKind.EMPLOYEE.value, payee_ref=line.beneficiary_ref
+            )
+        except payee_service.PayeeBankError as exc:
+            raise PayoutRefused(
+                "payee_instruction_required",
+                "A payee in this batch has no approved bank instruction; propose and approve one first",
+            ) from exc
+
+
 def _file_receipts(db: Session, tenant_id: UUID, lines: Sequence[PayrollPayoutLine]) -> list[DisbursementFileReceipt]:
     return list(
         db.scalars(
@@ -526,6 +545,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID, now: 
         raise PayoutRefused("sod_approver_is_preparer", "You prepared this batch; another person must approve it")
     lines = _lines(db, tenant.id, batch.id)
     _revalidate(db, batch, lines)
+    _require_payee_instructions(db, batch, lines)
     _refuse_instruction_party(db, batch, lines, party.id, code="sod_approver_is_instruction_party", role="approver")
     _refuse_returner(db, batch, lines, party.id, code="sod_approver_is_returner", role="approver")
     batch.status = APPROVED
@@ -748,6 +768,8 @@ def _record(
             _refuse_instruction_party(
                 db, batch, lines, party.id, code="sod_recorder_is_instruction_party", role="recorder"
             )
+    if batch.status != FILE_ISSUED:  # FILE_ISSUED is covered by _check_file_destinations below
+        _require_payee_instructions(db, batch, lines)
     try:
         bank_ref.claim(
             db,
