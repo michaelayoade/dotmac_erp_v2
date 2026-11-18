@@ -78,6 +78,9 @@ POLICIES: Final = MappingProxyType(
     {
         ("payables", "supplier_invoice"): RefPolicy(),
         ("payables", "credit_note"): RefPolicy(),
+        # payables a6: the deferred input VAT a credit application releases (Dr release / Cr deferral account,
+        # Account UUIDs from the owner's declared policy; no 2000 line).
+        ("payables", "supplier_credit_application"): RefPolicy(),
         # B3: Dr invoice liability account(s) (Account UUID), Cr the paying bank account's cash GL
         # (Account UUID from the bank account record); a5 WHT accounts are UUIDs too (WHT itself
         # is refused by the ERP workflow, so none are posted).

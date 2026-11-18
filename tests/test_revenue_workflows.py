@@ -30,6 +30,14 @@ from erp_v2.web import revenue_services as services
 from erp_v2.web.revenue_routes import WRITE_PERMISSION, revenue_web_feature, router
 
 
+def _a6_tables() -> list:
+    """The a6 deferral-policy table, read by the tax-role account check, when payables a6 is installed."""
+    from dotmac_payables import models as payables_models
+
+    model = getattr(payables_models, "TaxDeferralPolicy", None)
+    return [] if model is None else [model.__table__]
+
+
 @pytest.fixture()
 def data():
     engine = sa.create_engine("sqlite://")
@@ -52,6 +60,7 @@ def data():
             BillingDocument.__table__,
             ConfirmedSettlement.__table__,
             LegacyInvoiceReference.__table__,
+            *_a6_tables(),
         ],
     )
     with Session(engine) as db:
