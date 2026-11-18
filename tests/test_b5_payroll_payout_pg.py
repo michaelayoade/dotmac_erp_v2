@@ -1729,3 +1729,24 @@ def test_the_pinned_instruction_is_write_once_in_the_database(engine):
             )
             db.flush()
         db.rollback()
+
+
+def test_the_e2_0024_downgrade_refuses_while_a_payout_line_holds_a_pinned_instruction(engine):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from erp_v2.migrations.versions import e2_0024_statutory_payees as migration
+
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            with Operations.context(MigrationContext.configure(connection)):
+                with pytest.raises(RuntimeError, match="pinned payee instruction"):
+                    migration.downgrade()
+        finally:
+            transaction.rollback()
+    assert all(ln.payee_instruction_id is not None for ln in lines(engine, batch_id))

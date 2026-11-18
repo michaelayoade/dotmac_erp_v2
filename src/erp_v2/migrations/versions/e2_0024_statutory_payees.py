@@ -9,7 +9,7 @@ It also adds ``erp_payroll_payout_lines.payee_instruction_id`` (nullable): the a
 was approved against, written once at approve (runtime UPDATE on that column only, plus a write-once trigger).
 B5 record refuses with ``payee_instruction_changed`` if the current approved instruction differs.
 
-Downgrade refuses while any statutory instruction exists (it would violate the narrower CHECK).
+Downgrade refuses while any statutory instruction exists or any payout line holds a pinned instruction id.
 
 Revision chain: e2_0023 (staff loan entries) -> this revision.
 """
@@ -57,6 +57,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+    pinned = bind.execute(
+        sa.text("SELECT 1 FROM erp_payroll_payout_lines WHERE payee_instruction_id IS NOT NULL LIMIT 1")
+    )
+    if pinned.first() is not None:
+        raise RuntimeError("refusing to downgrade: payout lines hold pinned payee instruction ids")
     found = bind.execute(sa.text("SELECT 1 FROM payee_bank_instructions WHERE payee_kind = 'statutory' LIMIT 1"))
     if found.first() is not None:
         raise RuntimeError("refusing to downgrade: statutory payee instructions exist")
