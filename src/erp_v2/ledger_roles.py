@@ -25,6 +25,7 @@ PAYROLL_PAYABLE_CODE: Final = "2040"
 STAFF_LOAN_CODE: Final = "1410"
 CONTROL_ACCOUNT_CODES: Final = frozenset({AP_CONTROL_CODE, PAYROLL_PAYABLE_CODE, STAFF_LOAN_CODE})
 INVOICE_TAX_ACCOUNT_CODES: Final = frozenset({"1455"})
+INPUT_VAT_RELEASE_CODES: Final = frozenset({"1440"})  # where released deferred input VAT is claimed (a6)
 
 
 class LedgerRoleError(ValueError):
@@ -33,6 +34,26 @@ class LedgerRoleError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def tax_role_account_ids(db: Session, tenant_id: UUID) -> set[str]:
+    """Accounts that hold VAT (input-tax 1455, release 1440, any account named by a declared deferral policy):
+    never an invoice or credit line's own posting account."""
+    ids = {
+        str(i)
+        for i in db.scalars(
+            select(Account.id).where(
+                Account.tenant_id == tenant_id, Account.code.in_(INVOICE_TAX_ACCOUNT_CODES | INPUT_VAT_RELEASE_CODES)
+            )
+        )
+    }
+    try:
+        from dotmac_payables.models import TaxDeferralPolicy  # a6 only
+    except ImportError:
+        return ids
+    for policy in db.scalars(select(TaxDeferralPolicy).where(TaxDeferralPolicy.tenant_id == tenant_id)):
+        ids.update((str(policy.deferral_account_ref), str(policy.release_account_ref)))
+    return ids
 
 
 def account_id_for_code(db: Session, tenant_id: UUID, code: str) -> UUID | None:
@@ -70,6 +91,14 @@ def control_codes_among(db: Session, tenant_id: UUID, account_ids: Iterable[UUID
             )
         )
     )
+
+
+def _is_uuid(value: object) -> bool:
+    try:
+        UUID(str(value))
+    except ValueError:
+        return False
+    return True
 
 
 def same_account(ref: object, account_id: UUID) -> bool:
@@ -116,6 +145,13 @@ def invoice_account_violation(
                     f"Line {number}: a control account (2000/2040/1410) cannot be a line or tax account; "
                     "correct it through the owning subledger document",
                 )
+    tax_roles = tax_role_account_ids(db, tenant_id)
+    for number, (posting, _tax, _tax_ref) in enumerate(rows, start=1):
+        if any(same_account(posting, UUID(t)) for t in tax_roles if _is_uuid(t)) or str(posting) in tax_roles:
+            return (
+                "line_account_is_tax_account",
+                f"Line {number}: an input-tax or release account (1455/1440) cannot be a line's own posting account",
+            )
     taxed = [(posting, tax_ref) for posting, tax, tax_ref in rows if tax is not None and tax > 0]
     if not taxed:
         return None

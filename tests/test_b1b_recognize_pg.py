@@ -118,6 +118,7 @@ class Legacy:
         self.engine = db_engine
         self.overrides: dict[UUID, dict] = {}
         self.ledger: list[dict] = []
+        self.journals: list[dict] = []
         self.allocations: list[dict] = []
         self.inventory: list[dict] = []
         self.line_overrides: dict[UUID, dict] = {}
@@ -216,6 +217,7 @@ class Legacy:
                 ("supplier_invoice", headers),
                 ("supplier_invoice_line", lines),
                 ("payment_allocation", self.allocations),
+                ("journal_entry", self.journals),
                 ("posted_ledger_line", self.ledger),
                 ("inventory_transaction", self.inventory),
             ):
@@ -470,6 +472,31 @@ def test_legacy_gl_ledger_line_or_payment_allocation_refuses(engine, setup):
         "legacy_evidence:source_gl_ledger_present": 1,
     }
     assert plan["counts"]["eligible"] == 1
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [("POSTED", "deferral_on_unposted_invoice"), ("DRAFT", "source_gl_journal_present")],
+)
+def test_posted_legacy_deferral_journal_on_an_unposted_invoice_is_a_named_refusal(engine, setup, status, reason):
+    """The deferral journal is already in the v2 ledger (Dr 1455): B1 would debit the deferral account twice."""
+    env, legacy = setup
+    ids = (imported(engine, env),)
+    legacy.journals.append(
+        dict.fromkeys(READ_FIELDS["journal_entry"])
+        | dict(
+            journal_entry_id="00000000-0000-0000-0000-0000000000dd",
+            source_module="AP",
+            source_document_type="SUPPLIER_INVOICE_VAT_DEFERRAL",
+            source_document_id=str(ids[0]),
+            status=status,
+        )
+    )
+    legacy.build(ids)
+    before = counts(engine, env.tenant_id)
+    plan = legacy.run(engine, ids, apply=False)
+    assert plan["refusals_by_reason"] == {f"legacy_evidence:{reason}": 1}
+    assert counts(engine, env.tenant_id) == before
 
 
 def test_closed_period_refuses_in_plan(engine, setup):

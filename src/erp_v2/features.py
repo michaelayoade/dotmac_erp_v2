@@ -19,6 +19,7 @@ from erp_v2.payees.routes import payee_bank_feature
 from erp_v2.payroll_payouts.routes import payroll_payouts_feature
 from erp_v2.readiness import readiness_feature
 from erp_v2.supplier_payments.routes import supplier_payments_feature
+from erp_v2.web.credit_note_routes import credit_note_feature
 from erp_v2.web.legacy_reentry_routes import legacy_reentry_feature
 from erp_v2.web.payroll_routes import payroll_web_feature
 from erp_v2.web.payroll_run_routes import payroll_run_feature
@@ -32,6 +33,7 @@ ERP_FEATURES: tuple[FeatureManifest, ...] = (
     erp_web_feature,
     revenue_web_feature,
     revenue_approval_feature,
+    credit_note_feature,
     legacy_reentry_feature,
     payroll_web_feature,
     payroll_run_feature,

@@ -43,6 +43,7 @@ from erp_v2.importer.minting import MAP_MINTS, MintContext, MintResult, run_mint
 from erp_v2.importer.payroll_formula import convert_rule
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.tax_accounts import (
+    DEFERRAL_JOURNAL_SQL,
     GLOBAL_TAX_ACCOUNT_SQL,
     INVOICE_LINE_SQL,
     LEDGER_DEBIT_SQL,
@@ -613,7 +614,7 @@ def _supplier_line_dimensions(source: sa.Connection, dest: sa.Connection) -> dic
 
 def _build_supplier_line_tax_accounts(
     source: sa.Connection,
-) -> tuple[dict[Any, dict[str, Any]], dict[str, dict[str, int]]]:
+) -> tuple[dict[Any, dict[str, Any]], dict[str, Any]]:
     """tax_account_ref per supplier invoice line (two-regime rule, see tax_accounts.py).
 
     Legacy-posted invoices follow the posted ledger lines (A1 split, A2 folded, A3 other lands the
@@ -626,7 +627,8 @@ def _build_supplier_line_tax_accounts(
     rows = [dict(r) for r in source.execute(sa.text(INVOICE_LINE_SQL)).mappings()]
     ledger = [dict(r) for r in source.execute(sa.text(LEDGER_DEBIT_SQL)).mappings()]
     every_code = [dict(r) for r in source.execute(sa.text(GLOBAL_TAX_ACCOUNT_SQL)).mappings()]
-    outcomes = classify_snapshot(rows, ledger, every_code)
+    deferral = [dict(r) for r in source.execute(sa.text(DEFERRAL_JOURNAL_SQL)).mappings()]
+    outcomes = classify_snapshot(rows, ledger, every_code, deferral)
     by_line = {canonical(line_id): line for outcome in outcomes.values() for line_id, line in outcome.lines.items()}
     mapping: dict[Any, dict[str, Any]] = {}
     for row in rows:
@@ -1122,9 +1124,9 @@ class EnrolmentMaps:
         self._mint_context = mint_context
         self._cache: dict[str, dict[Any, Any]] = {}
         self._mints: dict[str, MintResult] = {}
-        self._tax_account_classes: dict[str, dict[str, int]] | None = None
+        self._tax_account_classes: dict[str, Any] | None = None
 
-    def tax_account_classes(self) -> dict[str, dict[str, int]] | None:
+    def tax_account_classes(self) -> dict[str, Any] | None:
         """Per-class counts (lines, invoices) of the tax-account map, once it has been built."""
 
         return self._tax_account_classes
