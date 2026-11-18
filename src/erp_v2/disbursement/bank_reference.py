@@ -1,6 +1,6 @@
-"""One bank-evidence-reference rule shared by B3 supplier payments and B5 payroll payouts.
+"""One bank-evidence-reference rule shared by B3 supplier payments, B5 payroll payouts and staff loan advances.
 
-A bank reference is used once per (tenant, bank account) across BOTH modules (a B5 bank
+A bank reference is used once per (tenant, bank account) across ALL these modules (a B5 bank
 return reference counts too). Each module has its own
 table (and its own unique constraint), so no single constraint can span them; the cross-module rule is
 enforced here, serialised by a transaction-scoped advisory lock.
@@ -25,6 +25,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from erp_v2.payroll_payouts.models import PayrollPayoutBatch, PayrollPayoutLine
+from erp_v2.staff_loans.models import StaffLoanEntry
 
 MIN_LENGTH = 3
 MAX_LENGTH = 255
@@ -101,6 +102,14 @@ def claim(
         PayrollPayoutLine.return_reference == reference,
     )
     if db.scalar(returned.limit(1)) is not None:
+        raise BankReferenceReused
+    # A staff loan advance (PR-3) is paid from a bank account with its own evidence reference.
+    loan = select(StaffLoanEntry.id).where(
+        StaffLoanEntry.tenant_id == tenant_id,
+        StaffLoanEntry.bank_account_id == bank_account_id,
+        StaffLoanEntry.bank_reference == reference,
+    )
+    if db.scalar(loan.limit(1)) is not None:
         raise BankReferenceReused
     if check_supplier_payments:
         supplier = select(SupplierPayment.id).where(

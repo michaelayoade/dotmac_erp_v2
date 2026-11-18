@@ -37,6 +37,7 @@ from dotmac_payroll import service as payroll
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement
 from dotmac_people.models import Employee
 from sqlalchemy.orm import Session
+from staff_loan_helpers import seed_recorded_opening
 from test_posting_bridge_pg import NOW, soft_close
 
 from erp_v2.assembly import assembly
@@ -1125,7 +1126,10 @@ def test_a4_internal_recovery_net_pay_or_remittance_is_refused_by_the_selection_
 
 def internal_world(engine):
     """PAYE is a staff-loan style deduction: internal_recovery, mapped to the ASSET account 1410."""
-    return world(engine, paye_liability="1410", paye_mode="internal_recovery")
+    env = world(engine, paye_liability="1410", paye_mode="internal_recovery")
+    for employee in env.emp.values():
+        seed_recorded_opening(engine, env.tenant_id, employee, "10000")  # a recovery needs a loan balance
+    return env
 
 
 def test_a4_internal_recovery_liability_is_settled_employee_side_and_in_no_payout(engine):

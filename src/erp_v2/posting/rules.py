@@ -87,6 +87,10 @@ POLICIES: Final = MappingProxyType(
         ("payroll", "payroll_liability_settlement"): RefPolicy(frozenset({"2040"})),
         # payroll a5: bank-returned salary. Dr the ORIGINAL bank cash GL (Account UUID) / Cr 2040.
         ("payroll", "payroll_settlement_reversal"): RefPolicy(frozenset({"2040"})),
+        # Staff loan entries (PR-3; no Starter owner): Dr/Cr the 1410 Staff Loan account against the paying
+        # bank account's cash GL (advance) or a Finance-chosen non-control offset (adjustment, control
+        # difference). Both refs are Account UUIDs, resolved from the tenant's records, never typed.
+        ("erp", "staff_loan_entry"): RefPolicy(),
     }
 )
 
