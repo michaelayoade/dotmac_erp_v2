@@ -145,9 +145,9 @@ def ledger(engine, journal_id):
 
 def test_approve_posts_dr_2000_cr_lines_and_tax_with_one_receipt_and_a_credit_event(engine):
     env = world(engine)
-    approved_invoice(engine, env)
+    iid, _ob = approved_invoice(engine, env)
     assert balance(engine, env) == Decimal("215")
-    cid = draft(engine, env)
+    cid = draft(engine, env, original_invoice_id=str(iid))
     out = approve(engine, env, cid)
     assert out.replayed is False and out.credit_note_id == cid and out.applied_amount == 0
     assert ledger(engine, out.accounting_reference) == {"2000": (215, 0), "5000": (0, 200), "1455": (0, 15)}
@@ -172,15 +172,15 @@ def test_approve_posts_dr_2000_cr_lines_and_tax_with_one_receipt_and_a_credit_ev
 
 def test_the_submitter_may_approve_their_own_credit_note_there_is_no_compulsory_second_person(engine):
     env = world(engine)
-    approved_invoice(engine, env)
-    cid = draft(engine, env)  # submitted by party 0
+    iid, _ob = approved_invoice(engine, env)
+    cid = draft(engine, env, original_invoice_id=str(iid))  # submitted by party 0
     assert approve(engine, env, cid, who=0).replayed is False
 
 
 def test_replay_is_a_no_op(engine):
     env = world(engine)
-    approved_invoice(engine, env)
-    cid = draft(engine, env)
+    iid, _ob = approved_invoice(engine, env)
+    cid = draft(engine, env, original_invoice_id=str(iid))
     first = approve(engine, env, cid)
     after = counts(engine, env)
     again = approve(engine, env, cid, who=2, evidence="OTHER")
@@ -258,11 +258,11 @@ def test_original_invoice_must_be_approved_and_match_supplier_and_currency(engin
 
 def test_evidence_reference_is_required_and_a_draft_is_not_approvable(engine):
     env = world(engine)
-    approved_invoice(engine, env)
-    cid = draft(engine, env)
+    iid, _ob = approved_invoice(engine, env)
+    cid = draft(engine, env, original_invoice_id=str(iid))
     refusal(engine, env, cid, "evidence_required", evidence="  ")
     refusal(engine, env, cid, "evidence_required", evidence="x" * 121)
-    unsent = draft(engine, env, number="CN-2", submit=False)
+    unsent = draft(engine, env, original_invoice_id=str(iid), number="CN-2", submit=False)
     refusal(engine, env, unsent, "not_submitted")
 
 
@@ -327,7 +327,7 @@ def rewrite(engine, cid, **fields):
 
 def test_v1_and_v2_are_enforced_again_at_approval(engine):
     env = world(engine)
-    approved_invoice(engine, env)
+    iid, _ob = approved_invoice(engine, env)
     other = add_account(engine, env, "2150")
     liability_other = add_account(engine, env, "2001", NormalBalance.CREDIT)
     cases = (
@@ -336,7 +336,7 @@ def test_v1_and_v2_are_enforced_again_at_approval(engine):
         ({"liability_account_ref": str(liability_other)}, "liability_not_ap_control"),
     )
     for index, (fields, code) in enumerate(cases):
-        cid = draft(engine, env, number=f"CN-V{index}", submit=False)
+        cid = draft(engine, env, original_invoice_id=str(iid), number=f"CN-V{index}", submit=False)
         rewrite(engine, cid, **fields)
         with Session(engine) as db:
             maker = db.get(Party, env.party_ids[0])
@@ -344,7 +344,7 @@ def test_v1_and_v2_are_enforced_again_at_approval(engine):
             db.commit()
         refusal(engine, env, cid, code)
         assert status(engine, cid) == CreditNoteStatus.SUBMITTED
-    cid = draft(engine, env, number="CN-V9")
+    cid = draft(engine, env, original_invoice_id=str(iid), number="CN-V9")
     b1.recode(engine, env.tax_account, "1456")
     refusal(engine, env, cid, "input_tax_account_unavailable")
     b1.recode(engine, env.tax_account, "1455")
@@ -354,15 +354,15 @@ def test_v1_and_v2_are_enforced_again_at_approval(engine):
 
 def test_closed_period_dimensions_and_missing_ledger_receipt_refuse_without_partial_state(engine):
     env = world(engine)
-    approved_invoice(engine, env)
-    cid = draft(engine, env, number="CN-C")
+    iid, _ob = approved_invoice(engine, env)
+    cid = draft(engine, env, original_invoice_id=str(iid), number="CN-C")
     bridge_pg.soft_close(engine, env)
     refusal(engine, env, cid, "posting_period_closed")
     assert balance(engine, env) == Decimal("215")
 
     env = world(engine)
-    approved_invoice(engine, env)
-    dim = draft(engine, env, submit=False)
+    iid, _ob = approved_invoice(engine, env)
+    dim = draft(engine, env, original_invoice_id=str(iid), submit=False)
     rewrite(engine, dim, dimension_refs=[["COST_CENTER", str(uuid4())]])
     with Session(engine) as db:
         svc.submit_credit_note_draft(
@@ -371,7 +371,7 @@ def test_closed_period_dimensions_and_missing_ledger_receipt_refuse_without_part
         db.commit()
     refusal(engine, env, dim, "dimensions_unsupported")
 
-    orphan = draft(engine, env, number="CN-O")
+    orphan = draft(engine, env, original_invoice_id=str(iid), number="CN-O")
     with Session(engine) as db:  # approved at the owner but never posted
         payables.approve_credit_note(
             db,
@@ -389,7 +389,7 @@ def test_closed_period_dimensions_and_missing_ledger_receipt_refuse_without_part
 
 def test_party_of_another_tenant_and_unknown_credit_note_are_refused(engine):
     env, other = world(engine), world(engine)
-    cid = draft(engine, env)
+    cid = draft(engine, env, tax="0")
     with Session(engine) as db:
         with pytest.raises(svc.CreditApprovalRefused) as exc:
             svc.approve_and_post(
@@ -413,11 +413,12 @@ def test_party_of_another_tenant_and_unknown_credit_note_are_refused(engine):
 
 def test_v2_a_control_account_is_refused_as_a_credit_line_or_tax_account(engine):
     env = world(engine)
+    iid, _ob = approved_invoice(engine, env)
     for field, code in (("posting_account_id", "2040"), ("posting_account_id", "2000"), ("tax_account_id", "2040")):
         draft_refused(engine, env, "line_account_is_control", **{field: str(env.accounts[code])})
     control = add_account(engine, env, "1410")
     draft_refused(engine, env, "line_account_is_control", posting_account_id=str(control), tax="0")
-    cid = draft(engine, env, number="CN-L", submit=False)
+    cid = draft(engine, env, original_invoice_id=str(iid), number="CN-L", submit=False)
     rewrite(engine, cid, posting_account_ref=str(control))
     with Session(engine) as db:
         svc.submit_credit_note_draft(
@@ -425,3 +426,38 @@ def test_v2_a_control_account_is_refused_as_a_credit_line_or_tax_account(engine)
         )
         db.commit()
     refusal(engine, env, cid, "line_account_is_control")
+
+
+def test_a_taxed_credit_note_must_name_its_original_invoice(engine):
+    env = world(engine)
+    approved_invoice(engine, env)
+    draft_refused(engine, env, "deferred_tax_credit_requires_invoice")  # tax 15, no original
+    cid = draft(engine, env, number="CN-U", tax="0")  # untaxed needs none
+    assert status(engine, cid) == CreditNoteStatus.SUBMITTED
+    taxed = draft(
+        engine, env, number="CN-T", submit=False, original_invoice_id=str(approved_invoice(engine, env, "AP-9")[0])
+    )
+    with Session(engine) as db:  # the original link is removed behind the draft check
+        db.execute(sa.update(CreditNote).where(CreditNote.id == taxed).values(original_invoice_id=None))
+        db.commit()
+        svc.submit_credit_note_draft(
+            db, tenant=db.get(Tenant, env.tenant_id), party=db.get(Party, env.party_ids[0]), credit_note_id=taxed
+        )
+        db.commit()
+    refusal(engine, env, taxed, "deferred_tax_credit_requires_invoice")
+
+
+def test_a_credit_is_applied_only_to_its_original_invoices_obligations(engine):
+    env = world(engine)
+    _iid, obligation = approved_invoice(engine, env)
+    cid = draft(engine, env, tax="0")  # no original invoice named
+    refusal(engine, env, cid, "apply_requires_original_invoice", obligation_id=obligation)
+    assert approve(engine, env, cid).replayed is False  # approving without applying is fine
+
+
+def test_a_credit_at_another_exchange_rate_than_the_original_is_not_applied(engine):
+    env = world(engine)
+    iid, obligation = approved_invoice(engine, env)
+    cid = draft(engine, env, tax="0", exchange_rate="2", original_invoice_id=str(iid))
+    refusal(engine, env, cid, "apply_exchange_rate_differs", obligation_id=obligation)
+    assert approve(engine, env, cid).applied_amount == 0

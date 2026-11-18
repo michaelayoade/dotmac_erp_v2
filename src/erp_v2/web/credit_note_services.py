@@ -111,28 +111,33 @@ def create_credit_note_draft(db: Session, *, tenant: Tenant, party: Party, value
             original = UUID(values["original_invoice_id"].strip())
         except ValueError as exc:
             raise RevenueActionError("The original invoice reference is not valid") from exc
-    command = CreateCreditNote(
-        number=values.get("number", ""),
-        supplier_ref=values.get("supplier_ref", ""),
-        supplier_name_snapshot=values.get("supplier_name", ""),
-        supplier_document_number=values.get("supplier_document_number", ""),
-        credit_date=_date(values, "credit_date"),
-        currency_code=currency,
-        exchange_rate=rate,
-        liability_account_ref=liability,
-        lines=(
-            PayableLineInput(
-                description=values.get("description", ""),
-                quantity=quantity,
-                unit_price=price,
-                posting_account_ref=posting,
-                tax_amount=tax,
-                tax_account_ref=tax_account,
-            ),
-        ),
-        original_invoice_id=original,
-    )
+    if tax > 0 and original is None:
+        raise RevenueActionError(
+            "A taxed credit note must name its original invoice", "deferred_tax_credit_requires_invoice"
+        )
+    # The owner command is built inside the try: its own validation (PayablesError) must surface as a refusal.
     try:
+        command = CreateCreditNote(
+            number=values.get("number", ""),
+            supplier_ref=values.get("supplier_ref", ""),
+            supplier_name_snapshot=values.get("supplier_name", ""),
+            supplier_document_number=values.get("supplier_document_number", ""),
+            credit_date=_date(values, "credit_date"),
+            currency_code=currency,
+            exchange_rate=rate,
+            liability_account_ref=liability,
+            lines=(
+                PayableLineInput(
+                    description=values.get("description", ""),
+                    quantity=quantity,
+                    unit_price=price,
+                    posting_account_ref=posting,
+                    tax_amount=tax,
+                    tax_account_ref=tax_account,
+                ),
+            ),
+            original_invoice_id=original,
+        )
         with db.begin_nested():
             return payables.create_credit_note(
                 db,
@@ -223,9 +228,18 @@ def _obligation_to_apply(
     )
     if obligation is None or invoice is None:
         raise CreditApprovalRefused("obligation_not_found", "The obligation to apply the credit to was not found")
-    if credit.original_invoice_id is not None and invoice.id != credit.original_invoice_id:
+    if credit.original_invoice_id is None:
+        raise CreditApprovalRefused(
+            "apply_requires_original_invoice", "A credit note can be applied only to its original invoice's obligations"
+        )
+    if invoice.id != credit.original_invoice_id:
         raise CreditApprovalRefused(
             "obligation_not_on_original_invoice", "The obligation belongs to a different invoice than the credit's"
+        )
+    if invoice.exchange_rate != credit.exchange_rate:
+        raise CreditApprovalRefused(
+            "apply_exchange_rate_differs",
+            "The credit note's exchange rate differs from the original invoice's; it cannot be applied",
         )
     if invoice.supplier_ref != credit.supplier_ref or invoice.currency_code != credit.currency_code:
         raise CreditApprovalRefused("obligation_mismatch", "The obligation is for another supplier or currency")
@@ -293,6 +307,10 @@ def _guarded(
             "dimensions_unsupported",
             "Lines " + ", ".join(map(str, with_dimensions)) + " carry cost-centre/project/segment dimensions, "
             "which cannot be posted yet; refer this credit note to the exceptions review",
+        )
+    if credit.original_invoice_id is None and any(line.tax_amount > 0 for line in lines):
+        raise CreditApprovalRefused(
+            "deferred_tax_credit_requires_invoice", "A taxed credit note must name its original invoice"
         )
     violation = invoice_account_violation(
         db,
