@@ -63,6 +63,7 @@ class Browser:
     supplier_read: Mock
     approve: Mock
     credit_approve: Mock
+    credit_apply: Mock
     payroll: dict | None = None
 
     def sign_in(self, role: str | None) -> str:
@@ -158,6 +159,8 @@ def browser(monkeypatch):
             return_value=SimpleNamespace(credit_note_id=DOCUMENT_ID, accounting_reference="j", replayed=False)
         )
         monkeypatch.setattr(credit_note_routes.services, "approve_and_post", credit_approve)
+        credit_apply = Mock(return_value=SimpleNamespace(credit_note_id=DOCUMENT_ID, release_journal=None))
+        monkeypatch.setattr(credit_note_routes.services, "apply_credit", credit_apply)
         approve = Mock(return_value=SimpleNamespace(invoice_id=DOCUMENT_ID, accounting_reference="j", replayed=False))
         monkeypatch.setattr(revenue_approval_routes.services, "approve_and_post", approve)
         payroll_mocks = {
@@ -187,6 +190,7 @@ def browser(monkeypatch):
                 supplier_read,
                 approve,
                 credit_approve,
+                credit_apply,
                 payroll_mocks,
             )
         finally:
@@ -341,6 +345,34 @@ def test_credit_note_approve_refused_for_admin_staff_and_anonymous(browser: Brow
     response = browser.client.post(CREDIT_APPROVE_PATH, data={"csrf_token": token, "evidence_ref": "x"})
     assert response.status_code == expected
     browser.credit_approve.assert_not_called()
+
+
+CREDIT_APPLY_PATH = f"/finance/supplier-credit-notes/{DOCUMENT_ID}/apply"
+
+
+def test_only_finance_approver_reaches_credit_note_apply(browser: Browser) -> None:
+    token = browser.sign_in("approver")
+    form = {"csrf_token": token, "obligation_id": str(DOCUMENT_ID), "evidence_ref": "FIN-1", "request_id": "r"}
+    assert browser.client.post(CREDIT_APPLY_PATH, data=form).status_code == 303
+    browser.credit_apply.assert_called_once()
+    kwargs = browser.credit_apply.call_args.kwargs
+    assert kwargs["credit_note_id"] == DOCUMENT_ID and kwargs["obligation_id"] == DOCUMENT_ID
+    browser.credit_approve.assert_not_called()
+
+
+@pytest.mark.parametrize("role,expected", [(None, 302), ("admin", 403), ("staff", 403), ("admin_approver", 403)])
+def test_credit_note_apply_refused_for_admin_staff_and_anonymous(browser: Browser, role, expected) -> None:
+    token = browser.sign_in(role)
+    response = browser.client.post(CREDIT_APPLY_PATH, data={"csrf_token": token, "obligation_id": str(DOCUMENT_ID)})
+    assert response.status_code == expected
+    browser.credit_apply.assert_not_called()
+
+
+def test_credit_note_apply_refuses_invalid_csrf(browser: Browser) -> None:
+    browser.sign_in("approver")
+    response = browser.client.post(CREDIT_APPLY_PATH, data={}, headers={"origin": "https://other.example"})
+    assert response.status_code == 403
+    browser.credit_apply.assert_not_called()
 
 
 def test_credit_note_approve_refuses_invalid_csrf(browser: Browser) -> None:

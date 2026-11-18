@@ -50,13 +50,33 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from erp_v2.ledger_roles import invoice_account_violation
+try:  # payables a6 (cash-basis VAT release); absent on the released a5 pin, which the ERP still pins
+    from dotmac_payables.models import CreditNoteTaxSplit, HistoricalCreditReceipt
+except ImportError:  # pragma: no cover - exercised on the a5 pin
+    CreditNoteTaxSplit = None  # type: ignore[assignment,misc]
+    HistoricalCreditReceipt = None  # type: ignore[assignment,misc]
+
+from erp_v2.ledger_roles import invoice_account_violation, same_account
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
 from erp_v2.web.revenue_services import RevenueActionError, _account, _actor, _date, _decimal
 
 AUDIT_APPROVED_POSTED: Final = "erp.finance.supplier_credit_note.approved_posted"
 AUDIT_APPROVAL_REFUSED: Final = "erp.finance.supplier_credit_note.approval_refused"
+AUDIT_APPLIED: Final = "erp.finance.supplier_credit_note.applied"
+AUDIT_APPLY_REFUSED: Final = "erp.finance.supplier_credit_note.apply_refused"
+APPLICATION_KIND: Final = "supplier_credit_application"
+# Owner refusals (payables a6) that route to the exceptions review rather than a retry.
+EXCEPTION_CODES: Final = frozenset(
+    {
+        "credit_tax_exceeds_invoice_tax",
+        "credit_tax_on_release_account",
+        "deferred_tax_credit_requires_invoice",
+        "historical_deferral_unproven",
+        "credit_setoff_on_deferred_invoice",
+        "credit_application_has_no_consequence",
+    }
+)
 DOCUMENT_KIND: Final = "credit_note"
 _MAXIMUM: Final = Decimal("99999999999999.999999")
 
@@ -75,6 +95,16 @@ class CreditApprovalOutcome:
     accounting_reference: str
     replayed: bool
     applied_amount: Decimal = Decimal(0)
+    application_reference: str | None = None  # the release journal, when the application released VAT
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyOutcome:
+    credit_note_id: UUID
+    application_id: UUID
+    amount: Decimal
+    release_journal: str | None
+    replayed: bool
 
 
 # --- draft and submit (the draft permission) ----------------------------------------------------
@@ -207,6 +237,114 @@ def _evidence(value: str | None) -> str:
     return text
 
 
+def is_cash_credit(db: Session, tenant_id: UUID, credit_note_id: UUID) -> bool:
+    """CASH credit (structural): a credit with a historical credit receipt, i.e. cash already paid."""
+    if HistoricalCreditReceipt is None:  # a5: no historical credits exist
+        return False
+    return (
+        db.scalar(
+            select(HistoricalCreditReceipt.id).where(
+                HistoricalCreditReceipt.tenant_id == tenant_id, HistoricalCreditReceipt.credit_note_id == credit_note_id
+            )
+        )
+        is not None
+    )
+
+
+def _owner_refusal(exc: PayablesError) -> CreditApprovalRefused:
+    code = getattr(exc, "code", None)
+    if code in EXCEPTION_CODES:
+        return CreditApprovalRefused(code, f"{exc} Refer it to the exceptions review.")
+    return CreditApprovalRefused("payables_refused", str(exc))
+
+
+def _check_consequence_accounts(db: Session, tenant_id: UUID, credit: CreditNote, lines, consequence) -> None:
+    """The credit consequence may touch only the liability, the line accounts, the line tax accounts and, for
+    1440, the release accounts of the OWNER's split rows. The ERP never types or computes 1440."""
+    release = (
+        []
+        if CreditNoteTaxSplit is None
+        else [
+            row.release_account_ref
+            for row in db.scalars(
+                select(CreditNoteTaxSplit).where(
+                    CreditNoteTaxSplit.tenant_id == tenant_id, CreditNoteTaxSplit.credit_note_id == credit.id
+                )
+            )
+            if row.released_amount > 0
+        ]
+    )
+    allowed = [credit.liability_account_ref]
+    for line in lines:
+        allowed.append(line.posting_account_ref)
+        if line.tax_account_ref:
+            allowed.append(line.tax_account_ref)
+    allowed.extend(release)
+    for entry in consequence.entries:
+        if not any(same_account(entry.account_ref, UUID(str(ref))) for ref in allowed if _is_uuid(ref)):
+            raise CreditApprovalRefused(
+                "credit_consequence_account_unexpected",
+                "The credit note's ledger entries touch an account that is not on the document; refer it to the "
+                "exceptions review",
+            )
+
+
+def _is_uuid(value: object) -> bool:
+    try:
+        UUID(str(value))
+    except ValueError:
+        return False
+    return True
+
+
+def _apply_and_post(
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    credit: CreditNote,
+    obligation: PaymentObligation,
+    amount: Decimal,
+    idempotency_key: str,
+    now: datetime,
+) -> tuple[UUID, str | None, bool]:
+    """Apply, then post the owner's release consequence (when the application released deferred VAT) and
+    record its receipt, all inside the caller's savepoint. Returns (application id, journal, replayed)."""
+    scope = TenantScope(tenant.id)
+    actor = str(party.id)
+    application = payables.apply_credit_note(
+        db,
+        scope=scope,
+        command=ApplyCredit(credit_note_id=credit.id, obligation_id=obligation.id, amount=amount, applied_by=actor),
+        idempotency_key=idempotency_key,
+        idempotency_expires_at=None,
+        applied_at=now,
+    )
+    releases = getattr(payables, "credit_application_tax_releases", None)  # a6 only
+    if releases is None or not releases(db, tenant.id, application.id):
+        return application.id, None, False
+    consequence = payables.build_credit_application_accounting_consequence(
+        db, tenant_id=tenant.id, application_id=application.id
+    )
+    approval_ref = f"erp.b1c:credit_application:{application.id}:actor:{actor}"
+    posted = post_consequence(db, scope=scope, consequence=consequence, approval_ref=approval_ref, actor=actor, now=now)
+    payables.record_accounting_receipt(
+        db,
+        scope=scope,
+        command=AccountingReceiptInput(
+            document_kind=APPLICATION_KIND,
+            document_id=application.id,
+            consequence_fingerprint=consequence.fingerprint,
+            accounting_reference=str(posted.journal_id),
+            accounting_evidence_fingerprint=posted.evidence_fingerprint,
+        ),
+        idempotency_key=f"erp.b1c.application-receipt:{application.id}",
+        idempotency_expires_at=None,
+        recorded_at=now,
+    )
+    return application.id, str(posted.journal_id), posted.replayed
+
+
 def _obligation_to_apply(
     db: Session, tenant_id: UUID, credit: CreditNote, obligation_id: UUID | None, amount: Decimal | None
 ) -> tuple[PaymentObligation, Decimal] | None:
@@ -228,11 +366,16 @@ def _obligation_to_apply(
     )
     if obligation is None or invoice is None:
         raise CreditApprovalRefused("obligation_not_found", "The obligation to apply the credit to was not found")
-    if credit.original_invoice_id is None:
+    if is_cash_credit(db, tenant_id, credit.id):
+        # CASH credit (a historical overpayment or advance): any open obligation of the same supplier and
+        # currency; its own shell invoice has no obligations and is never the original-only rule's subject.
+        pass
+    elif credit.original_invoice_id is None:
         raise CreditApprovalRefused(
             "apply_requires_original_invoice", "A credit note can be applied only to its original invoice's obligations"
         )
-    if invoice.id != credit.original_invoice_id:
+    elif invoice.id != credit.original_invoice_id:
+        # DOCUMENT credit (returns, discount): never set off against another invoice (D-A6-8).
         raise CreditApprovalRefused(
             "obligation_not_on_original_invoice", "The obligation belongs to a different invoice than the credit's"
         )
@@ -243,10 +386,11 @@ def _obligation_to_apply(
         )
     if invoice.supplier_ref != credit.supplier_ref or invoice.currency_code != credit.currency_code:
         raise CreditApprovalRefused("obligation_mismatch", "The obligation is for another supplier or currency")
-    applied = credit.total_amount if amount is None else amount
-    if applied <= 0 or applied > credit.total_amount:
+    available = credit.available_amount if credit.status == CreditNoteStatus.APPROVED else credit.total_amount
+    applied = available if amount is None else amount
+    if applied <= 0 or applied > available:
         raise CreditApprovalRefused(
-            "apply_amount_invalid", "The amount to apply must be positive and within the credit"
+            "apply_amount_invalid", "The amount to apply must be positive and within the available credit"
         )
     if applied > obligation.outstanding_amount:
         raise CreditApprovalRefused(
@@ -333,6 +477,7 @@ def _guarded(
         approved_at=now,
     )
     consequence = payables.build_credit_accounting_consequence(db, tenant_id=tenant.id, credit_note_id=credit.id)
+    _check_consequence_accounts(db, tenant.id, credit, lines, consequence)
     posted = post_consequence(db, scope=scope, consequence=consequence, approval_ref=approval_ref, actor=actor, now=now)
     payables.record_accounting_receipt(
         db,
@@ -349,17 +494,18 @@ def _guarded(
         recorded_at=now,
     )
     applied = Decimal(0)
+    release_journal: str | None = None
     if target is not None:
         obligation, applied = target
-        payables.apply_credit_note(
+        _application_id, release_journal, _ = _apply_and_post(
             db,
-            scope=scope,
-            command=ApplyCredit(
-                credit_note_id=credit.id, obligation_id=obligation.id, amount=applied, applied_by=actor
-            ),
+            tenant=tenant,
+            party=party,
+            credit=credit,
+            obligation=obligation,
+            amount=applied,
             idempotency_key=f"erp.b1c.apply:{credit.id}:{obligation.id}",
-            idempotency_expires_at=None,
-            applied_at=now,
+            now=now,
         )
     _audit(
         db,
@@ -376,9 +522,10 @@ def _guarded(
             "evidence_ref": evidence,
             "applied_obligation_id": str(target[0].id) if target else None,
             "applied_amount": str(applied),
+            "application_release_journal": release_journal,
         },
     )
-    return CreditApprovalOutcome(credit.id, str(posted.journal_id), posted.replayed, applied)
+    return CreditApprovalOutcome(credit.id, str(posted.journal_id), posted.replayed, applied, release_journal)
 
 
 def approve_and_post(
@@ -418,7 +565,9 @@ def approve_and_post(
         refusal = exc
     except PostingRefused as exc:
         refusal = CreditApprovalRefused(f"posting_{exc.code}", f"The ledger refused the posting ({exc.code})")
-    except (PayablesError, IdempotencyConflict) as exc:
+    except PayablesError as exc:
+        refusal = _owner_refusal(exc)
+    except IdempotencyConflict as exc:
         refusal = CreditApprovalRefused("payables_refused", str(exc))
     except IntegrityError:
         refusal = CreditApprovalRefused("conflict", "A concurrent change prevented the approval; reload and retry")
@@ -430,6 +579,98 @@ def approve_and_post(
             party=party,
             credit_note_id=credit_note_id,
             action=AUDIT_APPROVAL_REFUSED,
+            success=False,
+            details={"code": refusal.code},
+        )
+    raise refusal
+
+
+def apply_credit(
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    credit_note_id: UUID,
+    obligation_id: UUID,
+    apply_amount: Decimal | str | None,
+    evidence_ref: str | None,
+    request_id: str,
+    now: datetime | None = None,
+) -> ApplyOutcome:
+    """Apply an APPROVED credit to an obligation, posting the owner's VAT-release consequence in the same
+    savepoint. A DOCUMENT credit applies only to its original invoice's obligations; a CASH credit (a
+    historical overpayment or advance) to any open obligation of the same supplier and currency. Any
+    failure rolls the application back."""
+    if party.tenant_id != tenant.id:
+        raise CreditApprovalRefused("actor_tenant", "The acting party must belong to this tenant")
+    moment = now or datetime.now(UTC)
+    try:
+        key_id = str(UUID(request_id))
+        amount = None if apply_amount in (None, "") else Decimal(str(apply_amount))
+        if amount is not None and not amount.is_finite():
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        raise CreditApprovalRefused("apply_input_invalid", "The request id or amount is not valid") from None
+    try:
+        with db.begin_nested():
+            evidence = _evidence(evidence_ref)
+            credit = db.scalar(
+                select(CreditNote)
+                .where(CreditNote.tenant_id == tenant.id, CreditNote.id == credit_note_id)
+                .with_for_update()
+            )
+            if credit is None:
+                raise CreditApprovalRefused("not_found", "Supplier credit note was not found")
+            if credit.status != CreditNoteStatus.APPROVED:
+                raise CreditApprovalRefused("not_approved", "Only an approved supplier credit note can be applied")
+            target = _obligation_to_apply(db, tenant.id, credit, obligation_id, amount)
+            if target is None:  # an obligation was given, so a target is always returned
+                raise CreditApprovalRefused("obligation_not_found", "Select the obligation to apply to")
+            obligation, applied = target
+            application_id, journal, replayed = _apply_and_post(
+                db,
+                tenant=tenant,
+                party=party,
+                credit=credit,
+                obligation=obligation,
+                amount=applied,
+                idempotency_key=f"erp.b1c.apply:{credit.id}:{obligation.id}:{applied}:{key_id}",
+                now=moment,
+            )
+            _audit(
+                db,
+                tenant=tenant,
+                party=party,
+                credit_note_id=credit.id,
+                action=AUDIT_APPLIED,
+                success=True,
+                details={
+                    "application_id": str(application_id),
+                    "obligation_id": str(obligation.id),
+                    "amount": str(applied),
+                    "evidence_ref": evidence,
+                    "cash_credit": is_cash_credit(db, tenant.id, credit.id),
+                    "release_journal": journal,
+                },
+            )
+            return ApplyOutcome(credit.id, application_id, applied, journal, replayed)
+    except CreditApprovalRefused as exc:
+        refusal = exc
+    except PostingRefused as exc:
+        refusal = CreditApprovalRefused(f"posting_{exc.code}", f"The ledger refused the posting ({exc.code})")
+    except PayablesError as exc:
+        refusal = _owner_refusal(exc)
+    except IdempotencyConflict as exc:
+        refusal = CreditApprovalRefused("payables_refused", str(exc))
+    except IntegrityError:
+        refusal = CreditApprovalRefused("conflict", "A concurrent change prevented the application; reload and retry")
+    if refusal.code != "not_found":
+        _audit(
+            db,
+            tenant=tenant,
+            party=party,
+            credit_note_id=credit_note_id,
+            action=AUDIT_APPLY_REFUSED,
             success=False,
             details={"code": refusal.code},
         )

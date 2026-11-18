@@ -18,6 +18,11 @@ from dotmac_payables.models import (
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+try:  # payables a6; absent on the released a5 pin
+    from dotmac_payables.models import HistoricalCreditReceipt
+except ImportError:  # pragma: no cover
+    HistoricalCreditReceipt = None  # type: ignore[assignment,misc]
+
 from erp_v2.legacy_ap.models import LegacyInvoiceReference
 
 
@@ -122,11 +127,48 @@ def credit_note_detail(db: Session, *, tenant_id: UUID, credit_note_id: UUID) ->
         .where(CreditApplication.tenant_id == tenant_id, CreditApplication.credit_note_id == credit_note_id)
         .order_by(CreditApplication.applied_at)
     ).all()
-    obligations = []
-    if credit.original_invoice_id is not None:
-        obligations = db.scalars(
-            select(PaymentObligation)
-            .where(PaymentObligation.tenant_id == tenant_id, PaymentObligation.invoice_id == credit.original_invoice_id)
-            .order_by(PaymentObligation.sequence)
-        ).all()
-    return {"credit": credit, "lines": lines, "applications": applications, "obligations": obligations}
+    cash = HistoricalCreditReceipt is not None and (
+        db.scalar(
+            select(HistoricalCreditReceipt.id).where(
+                HistoricalCreditReceipt.tenant_id == tenant_id, HistoricalCreditReceipt.credit_note_id == credit_note_id
+            )
+        )
+        is not None
+    )
+    obligations: list[PaymentObligation] = []
+    if cash:  # a CASH credit applies to any open obligation of the same supplier and currency
+        obligations = list(
+            db.scalars(
+                select(PaymentObligation)
+                .join(
+                    SupplierInvoice,
+                    (SupplierInvoice.tenant_id == PaymentObligation.tenant_id)
+                    & (SupplierInvoice.id == PaymentObligation.invoice_id),
+                )
+                .where(
+                    PaymentObligation.tenant_id == tenant_id,
+                    PaymentObligation.outstanding_amount > 0,
+                    SupplierInvoice.supplier_ref == credit.supplier_ref,
+                    SupplierInvoice.currency_code == credit.currency_code,
+                )
+                .order_by(PaymentObligation.due_date)
+                .limit(200)
+            )
+        )
+    elif credit.original_invoice_id is not None:
+        obligations = list(
+            db.scalars(
+                select(PaymentObligation)
+                .where(
+                    PaymentObligation.tenant_id == tenant_id, PaymentObligation.invoice_id == credit.original_invoice_id
+                )
+                .order_by(PaymentObligation.sequence)
+            )
+        )
+    return {
+        "credit": credit,
+        "lines": lines,
+        "applications": applications,
+        "obligations": obligations,
+        "cash_credit": cash,
+    }

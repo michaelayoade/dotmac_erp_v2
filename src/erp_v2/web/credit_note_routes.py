@@ -50,7 +50,7 @@ def _detail_page(request, db, tenant, party, credit_note_id, *, error=None, stat
     return render(
         request,
         "erp_v2/revenue/credit_note_detail.html",
-        _context(request, party, **detail, error=error),
+        _context(request, party, **detail, error=error, apply_request_id=str(uuid4())),
         status_code=status_code,
     )
 
@@ -141,8 +141,45 @@ async def credit_note_approve(
     return RedirectResponse(f"/finance/supplier-credit-notes/{credit_note_id}", status_code=303)
 
 
+@router.post("/finance/supplier-credit-notes/{credit_note_id}/apply", response_model=None)
+async def credit_note_apply(
+    credit_note_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(APPROVE_PERMISSION)),
+) -> HTMLResponse | RedirectResponse:
+    form = await request.form()
+    text = {key: value for key, value in form.items() if isinstance(value, str)}
+    try:
+        obligation_id = UUID(text.get("obligation_id", "").strip())
+    except ValueError:
+        return _detail_page(
+            request, db, tenant, party, credit_note_id, error="Select the obligation to apply to", status_code=400
+        )
+    try:
+        services.apply_credit(
+            db,
+            tenant=tenant,
+            party=party,
+            credit_note_id=credit_note_id,
+            obligation_id=obligation_id,
+            apply_amount=text.get("apply_amount", "").strip() or None,
+            evidence_ref=text.get("evidence_ref"),
+            request_id=text.get("request_id", ""),
+        )
+    except services.CreditApprovalRefused as exc:
+        return _detail_page(request, db, tenant, party, credit_note_id, error=str(exc), status_code=400)
+    return RedirectResponse(f"/finance/supplier-credit-notes/{credit_note_id}", status_code=303)
+
+
 credit_note_feature = FeatureManifest(
     name="erp_supplier_credit_notes",
     web_routers=(router,),
-    audit_actions=(services.AUDIT_APPROVED_POSTED, services.AUDIT_APPROVAL_REFUSED),
+    audit_actions=(
+        services.AUDIT_APPROVED_POSTED,
+        services.AUDIT_APPROVAL_REFUSED,
+        services.AUDIT_APPLIED,
+        services.AUDIT_APPLY_REFUSED,
+    ),
 )
