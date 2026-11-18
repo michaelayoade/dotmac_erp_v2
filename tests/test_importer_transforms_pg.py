@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (hosted-Postgres fixture)
 
 from erp_v2.importer.enrolment import EnrolmentMaps
-from erp_v2.importer.transforms import TransformParams
+from erp_v2.importer.transforms import TransformParams, TransformParamsError
 
 D = Decimal
 
@@ -140,3 +140,61 @@ def test_null_expense_lines_land_wht_is_removed_and_the_partition_balances(engin
     parity = ledger.parity()
     assert (parity["declared_written_delta_lines"], parity["declared_written_delta_headers"]) == (1, -1)
     assert parity["changed_header_values"] == 1
+
+
+def test_real_destination_chart_sql_on_the_migrated_schema_validates_the_fallback(engine):
+    """No patching: the real DEST_ACCOUNT_SQL (mod_accounting.accounts joined to account_categories) against the
+    actually migrated v2 schema."""
+    from dotmac_accounting.contracts import AccountKind, NormalBalance
+    from dotmac_accounting.models import Account, AccountCategory
+    from sqlalchemy.orm import Session
+    from test_posting_bridge_pg import seed
+
+    from erp_v2.importer.transforms import DEST_ACCOUNT_SQL, destination_chart
+
+    env = seed(engine)  # tenant with expense 5000 and liability 2000 / 2040 (control)
+    with Session(engine) as db:
+        categories = {
+            c.code: c for c in db.scalars(sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id))
+        }
+        extra = {}
+        for code, category, kwargs in (
+            ("5100", "EXP", dict(is_active=False)),
+            ("5200", "EXP", dict(posting_allowed=False)),
+            ("1200", "LIA", {}),  # not expense class
+        ):
+            extra[code] = Account(
+                tenant_id=env.tenant_id,
+                category_id=categories[category].id,
+                code=code,
+                name=f"Account {code}",
+                kind=AccountKind.POSTING,
+                normal_balance=NormalBalance.DEBIT,
+                **kwargs,
+            )
+        db.add_all(extra.values())
+        db.commit()
+        ids = {code: str(a.id) for code, a in extra.items()}
+    ids["5000"], ids["2000"], ids["2040"] = (str(env.accounts[c]) for c in ("5000", "2000", "2040"))
+    with engine.connect() as conn:
+        chart = destination_chart(conn.execute(sa.text(DEST_ACCOUNT_SQL)).mappings().all())
+        conn.rollback()
+    tenant = str(env.tenant_id)
+
+    def check(code, tenant_id=tenant):
+        return TransformParams.from_mapping({"import.fallback_expense_account": ids[code]}, tenant_id).validate(chart)
+
+    assert check("5000") == str(UUID(ids["5000"]))  # valid: same tenant, active, postable, expense class
+    for code, problem in (
+        ("5100", "account_inactive_or_not_postable"),
+        ("5200", "account_inactive_or_not_postable"),
+        ("2000", "expense_account_is_control"),
+        ("2040", "expense_account_is_control"),
+        ("1200", "account_not_expense_class"),
+    ):
+        with pytest.raises(TransformParamsError) as exc:
+            check(code)
+        assert exc.value.code == f"fallback_expense_account_invalid:{problem}", code
+    with pytest.raises(TransformParamsError) as exc:  # another tenant's valid account
+        check("5000", tenant_id=str(uuid4()))
+    assert exc.value.code == "fallback_expense_account_invalid:account_other_tenant"

@@ -850,6 +850,21 @@ def _key(value: object) -> object:
     return value.hex if isinstance(value, uuid.UUID) else value
 
 
+def destination_chart(rows: Iterable[Mapping[str, object]]) -> dict[str, DestAccount]:
+    """``DEST_ACCOUNT_SQL`` rows -> the destination chart keyed by canonical account id."""
+
+    return {
+        canonical(r["id"]) or "": DestAccount(
+            canonical(r["tenant_id"]),
+            None if r.get("code") is None else str(r["code"]),
+            bool(r.get("is_active", True)),
+            bool(r.get("posting_allowed", True)),
+            None if r.get("account_class") is None else str(r["account_class"]),
+        )
+        for r in rows
+    }
+
+
 def build_transforms(
     rows: Sequence[Mapping[str, object]],
     ledger_rows: Iterable[Mapping[str, object]],
@@ -871,16 +886,7 @@ def build_transforms(
         )
         for r in account_rows
     }
-    chart = {
-        canonical(r["id"]) or "": DestAccount(
-            canonical(r["tenant_id"]),
-            None if r.get("code") is None else str(r["code"]),
-            bool(r.get("is_active", True)),
-            bool(r.get("posting_allowed", True)),
-            None if r.get("account_class") is None else str(r["account_class"]),
-        )
-        for r in destination_accounts
-    }
+    chart = destination_chart(destination_accounts)
     fallback = params.validate(chart)
     classes = classify_snapshot(rows, ledger_rows, global_accounts, deferral_rows)
     grouped, _controls, _hdr = group_invoice_rows(rows)
@@ -1000,6 +1006,7 @@ __all__ = [
     "TransformParamsError",
     "account_problem",
     "build_transforms",
+    "destination_chart",
     "read_and_build",
     "transform_invoice",
 ]
