@@ -822,6 +822,21 @@ def test_a_run_ending_on_or_before_the_opening_date_is_refused_not_silently_igno
     assert "E1" in str(exc.value) and run_status(engine, run_id) == ("draft", 0)
 
 
+def test_finalize_refuses_when_an_opening_dated_after_the_period_is_recorded_after_approval(engine):
+    env = b4_world(engine)
+    for employee, amount in (("E1", "10000"), ("E2", "5000")):
+        seed_recorded_adjustment(engine, env, employee, amount)  # a loan balance, no opening yet
+    run_id = b4.new_run(engine, env)
+    b4.batch(engine, env, run_id)
+    b4.approve(engine, env, run_id)  # passes: no opening, balance covers the recovery
+    for employee in ("E1", "E2"):  # Finance records an opening dated after the run's period (2026-01)
+        seed_recorded_opening(engine, env.tenant_id, employee, "10000", value_date=date(2026, 3, 31))
+    with pytest.raises(RunRefused) as exc:
+        b4.finalize(engine, env, run_id)
+    assert exc.value.code == "recovery_before_loan_opening"
+    assert run_status(engine, run_id) == ("approved", 0)
+
+
 def test_a_run_ending_after_the_opening_date_is_deducted_as_usual(engine):
     env = b4_world(engine, openings={"E1": "10000", "E2": "5000"}, opening_date=date(2026, 1, 30))  # run ends 01-31
     run_id = b4.new_run(engine, env)
@@ -1094,7 +1109,7 @@ def seed_recorded_adjustment(engine, env, employee, amount):
                 amount=Decimal(amount),
                 evidence_ref="n",
                 value_date=VALUE_DATE,
-                offset_account_id=env.accounts["6100"],
+                offset_account_id=env.accounts.get("6100") or env.accounts["5000"],
                 journal_id=uuid4(),
                 state="recorded",
                 dual_control=False,
@@ -1114,8 +1129,10 @@ def test_control_difference_is_refused_while_any_employee_balance_is_below_zero(
     seed_gl_1410(engine, env, 10000)
     seed_recorded_adjustment(engine, env, "EMP-NEG", "-50")  # a fault: no loan behind it
     refused(lambda: control_difference(env, amount="1"), "employee_balance_negative")
+    refused(lambda: opening(env, amount="1", employee="EMP-OTHER"), "employee_balance_negative")
     seed_recorded_adjustment(engine, env, "EMP-NEG", "50")  # repaired
     assert control_difference(env, amount="1").replayed is False
+    assert opening(env, amount="1", employee="EMP-OTHER").replayed is False
 
 
 # --- the 805,000 route, end to end ---------------------------------------------------------------

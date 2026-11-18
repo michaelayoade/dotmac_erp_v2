@@ -55,7 +55,7 @@ proposer/decider for an advance) and the recorder is neither preparer nor approv
 * **Opening bound:** the sum of all employee balances after the opening must not exceed GL(1410).
   All of an employee's openings share one value date (Finance's schedule date), and an opening cannot
   follow an earlier-dated advance, repayment or adjustment of that employee.
-* **Control difference:** at most the measured difference, and refused while any employee balance is below
+* **Control difference and openings:** a write-off is at most the measured difference; both it and an opening are refused while any employee balance is below
   zero (`employee_balance_negative`), because the difference is then not measurable.
 * **Repayment** may not exceed the employee's balance (`repayment_exceeds_balance`).
 * **Offsets** may not be a control account (2000, 2040, 1410) or a bank account's cash GL.

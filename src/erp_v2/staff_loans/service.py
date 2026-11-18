@@ -297,13 +297,7 @@ def _verify(db: Session, tenant_id: UUID, row: StaffLoanEntry) -> None:
         if row.kind == KIND_REPAYMENT and balance.balance + row.amount < 0:
             raise LoanRefused("repayment_exceeds_balance", "The repayment exceeds the employee's loan balance")
     else:
-        negative = [b.employee_ref for b in queries.all_balances(db, tenant_id=tenant_id).values() if b.balance < 0]
-        if negative:
-            raise LoanRefused(
-                "employee_balance_negative",
-                "A write-off is refused while any employee's loan balance is below zero "
-                f"({len(negative)} employee(s)); correct those first, because the difference is not measurable",
-            )
+        _refuse_negative_balances(db, tenant_id, "A write-off")
         position = queries.book_position(db, tenant_id=tenant_id)
         if position.difference <= 0 or -row.amount > position.difference:
             raise LoanRefused(
@@ -313,7 +307,18 @@ def _verify(db: Session, tenant_id: UUID, row: StaffLoanEntry) -> None:
             )
 
 
+def _refuse_negative_balances(db: Session, tenant_id: UUID, what: str) -> None:
+    negative = [b.employee_ref for b in queries.all_balances(db, tenant_id=tenant_id).values() if b.balance < 0]
+    if negative:
+        raise LoanRefused(
+            "employee_balance_negative",
+            f"{what} is refused while any employee's loan balance is below zero ({len(negative)} employee(s)); "
+            "correct those first, because the difference against the GL is not measurable",
+        )
+
+
 def _verify_opening(db: Session, tenant_id: UUID, row: StaffLoanEntry, balance: queries.LoanBalance) -> None:
+    _refuse_negative_balances(db, tenant_id, "An opening")
     if balance.opening_date is not None and balance.opening_date != row.value_date:
         raise LoanRefused(
             "opening_date_mismatch",
