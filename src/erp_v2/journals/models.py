@@ -14,7 +14,18 @@ from datetime import date, datetime
 from uuid import UUID
 
 from dotmac_kernel.models import Base, TimestampMixin, uuid_pk
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    true,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from erp_v2.hr.models import _tenant_fk
@@ -57,16 +68,16 @@ class ManualJournal(Base, TimestampMixin):
         # Post SoD: the approver differs from the preparer AND the requester, and
         # an approval cannot exist without a request.
         CheckConstraint(
-            "approved_by_party_id IS NULL OR (requested_by_party_id IS NOT NULL "
+            "NOT dual_control OR (approved_by_party_id IS NULL OR (requested_by_party_id IS NOT NULL "
             "AND approved_by_party_id <> prepared_by_party_id "
-            "AND approved_by_party_id <> requested_by_party_id)",
+            "AND approved_by_party_id <> requested_by_party_id))",
             name="ck_erp_manual_journals_post_sod",
         ),
         # Reversal SoD: approver differs from the reversal requester and the preparer.
         CheckConstraint(
-            "reversal_approved_by_party_id IS NULL OR (reversal_requested_by_party_id IS NOT NULL "
+            "NOT dual_control OR (reversal_approved_by_party_id IS NULL OR (reversal_requested_by_party_id IS NOT NULL "
             "AND reversal_approved_by_party_id <> reversal_requested_by_party_id "
-            "AND reversal_approved_by_party_id <> prepared_by_party_id)",
+            "AND reversal_approved_by_party_id <> prepared_by_party_id))",
             name="ck_erp_manual_journals_reversal_sod",
         ),
         CheckConstraint(
@@ -98,6 +109,8 @@ class ManualJournal(Base, TimestampMixin):
     id: Mapped[UUID] = uuid_pk()
     tenant_id: Mapped[UUID] = _tenant_fk()
     journal_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
+    # Stamped from the tenant policy at creation; DB default true keeps pre-e2_0022 rows strict (e2_0022).
+    dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     origin: Mapped[str] = mapped_column(String(20), nullable=False)
     state: Mapped[str] = mapped_column(String(30), nullable=False)
     # Mandatory reference to the supporting evidence (e.g. the Sub report id of an

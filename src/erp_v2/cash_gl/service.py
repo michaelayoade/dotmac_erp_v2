@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 
 from erp_v2.banking import recon_models as recon
 from erp_v2.cash_gl.models import CashAccountRepoint, RepointStatus
+from erp_v2.governance import policy as governance
 from erp_v2.payroll_payouts import models as payout
 
 AUDIT_PROPOSED: Final = "erp.banking.cash_gl_repoint.proposed"
@@ -231,6 +232,7 @@ def propose(
     row = CashAccountRepoint(
         id=uuid4(),
         tenant_id=tenant_id,
+        dual_control=governance.dual_control(db, tenant_id),
         bank_account_id=bank.id,
         from_ref=bank.cash_account_ref,
         to_account_id=target.id,
@@ -282,7 +284,7 @@ def approve(
     _actor(db, tenant_id, approver_party_id)
     decision_note = _text(note, "note", limit=500, required=False)
     row, bank = _load_for_decision(db, tenant_id, request_id)
-    if row.proposed_by_party_id == approver_party_id:
+    if row.dual_control and row.proposed_by_party_id == approver_party_id:
         raise RepointRefused("same_person", "the proposer cannot approve their own re-point")
     if (bank.cash_account_ref or "") != row.from_ref:
         raise RepointRefused("drift", "the bank account's cash reference changed since the proposal")

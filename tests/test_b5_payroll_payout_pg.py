@@ -36,6 +36,7 @@ from dotmac_payables.models import SupplierPayment, SupplierPaymentStatus
 from dotmac_payroll import service as payroll
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement
 from dotmac_people.models import Employee
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from staff_loan_helpers import seed_recorded_opening
 from test_posting_bridge_pg import NOW, soft_close
@@ -163,7 +164,9 @@ def finalized(engine, env) -> UUID:
     return run_id
 
 
-def seed_instructions(engine, env, *, proposer="proposer", decider="decider", origin="manual", name="EMP", refs=None):
+def seed_instructions(
+    engine, env, *, proposer="proposer", decider="decider", origin="manual", name="EMP", refs=None, dual_control=True
+):
     with Session(engine) as db:
         for i, key in enumerate(refs or ("E1", "E2", "E3")):
             ref = env.emp[key]
@@ -188,6 +191,7 @@ def seed_instructions(engine, env, *, proposer="proposer", decider="decider", or
                     account_name=f"{name} {ref}",
                     status="approved",
                     origin=origin,
+                    dual_control=dual_control,
                     proposed_by_party_id=env.people[proposer] if manual else None,
                     proposed_at=NOW,
                     decided_by_party_id=env.people[decider],
@@ -1018,24 +1022,21 @@ def test_missing_instruction_refuses_the_file(engine):
 # --- statutory remittances: recorded the same way, never a file ------------------
 
 
-def test_statutory_remittance_is_recorded_without_a_file_dr_liability_cr_bank(engine):
+def test_statutory_remittance_fails_closed_until_statutory_payees_exist(engine):
+    """Michael (v1531): statutory remittances are NOT exempt from V3. No statutory payee instruction exists
+    yet (a separate follow-up), so a statutory batch can be prepared but never approved or recorded."""
     env = world(engine)
-    enable_file(engine, env)  # even with files enabled a remittance has none
+    enable_file(engine, env)
     run_id = finalized(engine, env)
     out = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
     batch = batch_row(engine, out.batch_id)
     assert batch.kind == "statutory" and batch.line_count == 2 and batch.total_amount == Decimal("15000")
-    approve(engine, env, out.batch_id)
+    before = counts(engine, env)
+    refused(lambda: approve(engine, env, out.batch_id), "statutory_payee_instruction_required")
+    refused(lambda: record(engine, env, out.batch_id), "not_approved")
+    assert counts(engine, env) == before
+    assert batch_row(engine, out.batch_id).status == "draft"
     refused(lambda: generate(engine, env, out.batch_id), "statutory_no_file")
-    assert counts(engine, env)["erp_disbursement_file_receipts"] == 0
-    refused(lambda: record(engine, env, out.batch_id, who="approver"), "sod_recorder_is_approver")
-    assert record(engine, env, out.batch_id, "FIRS-REMIT-1").journals == 2
-    debits, credits, journals = settlement_posting(engine, env)
-    assert journals == 2 and debits["2110"] == Decimal("15000") and credits["1000"] == Decimal("15000")
-    assert "2040" not in debits
-    rows = liabilities(engine, env, run_id)
-    assert rows[("component", "dest:PAYE")].status == "settled"
-    assert rows[("employee-net-pay", env.emp["E1"])].status == "outstanding"  # net pay untouched
 
 
 def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
@@ -1055,14 +1056,12 @@ def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
     )
 
 
-def test_statutory_sod_has_no_instruction_rule_but_keeps_three_distinct_people(engine):
+def test_statutory_batch_keeps_its_sod_check_and_then_fails_closed_at_v3(engine):
     env = world(engine)
     run_id = finalized(engine, env)
     batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
     refused(lambda: approve(engine, env, batch_id, who="preparer"), "sod_approver_is_preparer")
-    approve(engine, env, batch_id)
-    refused(lambda: record(engine, env, batch_id, who="preparer"), "sod_recorder_is_preparer")
-    assert record(engine, env, batch_id).journals == 2
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
 
 
 # --- internal recovery exclusion (a3 explicit kind; a4 settlement_mode) ---------------
@@ -1307,12 +1306,12 @@ def test_with_files_enabled_recording_requires_the_issued_file(engine):
     assert record(engine, env, batch_id).journals == 3
 
 
-def test_statutory_recording_never_needs_a_file_even_when_files_are_enabled(engine):
+def test_statutory_batch_is_refused_even_when_files_are_enabled(engine):
     env = world(engine)
     enable_file(engine, env)
     run_id = finalized(engine, env)
-    batch_id = approved_batch(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
-    assert record(engine, env, batch_id).journals == 2
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
 
 
 @pytest.mark.parametrize("role", ["proposer", "decider"])
@@ -1490,9 +1489,67 @@ def test_v3_record_refuses_when_an_instruction_is_gone_and_no_file_was_issued(en
     assert record(engine, env, batch_id).replayed is False
 
 
-def test_v3_does_not_apply_to_statutory_batches(engine):
-    env = world(engine, payees=False)  # no employee instruction at all
+def test_v3_statutory_batches_fail_closed_with_their_own_code(engine):
+    env = world(engine, payees=False)
     run_id = finalized(engine, env)
     batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
-    approve(engine, env, batch_id)
-    assert record(engine, env, batch_id).journals == 2
+    refused(lambda: approve(engine, env, batch_id), "statutory_payee_instruction_required")
+    assert batch_row(engine, batch_id).status == "draft"
+
+
+@pytest.mark.parametrize("code", ["2000", "2040"])
+def test_a_bank_whose_cash_gl_is_a_control_account_is_refused_for_payroll_too(engine, code):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(BankAccount).where(BankAccount.id == env.bank_id).values(cash_account_ref=str(env.accounts[code]))
+        )
+        db.commit()
+    before = counts(engine, env)
+    refused(lambda: prepare(engine, env, run_id), "cash_account_is_control")
+    assert counts(engine, env) == before
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+# Payroll a5 still owns its own settlement separation until payroll a6; the ERP-side checks below are the ones
+# this policy controls, so the steps that stop at the ERP layer (approve, issue the file) use the same person.
+
+
+def test_policy_off_the_preparer_approves_the_instruction_party_acts_and_the_batch_is_stamped_off(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    seed_instructions(engine, env, proposer="approver", decider="approver", dual_control=False)
+    enable_file(engine, env)
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id)
+    assert batch_row(engine, out.batch_id).dual_control is False
+    assert all(line.dual_control is False for line in lines(engine, out.batch_id))
+    assert approve(engine, env, out.batch_id, who="preparer").replayed is False  # preparer approves
+    # the file is issued by the batch preparer (also an instruction party): none of the ERP refusals applies
+    assert generate(engine, env, out.batch_id, who="preparer") is not None
+    assert batch_row(engine, out.batch_id).status == "file_issued"
+
+
+def test_policy_on_stamps_true_and_the_refusals_still_fire(engine):
+    env = world(engine)  # the seed turns the policy ON
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id)
+    assert batch_row(engine, out.batch_id).dual_control is True
+    refused(lambda: approve(engine, env, out.batch_id, who="preparer"), "sod_approver_is_preparer")
+
+
+def test_check_distinct_people_is_rewritten_not_dual_control_or_predicate(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    sql = (
+        "UPDATE erp_payroll_payout_batches SET dual_control=:on, approved_by_party_id=:who, status='approved' "
+        "WHERE id=:id"
+    )
+    with Session(engine) as db, pytest.raises(sa.exc.IntegrityError) as err:  # on: the preparer is refused
+        db.execute(sa.text(sql), {"on": True, "who": env.people["preparer"], "id": batch_id})
+    assert "distinct_people" in str(err.value)
+    with Session(engine) as db:  # off: the database accepts the same person
+        db.execute(sa.text(sql), {"on": False, "who": env.people["preparer"], "id": batch_id})
+        db.rollback()

@@ -148,6 +148,7 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
         SupplierInvoiceLine,
     )
 
+    from erp_v2.governance.policy import dual_control
     from erp_v2.posting import bridge, rules
     from erp_v2.posting.rules import PostingRefused
     from erp_v2.web.revenue_approval_services import ApprovalRefused, _submitter_party_id
@@ -186,7 +187,12 @@ def _classify(session: Session, tenant: UUID, invoice_id: UUID, evidence_ref: st
     # Separation of duties, resolved the B1-1 way: imported submitted_by/approved_by hold legacy
     # credential ids, native ones party ids. The approver must be neither the submitter nor the
     # legacy approver; an unrecorded or unresolvable person cannot be proven different, so it refuses.
-    for recorded, label in ((invoice.submitted_by, "submitter"), (invoice.approved_by, "legacy_approver")):
+    # Only when the tenant's dual-control policy is on (default off: no compulsory two-person).
+    for recorded, label in (
+        ((invoice.submitted_by, "submitter"), (invoice.approved_by, "legacy_approver"))
+        if dual_control(session, tenant)
+        else ()
+    ):
         if not recorded:
             return f"{label}_unknown"
         try:

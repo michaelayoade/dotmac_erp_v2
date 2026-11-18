@@ -76,7 +76,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.governance import policy as governance
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
+from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
 from erp_v2.posting import rules
 from erp_v2.posting.payroll import post_payroll_consequence
 from erp_v2.posting.rules import PostingRefused
@@ -406,6 +408,12 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
                 "which must be a LIABILITY-class account (an asset recovery must be marked internal_recovery "
                 "on the pay structure rule)",
             )
+        if account.code in CONTROL_ACCOUNT_CODES and account.id != payable.id:
+            raise RunRefused(
+                "deduction_mapped_to_control",
+                f"{_listed(sorted(who))} is mapped to {account.code}, a subledger control account; "
+                "an external deduction maps to its own liability account",
+            )
         if account.id == payable.id:
             raise RunRefused(
                 "deduction_mapped_to_net_payable",
@@ -492,7 +500,7 @@ def _guarded_batch(
     run = _locked_run(db, tenant.id, run_id)
     if run.status != "draft":
         raise RunRefused("not_draft", "Only a draft payroll run can be calculated")
-    if run.created_by_id != party.id:
+    if governance.dual_control(db, tenant.id) and run.created_by_id != party.id:
         raise RunRefused(
             "sod_not_run_creator",
             "Only the person who created this run can enter its calculations; they cannot also approve it",
@@ -670,7 +678,7 @@ def _guarded_approve(db: Session, *, tenant: Tenant, party: Party, run_id: UUID,
         return ApproveOutcome(run.id, True)
     if run.status != "draft":
         raise RunRefused("not_draft", "Only a draft payroll run can be approved")
-    if run.created_by_id == party.id:
+    if governance.dual_control(db, tenant.id) and run.created_by_id == party.id:
         raise RunRefused("sod_creator_is_approver", "You created this run; another person must approve it")
     check_currency(db, run)
     check_no_overlap(db, run)
@@ -793,9 +801,10 @@ def _guarded_finalize(db: Session, *, tenant: Tenant, party: Party, run_id: UUID
         return FinalizeOutcome(run.id, journal.id, journal.number, _net_total(db, run), True)
     if run.status != "approved" or run.approved_by_id is None:
         raise RunRefused("not_approved", "Only an approved payroll run can be finalized")
-    if party.id == run.approved_by_id:
+    strict = governance.dual_control(db, tenant.id)
+    if strict and party.id == run.approved_by_id:
         raise RunRefused("sod_approver_is_finalizer", "You approved this run; another person must finalize it")
-    if party.id == run.created_by_id:
+    if strict and party.id == run.created_by_id:
         raise RunRefused("sod_creator_is_finalizer", "You created this run; another person must finalize it")
     functional = check_currency(db, run)
     check_no_overlap(db, run)

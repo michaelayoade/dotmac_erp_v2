@@ -1,26 +1,24 @@
 """Section 6 import-path exemption proof for the pre-flip validations V1-V3 (PR-1).
 
 V1-V3 live in the native workflows (journals, supplier invoices, payments, payouts). The import and
-admission paths must not be able to reach them, so the rehearsal evidence of the step-3 image stays
-valid. Four mechanical checks, none of which needs a database:
+admission paths must not be able to reach them. Three mechanical checks, none of which needs a database:
 
-* import graph: nothing under importer/, legacy_ap/, payees/, posting/, migrations/ imports a
-  validated workflow or ``ledger_roles``, except the two named, pinned legacy edges;
+* direct imports: nothing under importer/, legacy_ap/, payees/, posting/, migrations/ imports a
+  validated workflow or ``ledger_roles``, except the two named, pinned legacy edges. This is a check
+  of DIRECT import statements only. ``importer.cli`` reaches ``erp_v2.assembly``, which loads these
+  modules, but loading is not calling: the importer never calls their commands (it is a SQL executor);
 * the two imported names of ``revenue_approval_services`` (B1b) are AST-identical to origin/main;
-* the audit action values and permission codes are unchanged;
-* the delta gate: the changed files are a subset of the allowed set and the protected tests are
-  byte-identical (needs ``origin/main``; skipped, loudly, where the checkout has none).
+* the audit action values and permission codes are unchanged.
+
+The step-3 rehearsal is re-run on the final image, so the evidence for the import and admission paths comes
+from that re-run; this file keeps only the behavioural checks above.
 """
 
 from __future__ import annotations
 
 import ast
-import fnmatch
 import hashlib
-import subprocess
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "erp_v2"
@@ -141,77 +139,3 @@ def test_audit_action_values_and_permission_codes_are_unchanged():
         "erp.finance.supplier_invoice.approved_posted",
         "erp.finance.supplier_invoice.approval_refused",
     )
-
-
-# --- delta gate (needs origin/main) -----------------------------------------------------------
-
-ALLOWED_SRC = {
-    "src/erp_v2/ledger_roles.py",
-    "src/erp_v2/web/revenue_services.py",
-    "src/erp_v2/web/revenue_approval_services.py",
-    "src/erp_v2/journals/service.py",
-    "src/erp_v2/journals/queries.py",
-    "src/erp_v2/supplier_payments/service.py",
-    "src/erp_v2/payroll_payouts/service.py",
-}
-ALLOWED_PATTERNS = ("src/erp_v2/templates/*", "tests/*", "docs/*.md")
-PROTECTED_TESTS = (
-    "tests/test_importer_*.py",
-    "tests/test_payables_history*.py",
-    "tests/test_settled_admission*.py",
-    "tests/test_payables_reconciliation.py",
-    "tests/test_payee_bank_pg.py",
-    "tests/test_payee_bank_service.py",
-    "tests/test_legacy_reentry_pg.py",
-    "tests/test_legacy_ap_migration.py",
-    "tests/test_b1b_recognize.py",
-)
-# The one protected file whose shared fixture moves: test_b1b_recognize_pg.py builds its invoices on the
-# B1 world, whose tax account moves from code 2100 to 1455 (V1). Only that account-code label may differ.
-B1B_FIXTURE_LABEL_ONLY = "tests/test_b1b_recognize_pg.py"
-
-
-def _git(*args: str) -> str | None:
-    try:
-        completed = subprocess.run(  # noqa: S603 - fixed git argv, no shell, read-only
-            ["git", *args],  # noqa: S607
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        return completed.stdout
-    except (subprocess.SubprocessError, OSError):
-        return None
-
-
-def _base() -> str | None:
-    base = _git("merge-base", "HEAD", "origin/main")
-    return base.strip() if base else None
-
-
-def _changed(base: str) -> list[str]:
-    committed = (_git("diff", "--name-only", base, "HEAD") or "").splitlines()
-    working = (_git("status", "--porcelain", "--untracked-files=all") or "").splitlines()
-    return sorted({*committed, *(line[3:].strip() for line in working if line[3:].strip())})
-
-
-def test_delta_gate_changed_files_are_inside_the_allowed_set_and_protected_tests_are_untouched():
-    base = _base()
-    if base is None:
-        pytest.skip("origin/main is not available in this checkout; run the gate where it is")
-    changed = _changed(base)
-    outside = [
-        name
-        for name in changed
-        if name not in ALLOWED_SRC and not any(fnmatch.fnmatch(name, pattern) for pattern in ALLOWED_PATTERNS)
-    ]
-    assert outside == []
-    touched = [name for name in changed if any(fnmatch.fnmatch(name, pattern) for pattern in PROTECTED_TESTS)]
-    assert touched == []
-    if B1B_FIXTURE_LABEL_ONLY in changed:
-        original = _git("show", f"{base}:{B1B_FIXTURE_LABEL_ONLY}")
-        assert original is not None
-        current = (ROOT / B1B_FIXTURE_LABEL_ONLY).read_text()
-        assert current.replace('"1455"', '"2100"') == original

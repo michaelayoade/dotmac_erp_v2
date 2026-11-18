@@ -59,10 +59,9 @@ def test_the_feature_manifest_registers_the_audit_actions_and_no_routes():
     assert len(set(service.AUDIT_ACTIONS)) == 4
 
 
-def test_the_migration_takes_a_distinct_revision_id_after_e2_0021():
+def test_the_migration_follows_the_dual_control_policy_revision():
     assert migration.revision == "e2_0023_staff_loan_entries"
-    assert migration.down_revision == "e2_0021_payroll_payout_returns"
-    assert migration.revision != "e2_0022_dual_control_policy"  # PR-4 owns e2_0022
+    assert migration.down_revision == "e2_0022_dual_control_policy"
 
 
 def test_the_runtime_role_updates_lifecycle_columns_only():

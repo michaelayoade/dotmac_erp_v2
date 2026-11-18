@@ -45,6 +45,7 @@ from dotmac_kernel.models import Party, PartyType, Tenant
 from dotmac_kernel.setting_domains import SettingDomainRegistry, install_setting_domains
 from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
+from dual_control_support import set_dual_control, set_dual_control_engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (hosted-Postgres fixture)
@@ -81,6 +82,7 @@ def seed(engine, *, ref_form="uuid", currency="NGN", closing="350.00", baseline=
     with Session(engine) as db:
         db.add(Tenant(id=tenant_id, slug=f"t{tenant_id.hex[:24]}", name="Recon"))
         db.flush()
+        set_dual_control(db, tenant_id, True)  # existing separation-of-duties assertions run with the policy ON
         categories = {
             code: AccountCategory(tenant_id=tenant_id, code=code, name=code, account_class=klass)
             for code, klass in (
@@ -1853,3 +1855,50 @@ def test_a_linked_journal_serves_one_item_only_and_the_shared_gl_check_repeats_a
     with pytest.raises(ReconRefused) as exc:
         run(engine, svc.prepare, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=recon.id)
     assert exc.value.code == "shared_cash_gl"
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+
+
+def test_policy_off_the_preparer_opener_and_matcher_may_approve(engine):
+    env = scenario(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    rid = prepared(engine, env)  # opener opened + itemized, matcher matched, preparer prepared
+    assert row(engine, "erp_bank_reconciliations", id=rid)["dual_control"] is False
+    approved = run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties["preparer"], reconciliation_id=rid)
+    assert approved.status == "approved" and approved.approved_by_party_id == approved.prepared_by_party_id
+
+
+def test_policy_on_stamps_true_and_still_refuses_preparer_opener_and_matcher(engine):
+    env = scenario(engine)
+    rid = prepared(engine, env)
+    assert row(engine, "erp_bank_reconciliations", id=rid)["dual_control"] is True
+    for who, code in (("preparer", "sod_preparer"), ("opener", "sod_participant"), ("matcher", "sod_participant")):
+        with pytest.raises(ReconRefused) as exc:
+            run(engine, svc.approve, tenant_id=env.tenant_id, actor=env.parties[who], reconciliation_id=rid)
+        assert exc.value.code == code
+
+
+def test_check_approved_is_rewritten_and_its_integrity_terms_stay_unconditional(engine):
+    env = scenario(engine)
+    rid = prepared(engine, env)
+    r = row(engine, "erp_bank_reconciliations", id=rid)
+    sod = (
+        "UPDATE erp_bank_reconciliations SET dual_control=:on, status='approved', approved_at=now(), "
+        "approved_by_party_id=:who WHERE id=:id"
+    )
+    with Session(engine) as db, pytest.raises(IntegrityError) as err:  # on: preparer refused by the CHECK
+        db.execute(sa.text(sod), {"on": True, "who": r["prepared_by_party_id"], "id": rid})
+    assert "ck_erp_bank_reconciliations_approved" in str(err.value)
+    with Session(engine) as db, pytest.raises(IntegrityError) as err:  # off: still no approval without a time
+        db.execute(
+            sa.text(
+                "UPDATE erp_bank_reconciliations SET dual_control=false, status='approved', "
+                "approved_by_party_id=:who WHERE id=:id"
+            ),
+            {"who": r["prepared_by_party_id"], "id": rid},
+        )
+    assert "ck_erp_bank_reconciliations_approved_integrity" in str(err.value)
+    with Session(engine) as db:  # off: the preparer is accepted by the database
+        db.execute(sa.text(sod), {"on": False, "who": r["prepared_by_party_id"], "id": rid})
+        db.rollback()

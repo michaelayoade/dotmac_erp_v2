@@ -27,6 +27,7 @@ EXPECTED_MODULE_VERSIONS = {
     "erp_banking_reconciliation": None,
     "erp_cash_gl": None,
     "erp_access": None,
+    "erp_governance": None,
     "erp_payroll": None,
     "erp_payroll_run": None,
     "accounting": "0.1.0a2",

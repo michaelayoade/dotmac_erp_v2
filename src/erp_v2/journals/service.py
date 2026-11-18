@@ -54,6 +54,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.governance import policy as governance
 from erp_v2.journals import models as m
 from erp_v2.journals.models import ManualJournal
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
@@ -76,7 +77,6 @@ SOURCE_APPLICATION: Final = "dotmac_erp"
 # identity is the only thing the control-account guard admits control lines for, and only after the
 # fault is re-verified.
 LEDGER_FAULT_KIND: Final = "ledger_fault_correction"
-LEDGER_FAULT_VERSION: Final = "1"
 _LEDGER_FAULT_NAMESPACE: Final = UUID("5f0b6d2e-7c1a-4b43-9d58-3a9c2e61f0a7")
 CONTROL_ROUTES: Final = {
     AP_CONTROL_CODE: "a supplier invoice (adjustment invoice) or supplier credit note",
@@ -302,7 +302,7 @@ def _refuse_control(codes: set[str]) -> None:
 
 def _control_net(db: Session, tenant_id: UUID, journal_id: UUID, account_id: UUID) -> Decimal:
     return db.scalar(
-        select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0)).where(
+        select(func.coalesce(func.sum(JournalLine.debit_functional - JournalLine.credit_functional), 0)).where(
             JournalLine.tenant_id == tenant_id,
             JournalLine.journal_id == journal_id,
             JournalLine.account_id == account_id,
@@ -315,7 +315,12 @@ def _fault_key(source_journal_id: UUID, control_code: str) -> str:
 
 
 def _source_ledger_delta(db: Session, tenant_id: UUID, source_journal_id: UUID, account_id: UUID) -> Decimal:
-    """Σ(ledger debit - credit) minus Σ(journal line debit - credit) for one journal and account."""
+    """Σ(ledger debit - credit) minus Σ(journal line debit_functional - credit_functional), one journal and account.
+
+    Both sides are in the functional currency: the ledger line amounts are functional, and the journal
+    line's own debit/credit are in the document currency, so a clean journal at another rate must not
+    read as a fault.
+    """
     ledger = db.scalar(
         select(func.coalesce(func.sum(PostedLedgerLine.debit - PostedLedgerLine.credit), 0)).where(
             PostedLedgerLine.tenant_id == tenant_id,
@@ -348,7 +353,11 @@ def _residual_fault(db: Session, tenant_id: UUID, source_journal_id: UUID, code:
 
 
 def _verify_ledger_fault(db: Session, tenant_id: UUID, journal: JournalEntry) -> None:
-    """Re-prove that this system-built correction still corrects exactly the proven fault."""
+    """Re-prove that this system-built correction still corrects exactly the proven fault.
+
+    This re-verification must stay UNCONDITIONAL: it is the only thing that makes the GL-only door safe,
+    so no approval policy (including the coming optional dual-control setting) may switch it off.
+    """
     try:
         source_text, control_code = (journal.source_document_id or "").rsplit(":", 1)
         source_id = UUID(source_text)
@@ -478,6 +487,7 @@ def prepare_journal(
                 raise JournalRefused("journal_state_refused", journal.status.value.lower())
             row = ManualJournal(
                 tenant_id=tenant_id,
+                dual_control=governance.dual_control(db, tenant_id),
                 journal_id=journal.id,
                 origin=m.ORIGIN_MANUAL,
                 state=m.STATE_PREPARED,
@@ -524,7 +534,6 @@ def prepare_ledger_fault_correction(
     if command.control_code not in CONTROL_ACCOUNT_CODES:
         raise JournalRefused("invalid_input", "the control account must be 2000, 2040 or 1410")
     key = _fault_key(command.source_journal_id, command.control_code)
-    request_id = uuid5(_LEDGER_FAULT_NAMESPACE, key)
     try:
         _actor(db, tenant_id, actor)
         with db.begin_nested():
@@ -537,8 +546,14 @@ def prepare_ledger_fault_correction(
                 raise JournalRefused(
                     "ledger_fault_source_invalid", "the source must be a posted journal from the legacy import"
                 )
-            existing = db.scalar(
-                select(ManualJournal)
+            control_id = account_id_for_code(db, tenant_id, command.control_code)
+            if control_id is None:
+                raise JournalRefused("invalid_input", "the control account does not exist for this tenant")
+            offset = control_codes_among(db, tenant_id, {command.offset_account_id})
+            if offset or command.offset_account_id == control_id:
+                raise JournalRefused("offset_is_control_account", "the offset must not be a control account")
+            history = db.execute(
+                select(ManualJournal, JournalEntry)
                 .join(
                     JournalEntry,
                     (JournalEntry.tenant_id == ManualJournal.tenant_id) & (JournalEntry.id == ManualJournal.journal_id),
@@ -548,17 +563,39 @@ def prepare_ledger_fault_correction(
                     JournalEntry.source_owner == MANUAL_OWNER,
                     JournalEntry.source_document_kind == LEDGER_FAULT_KIND,
                     JournalEntry.source_document_id == key,
-                    JournalEntry.source_version == LEDGER_FAULT_VERSION,
                 )
-            )
-            if existing is not None:
-                return _outcome(existing, replayed=True)
-            control_id = account_id_for_code(db, tenant_id, command.control_code)
-            if control_id is None:
-                raise JournalRefused("invalid_input", "the control account does not exist for this tenant")
-            offset = control_codes_among(db, tenant_id, {command.offset_account_id})
-            if offset or command.offset_account_id == control_id:
-                raise JournalRefused("offset_is_control_account", "the offset must not be a control account")
+            ).all()
+            # A REJECTED or REVERSED correction is finished: a new version may be prepared. One that is
+            # still live replays only for the same full fingerprint; any difference is a named refusal, never a replay.
+            live = [(row, entry) for row, entry in history if row.state not in (m.STATE_REJECTED, m.STATE_REVERSED)]
+            if live:
+                row, entry = live[0]
+                used = db.scalar(
+                    select(JournalLine.account_id).where(
+                        JournalLine.tenant_id == tenant_id,
+                        JournalLine.journal_id == entry.id,
+                        JournalLine.account_id != control_id,
+                    )
+                )
+                # Replay only for the FULL fingerprint: offset, posting date, evidence reference and amount.
+                same = (
+                    used == command.offset_account_id
+                    and entry.posting_date == command.posting_date
+                    and entry.reference == evidence
+                    and abs(Decimal(_control_net(db, tenant_id, entry.id, control_id)))
+                    == abs(_source_ledger_delta(db, tenant_id, source.id, control_id))
+                )
+                if not same:
+                    raise JournalRefused(
+                        "ledger_fault_correction_active",
+                        "a correction for this fault is already in progress with a different offset, date, "
+                        "evidence reference or amount; reject or reverse it before preparing another",
+                    )
+                if row.state in (m.STATE_PREPARED, m.STATE_POST_REQUESTED):
+                    _verify_ledger_fault(db, tenant_id, entry)
+                return _outcome(row, replayed=True)
+            version = str(max((int(entry.source_version) for _row, entry in history), default=0) + 1)
+            request_id = uuid5(_LEDGER_FAULT_NAMESPACE, f"{key}:{version}")
             delta = _residual_fault(db, tenant_id, source.id, command.control_code, control_id)
             if delta == 0:
                 raise JournalRefused("no_ledger_fault", "the ledger agrees with the journal lines on this account")
@@ -581,6 +618,7 @@ def prepare_ledger_fault_correction(
             fingerprint = _fingerprint(
                 {
                     "key": key,
+                    "version": version,
                     "posting_date": command.posting_date.isoformat(),
                     "description": description,
                     "evidence_ref": evidence,
@@ -604,7 +642,7 @@ def prepare_ledger_fault_correction(
                         owner=MANUAL_OWNER,
                         document_kind=LEDGER_FAULT_KIND,
                         document_id=key,
-                        version=LEDGER_FAULT_VERSION,
+                        version=version,
                         fingerprint=fingerprint,
                     ),
                     lines=lines,
@@ -734,6 +772,7 @@ def request_legacy_post(
             else:
                 row = ManualJournal(
                     tenant_id=tenant_id,
+                    dual_control=governance.dual_control(db, tenant_id),
                     journal_id=journal.id,
                     origin=m.ORIGIN_LEGACY_HELD,
                     state=m.STATE_POST_REQUESTED,
@@ -788,9 +827,9 @@ def approve_and_post(
                 return _outcome(row, replayed=True)
             if row.state != m.STATE_POST_REQUESTED:
                 raise JournalRefused("state_refused", f"cannot approve from state {row.state}")
-            if approver == row.prepared_by_party_id:
+            if row.dual_control and approver == row.prepared_by_party_id:
                 raise JournalRefused("sod_preparer_cannot_approve", "the preparer cannot approve their own journal")
-            if approver == row.requested_by_party_id:
+            if row.dual_control and approver == row.requested_by_party_id:
                 raise JournalRefused("sod_requester_cannot_approve", "the requester cannot approve their own request")
             journal = _journal(db, tenant_id, row.journal_id)
             if journal.status != JournalStatus.DRAFT:
@@ -938,9 +977,9 @@ def approve_reversal(
                 return _outcome(row, replayed=True)
             if row.state != m.STATE_REVERSAL_REQUESTED:
                 raise JournalRefused("state_refused", f"cannot approve a reversal from state {row.state}")
-            if approver == row.reversal_requested_by_party_id:
+            if row.dual_control and approver == row.reversal_requested_by_party_id:
                 raise JournalRefused("sod_requester_cannot_approve", "the requester cannot approve their own reversal")
-            if approver == row.prepared_by_party_id:
+            if row.dual_control and approver == row.prepared_by_party_id:
                 raise JournalRefused("sod_preparer_cannot_approve", "the preparer cannot approve the reversal")
             if row.reversal_posting_date is None or row.reversal_reason is None:
                 raise JournalRefused("state_refused", "the reversal request is incomplete")

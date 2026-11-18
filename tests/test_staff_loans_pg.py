@@ -24,6 +24,7 @@ from dotmac_kernel.features import FeatureManifest
 from dotmac_kernel.setting_domains import SettingDomainRegistry, install_setting_domains
 from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from staff_loan_helpers import seed_recorded_opening
@@ -56,6 +57,7 @@ def registries():
 
 def world(engine, *, instruction=True):
     env = b3._world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)  # the default policy; the policy tests set it explicitly
     with Session(engine) as db:
         asset = db.scalar(
             sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "AST")
@@ -792,6 +794,7 @@ def test_finalize_rechecks_after_a_balance_fell_between_approve_and_finalize(eng
                 offset_account_id=env.accounts["5000"],
                 journal_id=uuid4(),
                 state="recorded",
+                dual_control=False,
                 prepared_by_party_id=uuid4(),
                 prepared_at=NOW,
                 approved_by_party_id=uuid4(),
@@ -837,3 +840,73 @@ def test_all_balances_sum_the_subledger_for_the_book_position(engine):
     assert {k: v.balance for k, v in balances.items()} == {"EMP-A": Decimal(100), "EMP-B": Decimal("250.5")}
     pos = position(engine, env)
     assert (pos.subledger_total, pos.difference) == (Decimal("350.5"), Decimal("9649.5"))
+
+
+# --- dual-control policy (PR-4): off = one person, on = separation ----------------------------------
+
+
+def test_policy_off_is_stamped_on_the_row_and_one_person_may_do_every_step(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    created = advance(env)
+    approve(env, created.entry_id)
+    record(env, created.entry_id, ref="BANK-REF-OFF")
+    assert row(engine, created.entry_id).dual_control is False
+
+
+def test_policy_on_requires_separate_preparer_approver_and_recorder(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    created = advance(env)
+    assert row(engine, created.entry_id).dual_control is True
+    refused(lambda: approve(env, created.entry_id, who="preparer"), "sod_approver_is_preparer")
+    approve(env, created.entry_id, who="approver")
+    refused(lambda: record(env, created.entry_id, who="preparer", ref="BANK-REF-ON"), "sod_recorder_is_preparer")
+    refused(lambda: record(env, created.entry_id, who="approver", ref="BANK-REF-ON"), "sod_recorder_is_approver")
+    assert row(engine, created.entry_id).state == "approved" and counts(engine, env)["journals"] == 0
+    record(env, created.entry_id, who="recorder", ref="BANK-REF-ON")
+    assert row(engine, created.entry_id).state == "recorded"
+
+
+def test_policy_on_refuses_an_approver_who_decided_the_employee_instruction(engine):
+    env = world(engine, instruction=False)
+    with Session(engine) as db:
+        db.add(
+            PayeeBankInstruction(
+                tenant_id=env.tenant_id,
+                payee_kind="employee",
+                payee_ref="EMP-1",
+                payee_label="E",
+                bank_code="058",
+                bank_name="Example Bank",
+                account_number="0123456789",
+                account_last4="6789",
+                account_name="EMPLOYEE ONE",
+                status="approved",
+                origin="manual",
+                proposed_at=NOW,
+                proposed_by_party_id=env.people["recorder"],
+                decided_by_party_id=env.people["approver"],
+                decided_at=NOW,
+                approved_at=NOW,
+            )
+        )
+        db.commit()
+    set_dual_control_engine(engine, env.tenant_id, True)
+    created = advance(env)
+    refused(lambda: approve(env, created.entry_id, who="approver"), "sod_approver_is_instruction_party")
+
+
+def test_the_database_backstops_the_policy_stamped_on_the_row(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    created = advance(env)
+    with pytest.raises(sa.exc.IntegrityError):
+        with Session(engine) as db:
+            db.execute(
+                sa.text(
+                    "UPDATE erp_staff_loan_entries SET state='approved', approved_by_party_id=prepared_by_party_id,"
+                    " approved_at=now() WHERE id=:i"
+                ),
+                {"i": created.entry_id},
+            )

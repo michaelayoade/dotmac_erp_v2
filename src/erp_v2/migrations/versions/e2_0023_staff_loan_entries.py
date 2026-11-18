@@ -4,9 +4,7 @@ Additive: one new table, no change to any existing object. RLS forced; the runti
 INSERT and UPDATE the lifecycle columns only; no DELETE. Amounts, kind and membership are immutable
 after insert (the database refuses to change them even for the owner role).
 
-Revision id note: PR-4 (per-tenant dual-control policy) also takes ``e2_0022``. This revision uses a
-distinct id and branches from e2_0021 (the head of the stacked PR-1), so the heads are rebased when
-the two PRs meet.
+Revision chain: e2_0021 -> e2_0022 (PR-4, dual-control policy) -> this revision.
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ from alembic import op
 from erp_v2.staff_loans.models import KINDS, STATES, TABLE, UPDATE_COLUMNS
 
 revision = "e2_0023_staff_loan_entries"
-down_revision = "e2_0021_payroll_payout_returns"
+down_revision = "e2_0022_dual_control_policy"
 branch_labels = None
 depends_on = None
 
@@ -35,6 +33,7 @@ _IMMUTABLE = (
     "offset_account_id",
     "prepared_by_party_id",
     "prepared_at",
+    "dual_control",
 )
 
 
@@ -56,6 +55,7 @@ def upgrade() -> None:
         sa.Column("offset_account_id", sa.Uuid(), nullable=True),
         sa.Column("bank_reference", sa.String(255), nullable=True),
         sa.Column("journal_id", sa.Uuid(), nullable=True),
+        sa.Column("dual_control", sa.Boolean(), nullable=False, server_default=sa.true()),
         sa.Column("state", sa.String(10), nullable=False),
         sa.Column("prepared_by_party_id", sa.Uuid(), nullable=False),
         sa.Column("prepared_at", sa.DateTime(timezone=True), nullable=False),
@@ -100,6 +100,15 @@ def upgrade() -> None:
             "AND ((kind = 'opening' AND journal_id IS NULL) OR (kind <> 'opening' AND journal_id IS NOT NULL)) "
             "AND (kind <> 'advance' OR (bank_reference IS NOT NULL AND length(btrim(bank_reference)) > 0)))",
             name=f"ck_{TABLE}_recorded",
+        ),
+        sa.CheckConstraint(
+            "NOT dual_control OR state = 'draft' OR approved_by_party_id <> prepared_by_party_id",
+            name=f"ck_{TABLE}_approve_sod",
+        ),
+        sa.CheckConstraint(
+            "NOT dual_control OR state <> 'recorded' OR (recorded_by_party_id <> prepared_by_party_id "
+            "AND recorded_by_party_id <> approved_by_party_id)",
+            name=f"ck_{TABLE}_record_sod",
         ),
         sa.CheckConstraint("bank_reference IS NULL OR kind = 'advance'", name=f"ck_{TABLE}_bank_reference_kind"),
     )

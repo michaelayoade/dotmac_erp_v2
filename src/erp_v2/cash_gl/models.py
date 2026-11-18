@@ -16,6 +16,7 @@ from uuid import UUID
 
 from dotmac_kernel.models import Base, uuid_pk
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
@@ -25,6 +26,7 @@ from sqlalchemy import (
     Uuid,
     func,
     text,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -67,9 +69,11 @@ class CashAccountRepoint(Base):
         ),
         # The database enforces the two-person rule as well as the service.
         CheckConstraint(
-            "status <> 'approved' OR (decided_by_party_id <> proposed_by_party_id AND applied_ref IS NOT NULL)",
+            "NOT dual_control OR (status <> 'approved' OR "
+            "(decided_by_party_id <> proposed_by_party_id AND applied_ref IS NOT NULL))",
             name=f"ck_{TABLE}_two_person",
         ),
+        CheckConstraint("status <> 'approved' OR applied_ref IS NOT NULL", name=f"ck_{TABLE}_two_person_integrity"),
         Index(
             f"uq_{TABLE}_one_proposed",
             "tenant_id",
@@ -82,6 +86,8 @@ class CashAccountRepoint(Base):
 
     id: Mapped[UUID] = uuid_pk()
     tenant_id: Mapped[UUID] = _tenant_fk()
+    # Stamped from the tenant policy at creation; DB default true keeps pre-e2_0022 rows strict (e2_0022).
+    dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     bank_account_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     # The bank account's cash_account_ref at proposal time (verified again at approval).
     from_ref: Mapped[str] = mapped_column(String(240), nullable=False)

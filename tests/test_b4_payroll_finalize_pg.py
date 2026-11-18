@@ -32,6 +32,7 @@ from dotmac_payroll.models import (
     PayrollLiability,
     PayrollRun,
 )
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from staff_loan_helpers import seed_recorded_opening
 from test_posting_bridge_pg import NOW, seed, soft_close
@@ -607,6 +608,14 @@ def test_a_deduction_mapped_to_2040_is_refused_so_2040_holds_net_pay_only(engine
     refusal(engine, env, svc.approve, run_id, "deduction_mapped_to_net_payable", 1)
 
 
+def test_a_deduction_mapped_to_ap_control_2000_is_refused(engine):
+    env = world(engine, paye_liability="2000")
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    refusal(engine, env, svc.approve, run_id, "deduction_mapped_to_control", 1)
+    assert counts(engine, env.tenant_id)["payroll_liabilities"] == 0
+
+
 def test_net_payable_account_other_than_2040_is_refused(engine):
     env = world(engine, net_ref="2120")
     run_id = new_run(engine, env)
@@ -874,3 +883,39 @@ def test_leaver_on_an_input_structure_goes_through_the_erp_form_batch_approve_an
     approve(engine, env, run_id)
     finalize(engine, env, run_id)
     assert status(engine, run_id) == "finalized"
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+# The ERP checks (calculator = creator, creator != approver != finalizer) become no-ops. Until payroll a6 pins
+# ``separation_of_duties`` the Starter owner still refuses creator-approves and approver-finalizes with its own
+# error; the ERP ``sod_*`` codes must not appear.
+
+
+def test_policy_off_any_permitted_person_may_enter_calculations(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    run_id = new_run(engine, env)
+    assert batch(engine, env, run_id, party_index=1).calculated == 3  # not the creator
+
+
+def test_policy_off_erp_separation_codes_do_not_fire_for_approve_and_finalize(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    run_id = new_run(engine, env)
+    batch(engine, env, run_id)
+    with pytest.raises(svc.RunRefused) as exc:
+        approve(engine, env, run_id, party_index=0)  # the creator approves: the owner (payroll a5) still refuses
+    assert exc.value.code == "payroll_refused"
+    run_id = ready_to_finalize(engine, env, ref="RUN-2026-02", start=date(2026, 2, 1), end=date(2026, 2, 28))
+    try:
+        finalize(engine, env, run_id, party_index=1)  # the approver finalizes
+    except svc.RunRefused as exc:
+        assert exc.code == "payroll_refused", exc.code  # owner refusal only; never the ERP sod_* code
+
+
+def test_policy_on_keeps_the_existing_refusals(engine):
+    env = world(engine)  # the seed turns the policy ON
+    run_id = new_run(engine, env)
+    refusal(engine, env, svc.batch_calculate, run_id, "sod_not_run_creator", 1, input_bytes=GOOD_FILE)
+    batch(engine, env, run_id)
+    refusal(engine, env, svc.approve, run_id, "sod_creator_is_approver", 0)

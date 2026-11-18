@@ -68,6 +68,7 @@ from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import file as bank_file
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import KIND_PAYROLL_PAYOUT, DisbursementFileReceipt
+from erp_v2.governance import policy as governance
 from erp_v2.journals import policy as journal_policy
 from erp_v2.payees import service as payee_service
 from erp_v2.payees.models import InstructionOrigin, InstructionStatus, PayeeBankInstruction, PayeeKind
@@ -308,7 +309,7 @@ def _refuse_instruction_party(
     db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine], person: object, *, code: str, role: str
 ) -> None:
     """``person`` must not have proposed or decided any net-pay line's CURRENT instruction (legacy exempt)."""
-    if batch.kind != KIND_NET_PAY or person is None:
+    if not batch.dual_control or batch.kind != KIND_NET_PAY or person is None:
         return
     for line in lines:
         instruction = _current_instruction(db, batch.tenant_id, line.beneficiary_ref)
@@ -327,7 +328,7 @@ def _refuse_returner(
 ) -> None:
     """A re-payment batch must not be approved, filed or recorded by the person who recorded the bank return
     of any of its liabilities (they attested the credit failed; they must not also release the money again)."""
-    if person is None:
+    if not batch.dual_control or person is None:
         return
     returners = set(
         db.scalars(
@@ -347,10 +348,15 @@ def _refuse_returner(
 def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]) -> None:
     """V3: every net-pay line's employee has an approved payee bank instruction, whatever the file setting.
 
-    Statutory remittances are excluded (their destination is chosen on the batch, not a person).
+    A statutory remittance goes to a destination chosen on the batch (``dest:...``), for which no payee
+    instruction exists yet, so it fails closed until statutory payees exist (separate follow-up).
     """
     if batch.kind != KIND_NET_PAY:
-        return
+        raise PayoutRefused(
+            "statutory_payee_instruction_required",
+            "A statutory remittance needs an approved payee instruction for its destination, and statutory "
+            "payees are not available yet; refer it to Finance",
+        )
     for line in lines:
         try:
             payee_service.destination_for_payment(
@@ -486,8 +492,10 @@ def _prepare(
         if liability.currency_code != functional:
             raise PayoutRefused("non_functional_currency", "Payouts are in the tenant functional currency only")
     total = sum((c.amount for c in chosen), Decimal(0))
+    dual = governance.dual_control(db, tenant.id)
     batch = PayrollPayoutBatch(
         tenant_id=tenant.id,
+        dual_control=dual,
         request_id=request_id,
         number=f"PO-{request_id.hex[:16].upper()}",
         run_id=run.id,
@@ -508,6 +516,7 @@ def _prepare(
         db.add(
             PayrollPayoutLine(
                 tenant_id=tenant.id,
+                dual_control=dual,
                 batch_id=batch.id,
                 liability_id=liability.id,
                 beneficiary_ref=liability.beneficiary_ref,
@@ -541,7 +550,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID, now: 
         return PayoutOutcome(batch.id, True)
     if batch.status != DRAFT:
         raise PayoutRefused("not_draft", "Only a draft payout batch can be approved")
-    if _same(batch.prepared_by_party_id, party.id):
+    if batch.dual_control and _same(batch.prepared_by_party_id, party.id):
         raise PayoutRefused("sod_approver_is_preparer", "You prepared this batch; another person must approve it")
     lines = _lines(db, tenant.id, batch.id)
     _revalidate(db, batch, lines)
@@ -643,7 +652,9 @@ def _generate_file(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID,
         )
     if batch.status != APPROVED:
         raise PayoutRefused("not_approved", "Only an approved payout batch can have a bank file")
-    if _same(batch.prepared_by_party_id, party.id) or _same(batch.approved_by_party_id, party.id):
+    if batch.dual_control and (
+        _same(batch.prepared_by_party_id, party.id) or _same(batch.approved_by_party_id, party.id)
+    ):
         raise PayoutRefused(
             "sod_file_issuer_is_batch_party", "You prepared or approved this batch; someone else must issue its file"
         )
@@ -749,11 +760,11 @@ def _record(
         raise PayoutRefused("not_approved", "Only an approved payout batch can be recorded")
     if batch.value_date > now.astimezone(UTC).date():
         raise PayoutRefused("value_date_future", "The value date is in the future; record on or after that date")
-    if _same(batch.prepared_by_party_id, party.id):
+    if batch.dual_control and _same(batch.prepared_by_party_id, party.id):
         raise PayoutRefused("sod_recorder_is_preparer", "You prepared this batch; someone else must record it")
-    if _same(batch.approved_by_party_id, party.id):
+    if batch.dual_control and _same(batch.approved_by_party_id, party.id):
         raise PayoutRefused("sod_recorder_is_approver", "You approved this batch; someone else must record it")
-    if _same(batch.file_issued_by_party_id, party.id):
+    if batch.dual_control and _same(batch.file_issued_by_party_id, party.id):
         raise PayoutRefused("sod_recorder_is_file_issuer", "You issued this batch's file; someone else must record it")
     if batch.kind == KIND_NET_PAY:
         if disbursement_policy.bank_file_generation_enabled(db, tenant.id):
@@ -1031,7 +1042,7 @@ def _return_line(
         ("file issuer", "sod_returner_is_file_issuer", batch.file_issued_by_party_id),
         ("recorder", "sod_returner_is_recorder", batch.recorded_by_party_id),
     ):
-        if _same(member, party.id):
+        if line.dual_control and _same(member, party.id):
             raise PayoutRefused(code, f"You were this batch's {role}; someone else must record its return")
     if value_date > now.astimezone(UTC).date():
         raise PayoutRefused("return_date_future", "The bank return date is in the future")

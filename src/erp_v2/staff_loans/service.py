@@ -5,9 +5,12 @@ GL); an ``opening`` carries an employee's existing balance into the subledger (n
 it); an ``adjustment`` moves one employee's balance against an offset account; a ``control_difference``
 writes off part of the measured difference between GL(1410) and the subledger.
 
-Every kind goes draft -> approved -> recorded. There is NO compulsory second person: the approver (and the
-recorder) may be the preparer. The approval is still an explicit, audited action with its own evidence on
-the row. Recording posts through the P0 bridge (new ``("erp","staff_loan_entry")`` RefPolicy) in the SAME
+Every kind goes draft -> approved -> recorded. There is NO compulsory second person by default: with the
+tenant's dual-control policy off (the default, ``erp_v2.governance``) the approver and recorder may be the
+preparer. The policy is stamped on the row at prepare. When on, the approver is not the preparer or the
+borrower's instruction proposer/decider and the recorder is neither preparer nor approver (CHECKs back this).
+Approval is always an explicit, audited action.
+Recording posts through the P0 bridge (new ``("erp","staff_loan_entry")`` RefPolicy) in the SAME
 savepoint as the state change, so a refusal leaves no row change and no journal.
 
 Reused, not reinvented: ``supplier_payments.service.payer_references`` (cash GL from the selected bank
@@ -41,10 +44,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from erp_v2.disbursement import bank_reference as bank_ref
+from erp_v2.governance import policy as governance
 from erp_v2.journals import policy as journal_policy
 from erp_v2.ledger_roles import STAFF_LOAN_CODE, account_id_for_code, control_codes_among
 from erp_v2.payees import service as payee_service
-from erp_v2.payees.models import PayeeKind
+from erp_v2.payees.models import InstructionOrigin, InstructionStatus, PayeeBankInstruction, PayeeKind
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
 from erp_v2.staff_loans import queries
@@ -228,6 +232,31 @@ def _require_instruction(db: Session, tenant_id: UUID, employee_ref: str) -> Non
         ) from exc
 
 
+def _refuse_instruction_party(
+    db: Session, tenant_id: UUID, row: StaffLoanEntry, approver: UUID | None, code: str
+) -> None:
+    """Dual control only: the approver must not have proposed or decided the borrower's current instruction.
+
+    Instructions migrated from legacy (origin legacy_import) are exempt, as in B3.
+    """
+    if row.kind != KIND_ADVANCE or approver is None:
+        return
+    instruction = db.scalar(
+        select(PayeeBankInstruction).where(
+            PayeeBankInstruction.tenant_id == tenant_id,
+            PayeeBankInstruction.payee_kind == PayeeKind.EMPLOYEE.value,
+            PayeeBankInstruction.payee_ref == row.employee_ref,
+            PayeeBankInstruction.status == InstructionStatus.APPROVED.value,
+        )
+    )
+    if instruction is None or instruction.origin == InstructionOrigin.LEGACY_IMPORT.value:
+        return
+    if approver in (instruction.proposed_by_party_id, instruction.decided_by_party_id):
+        raise LoanRefused(
+            code, "The approver proposed or approved the employee's bank instruction; a different person must act"
+        )
+
+
 def _verify(db: Session, tenant_id: UUID, row: StaffLoanEntry) -> None:
     """Every business check for one entry, under the tenant's staff-loan lock. Used at prepare, approve, record."""
     queries.lock_book(db, tenant_id)
@@ -362,6 +391,7 @@ def _prepare(
         bank_account_id=bank_account_id,
         offset_account_id=offset_account_id,
         state=DRAFT,
+        dual_control=governance.dual_control(db, tenant.id),
         prepared_by_party_id=party.id,
         prepared_at=now,
     )
@@ -398,6 +428,10 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, entry_id: UUID, now: 
     _verify(db, tenant.id, row)
     if row.kind == KIND_ADVANCE:
         _require_instruction(db, tenant.id, _present(row.employee_ref, "employee"))
+    if row.dual_control:  # the policy stamped at prepare; off means one person may approve their own entry
+        if row.prepared_by_party_id == party.id:
+            raise LoanRefused("sod_approver_is_preparer", "You prepared this entry; another person must approve it")
+        _refuse_instruction_party(db, tenant.id, row, party.id, "sod_approver_is_instruction_party")
     row.state = APPROVED
     row.approved_by_party_id = party.id
     row.approved_at = now
@@ -473,6 +507,12 @@ def _record(
             "value_date_future", "The entry's value date is in the future; record it on or after that date"
         )
     _verify(db, tenant.id, row)
+    if row.dual_control:
+        if party.id == row.prepared_by_party_id:
+            raise LoanRefused("sod_recorder_is_preparer", "You prepared this entry; someone else must record it")
+        if party.id == row.approved_by_party_id:
+            raise LoanRefused("sod_recorder_is_approver", "You approved this entry; someone else must record it")
+        _refuse_instruction_party(db, tenant.id, row, row.approved_by_party_id, "sod_approver_is_instruction_party")
     scope = TenantScope(tenant.id)
     actor = str(party.id)
     posted = None

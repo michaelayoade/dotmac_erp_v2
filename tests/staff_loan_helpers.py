@@ -26,6 +26,7 @@ def seed_recorded_opening(engine, tenant_id, employee_ref, amount, *, value_date
             evidence_ref="test schedule",
             value_date=value_date,
             state="recorded",
+            dual_control=False,
             prepared_by_party_id=actor,
             prepared_at=when,
             approved_by_party_id=actor,

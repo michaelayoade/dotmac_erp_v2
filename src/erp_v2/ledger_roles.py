@@ -94,7 +94,8 @@ def invoice_account_violation(
     ``lines`` are ``(posting_account_ref, tax_amount, tax_account_ref)``. The liability must be the AP
     control account (2000). A taxed line's tax account must not be the line's own posting account and
     must be a declared input-tax account (1455); that also blocks WHT payable, 1440, 2120 and expense
-    accounts. Read-only; nothing is created.
+    accounts. No line or tax account may be a control account (2000/2040/1410): the liability pin alone
+    would still let ``Dr 1410 / Cr 2000`` through as an invoice line. Read-only; nothing is created.
     """
     try:
         ap_control = ap_control_account_id(db, tenant_id)
@@ -102,7 +103,20 @@ def invoice_account_violation(
         return exc.code, str(exc)
     if not same_account(liability_ref, ap_control):
         return "liability_not_ap_control", "A supplier invoice must be booked to the AP control account (2000)"
-    taxed = [(posting, tax_ref) for posting, tax, tax_ref in lines if tax is not None and tax > 0]
+    rows = list(lines)
+    control_ids = set(
+        db.scalars(select(Account.id).where(Account.tenant_id == tenant_id, Account.code.in_(CONTROL_ACCOUNT_CODES)))
+    )
+    for number, (posting, tax, tax_ref) in enumerate(rows, start=1):
+        refs = [posting, tax_ref] if tax is not None and tax > 0 else [posting]
+        for ref in refs:
+            if any(same_account(ref, control_id) for control_id in control_ids):
+                return (
+                    "line_account_is_control",
+                    f"Line {number}: a control account (2000/2040/1410) cannot be a line or tax account; "
+                    "correct it through the owning subledger document",
+                )
+    taxed = [(posting, tax_ref) for posting, tax, tax_ref in rows if tax is not None and tax > 0]
     if not taxed:
         return None
     allowed: frozenset[UUID] | None = None

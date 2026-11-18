@@ -26,6 +26,7 @@ from dotmac_payables.models import (
     SupplierInvoice,
     SupplierInvoiceLine,
 )
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, seed, soft_close
 
@@ -617,3 +618,68 @@ def test_v1_refusals_come_after_the_historical_and_receipt_checks(engine):
         db.commit()
     refusal(engine, env, hist, "historical_invoice")
     refusal(engine, env, approved, "approved_without_ledger_receipt")
+
+
+@pytest.mark.parametrize("code", ["1410", "2040", "2000"])
+def test_v2_draft_refuses_a_control_account_as_the_line_account_dr_1410_cr_2000(engine, code):
+    env = world(engine)
+    control = env.accounts[code] if code in env.accounts else add_account(engine, env, code)
+    draft_refused(engine, env, "line_account_is_control", posting_account_id=str(control), tax="0")
+
+
+def test_v2_draft_refuses_a_control_account_as_the_tax_account(engine):
+    env = world(engine)
+    draft_refused(engine, env, "line_account_is_control", tax_account_id=str(env.accounts["2040"]))
+
+
+@pytest.mark.parametrize("code", ["1410", "2040"])
+def test_v2_b1_refuses_an_imported_shape_invoice_whose_line_account_is_a_control_account(engine, code):
+    env = world(engine)
+    control = env.accounts[code] if code in env.accounts else add_account(engine, env, code)
+    iid = invoice(engine, env, submit=False)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(SupplierInvoiceLine)
+            .where(SupplierInvoiceLine.invoice_id == iid)
+            .values(posting_account_ref=str(control))
+        )
+        db.commit()
+    submit(engine, env, iid)
+    refusal(engine, env, iid, "line_account_is_control")
+    assert status(engine, iid) == InvoiceStatus.SUBMITTED
+
+
+def test_v2_b1_refuses_a_control_account_as_the_tax_account(engine):
+    env = world(engine)
+    iid = invoice(engine, env, tax_account=env.accounts["2040"])
+    refusal(engine, env, iid, "line_account_is_control")
+
+
+# --- dual-control policy (D-9): default OFF, a single person can submit and approve ---------------------------
+
+
+def test_policy_off_the_submitter_can_approve_and_post_their_own_invoice(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    iid = invoice(engine, env)
+    out = approve(engine, env, iid, party_index=0)  # the submitter approves
+    assert out.replayed is False
+    with Session(engine) as db:
+        assert db.get(SupplierInvoice, iid).status == InvoiceStatus.APPROVED
+    assert len(audits(engine, env.tenant_id, svc.AUDIT_APPROVED_POSTED)) == 1
+
+
+def test_policy_off_without_any_policy_row_is_the_same_default(engine):
+    env = world(engine)
+    with Session(engine) as db:
+        db.execute(sa.text("DELETE FROM erp_governance_policies WHERE tenant_id = :t"), {"t": env.tenant_id})
+        db.commit()
+    iid = invoice(engine, env)
+    assert approve(engine, env, iid, party_index=0).replayed is False
+
+
+def test_policy_on_the_submitter_refusal_still_fires(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    iid = invoice(engine, env)
+    refusal(engine, env, iid, "sod_submitter_is_approver", party_index=0)

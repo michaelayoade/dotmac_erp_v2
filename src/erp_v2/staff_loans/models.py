@@ -25,6 +25,7 @@ from uuid import UUID
 
 from dotmac_kernel.models import Base, uuid_pk
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -36,6 +37,7 @@ from sqlalchemy import (
     Uuid,
     func,
     text,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -110,6 +112,16 @@ class StaffLoanEntry(Base):
             "AND (kind <> 'advance' OR (bank_reference IS NOT NULL AND length(btrim(bank_reference)) > 0)))",
             name=f"ck_{TABLE}_recorded",
         ),
+        # With dual control stamped on the row, the database refuses a self-approval or self-recording.
+        CheckConstraint(
+            "NOT dual_control OR state = 'draft' OR approved_by_party_id <> prepared_by_party_id",
+            name=f"ck_{TABLE}_approve_sod",
+        ),
+        CheckConstraint(
+            "NOT dual_control OR state <> 'recorded' OR (recorded_by_party_id <> prepared_by_party_id "
+            "AND recorded_by_party_id <> approved_by_party_id)",
+            name=f"ck_{TABLE}_record_sod",
+        ),
         CheckConstraint("bank_reference IS NULL OR kind = 'advance'", name=f"ck_{TABLE}_bank_reference_kind"),
         # Backstop for bank_reference.claim (which serialises and also checks B3/B5): one use per account.
         Index(
@@ -145,6 +157,8 @@ class StaffLoanEntry(Base):
     offset_account_id: Mapped[UUID | None] = mapped_column(Uuid())
     bank_reference: Mapped[str | None] = mapped_column(String(255))
     journal_id: Mapped[UUID | None] = mapped_column(Uuid())
+    # The tenant's dual-control policy when the entry was prepared (erp_v2.governance); later checks read the row.
+    dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
     state: Mapped[str] = mapped_column(String(10), nullable=False)
     prepared_by_party_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -36,6 +36,7 @@ from dotmac_accounting.models import (
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.idempotency_models import IdempotencyRecord
 from dotmac_kernel.models import Tenant
+from dual_control_support import set_dual_control
 from sqlalchemy.orm import Session
 
 from erp_v2.posting import bridge
@@ -102,6 +103,7 @@ def seed(engine) -> SimpleNamespace:
     with Session(engine) as db:
         db.add(Tenant(id=tenant_id, slug=f"t{tenant_id.hex[:24]}", name="Bridge"))
         db.flush()
+        set_dual_control(db, tenant_id, True)  # existing separation-of-duties assertions run with the policy ON
         # Direct owner rows: accounting a1's create_* helpers import the kernel's reference
         # runtime (dotmac_kernel.db), which a composed ERP process must not construct.
         categories = {
