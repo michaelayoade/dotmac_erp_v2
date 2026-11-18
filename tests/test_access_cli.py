@@ -136,18 +136,23 @@ class Store:
         return catalog + tuple(SimpleNamespace(id=missing_role_ids[s], slug=s) for s in configured_names)
 
     @staticmethod
-    def db(active=True):
-        return SimpleNamespace(scalar=lambda stmt: SimpleNamespace(is_active=active))
+    def db(active=True, dual_control=True):
+        """Tenant row for the tenant query; the tenant's dual-control policy value for the policy query."""
+
+        def scalar(stmt):
+            return dual_control if "erp_governance_policies" in str(stmt) else SimpleNamespace(is_active=active)
+
+        return SimpleNamespace(scalar=scalar)
 
 
 def party(pid, active=True, kind="person"):
     return SimpleNamespace(id=pid, is_active=active, party_type=kind)
 
 
-def apply(store, allow, **over):
+def apply(store, allow, *, dual_control=True, **over):
     args = dict(allowlist_sha256="d" * 64, operator_ref="ops-1", audit=lambda db, **kw: store.audited.append(kw))
     args.update(over)
-    return cli.apply_grants(store.db(), allow, **args)
+    return cli.apply_grants(store.db(dual_control=dual_control), allow, **args)
 
 
 def test_plan_writes_nothing_and_apply_is_additive_and_audited(monkeypatch):
@@ -197,6 +202,33 @@ def test_approver_treasury_pair_is_never_waivable(monkeypatch):
     store = Store(monkeypatch, [party(P1)])
     plan = apply(store, cli.parse_allowlist(doc(pair)))
     assert dict(plan.blockers) == {"sod_conflict": 1} and store.ensured == []
+
+
+def test_policy_off_role_pairs_are_warnings_not_blockers_including_the_non_waivable_pair(monkeypatch):
+    for roles in (
+        ("treasury", "bank_reconciler"),
+        ("finance_approver", "treasury"),
+        ("finance_preparer", "finance_approver"),
+    ):
+        pair = [{"party_id": str(P1), "role": roles[0]}, {"party_id": str(P1), "role": roles[1]}]
+        store = Store(monkeypatch, [party(P1)])
+        plan = apply(store, cli.parse_allowlist(doc(pair)), dual_control=False)
+        assert plan.ready and dict(plan.blockers) == {} and dict(plan.warnings) == {"sod_conflict": 1}
+        assert len(store.ensured) == 2 and len(store.audited) == 2  # the grants are written and audited
+        assert plan.receipt()["warnings"] == {"sod_conflict": 1} and plan.receipt()["ready"] is True
+
+
+def test_policy_off_still_refuses_what_is_not_a_role_pair(monkeypatch):
+    store = Store(monkeypatch, [party(P1)], staff=False)
+    plan = apply(store, cli.parse_allowlist(doc()), dual_control=False)
+    assert dict(plan.blockers) == {"party_lacks_portal_access": 1} and store.ensured == []
+
+
+def test_policy_off_an_excepted_pair_is_not_even_a_warning(monkeypatch):
+    pair = [{"party_id": str(P1), "role": "treasury"}, {"party_id": str(P1), "role": "bank_reconciler"}]
+    allowed = doc(pair, sod_exceptions=[{"party_id": str(P1), "roles": ["treasury", "bank_reconciler"]}])
+    plan = apply(Store(monkeypatch, [party(P1)]), cli.parse_allowlist(allowed), dual_control=False)
+    assert plan.ready and dict(plan.warnings) == {}
 
 
 def test_sod_pair_against_existing_role_refuses(monkeypatch):

@@ -54,6 +54,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.governance import policy as governance
 from erp_v2.journals import models as m
 from erp_v2.journals.models import ManualJournal
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
@@ -326,6 +327,7 @@ def prepare_journal(
                 raise JournalRefused("journal_state_refused", journal.status.value.lower())
             row = ManualJournal(
                 tenant_id=tenant_id,
+                dual_control=governance.dual_control(db, tenant_id),
                 journal_id=journal.id,
                 origin=m.ORIGIN_MANUAL,
                 state=m.STATE_PREPARED,
@@ -439,6 +441,7 @@ def request_legacy_post(
             else:
                 row = ManualJournal(
                     tenant_id=tenant_id,
+                    dual_control=governance.dual_control(db, tenant_id),
                     journal_id=journal.id,
                     origin=m.ORIGIN_LEGACY_HELD,
                     state=m.STATE_POST_REQUESTED,
@@ -493,9 +496,9 @@ def approve_and_post(
                 return _outcome(row, replayed=True)
             if row.state != m.STATE_POST_REQUESTED:
                 raise JournalRefused("state_refused", f"cannot approve from state {row.state}")
-            if approver == row.prepared_by_party_id:
+            if row.dual_control and approver == row.prepared_by_party_id:
                 raise JournalRefused("sod_preparer_cannot_approve", "the preparer cannot approve their own journal")
-            if approver == row.requested_by_party_id:
+            if row.dual_control and approver == row.requested_by_party_id:
                 raise JournalRefused("sod_requester_cannot_approve", "the requester cannot approve their own request")
             journal = _journal(db, tenant_id, row.journal_id)
             if journal.status != JournalStatus.DRAFT:
@@ -641,9 +644,9 @@ def approve_reversal(
                 return _outcome(row, replayed=True)
             if row.state != m.STATE_REVERSAL_REQUESTED:
                 raise JournalRefused("state_refused", f"cannot approve a reversal from state {row.state}")
-            if approver == row.reversal_requested_by_party_id:
+            if row.dual_control and approver == row.reversal_requested_by_party_id:
                 raise JournalRefused("sod_requester_cannot_approve", "the requester cannot approve their own reversal")
-            if approver == row.prepared_by_party_id:
+            if row.dual_control and approver == row.prepared_by_party_id:
                 raise JournalRefused("sod_preparer_cannot_approve", "the preparer cannot approve the reversal")
             if row.reversal_posting_date is None or row.reversal_reason is None:
                 raise JournalRefused("state_refused", "the reversal request is incomplete")

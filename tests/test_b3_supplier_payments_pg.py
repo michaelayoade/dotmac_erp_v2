@@ -43,6 +43,7 @@ from dotmac_payables.models import (
     SupplierInvoice,
     SupplierPayment,
 )
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, soft_close
 
@@ -1253,3 +1254,62 @@ def test_downgrade_refuses_when_receipts_exist(engine):
 
 def test_downgrade_drops_an_empty_table(engine):
     assert _run_downgrade(engine, with_receipt=False) is None
+
+
+# --- dual-control policy OFF (D-9) ------------------------------------------------------------------------------
+# The ERP-side checks (instruction party, recorder, reverser, file issuer) become no-ops. Until payables a6 pins
+# ``separation_of_duties`` the Starter owner still refuses approve-by-preparer (and its own reverse/record rules),
+# so those steps keep the owner's refusal; the ERP codes must not appear.
+
+
+def test_policy_off_erp_checks_do_not_fire_and_the_owner_still_refuses_approve_by_preparer(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    created = prepare(engine, env, open_obligation(engine, env))
+    with pytest.raises(PaymentRefused) as exc:
+        approve(engine, env, created.payment_id, who="preparer")
+    assert not exc.value.code.startswith("sod_")  # the owner (payables a5) refuses, not the ERP check
+    assert payment(engine, created.payment_id).status == SupplierPaymentStatus.DRAFT
+
+
+def test_policy_off_instruction_party_approves_and_issues_the_file(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    created = prepare(engine, env, open_obligation(engine, env))
+    seed_payee(engine, env, proposer="approver", decider="approver")  # the approver also decided the instruction
+    enable_file(engine, env)
+    approve(engine, env, created.payment_id)  # sod_approver_is_instruction_party does not fire
+    generate(engine, env, [created.payment_id], who="approver")  # approver issues the file: no ERP refusal
+    assert record(engine, env, created.payment_id).replayed is False
+    assert payment(engine, created.payment_id).status == SupplierPaymentStatus.RECORDED
+    with pytest.raises(PaymentRefused) as exc:  # payables a5 still refuses a recorder-reversal; the ERP code is gone
+        reverse(engine, env, created.payment_id, who="recorder")
+    assert not exc.value.code.startswith("sod_")
+    assert reverse(engine, env, created.payment_id, who="reverser").replayed is False
+    assert payment(engine, created.payment_id).status == SupplierPaymentStatus.REVERSED
+
+
+def test_policy_on_the_refusals_still_fire_for_the_same_actors(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    created = prepare(engine, env, open_obligation(engine, env))
+    refused(lambda: approve(engine, env, created.payment_id, who="preparer"), "sod_approver_is_preparer")
+    approve(engine, env, created.payment_id)
+    refused(lambda: record(engine, env, created.payment_id, who="approver"), "sod_recorder_is_approver")
+    refused(lambda: record(engine, env, created.payment_id, who="preparer"), "sod_recorder_is_preparer")
+    record(engine, env, created.payment_id)
+    for who, code in (
+        ("recorder", "sod_reverser_is_recorder"),
+        ("approver", "sod_reverser_is_approver"),
+        ("preparer", "sod_reverser_is_preparer"),
+    ):
+        refused(lambda who=who: reverse(engine, env, created.payment_id, who=who), code)
+
+
+def test_policy_on_the_instruction_party_cannot_approve_or_issue_the_file(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    created = prepare(engine, env, open_obligation(engine, env))
+    seed_payee(engine, env, proposer="approver", decider="reverser")
+    enable_file(engine, env)
+    refused(lambda: approve(engine, env, created.payment_id), "sod_approver_is_instruction_party")

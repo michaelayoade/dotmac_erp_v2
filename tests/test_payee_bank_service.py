@@ -14,8 +14,10 @@ from dotmac_kernel import audit_actions
 from dotmac_kernel.audit import AuditEvent
 from dotmac_kernel.audit_actions import AuditActionRegistry
 from dotmac_kernel.models import Base, Tenant
+from dual_control_support import set_dual_control
 from sqlalchemy.orm import Session
 
+from erp_v2.governance.models import GovernancePolicy
 from erp_v2.payees import service
 from erp_v2.payees.models import PayeeBankInstruction
 from erp_v2.payees.routes import payee_bank_feature
@@ -42,11 +44,15 @@ def env(monkeypatch):
         audit_actions, "_active_registry", AuditActionRegistry.from_manifests([payee_bank_feature]), raising=False
     )
     engine = sa.create_engine("sqlite://")
-    Base.metadata.create_all(engine, tables=[Tenant.__table__, AuditEvent.__table__, PayeeBankInstruction.__table__])
+    Base.metadata.create_all(
+        engine,
+        tables=[Tenant.__table__, AuditEvent.__table__, PayeeBankInstruction.__table__, GovernancePolicy.__table__],
+    )
     with Session(engine) as db:
         tenant = Tenant(id=uuid4(), slug="acme", name="Acme")
         db.add(tenant)
         db.flush()
+        set_dual_control(db, tenant.id, True)  # the existing two-person assertions run with the policy ON
         yield db, tenant.id
     engine.dispose()
 

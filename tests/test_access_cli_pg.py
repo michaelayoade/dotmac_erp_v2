@@ -16,6 +16,7 @@ import pytest
 import sqlalchemy as sa
 from dotmac_kernel.audit import AuditEvent
 from dotmac_kernel.models import Party, PartyPerson, PartyRoleGrant, PartyType, Role, Tenant
+from dual_control_support import set_dual_control, set_dual_control_engine
 from sqlalchemy.orm import Session
 
 from erp_v2 import access, access_cli
@@ -78,6 +79,7 @@ def seed(engine, *, parties=1, staff=True):
     with Session(engine) as db:
         db.add(Tenant(id=tenant_id, slug=f"t{tenant_id.hex[:24]}", name="Access"))
         db.flush()
+        set_dual_control(db, tenant_id, True)  # existing separation-of-duties assertions run with the policy ON
         staff_role = Role(tenant_id=tenant_id, slug="staff", name="Staff")
         db.add(staff_role)
         db.flush()
@@ -320,3 +322,33 @@ def test_audit_failure_after_removals_rolls_everything_back_through_run(engine, 
     # the same revoke succeeds afterwards (nothing was left half-done)
     assert runner.run("revoke-apply", tenant, [(a, "treasury"), (b, "treasury")])[0] == 0
     assert held(engine, tenant, a) == {"staff"} and len(audits(engine, tenant, access.AUDIT_ROLE_REVOKED)) == 2
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+
+
+def test_policy_off_role_pair_grants_apply_with_a_counted_warning(engine, runner):
+    tenant, (a,) = seed(engine)
+    set_dual_control_engine(engine, tenant, False)
+    code, receipt = runner.run("apply", tenant, [(a, "finance_approver"), (a, "treasury")])  # the non-waivable pair
+    assert code == 0
+    assert receipt["access"]["blockers"] == {} and receipt["access"]["warnings"] == {"sod_conflict": 1}
+    assert held(engine, tenant, a) == {"staff", "finance_approver", "treasury"}
+    assert len(audits(engine, tenant)) == 2  # both grants audited
+
+
+def test_policy_on_the_pair_still_blocks_and_writes_nothing(engine, runner):
+    tenant, (a,) = seed(engine)  # the seed turns the policy ON
+    code, receipt = runner.run("apply", tenant, [(a, "finance_approver"), (a, "treasury")])
+    assert code == 3 and receipt["access"]["blockers"] == {"sod_conflict": 1}
+    assert receipt["access"]["warnings"] == {}
+    assert held(engine, tenant, a) == {"staff"} and audits(engine, tenant) == []
+
+
+def test_no_policy_row_reads_as_off(engine, runner):
+    tenant, (a,) = seed(engine)
+    with Session(engine) as db:
+        db.execute(sa.text("DELETE FROM erp_governance_policies WHERE tenant_id = :t"), {"t": tenant})
+        db.commit()
+    code, receipt = runner.run("plan", tenant, [(a, "treasury"), (a, "bank_reconciler")])
+    assert code == 0 and receipt["access"]["warnings"] == {"sod_conflict": 1}

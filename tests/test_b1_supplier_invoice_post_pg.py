@@ -26,6 +26,7 @@ from dotmac_payables.models import (
     SupplierInvoice,
     SupplierInvoiceLine,
 )
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, seed, soft_close
 
@@ -408,3 +409,33 @@ def test_concurrent_approvers_yield_one_journal_and_one_receipt(engine):
     c = counts(engine, env.tenant_id)
     assert c["journal_entries"] == 1 and c["accounting_receipts"] == 1 and c["payment_obligations"] == 1
     assert len(audits(engine, env.tenant_id, svc.AUDIT_APPROVED_POSTED)) == 1
+
+
+# --- dual-control policy (D-9): default OFF, a single person can submit and approve ---------------------------
+
+
+def test_policy_off_the_submitter_can_approve_and_post_their_own_invoice(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    iid = invoice(engine, env)
+    out = approve(engine, env, iid, party_index=0)  # the submitter approves
+    assert out.replayed is False
+    with Session(engine) as db:
+        assert db.get(SupplierInvoice, iid).status == InvoiceStatus.APPROVED
+    assert len(audits(engine, env.tenant_id, svc.AUDIT_APPROVED_POSTED)) == 1
+
+
+def test_policy_off_without_any_policy_row_is_the_same_default(engine):
+    env = world(engine)
+    with Session(engine) as db:
+        db.execute(sa.text("DELETE FROM erp_governance_policies WHERE tenant_id = :t"), {"t": env.tenant_id})
+        db.commit()
+    iid = invoice(engine, env)
+    assert approve(engine, env, iid, party_index=0).replayed is False
+
+
+def test_policy_on_the_submitter_refusal_still_fires(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    iid = invoice(engine, env)
+    refusal(engine, env, iid, "sod_submitter_is_approver", party_index=0)

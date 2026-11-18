@@ -65,6 +65,7 @@ from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import file as bank_file
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import KIND_SUPPLIER_PAYMENT, DisbursementFileReceipt
+from erp_v2.governance import policy as governance
 from erp_v2.journals import policy as journal_policy
 from erp_v2.payees import service as payee_service
 from erp_v2.payees.models import InstructionOrigin, InstructionStatus, PayeeBankInstruction, PayeeKind
@@ -324,7 +325,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
     if payment.status != SupplierPaymentStatus.DRAFT:
         raise PaymentRefused("not_draft", "Only a draft supplier payment can be approved")
     _refuse_wht(payment)
-    if _same(payment.prepared_by, actor):
+    if governance.dual_control(db, tenant.id) and _same(payment.prepared_by, actor):
         raise PaymentRefused("sod_approver_is_preparer", "You prepared this payment; another person must approve it")
     _refuse_approver_instruction_party(db, tenant.id, payment, actor)
     payables.approve_supplier_payment(
@@ -367,6 +368,8 @@ def _refuse_approver_instruction_party(
 
     Instructions migrated from legacy (origin legacy_import, decided by the migration actor) are exempt.
     """
+    if not governance.dual_control(db, tenant_id):
+        return
     instruction = _current_instruction(db, tenant_id, payment.supplier_ref)
     if instruction is None or instruction.origin == InstructionOrigin.LEGACY_IMPORT.value or not approver:
         return
@@ -509,9 +512,10 @@ def _record(
         raise PaymentRefused(
             "value_date_future", "The payment's value date is in the future; record it on or after that date"
         )
-    if _same(payment.prepared_by, actor):
+    strict = governance.dual_control(db, tenant.id)
+    if strict and _same(payment.prepared_by, actor):
         raise PaymentRefused("sod_recorder_is_preparer", "You prepared this payment; someone else must record it")
-    if _same(payment.approved_by, actor):
+    if strict and _same(payment.approved_by, actor):
         raise PaymentRefused("sod_recorder_is_approver", "You approved this payment; someone else must record it")
     _refuse_approver_instruction_party(db, tenant.id, payment, payment.approved_by)
     _check_file_destination(db, tenant.id, payment)
@@ -605,11 +609,12 @@ def _reverse(
     _refuse_wht(payment)
     if not reason or not reason.strip():
         raise PaymentRefused("reason_required", "Give a reason for the reversal")
-    if _same(payment.recorded_by, actor):
+    strict = governance.dual_control(db, tenant.id)
+    if strict and _same(payment.recorded_by, actor):
         raise PaymentRefused("sod_reverser_is_recorder", "You recorded this payment; someone else must reverse it")
-    if _same(payment.approved_by, actor):
+    if strict and _same(payment.approved_by, actor):
         raise PaymentRefused("sod_reverser_is_approver", "You approved this payment; someone else must reverse it")
-    if _same(payment.prepared_by, actor):
+    if strict and _same(payment.prepared_by, actor):
         raise PaymentRefused("sod_reverser_is_preparer", "You prepared this payment; someone else must reverse it")
     payables.reverse_supplier_payment(
         db,
@@ -676,6 +681,7 @@ def _generate_file(
     if bank is None or bank.status != "active":
         raise PaymentRefused("bank_account_inactive", "The paying bank account is not active")
     actor = str(party.id)
+    strict = governance.dual_control(db, tenant.id)
     rows: list[bank_file.DisbursementRow] = []
     instruction_ids: list[UUID] = []
     ordered = sorted(payments, key=lambda p: p.number)
@@ -697,16 +703,21 @@ def _generate_file(
             raise PaymentRefused(
                 "no_approved_payee_instruction", f"Payment {payment.number}: the payee has no approved bank instruction"
             ) from exc
-        if _same(payment.prepared_by, actor) or _same(payment.approved_by, actor):
+        if strict and (_same(payment.prepared_by, actor) or _same(payment.approved_by, actor)):
             raise PaymentRefused(
                 "sod_file_issuer_is_payment_party",
                 f"You prepared or approved payment {payment.number}; someone else must generate its bank file",
             )
         instruction = db.get(PayeeBankInstruction, destination.instruction_id)
-        if instruction is not None and actor in {
-            str(instruction.proposed_by_party_id),
-            str(instruction.decided_by_party_id),
-        }:
+        if (
+            strict
+            and instruction is not None
+            and actor
+            in {
+                str(instruction.proposed_by_party_id),
+                str(instruction.decided_by_party_id),
+            }
+        ):
             raise PaymentRefused(
                 "sod_file_issuer_is_instruction_party",
                 f"You proposed or approved the bank instruction for payment {payment.number}; "

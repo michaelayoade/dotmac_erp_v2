@@ -25,6 +25,7 @@ from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
 from dotmac_payables.contracts import SupplierPaymentStatus
 from dotmac_payables.models import SupplierPayment
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 from test_bank_recon_pg import (  # noqa: F401  (hosted-Postgres fixtures and seed helpers)
@@ -722,3 +723,65 @@ def test_runtime_role_flow_and_immutability(engine, runtime_engine):  # noqa: F8
     other = shared_env(engine)  # tenant isolation: another tenant sees none of these requests
     with _scoped(runtime_engine, other.tenant_id) as db:
         assert db.scalar(sa.text("SELECT count(*) FROM erp_cash_account_repoints")) == 0
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+
+
+def test_policy_off_the_proposer_can_approve_the_repoint(engine):
+    env = shared_env(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    req = propose(engine, env, env.twin.id, env.new_b)
+    assert req.dual_control is False  # stamped from the tenant policy
+    done = approve(engine, env, req.id, who="opener")  # the proposer approves their own request
+    assert done.status == "approved" and done.decided_by_party_id == done.proposed_by_party_id
+    assert bank_ref(engine, env, env.twin.id) == str(env.new_b)
+
+
+def test_policy_on_stamps_true_and_the_proposer_is_refused(engine):
+    env = shared_env(engine)  # seed has the policy ON
+    req = propose(engine, env, env.twin.id, env.new_b)
+    assert req.dual_control is True
+    with Session(engine) as db:
+        with pytest.raises(svc.RepointRefused) as exc:
+            svc.approve(db, tenant_id=env.tenant_id, request_id=req.id, approver_party_id=env.parties["opener"])
+        assert exc.value.code == "same_person"
+        db.rollback()
+
+
+def _repoint_row(env, *, dual_control, applied_ref):
+    return CashAccountRepoint(
+        tenant_id=env.tenant_id,
+        bank_account_id=env.twin.id,
+        from_ref="1000",
+        to_account_id=env.new_b,
+        to_account_code="1000-B",
+        status="approved",
+        evidence_ref="minute",
+        dual_control=dual_control,
+        proposed_by_party_id=env.parties["opener"],
+        proposed_at=NOW,
+        decided_by_party_id=env.parties["opener"],  # the same person
+        decided_at=NOW,
+        applied_ref=applied_ref,
+    )
+
+
+def test_check_two_person_is_rewritten_and_its_integrity_term_stays_unconditional(engine):
+    env = shared_env(engine)
+    with Session(engine) as db:  # on: refused by the rewritten CHECK
+        db.add(_repoint_row(env, dual_control=True, applied_ref="x"))
+        with pytest.raises(IntegrityError) as err:
+            db.flush()
+        assert "erp_cash_account_repoints_two_person" in str(err.value)
+        db.rollback()
+    with Session(engine) as db:  # off: same person accepted
+        db.add(_repoint_row(env, dual_control=False, applied_ref="x"))
+        db.flush()
+        db.rollback()
+    with Session(engine) as db:  # off: an approved row still records what it applied
+        db.add(_repoint_row(env, dual_control=False, applied_ref=None))
+        with pytest.raises(IntegrityError) as err:
+            db.flush()
+        assert "erp_cash_account_repoints_two_person_integrity" in str(err.value)
+        db.rollback()

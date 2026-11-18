@@ -64,6 +64,7 @@ from erp_v2.academy_sync import models as academy_sync_models  # noqa: F401
 from erp_v2.banking import models as banking_models_e2  # noqa: F401
 from erp_v2.cash_gl import models as cash_gl_models  # noqa: F401
 from erp_v2.disbursement import models as disbursement_models  # noqa: F401
+from erp_v2.governance import models as governance_models  # noqa: F401
 from erp_v2.hr import appraisals as hr_appraisal_models  # noqa: F401
 from erp_v2.hr import attendance as hr_attendance_models  # noqa: F401
 from erp_v2.hr import discipline as hr_discipline_models  # noqa: F401

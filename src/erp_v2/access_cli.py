@@ -13,8 +13,11 @@ carries counts/codes, never identities.
         --receipt R.json --approved-allowlist-sha256 <sha256 of A.json> --operator-ref <who>
 
 No access is widened: a party must already hold ``staff`` or ``admin`` (portal
-entry) and must not end up with a conflicting role pair (``SOD_CONFLICT_PAIRS``)
-unless the sha-bound allowlist lists that pair under ``sod_exceptions``. Every
+entry). With the tenant's dual-control policy ON (``erp_v2.governance``) the party must also not
+end up with a conflicting role pair (``SOD_CONFLICT_PAIRS``) unless the sha-bound allowlist lists
+that pair under ``sod_exceptions``. With the policy OFF (the default; Michael 2026-11-17/18) a
+conflicting pair is a counted ``warnings.sod_conflict`` in the receipt, not a blocker, including the
+otherwise non-waivable ``finance_approver`` + ``treasury`` pair. Every
 inserted grant writes a DB audit event (``erp.access.role_granted``) in the same
 transaction.
 
@@ -133,6 +136,8 @@ class AccessPlan:
     grant_replays: int
     role_inserts: int
     blockers: tuple[tuple[str, int], ...]
+    # Role-pair conflicts the tenant's dual-control policy (default off) does not block on: counted, not refused.
+    warnings: tuple[tuple[str, int], ...] = ()
 
     @property
     def ready(self) -> bool:
@@ -145,6 +150,7 @@ class AccessPlan:
             "grant_replays": self.grant_replays,
             "role_inserts": self.role_inserts,
             "blockers": dict(self.blockers),
+            "warnings": dict(self.warnings),
             "ready": self.ready,
         }
 
@@ -174,11 +180,15 @@ def _observe(
     from dotmac_kernel.models import Tenant
     from sqlalchemy import select
 
+    from erp_v2.governance.policy import dual_control
+
     blockers: Counter[str] = Counter()
+    warnings: Counter[str] = Counter()
     tenant = db.scalar(select(Tenant).where(Tenant.id == allow.tenant_id).with_for_update())
     if tenant is None or not tenant.is_active:
         blockers["tenant_missing_or_inactive"] += 1
         return AccessPlan(len(allow.grants), 0, 0, 0, tuple(blockers.items()))
+    strict = dual_control(db, allow.tenant_id)
     party_ids = tuple(sorted({party for party, _ in allow.grants}, key=str))
     parties = {p.id: p for p in identity_storage.lock_parties(db, tenant_id=allow.tenant_id, party_ids=party_ids)}
     for party_id in party_ids:
@@ -210,7 +220,9 @@ def _observe(
         for pair in SOD_CONFLICT_PAIRS:
             waived = pair not in NON_WAIVABLE_SOD_PAIRS and (party_id, pair) in allow.sod_exceptions
             if pair <= final and not waived:
-                blockers["sod_conflict"] += 1
+                # Policy on: the pair blocks (the non-waivable pair stays non-waivable). Policy off (the
+                # default): a counted warning, never a blocker (Michael 2026-11-17/18).
+                (blockers if strict else warnings)["sod_conflict"] += 1
     replays = sum(1 for party, role in allow.grants if role in roles and (party, roles[role].id) in existing)
     inserts = len(allow.grants) - replays
     if write and not blockers:
@@ -249,7 +261,14 @@ def _observe(
                     allowlist_sha256=allowlist_sha256,
                     operator_ref=operator_ref,
                 )
-    return AccessPlan(len(allow.grants), inserts, replays, len(missing), tuple(sorted(blockers.items())))
+    return AccessPlan(
+        len(allow.grants),
+        inserts,
+        replays,
+        len(missing),
+        tuple(sorted(blockers.items())),
+        tuple(sorted(warnings.items())),
+    )
 
 
 def plan_grants(db, allow: Allowlist) -> AccessPlan:

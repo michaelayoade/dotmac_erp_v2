@@ -25,6 +25,7 @@ from dotmac_payables.models import (
     SupplierInvoice,
     SupplierInvoiceLine,
 )
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from test_b1_supplier_invoice_post_pg import NOW, invoice, submit, world
 from test_posting_bridge_pg import soft_close
@@ -585,6 +586,23 @@ def test_approver_cannot_be_the_submitter_or_the_legacy_approver(engine, setup):
     by_legacy = legacy.run(engine, ids, apply=False, actor=env.party_ids[2])
     assert by_legacy["refusals_by_reason"] == {"approver_is_legacy_approver": 2}
     assert legacy.run(engine, ids, apply=False)["counts"]["eligible"] == 2
+
+
+def test_policy_off_the_approver_may_be_the_submitter_or_legacy_approver_or_unrecorded(engine, setup):
+    env, legacy = setup
+    set_dual_control_engine(engine, env.tenant_id, False)
+    ids = (
+        imported(engine, env, number="AP-1"),
+        imported(engine, env, number="AP-2"),
+        imported(engine, env, number="AP-3", approved_by=None),
+        imported(engine, env, number="AP-4", approved_by="legacy-user-7"),
+    )
+    legacy.build(ids)
+    grant(engine, env, env.party_ids[0])  # the submitter holds the grant
+    grant(engine, env, env.party_ids[2])  # and so does the legacy approver
+    assert legacy.run(engine, ids[:2], apply=False, actor=env.party_ids[0])["counts"]["eligible"] == 2
+    assert legacy.run(engine, ids[:2], apply=False, actor=env.party_ids[2])["counts"]["eligible"] == 2
+    assert legacy.run(engine, ids[2:], apply=False, actor=env.party_ids[0])["counts"]["eligible"] == 2
 
 
 def test_credential_id_of_the_approver_counts_as_the_approver(engine, setup):

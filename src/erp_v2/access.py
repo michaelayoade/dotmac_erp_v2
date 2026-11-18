@@ -150,7 +150,8 @@ ROLE_GRANT_PROFILES: Final = (
 )
 
 # Role pairs one person must not hold together (approve-and-pay, pay-and-reconcile,
-# prepare-and-approve, approve-and-finalize). Overridable only by an explicit
+# prepare-and-approve, approve-and-finalize) WHEN the tenant's dual-control policy is ON (default OFF: the
+# pair is then only a warning in the access_cli receipt). Overridable only by an explicit
 # ``sod_exceptions`` entry inside the sha-bound allowlist (access_cli).
 SOD_CONFLICT_PAIRS: Final = frozenset(
     frozenset(pair)

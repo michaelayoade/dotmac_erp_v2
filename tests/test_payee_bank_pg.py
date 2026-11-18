@@ -20,6 +20,7 @@ from dotmac_kernel.audit_actions import AuditActionRegistry
 from dotmac_kernel.models import Party, PartyPerson, PartyType, Tenant
 from dotmac_payables.models import SupplierInvoice
 from dotmac_people.models import Employee
+from dual_control_support import set_dual_control, set_dual_control_engine
 from sqlalchemy.orm import Session
 
 from erp_v2.importer.minting import MintContext, run_mint_step
@@ -97,6 +98,7 @@ def new_tenant(engine, suppliers=("sup-1", "sup-2", "sup-3")):
     with Session(engine) as db:
         db.add(Tenant(id=tenant_id, slug=f"t{tenant_id.hex[:24]}", name="Payee"))
         db.flush()
+        set_dual_control(db, tenant_id, True)  # existing separation-of-duties assertions run with the policy ON
         for n, ref in enumerate(suppliers):
             add_supplier(db, tenant_id, ref, n)
         db.commit()
@@ -497,3 +499,74 @@ def test_runtime_role_lifecycle_rls_and_privileges_without_bypass(engine, runtim
         assert db.get(PayeeBankInstruction, second_id).status == "proposed"
     with Session(runtime_engine) as db:  # no tenant scope at all: RLS yields no rows
         assert db.scalar(sa.select(sa.func.count()).select_from(PayeeBankInstruction)) == 0
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+
+
+def test_policy_off_the_proposer_can_approve_and_the_row_is_stamped_off(engine):
+    tenant = new_tenant(engine)
+    set_dual_control_engine(engine, tenant, False)
+    with Session(engine) as db:
+        row = propose(db, tenant)
+        approved = service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=PREPARER)
+        db.commit()
+        assert approved.status == "approved" and approved.dual_control is False
+        assert approved.proposed_by_party_id == approved.decided_by_party_id == PREPARER
+
+
+def test_policy_on_stamps_true_and_the_proposer_is_refused(engine):
+    tenant = new_tenant(engine)
+    with Session(engine) as db:
+        row = propose(db, tenant)
+        assert row.dual_control is True
+        with pytest.raises(PayeeBankError) as err:
+            service.approve(db, tenant_id=tenant, instruction_id=row.id, approver_party_id=PREPARER)
+        assert err.value.code == "same_person"
+
+
+def _approved_clone(tenant, *, dual_control, decider, approved_at=True):
+    return PayeeBankInstruction(
+        tenant_id=tenant,
+        payee_kind="supplier",
+        payee_ref="sup-3",
+        payee_label="x",
+        bank_code="058",
+        account_number=NUMBER,
+        account_last4=NUMBER[-4:],
+        status="approved",
+        origin="manual",
+        dual_control=dual_control,
+        proposed_by_party_id=PREPARER,
+        proposed_at=datetime.now(UTC),
+        decided_by_party_id=decider,
+        approved_at=datetime.now(UTC) if approved_at else None,
+    )
+
+
+def test_check_two_person_is_rewritten_and_its_integrity_terms_stay_unconditional(engine):
+    tenant = new_tenant(engine)
+    with Session(engine) as db:  # on: self-approval refused by the rewritten CHECK
+        db.add(_approved_clone(tenant, dual_control=True, decider=PREPARER))
+        with pytest.raises(sa.exc.IntegrityError) as err:
+            db.flush()
+        assert "ck_payee_bank_instructions_two_person" in str(err.value)
+        db.rollback()
+    with Session(engine) as db:  # off: the same person is accepted
+        db.add(_approved_clone(tenant, dual_control=False, decider=PREPARER))
+        db.flush()
+        db.rollback()
+    with Session(engine) as db:  # off: an approved row still needs its approval time (integrity companion)
+        db.add(_approved_clone(tenant, dual_control=False, decider=APPROVER, approved_at=False))
+        with pytest.raises(sa.exc.IntegrityError) as err:
+            db.flush()
+        assert "ck_payee_bank_instructions_two_person_integrity" in str(err.value)
+        db.rollback()
+
+
+def test_runtime_has_no_update_on_the_dual_control_column(engine, runtime_engine):
+    with runtime_engine.connect() as c:
+        allowed = c.execute(
+            sa.text("SELECT has_column_privilege('app_user', 'payee_bank_instructions', 'dual_control', 'UPDATE')")
+        ).scalar()
+    assert allowed is False

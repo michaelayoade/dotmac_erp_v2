@@ -46,6 +46,7 @@ from dotmac_kernel.models import Party, PartyType, Tenant
 from dotmac_kernel.setting_domains import SettingDomainRegistry, install_setting_domains
 from dotmac_kernel.setting_scopes import ScopeKindRegistry, install_scope_kinds
 from dotmac_kernel.setting_value_types import SettingValueTypeRegistry, install_setting_value_types
+from dual_control_support import set_dual_control, set_dual_control_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (hosted-Postgres fixture)
@@ -79,6 +80,7 @@ def seed(engine, *, currency: str | None = "USD", adjustment: bool = False) -> S
     with Session(engine) as db:
         db.add(Tenant(id=tenant_id, slug=f"t{tenant_id.hex[:24]}", name="Journals"))
         db.flush()
+        set_dual_control(db, tenant_id, True)  # existing separation-of-duties assertions run with the policy ON
         categories = {
             code: AccountCategory(tenant_id=tenant_id, code=code, name=code, account_class=klass)
             for code, klass in (
@@ -1011,3 +1013,121 @@ def test_held_drafts_are_counted_per_period_for_the_soft_close_screen(engine):
     legacy_draft(engine, env, document="c", owner="finance")
     with Session(engine) as db:
         assert queries.held_counts_by_period(db, tenant_id=env.tenant_id) == {env.periods[1]: 2}
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+
+
+def _stamp(engine, manual_id) -> bool:
+    with Session(engine) as db:
+        return db.scalar(sa.select(ManualJournal.dual_control).where(ManualJournal.id == manual_id))
+
+
+def test_policy_off_one_person_prepares_requests_approves_and_reverses(engine):
+    env = seed(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    outcome = prepare(engine, env, who="preparer")
+    assert _stamp(engine, outcome.manual_id) is False  # the row takes the tenant policy at creation
+    request(engine, env, outcome, who="preparer")
+    assert approve(engine, env, outcome, who="preparer").state == m.STATE_POSTED  # the same person approves
+    run(
+        engine,
+        env,
+        service.request_reversal,
+        manual_id=outcome.manual_id,
+        actor=env.parties["preparer"],
+        reason="booked twice",
+        posting_date=DAY,
+    )
+    done = run(engine, env, service.approve_reversal, manual_id=outcome.manual_id, approver=env.parties["preparer"])
+    assert done.state == m.STATE_REVERSED
+
+
+def test_policy_on_stamps_the_row_and_the_refusals_still_fire(engine):
+    env = seed(engine)  # the seed turns the policy ON
+    outcome = prepare(engine, env)
+    assert _stamp(engine, outcome.manual_id) is True
+    request(engine, env, outcome, who="requester")
+    for who, code in (("preparer", "sod_preparer_cannot_approve"), ("requester", "sod_requester_cannot_approve")):
+        with pytest.raises(JournalRefused) as exc:
+            approve(engine, env, outcome, who=who)
+        assert exc.value.code == code
+
+
+def test_a_row_keeps_the_stamp_it_was_created_with_when_the_policy_changes_later(engine):
+    env = seed(engine)
+    outcome = prepare(engine, env)  # created with the policy ON
+    set_dual_control_engine(engine, env.tenant_id, False)
+    request(engine, env, outcome, who="requester")
+    with pytest.raises(JournalRefused) as exc:
+        approve(engine, env, outcome, who="requester")
+    assert exc.value.code == "sod_requester_cannot_approve"  # strict rows stay strict
+
+
+def test_runtime_cannot_flip_the_stamp_of_a_manual_journal(engine):
+    env = seed(engine)
+    outcome = prepare(engine, env)
+    with pytest.raises(IntegrityError):
+        _raw_update(engine, outcome.manual_id, dual_control=False)
+
+
+def test_check_post_sod_is_rewritten_not_dual_control_or_predicate(engine):
+    env = seed(engine)
+    for on, expect_error in ((True, True), (False, False)):
+        outcome = prepare(engine, env)
+        request(engine, env, outcome)
+        with Session(engine) as db:
+            # dual_control is frozen by trigger for updates, so exercise the CHECK through a fresh INSERT
+            row = db.get(ManualJournal, outcome.manual_id)
+            clone = ManualJournal(
+                tenant_id=env.tenant_id,
+                journal_id=uuid4(),
+                dual_control=on,
+                origin=m.ORIGIN_MANUAL,
+                state=m.STATE_POSTED,
+                evidence_ref="E",
+                prepared_by_party_id=env.parties["preparer"],
+                prepared_at=NOW,
+                requested_by_party_id=env.parties["requester"],
+                requested_at=NOW,
+                approved_by_party_id=row.prepared_by_party_id,  # self-approval
+                approved_at=NOW,
+            )
+            db.add(clone)
+            if expect_error:
+                with pytest.raises(IntegrityError) as exc:
+                    db.flush()
+                assert "ck_erp_manual_journals_post_sod" in str(exc.value)
+            else:
+                db.flush()  # policy off: the database accepts the same person
+            db.rollback()
+
+
+def test_check_reversal_sod_is_rewritten_not_dual_control_or_predicate(engine):
+    env = seed(engine)
+    for on, expect_error in ((True, True), (False, False)):
+        with Session(engine) as db:
+            clone = ManualJournal(
+                tenant_id=env.tenant_id,
+                journal_id=uuid4(),
+                dual_control=on,
+                origin=m.ORIGIN_MANUAL,
+                state=m.STATE_POSTED,
+                evidence_ref="E",
+                prepared_by_party_id=env.parties["preparer"],
+                prepared_at=NOW,
+                requested_by_party_id=env.parties["requester"],
+                requested_at=NOW,
+                approved_by_party_id=env.parties["approver"],
+                approved_at=NOW,
+                reversal_requested_by_party_id=env.parties["requester"],
+                reversal_approved_by_party_id=env.parties["requester"],  # reverser == reversal requester
+            )
+            db.add(clone)
+            if expect_error:
+                with pytest.raises(IntegrityError) as exc:
+                    db.flush()
+                assert "ck_erp_manual_journals_reversal_sod" in str(exc.value)
+            else:
+                db.flush()
+            db.rollback()

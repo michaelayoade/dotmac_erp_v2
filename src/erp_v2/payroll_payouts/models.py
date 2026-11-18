@@ -29,6 +29,7 @@ from sqlalchemy import (
     Uuid,
     func,
     text,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -103,12 +104,12 @@ class PayrollPayoutBatch(Base):
         CheckConstraint("kind = 'net_pay' OR file_issued_by_party_id IS NULL", name=f"ck_{_B}_statutory_no_file"),
         # Distinct people, enforced by the database as well as the service.
         CheckConstraint(
-            "(approved_by_party_id IS NULL OR approved_by_party_id <> prepared_by_party_id) "
+            "NOT dual_control OR ((approved_by_party_id IS NULL OR approved_by_party_id <> prepared_by_party_id) "
             "AND (file_issued_by_party_id IS NULL OR (file_issued_by_party_id <> prepared_by_party_id "
             "AND file_issued_by_party_id <> approved_by_party_id)) "
             "AND (recorded_by_party_id IS NULL OR (recorded_by_party_id <> prepared_by_party_id "
             "AND recorded_by_party_id <> approved_by_party_id "
-            "AND recorded_by_party_id <> file_issued_by_party_id))",
+            "AND recorded_by_party_id <> file_issued_by_party_id)))",
             name=f"ck_{_B}_distinct_people",
         ),
         CheckConstraint(
@@ -120,6 +121,8 @@ class PayrollPayoutBatch(Base):
 
     id: Mapped[UUID] = uuid_pk()
     tenant_id: Mapped[UUID] = _tenant_fk()
+    # Stamped from the tenant policy at creation; DB default true keeps pre-e2_0022 rows strict (e2_0022).
+    dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     request_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     number: Mapped[str] = mapped_column(String(40), nullable=False)
     run_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
@@ -190,6 +193,8 @@ class PayrollPayoutLine(Base):
 
     id: Mapped[UUID] = uuid_pk()
     tenant_id: Mapped[UUID] = _tenant_fk()
+    # Stamped from the tenant policy at creation; DB default true keeps pre-e2_0022 rows strict (e2_0022).
+    dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     batch_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     liability_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     beneficiary_ref: Mapped[str] = mapped_column(String(240), nullable=False)

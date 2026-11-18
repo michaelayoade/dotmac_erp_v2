@@ -22,6 +22,7 @@ from dotmac_kernel.models import Party, Tenant
 from dotmac_kernel.money import Currency, Money
 from dotmac_payroll import service as payroll
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement, PayrollSettlementReversal
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from test_b5_payroll_payout_pg import (  # noqa: F401  (hosted-Postgres fixtures and seed helpers)
     NOW,
@@ -548,3 +549,49 @@ def test_the_batch_detail_shows_the_repayment_of_a_return(engine):
     with Session(engine) as db:
         data = queries.detail(db, tenant_id=env.tenant_id, batch_id=second)
     assert list(data["repayments"].values()) == ["RET-1"]
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("who", ["preparer", "approver", "recorder"])
+def test_policy_off_a_batch_person_may_record_the_return(engine, who):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    _run, batch_id = recorded(engine, env)
+    line = line_of(engine, env, batch_id)
+    assert line.dual_control is False
+    try:
+        out = give_back(engine, env, batch_id, line, who=who)
+    except svc.PayoutRefused as exc:  # payroll a5's own reversal rules may still apply to the recorder
+        assert not exc.code.startswith("sod_"), exc.code
+    else:
+        assert out.replayed is False
+
+
+def test_policy_off_the_returner_guard_trigger_is_gated_on_the_line_stamp(engine):
+    env = world(engine)
+    _run, batch_id = recorded(engine, env)
+    one, two = line_of(engine, env, batch_id, "E1"), line_of(engine, env, batch_id, "E2")
+    values = {
+        "active": False,
+        "returned_at": RET_NOW,
+        "returned_by_party_id": env.people["preparer"],
+        "return_reference": "RET-DB",
+        "return_reason": "x",
+        "return_value_date": RET_DATE,
+        "return_bank_account_id": env.bank_id,
+        "reversal_id": uuid4(),
+        "reversal_journal_id": uuid4(),
+        "reversal_fingerprint": "f" * 64,
+    }
+    with Session(engine) as db:
+        with pytest.raises(sa.exc.DBAPIError) as err:  # stamp true (the default of existing rows): refused
+            db.execute(sa.update(PayrollPayoutLine).where(PayrollPayoutLine.id == one.id).values(**values))
+            db.flush()
+        assert "different person" in str(err.value)
+        db.rollback()
+        db.execute(sa.update(PayrollPayoutLine).where(PayrollPayoutLine.id == two.id).values(dual_control=False))
+        db.execute(sa.update(PayrollPayoutLine).where(PayrollPayoutLine.id == two.id).values(**values))
+        db.flush()  # stamp false: the same person is accepted by the trigger
+        db.rollback()

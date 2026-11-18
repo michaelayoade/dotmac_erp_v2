@@ -18,7 +18,7 @@ from typing import Final
 from uuid import UUID
 
 from dotmac_kernel.models import Base, TimestampMixin, uuid_pk
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, UniqueConstraint, Uuid, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, String, UniqueConstraint, Uuid, text, true
 from sqlalchemy.orm import Mapped, mapped_column
 
 from erp_v2.hr.models import _tenant_fk
@@ -78,10 +78,15 @@ class PayeeBankInstruction(Base, TimestampMixin):
         # Two-person rule enforced by the database as well as the service: any row that was
         # ever approved carries a decider who is not the proposer.
         CheckConstraint(
-            "status IN ('proposed', 'rejected') OR (approved_at IS NOT NULL "
+            "NOT dual_control OR (status IN ('proposed', 'rejected') OR (approved_at IS NOT NULL "
             "AND decided_by_party_id IS NOT NULL "
-            "AND (proposed_by_party_id IS NULL OR decided_by_party_id <> proposed_by_party_id))",
+            "AND (proposed_by_party_id IS NULL OR decided_by_party_id <> proposed_by_party_id)))",
             name="ck_payee_bank_instructions_two_person",
+        ),
+        # The separation-free part: an approved row always carries its decider and time (e2_0022).
+        CheckConstraint(
+            "status IN ('proposed', 'rejected') OR (approved_at IS NOT NULL AND decided_by_party_id IS NOT NULL)",
+            name="ck_payee_bank_instructions_two_person_integrity",
         ),
         Index(
             "uq_payee_bank_instructions_one_approved",
@@ -106,6 +111,8 @@ class PayeeBankInstruction(Base, TimestampMixin):
 
     id: Mapped[UUID] = uuid_pk()
     tenant_id: Mapped[UUID] = _tenant_fk()
+    # Stamped from the tenant policy at creation; DB default true keeps pre-e2_0022 rows strict (e2_0022).
+    dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     payee_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     # Employee: canonical dashed lowercase mod_people.employees id. Supplier: the
     # supplier reference spelling used by mod_payables.supplier_invoices.supplier_ref.
