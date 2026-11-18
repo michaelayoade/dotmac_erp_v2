@@ -897,6 +897,75 @@ def test_debit_on_another_codes_tax_account_keeps_the_invoice_out_of_a1(db):
         evidence(db)
 
 
+def _add_deferral_journal(db, debit, *, n=60, status="POSTED"):
+    """A legacy VAT-deferral journal of the invoice: Dr TAX ``debit`` / Cr EXP ``debit`` (copies of source rows)."""
+
+    source, tables = db[0], db[4]
+    source.exec_driver_sql("PRAGMA query_only=0")
+    header = tables[True, "journal_entry"]
+    row = dict(source.execute(sa.select(header)).mappings().first())
+    row.update(
+        journal_entry_id=str(UUID(int=n)),
+        source_module="AP",
+        source_document_type="SUPPLIER_INVOICE_VAT_DEFERRAL",
+        source_document_id=INVOICE,
+        status=status,
+    )
+    source.execute(header.insert(), [row])
+    ledger = tables[True, "posted_ledger_line"]
+    base = dict(source.execute(sa.select(ledger).where(ledger.c.account_id == EXP)).mappings().first())
+    for offset, account, side in ((1, TAX, "debit_amount"), (2, EXP, "credit_amount")):
+        copy = dict(base, journal_entry_id=str(UUID(int=n)), account_id=account)
+        copy.update(ledger_line_id=str(UUID(int=n * 10 + offset)), debit_amount="0", credit_amount="0")
+        copy.update(original_debit_amount="0", original_credit_amount="0")
+        copy[side] = str(debit)
+        copy["original_" + side] = str(debit)
+        source.execute(ledger.insert(), [copy])
+    source.commit()
+
+
+def test_deferral_journal_equal_to_the_vat_admits_as_a1d(db):
+    taxed(db, "A2", ref=TAX)  # legacy folded the VAT; the destination carries the split account
+    _add_deferral_journal(db, 15)
+    from erp_v2.importer import payables_history as module
+
+    item = evidence(db)
+    assert item.tax_amount == Decimal("15")
+    command = db[3].command(item)
+    assert db[3].verify(scope=SimpleNamespace(tenant_id=UUID(T)), command=command, destination=db[2]) == item
+    lines = [
+        dict(
+            line_id=str(UUID(int=11)),
+            line_amount=Decimal(100),
+            tax_amount=Decimal(15),
+            tax_code_id=CODE,
+            expense_account_id=EXP,
+        )
+    ]
+    outcome, _ = module.invoice_tax(db[0], T, J, lines, INVOICE, AP)
+    assert outcome.klass == "A1D" and outcome.lines[str(UUID(int=11))].ref == TAX and outcome.deferral_journals == 1
+
+
+@pytest.mark.parametrize(
+    "scenario,flag", [("unequal", "deferral_amount_mismatch"), ("multiple", "deferral_journal_multiple")]
+)
+def test_unequal_or_multiple_deferral_journals_refuse_with_the_flag(db, scenario, flag):
+    taxed(db, "A2")
+    _add_deferral_journal(db, 14 if scenario == "unequal" else 5)
+    if scenario == "multiple":
+        _add_deferral_journal(db, 5, n=61)
+    with pytest.raises(HistoricalEvidenceError, match="legacy_gl_tax_treatment_unrecognised") as caught:
+        evidence(db)
+    assert caught.value.flag == flag
+
+
+def test_missing_deferral_journal_still_admits_a2_and_a_not_posted_one_is_ignored(db):
+    taxed(db, "A2")
+    _add_deferral_journal(db, 15, status="DRAFT")
+    item = evidence(db)  # ignored: the folded GL is A2
+    assert item.tax_amount == Decimal("15")
+
+
 def test_verifier_classification_reports_a1_expense_elsewhere(db):
     taxed(db, "A1")
     ledger = db[4][True, "posted_ledger_line"]

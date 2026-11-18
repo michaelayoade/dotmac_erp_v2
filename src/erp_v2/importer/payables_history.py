@@ -30,8 +30,9 @@ from erp_v2.importer.snapshot import SnapshotManifest
 class HistoricalEvidenceError(ValueError):
     """A named fail-closed evidence failure; contains no business row contents."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, flag: str | None = None):
         self.reason = reason
+        self.flag = flag  # e.g. the A3 reason (deferral_amount_mismatch); evidence only, never the refusal key
         super().__init__(reason)
 
 
@@ -183,7 +184,12 @@ def _id(value: object) -> str:
 
 
 def invoice_tax(
-    src: sa.Connection, organization: object, journal_id: object, lines: list[dict]
+    src: sa.Connection,
+    organization: object,
+    journal_id: object,
+    lines: list[dict],
+    invoice_id: object = None,
+    control_account: object = None,
 ) -> tuple[tax_accounts.InvoiceTax, list[dict]]:
     """Tax-account classification of one invoice from the snapshot (the importer's rule, shared).
 
@@ -234,18 +240,61 @@ def invoice_tax(
             if paid_id is not None:
                 every_tax_account += [paid_id, pairs.get(_id(paid_id))]
     debits = None
+    net: dict[str, Decimal] | None = None
     if journal_id is not None:
         ledger = _read(src, "posted_ledger_line", key="journal_entry_id", value=journal_id)
         if ledger:
-            debits = {}
+            debits, net = {}, {}
             for row in ledger:
                 key = _id(row["account_id"])
                 debits[key] = debits.get(key, Decimal(0)) + row["debit_amount"]
+                net[key] = net.get(key, Decimal(0)) + row["debit_amount"] - (row["credit_amount"] or Decimal(0))
+    # Legacy VAT-deferral journals of the invoice (conversion spec section 9): linked by document type, the
+    # invoice id, module AP; POSTED ones are read from their posted ledger lines, others are counted and ignored.
+    deferral = None
+    if debits is not None and invoice_id is not None:
+        journals, not_posted = [], 0
+        for header in _read(src, "journal_entry", key="source_document_id", value=invoice_id):
+            if (
+                str(header["source_document_type"]) != tax_accounts.DEFERRAL_DOCUMENT_TYPE
+                or str(header["source_module"]) != "AP"
+            ):
+                continue
+            if str(header["status"]).strip().upper() != "POSTED":
+                not_posted += 1
+                continue
+            jnet: dict[str, Decimal] = {}
+            for row in _read(src, "posted_ledger_line", key="journal_entry_id", value=header["journal_entry_id"]):
+                key = _id(row["account_id"])
+                jnet[key] = jnet.get(key, Decimal(0)) + row["debit_amount"] - (row["credit_amount"] or Decimal(0))
+            journals.append(jnet)
+        deferral = tax_accounts.DeferralFacts(tuple(journals), not_posted)
     try:
-        outcome = tax_accounts.classify_invoice(organization, facts, debits, every_tax_account)
+        outcome = tax_accounts.classify_invoice(
+            organization,
+            facts,
+            debits,
+            every_tax_account,
+            invoice_net=net,
+            deferral=deferral,
+            control_account=control_account,
+        )
     except tax_accounts.TaxAccountMappingError as exc:
         raise HistoricalEvidenceError(str(exc)) from exc
     return outcome, sorted(evidence, key=lambda item: item["line_id"])
+
+
+def _deferral_evidence(outcome: tax_accounts.InvoiceTax) -> dict:
+    """Fingerprint keys for the deferral-journal rule; absent (so existing fingerprints are stable) when the invoice
+    has no deferral journal."""
+
+    if not (outcome.deferral_journals or outcome.deferral_not_posted):
+        return {}
+    return dict(
+        deferral_journals=outcome.deferral_journals,
+        deferral_not_posted=outcome.deferral_not_posted,
+        a3_reason=outcome.reason,
+    )
 
 
 def require_line_tax_account(outcome: tax_accounts.InvoiceTax, line_id: object, imported: dict) -> tax_accounts.LineTax:
@@ -584,7 +633,9 @@ class HistoricalPayablesVerifier:
         lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
         targets = _read(dest, "supplier_invoice_lines", schema="mod_payables", key="invoice_id", value=invoice_id)
         _tenant(targets, tenant, "invoice_line")
-        outcome, tax_evidence = invoice_tax(src, tenant, header["journal_entry_id"], lines)
+        outcome, tax_evidence = invoice_tax(
+            src, tenant, header["journal_entry_id"], lines, invoice_id, header["ap_control_account_id"]
+        )
         line_mapping = {
             k: k
             for k in (
@@ -624,7 +675,8 @@ class HistoricalPayablesVerifier:
             )
             _require(sorted([[pair[0], _id(pair[1])] for pair in actual]) == dimensions, "invoice_line_dimensions")
         # Legacy-posted invoices must show a GL treatment the rule recognises (A1 split / A2 folded).
-        _require(outcome.klass != "A3", "legacy_gl_tax_treatment_unrecognised")
+        if outcome.klass == "A3":
+            raise HistoricalEvidenceError("legacy_gl_tax_treatment_unrecognised", flag=outcome.reason)
         # Inclusive line prices are evidence; never recompute quantity * unit_price.
         _require(
             _sum([row["line_amount"] for row in lines]) == header["subtotal"]
@@ -647,6 +699,7 @@ class HistoricalPayablesVerifier:
                 tax_accounts=dict(
                     invoice_class=outcome.klass,
                     a1_expense_elsewhere=outcome.expense_elsewhere,
+                    **_deferral_evidence(outcome),
                     lines=[
                         dict(line_id=line_id, klass=item.klass, ref=item.ref)
                         for line_id, item in sorted(outcome.lines.items())
