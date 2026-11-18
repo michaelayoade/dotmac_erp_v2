@@ -564,7 +564,7 @@ def prepare_ledger_fault_correction(
                 )
             ).all()
             # A REJECTED or REVERSED correction is finished: a new version may be prepared. One that is
-            # still live replays only for the same offset; another offset is a named refusal, never a replay.
+            # still live replays only for the same full fingerprint; any difference is a named refusal, never a replay.
             live = [(row, entry) for row, entry in history if row.state not in (m.STATE_REJECTED, m.STATE_REVERSED)]
             if live:
                 row, entry = live[0]
@@ -575,11 +575,19 @@ def prepare_ledger_fault_correction(
                         JournalLine.account_id != control_id,
                     )
                 )
-                if used != command.offset_account_id:
+                # Replay only for the FULL fingerprint: offset, posting date, evidence reference and amount.
+                same = (
+                    used == command.offset_account_id
+                    and entry.posting_date == command.posting_date
+                    and entry.reference == evidence
+                    and abs(Decimal(_control_net(db, tenant_id, entry.id, control_id)))
+                    == abs(_source_ledger_delta(db, tenant_id, source.id, control_id))
+                )
+                if not same:
                     raise JournalRefused(
                         "ledger_fault_correction_active",
-                        "a correction for this fault is already in progress with a different offset account; "
-                        "reject or reverse it before preparing another",
+                        "a correction for this fault is already in progress with a different offset, date, "
+                        "evidence reference or amount; reject or reverse it before preparing another",
                     )
                 if row.state in (m.STATE_PREPARED, m.STATE_POST_REQUESTED):
                     _verify_ledger_fault(db, tenant_id, entry)

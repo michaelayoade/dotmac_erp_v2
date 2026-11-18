@@ -1493,3 +1493,40 @@ def test_v2_after_a_reversal_a_new_version_can_be_prepared_and_the_fault_is_clea
     request(engine, env, second)
     approve(engine, env, second)
     assert ledger_net(engine, env, "2000") == -FAULT_LINE
+
+
+def test_v2_a_live_correction_replays_only_for_the_full_fingerprint(engine):
+    from datetime import date as _date
+
+    env = seed(engine)
+    source = fault_source(engine, env)
+    first = prepare_fix(engine, env, source)
+    assert prepare_fix(engine, env, source).replayed is True  # identical
+    before = counts(engine, env)
+    refused_fix(lambda: prepare_fix(engine, env, source, evidence="FIN-EXC-OTHER"), "ledger_fault_correction_active")
+    refused_fix(
+        lambda: run(
+            engine,
+            env,
+            service.prepare_ledger_fault_correction,
+            actor=env.parties["preparer"],
+            command=service.LedgerFaultCorrection(
+                source_journal_id=source,
+                control_code="2000",
+                offset_account_id=env.accounts["1000"],
+                posting_date=_date(2026, 1, 12),  # another posting date
+                evidence_ref="FIN-EXC-1",
+                description="Reverse the proven legacy posting fault",
+            ),
+        ),
+        "ledger_fault_correction_active",
+    )
+    assert counts(engine, env) == before
+    # the amount: the fault moves after the correction was prepared
+    ledger_edit(
+        engine,
+        "UPDATE mod_accounting.posted_ledger_lines SET credit = 500 WHERE journal_id = :j AND credit > 0",
+        j=source,
+    )
+    refused_fix(lambda: prepare_fix(engine, env, source), "ledger_fault_correction_active")
+    assert first.manual_id
