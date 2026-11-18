@@ -78,14 +78,17 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
     `source_document_type = 'SUPPLIER_INVOICE_VAT_DEFERRAL'`, `source_document_id` = the invoice,
     `source_module = 'AP'`, status POSTED (amounts from its `gl.posted_ledger_line` rows only). With exactly one
     such journal, and the invoice journal alone not an A1, the combined NET map (debit - credit per account over both
-    journals, AP control account excluded, zeros dropped) must show: every taxed line splits, each split account's
+    journals, AP control account excluded on the invoice-journal side only, zeros dropped) must show: every taxed line splits, each split account's
     net = its mapped tax, no other tax-code account with a net, nets sum to the invoice total, none negative. The
     ref is the split account (as A1); `a1d_expense_elsewhere` counts placement differences. An A1 invoice that also
     has a deferral journal is A3 `deferral_on_split_invoice`; two or more are A3 `deferral_journal_multiple` (never
-    summed); otherwise A3 `deferral_amount_mismatch` (a split-account net differs from its tax) or
-    `deferral_combined_unbalanced`. An invoice with a deferral journal is never A2. A deferral journal that is not
+    summed); otherwise A3 `deferral_amount_mismatch` (a split-account net differs from its tax),
+    `invoice_lines_exceed_header` (the lines sum to more than the header subtotal while the combined ledger equals the
+    header total) or `deferral_combined_unbalanced`. An invoice with a deferral journal is never A2. A deferral journal that is not
     POSTED is ignored and counted as `deferral_journal_not_posted`. The receipt also carries `a3_reasons` and the
-    informational `untaxed_with_deferral`. Unposted invoices ignore deferral journals.
+    informational `untaxed_with_deferral`. An unposted taxed invoice with a POSTED deferral journal keeps its B class
+    but is counted as `deferral_on_unposted_invoice` (that journal is already in the v2 ledger, so B1 would debit the
+    deferral account twice) and the B1b verifier refuses it by that name.
 - Not legacy-posted: legacy's current posting rule (`ap/posting/invoice.py`,
   `posting/tax.py:resolve_tax_posting_account_id`). B1 split (tax != 0, tax code of the invoice's
   organisation, type VAT/GST, `tax.tax_code.tax_paid_account_id` set) maps the paid account's
