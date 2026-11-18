@@ -186,7 +186,7 @@ def snapshot():
     src = sa.create_engine("sqlite://").connect()
     for stmt in (
         "CREATE TABLE supplier_invoice (invoice_id TEXT, organization_id TEXT, journal_entry_id TEXT, "
-        "ap_control_account_id TEXT)",
+        "ap_control_account_id TEXT, subtotal TEXT, total_amount TEXT)",
         "CREATE TABLE supplier_invoice_line (line_id TEXT, invoice_id TEXT, line_amount TEXT, tax_amount TEXT, "
         "expense_account_id TEXT, tax_code_id TEXT)",
         "CREATE TABLE tax_code (tax_code_id TEXT, organization_id TEXT, tax_type TEXT, tax_paid_account_id TEXT)",
@@ -208,10 +208,10 @@ def snapshot():
     insert(
         "supplier_invoice",
         [
-            dict(a=INV[0], b=ORG, c=journals[INV[0]], d=None),
-            dict(a=INV[1], b=ORG, c=journals[INV[1]], d=None),
-            dict(a=INV[2], b=ORG, c=journals[INV[2]], d=None),
-            dict(a=INV[3], b=ORG, c=None, d=None),
+            dict(a=INV[0], b=ORG, c=journals[INV[0]], d=None, e=None, f=None),
+            dict(a=INV[1], b=ORG, c=journals[INV[1]], d=None, e=None, f=None),
+            dict(a=INV[2], b=ORG, c=journals[INV[2]], d=None, e=None, f=None),
+            dict(a=INV[3], b=ORG, c=None, d=None, e=None, f=None),
         ],
     )
     line_rows = [
@@ -276,7 +276,7 @@ def test_one_x_invoice_and_one_untaxed_negative_invoice_do_not_stop_the_others()
     tc = str(UUID(int=77))
     x_inv, credit_note = str(UUID(int=1005)), str(UUID(int=1006))
     for inv in (x_inv, credit_note):
-        src.execute(sa.text("INSERT INTO supplier_invoice VALUES (:a, :b, NULL, NULL)"), dict(a=inv, b=ORG))
+        src.execute(sa.text("INSERT INTO supplier_invoice VALUES (:a, :b, NULL, NULL, NULL, NULL)"), dict(a=inv, b=ORG))
     for n, (inv, amt, tax, code_id) in enumerate(((x_inv, "-100", "10", tc), (credit_note, "-40", "0", None))):
         src.execute(
             sa.text("INSERT INTO supplier_invoice_line VALUES (:a, :b, :c, :d, :e, :f)"),
@@ -522,12 +522,15 @@ def test_a1_without_a_deferral_journal_is_unchanged_and_a1_expense_elsewhere_sta
 DEF_J = str(UUID(int=8001))
 
 
-def _deferral_snapshot(*, status="POSTED", extra_journal=False, credit="10", debit="10"):
+def _deferral_snapshot(*, status="POSTED", extra_journal=False, credit="10", debit="10", subtotal=None, total=None):
     src = snapshot()
     inv = str(UUID(int=1100))
     ctrl = str(UUID(int=50))
     journal = str(UUID(int=9100))
-    src.execute(sa.text("INSERT INTO supplier_invoice VALUES (:a, :b, :c, :d)"), dict(a=inv, b=ORG, c=journal, d=ctrl))
+    src.execute(
+        sa.text("INSERT INTO supplier_invoice VALUES (:a, :b, :c, :d, :e, :f)"),
+        dict(a=inv, b=ORG, c=journal, d=ctrl, e=subtotal, f=total),
+    )
     src.execute(
         sa.text("INSERT INTO supplier_invoice_line VALUES (:a, :b, 100, 10, :e, :t)"),
         dict(a=str(UUID(int=4000)), b=inv, e=EXP, t=str(UUID(int=77))),
@@ -583,3 +586,87 @@ def test_snapshot_deferral_unequal_missing_multiple_and_not_posted():
     src.exec_driver_sql("DELETE FROM journal_entry")  # missing deferral journal: folded invoice is A2
     built, counts = _classes(src)
     assert counts["A1D"]["invoices"] == 0 and counts["A2"]["invoices"] == 2
+
+
+# ---- review findings on PR #64 ----
+
+
+def test_no_negative_net_is_checked_on_its_own_when_the_total_still_ties():
+    # Nets: EXP 120, DEFER 10 (= the tax), ELSEWHERE -20; they sum to the total 110, so only the sign rule fails.
+    journals = [{DEFER: D(10), ELSEWHERE: D(-20)}]
+    invoice_net = {EXP: D(120), CTRL: D(-120)}
+    outcome = deferral_invoice(invoice_net, journals)
+    assert sum([D(120), D(10), D(-20)]) == D(110)
+    assert outcome.klass == "A3" and outcome.reason == "deferral_combined_unbalanced"
+    # The same total without the negative leg is A1D.
+    assert deferral_invoice({EXP: D(100), CTRL: D(-100)}, [{DEFER: D(10)}]).klass == "A1D"
+
+
+def test_lines_exceeding_the_header_are_named_when_the_ledger_equals_the_header_total():
+    # Lines 100 + 10 tax, but the header says subtotal 90 / total 100 and legacy posted 100 (EXP 90 + DEFER 10 net).
+    args = dict(invoice_net={EXP: D(100), CTRL: D(-100)}, control_account=CTRL)
+    lines = [line(1, tax_code=code())]
+    facts = DeferralFacts(({DEFER: D(10), EXP: D(-10)},))
+    outcome = classify_invoice(
+        ORG, lines, {EXP: D(100)}, [PAID, DEFER], deferral=facts, header_subtotal=D(90), header_total=D(100), **args
+    )
+    assert outcome.klass == "A3" and outcome.reason == "invoice_lines_exceed_header"
+    assert class_counts([outcome])["a3_reasons"]["invoice_lines_exceed_header"] == dict(lines=1, invoices=1)
+    # The comparison stays against line + tax: the same ledger without the header facts is plainly unbalanced,
+    for header in (
+        dict(),
+        dict(header_subtotal=D(110), header_total=D(100)),
+        dict(header_subtotal=D(90), header_total=D(99)),
+    ):
+        other = classify_invoice(ORG, lines, {EXP: D(100)}, [PAID, DEFER], deferral=facts, **args, **header)
+        assert other.reason == "deferral_combined_unbalanced", header
+    # and a split-net mismatch is still named first.
+    mismatch = classify_invoice(
+        ORG,
+        lines,
+        {EXP: D(100)},
+        [PAID, DEFER],
+        deferral=DeferralFacts(({DEFER: D(9), EXP: D(-9)},)),
+        header_subtotal=D(90),
+        header_total=D(100),
+        **args,
+    )
+    assert mismatch.reason == "deferral_amount_mismatch"
+
+
+def test_ap_control_is_excluded_on_the_invoice_side_only():
+    # A deferral journal that touches the control account is not the invoice's liability: it stays in the net.
+    outcome = deferral_invoice(FOLDED, [{DEFER: D(10), EXP: D(-10), CTRL: D(5)}])
+    assert outcome.klass == "A3" and outcome.reason == "deferral_combined_unbalanced"
+    # The invoice side's credit to the control account still nets out.
+    assert deferral_invoice(FOLDED, [EQUAL]).klass == "A1D"
+
+
+def test_unposted_invoice_with_a_posted_deferral_journal_is_named_and_counted():
+    facts = DeferralFacts(({DEFER: D(10), EXP: D(-10)},), 0, (str(UUID(int=8001)),))
+    outcome = classify_invoice(ORG, [line(1, tax_code=code())], None, deferral=facts)
+    assert outcome.klass == "B" and outcome.reason == "deferral_on_unposted_invoice" and not outcome.other
+    assert outcome.deferral_journal_ids == (str(UUID(int=8001)),)
+    assert ref(outcome, 1) == ("B1", DEFER)  # the map still lands the B1 ref; the verifier path refuses the invoice
+    counts = class_counts([outcome])
+    assert counts["deferral_on_unposted_invoice"] == dict(lines=1, invoices=1)
+    assert counts["B1"] == dict(lines=1, invoices=1) and counts["A3"] == dict(lines=0, invoices=0)
+    # A not-posted deferral journal is ignored and does not trigger it.
+    ignored = classify_invoice(ORG, [line(1, tax_code=code())], None, deferral=DeferralFacts((), 1))
+    assert ignored.reason is None and class_counts([ignored])["deferral_on_unposted_invoice"]["invoices"] == 0
+
+
+def test_snapshot_unposted_with_deferral_and_lines_exceed_header():
+    src = _deferral_snapshot(subtotal="90", total="100")
+    src.exec_driver_sql("UPDATE posted_ledger_line SET debit_amount = '100' WHERE debit_amount = '110'")
+    src.exec_driver_sql("UPDATE posted_ledger_line SET credit_amount = '100' WHERE credit_amount = '110'")
+    _built, counts = _classes(src)
+    assert counts["a3_reasons"]["invoice_lines_exceed_header"] == dict(lines=1, invoices=1)
+    src = _deferral_snapshot()
+    src.execute(
+        sa.text("UPDATE supplier_invoice SET journal_entry_id = NULL WHERE invoice_id = :i"),
+        dict(i=str(UUID(int=1100))),
+    )
+    built, counts = _classes(src)
+    assert counts["deferral_on_unposted_invoice"] == dict(lines=1, invoices=1)
+    assert counts["A1D"]["invoices"] == 0 and built[str(UUID(int=4000))]["tax_account_ref"] == DEFER  # B1

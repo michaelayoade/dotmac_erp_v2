@@ -28,12 +28,16 @@ Two regimes, per invoice (design RUN-G-TAX-ACCOUNT-DESIGN, revision 3):
     ``source_module`` AP and status POSTED; amounts come from its posted ledger lines. Proof order: A1 on the invoice
     journal alone first (an A1 invoice that also has a deferral journal is A3 ``deferral_on_split_invoice``); else with
     exactly one deferral journal the A1D test on the combined NET map (debit - credit per account over both journals,
-    excluding the AP control account, zeros dropped): every taxed line splits, each split account's net equals its
-    mapped tax, no other tax-code account has a non-zero net, the nets sum to the invoice total, none is negative.
+    excluding the AP control account on the invoice-journal side only, zeros dropped): every taxed line
+    splits, each split account's net equals its mapped tax, no other tax-code account has a non-zero net, the nets
+    sum to the invoice total, none is negative.
     ``tax_account_ref`` is the split account, as A1. Expense placement only sets ``a1d_expense_elsewhere``. Two or more
     deferral journals are never summed: A3 ``deferral_journal_multiple``. An invoice with a deferral journal is never
     A2. Otherwise A3 ``deferral_amount_mismatch`` (a split-account net differs from its tax) or
-    ``deferral_combined_unbalanced``. A3 without a deferral journal is reason ``other``.
+    ``invoice_lines_exceed_header`` (the lines sum to more than the header subtotal while the combined ledger equals the
+    header total) or ``deferral_combined_unbalanced``. An UNPOSTED invoice with a POSTED deferral journal keeps its B
+    class but carries reason ``deferral_on_unposted_invoice``: that journal is already in the v2 ledger, so B1 would
+    debit the deferral account twice; the B1 path refuses it. A3 without a deferral journal is reason ``other``.
 
 * Not legacy-posted: legacy's CURRENT posting rule (``ap/posting/invoice.py``,
   ``posting/tax.py:resolve_tax_posting_account_id``), because v2 posts these invoices now.
@@ -69,6 +73,7 @@ CLASSES: Final = ("A1", "A1D", "A2", "A3", "B1", "B2", "X")
 EXPENSE_ELSEWHERE: Final = "a1_expense_elsewhere"
 EXPENSE_ELSEWHERE_A1D: Final = "a1d_expense_elsewhere"
 DEFERRAL_NOT_POSTED: Final = "deferral_journal_not_posted"
+DEFERRAL_ON_UNPOSTED: Final = "deferral_on_unposted_invoice"
 UNTAXED_WITH_DEFERRAL: Final = "untaxed_with_deferral"
 A3_REASONS_KEY: Final = "a3_reasons"
 A3_REASONS: Final = (
@@ -76,6 +81,7 @@ A3_REASONS: Final = (
     "deferral_combined_unbalanced",
     "deferral_journal_multiple",
     "deferral_on_split_invoice",
+    "invoice_lines_exceed_header",
     "other",
 )
 DEFERRAL_DOCUMENT_TYPE: Final = "SUPPLIER_INVOICE_VAT_DEFERRAL"
@@ -132,6 +138,7 @@ class InvoiceTax:
     reason: str | None = None  # A3 only: one of A3_REASONS
     deferral_journals: int = 0  # POSTED legacy VAT-deferral journals linked to the invoice
     deferral_not_posted: int = 0  # linked deferral journals in another status (ignored)
+    deferral_journal_ids: tuple[str, ...] = ()  # POSTED deferral journals (evidence; the admission checks them)
 
     @property
     def other(self) -> bool:
@@ -149,6 +156,7 @@ class DeferralFacts:
 
     journals: tuple[Mapping[object, Decimal], ...] = ()
     not_posted: int = 0
+    ids: tuple[str, ...] = ()  # canonical ids of the POSTED journals, in the order of ``journals`` (evidence)
 
 
 def _money(value: object, what: str) -> Decimal:
@@ -204,19 +212,36 @@ def classify_invoice(
     invoice_net: Mapping[object, Decimal] | None = None,
     deferral: DeferralFacts | None = None,
     control_account: object = None,
+    header_subtotal: object = None,
+    header_total: object = None,
 ) -> InvoiceTax:
     """Classify one invoice's taxed lines (see the module docstring for the A1D deferral-journal rule).
 
     ``invoice_net`` is the invoice journal's Σ(debit - credit) per account (defaults to ``ledger_debits``);
     ``deferral`` the linked deferral journals; ``control_account`` the invoice's AP control account, excluded
-    from the combined net.
+    from the combined net (the invoice side only; the deferral journal's side is never excluded). ``header_subtotal``
+    and ``header_total`` (optional) are the invoice header's amounts, used only to name A3
+    ``invoice_lines_exceed_header``.
     """
 
     outcome = _classify(
-        organization_id, lines, ledger_debits, global_tax_accounts, invoice_net, deferral, control_account
+        organization_id,
+        lines,
+        ledger_debits,
+        global_tax_accounts,
+        invoice_net,
+        deferral,
+        control_account,
+        header_subtotal,
+        header_total,
     )
     if deferral is not None and (deferral.journals or deferral.not_posted):
-        outcome = replace(outcome, deferral_journals=len(deferral.journals), deferral_not_posted=deferral.not_posted)
+        outcome = replace(
+            outcome,
+            deferral_journals=len(deferral.journals),
+            deferral_not_posted=deferral.not_posted,
+            deferral_journal_ids=tuple(deferral.ids),
+        )
     return outcome
 
 
@@ -228,6 +253,8 @@ def _classify(
     invoice_net: Mapping[object, Decimal] | None,
     deferral: DeferralFacts | None,
     control_account: object,
+    header_subtotal: object,
+    header_total: object,
 ) -> InvoiceTax:
     """Classify one invoice's taxed lines.
 
@@ -252,6 +279,7 @@ def _classify(
             result[canonical(line.line_id)] = LineTax("X", None)
         return InvoiceTax(ledger_debits is not None, result, "X")
     splits = {canonical(line.line_id): snapshot_split_account(line, organization_id) for line in taxed}
+    n_deferral = len(deferral.journals) if deferral is not None else 0
 
     if ledger_debits is None:
         for line in taxed:
@@ -260,7 +288,9 @@ def _classify(
                 result[canonical(line.line_id)] = LineTax("B1", account)
             else:
                 result[canonical(line.line_id)] = LineTax("B2", canonical(line.expense_account_id))
-        return InvoiceTax(False, result, "B")
+        # A POSTED deferral journal of an unposted invoice is already in the v2 ledger (Dr 1455): posting the invoice
+        # under B1 would debit the deferral account a second time. Never dropped silently; the B1 path refuses it.
+        return InvoiceTax(False, result, "B", reason=DEFERRAL_ON_UNPOSTED if n_deferral else None)
 
     actual: dict[str, Decimal] = {}
     for account, amount in ledger_debits.items():
@@ -275,8 +305,6 @@ def _classify(
                 canonical(a) for a in (line.tax_code.paid_account_id, line.tax_code.deferral_account_id) if a
             )
     total = sum((line.line_amount + line.tax_amount for line in lines), Decimal(0))
-
-    n_deferral = len(deferral.journals) if deferral is not None else 0
 
     # A1: every taxed line splits on the snapshot account; the ledger debit on each split account is
     # exactly the tax mapped to it, no other tax-code account is debited, and the debits total the
@@ -308,11 +336,15 @@ def _classify(
         if any(actual.get(account, Decimal(0)) != 0 for account in split_accounts):
             return _a3(result, taxed, "deferral_on_split_invoice")  # the invoice journal already split: no double count
         net: dict[str, Decimal] = {}
-        for source in (ledger_debits if invoice_net is None else invoice_net, deferral.journals[0]):
-            for account, amount in source.items():
-                _add_ledger(net, account, _money(amount, "ledger_net"))
         control = canonical(control_account)
-        net = _nonzero({account: value for account, value in net.items() if control is None or account != control})
+        # The AP control account is excluded on the invoice-journal side ONLY: a deferral journal that touches it is
+        # not the invoice's own liability and must show in the net (and fail the proof).
+        for account, amount in (ledger_debits if invoice_net is None else invoice_net).items():
+            if control is None or canonical(account) != control:
+                _add_ledger(net, account, _money(amount, "ledger_net"))
+        for account, amount in deferral.journals[0].items():
+            _add_ledger(net, account, _money(amount, "ledger_net"))
+        net = _nonzero(net)
         split_tax = {}
         for line in taxed:
             if splits[canonical(line.line_id)] is not None:
@@ -333,7 +365,18 @@ def _classify(
             for account, tax in split_tax.items():
                 _add(expected, account, tax)
             return InvoiceTax(True, result, "A1D", _nonzero(expected) != net)
-        return _a3(result, taxed, "deferral_amount_mismatch" if mismatch else "deferral_combined_unbalanced")
+        if mismatch:
+            return _a3(result, taxed, "deferral_amount_mismatch")
+        # The ledger agrees with the header total but the lines sum to more than the header subtotal: a header/line
+        # fault (conversion spec section 9), not a deferral fault. The comparison above stays against line + tax.
+        if (
+            header_subtotal is not None
+            and header_total is not None
+            and sum((line.line_amount for line in lines), Decimal(0)) > _money(header_subtotal, "header_subtotal")
+            and sum(net.values(), Decimal(0)) == _money(header_total, "header_total")
+        ):
+            return _a3(result, taxed, "invoice_lines_exceed_header")
+        return _a3(result, taxed, "deferral_combined_unbalanced")
 
     # A2: no debit on any tax-code paid or deferral account; per expense account the debit equals
     # line amount plus tax.
@@ -361,13 +404,21 @@ def class_counts(outcomes: Iterable[InvoiceTax]) -> dict[str, Any]:
     """Receipt counts only: per class, taxed lines and invoices holding such a line.
 
     Beyond the classes: ``a1_expense_elsewhere`` (A1 only), ``a1d_expense_elsewhere`` (A1D only),
-    ``deferral_journal_not_posted`` and ``untaxed_with_deferral`` (invoices; lines are 0), and ``a3_reasons``,
-    a map reason -> {lines, invoices} over the A3 invoices.
+    ``deferral_journal_not_posted`` and ``untaxed_with_deferral`` (invoices; lines are 0),
+    ``deferral_on_unposted_invoice`` (an unposted taxed invoice with a POSTED deferral journal; expected 0),
+    and ``a3_reasons``, a map reason -> {lines, invoices} over the A3 invoices.
     """
 
     counts: dict[str, Any] = {
         name: {"lines": 0, "invoices": 0}
-        for name in (*CLASSES, EXPENSE_ELSEWHERE, EXPENSE_ELSEWHERE_A1D, DEFERRAL_NOT_POSTED, UNTAXED_WITH_DEFERRAL)
+        for name in (
+            *CLASSES,
+            EXPENSE_ELSEWHERE,
+            EXPENSE_ELSEWHERE_A1D,
+            DEFERRAL_NOT_POSTED,
+            DEFERRAL_ON_UNPOSTED,
+            UNTAXED_WITH_DEFERRAL,
+        )
     }
     counts[A3_REASONS_KEY] = {reason: {"lines": 0, "invoices": 0} for reason in A3_REASONS}
     for outcome in outcomes:
@@ -377,6 +428,11 @@ def class_counts(outcomes: Iterable[InvoiceTax]) -> dict[str, Any]:
             counts[key]["lines"] += sum(1 for item in outcome.lines.values() if item.klass == outcome.klass)
         if outcome.deferral_not_posted:
             counts[DEFERRAL_NOT_POSTED]["invoices"] += 1
+        if outcome.reason == DEFERRAL_ON_UNPOSTED:
+            counts[DEFERRAL_ON_UNPOSTED]["invoices"] += 1
+            counts[DEFERRAL_ON_UNPOSTED]["lines"] += len(
+                [item for item in outcome.lines.values() if item.klass is not None]
+            )
         if outcome.klass is None and outcome.deferral_journals:
             counts[UNTAXED_WITH_DEFERRAL]["invoices"] += 1
         if outcome.klass == "A3":
@@ -397,7 +453,7 @@ def class_counts(outcomes: Iterable[InvoiceTax]) -> dict[str, Any]:
 # The one read-only SQL of the importer (legacy names, resolved through the snapshot search_path).
 
 INVOICE_LINE_SQL: Final = """
-SELECT i.invoice_id, i.organization_id, i.journal_entry_id, i.ap_control_account_id,
+SELECT i.invoice_id, i.organization_id, i.journal_entry_id, i.ap_control_account_id, i.subtotal, i.total_amount,
        l.line_id, l.line_amount, l.tax_amount, l.expense_account_id, l.tax_code_id,
        tc.tax_code_id AS code_row, tc.organization_id AS code_organization_id, tc.tax_type,
        tc.tax_paid_account_id,
@@ -484,6 +540,7 @@ def classify_snapshot(
         net = nets.setdefault(journal, {})
         net[key] = net.get(key, Decimal(0)) + debit - _money(row.get("credit_amount") or 0, "ledger_credit")
     posted_deferral: dict[str, list[str]] = {}
+    headers: dict[str, tuple[object, object]] = {}
     not_posted: dict[str, int] = {}
     for row in deferral_journals:
         invoice = canonical(row["source_document_id"])
@@ -497,6 +554,7 @@ def classify_snapshot(
         invoice = canonical(row["invoice_id"])
         entry = grouped.setdefault(invoice, (row["organization_id"], canonical(row["journal_entry_id"]), []))
         controls[invoice] = row.get("ap_control_account_id")
+        headers[invoice] = (row.get("subtotal"), row.get("total_amount"))
         entry[2].append(
             LineFacts(
                 line_id=row["line_id"],
@@ -524,7 +582,9 @@ def classify_snapshot(
     outcomes: dict[str, InvoiceTax] = {}
     for invoice, (organization, journal, lines) in grouped.items():
         facts = DeferralFacts(
-            tuple(nets.get(j, {}) for j in posted_deferral.get(invoice, [])), not_posted.get(invoice, 0)
+            tuple(nets.get(j, {}) for j in posted_deferral.get(invoice, [])),
+            not_posted.get(invoice, 0),
+            tuple(posted_deferral.get(invoice, [])),
         )
         outcomes[invoice] = classify_invoice(
             organization,
@@ -534,6 +594,8 @@ def classify_snapshot(
             invoice_net=nets.get(journal) if journal else None,
             deferral=facts,
             control_account=controls.get(invoice),
+            header_subtotal=headers[invoice][0],
+            header_total=headers[invoice][1],
         )
     return outcomes
 
@@ -543,6 +605,7 @@ __all__ = [
     "ACCEPTED_CLASSES",
     "CLASSES",
     "DEFERRAL_JOURNAL_SQL",
+    "DEFERRAL_ON_UNPOSTED",
     "EXPENSE_ELSEWHERE",
     "GLOBAL_TAX_ACCOUNT_SQL",
     "INVOICE_LINE_SQL",

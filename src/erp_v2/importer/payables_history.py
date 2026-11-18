@@ -190,6 +190,8 @@ def invoice_tax(
     lines: list[dict],
     invoice_id: object = None,
     control_account: object = None,
+    header_subtotal: object = None,
+    header_total: object = None,
 ) -> tuple[tax_accounts.InvoiceTax, list[dict]]:
     """Tax-account classification of one invoice from the snapshot (the importer's rule, shared).
 
@@ -252,8 +254,8 @@ def invoice_tax(
     # Legacy VAT-deferral journals of the invoice (conversion spec section 9): linked by document type, the
     # invoice id, module AP; POSTED ones are read from their posted ledger lines, others are counted and ignored.
     deferral = None
-    if debits is not None and invoice_id is not None:
-        journals, not_posted = [], 0
+    if invoice_id is not None:
+        journals, ids, not_posted = [], [], 0
         for header in _read(src, "journal_entry", key="source_document_id", value=invoice_id):
             if (
                 str(header["source_document_type"]) != tax_accounts.DEFERRAL_DOCUMENT_TYPE
@@ -268,7 +270,8 @@ def invoice_tax(
                 key = _id(row["account_id"])
                 jnet[key] = jnet.get(key, Decimal(0)) + row["debit_amount"] - (row["credit_amount"] or Decimal(0))
             journals.append(jnet)
-        deferral = tax_accounts.DeferralFacts(tuple(journals), not_posted)
+            ids.append(_id(header["journal_entry_id"]))
+        deferral = tax_accounts.DeferralFacts(tuple(journals), not_posted, tuple(ids))
     try:
         outcome = tax_accounts.classify_invoice(
             organization,
@@ -278,6 +281,8 @@ def invoice_tax(
             invoice_net=net,
             deferral=deferral,
             control_account=control_account,
+            header_subtotal=header_subtotal,
+            header_total=header_total,
         )
     except tax_accounts.TaxAccountMappingError as exc:
         raise HistoricalEvidenceError(str(exc)) from exc
@@ -291,6 +296,7 @@ def _deferral_evidence(outcome: tax_accounts.InvoiceTax) -> dict:
     if not (outcome.deferral_journals or outcome.deferral_not_posted):
         return {}
     return dict(
+        deferral_journal_ids=sorted(outcome.deferral_journal_ids),
         deferral_journals=outcome.deferral_journals,
         deferral_not_posted=outcome.deferral_not_posted,
         a3_reason=outcome.reason,
@@ -634,7 +640,14 @@ class HistoricalPayablesVerifier:
         targets = _read(dest, "supplier_invoice_lines", schema="mod_payables", key="invoice_id", value=invoice_id)
         _tenant(targets, tenant, "invoice_line")
         outcome, tax_evidence = invoice_tax(
-            src, tenant, header["journal_entry_id"], lines, invoice_id, header["ap_control_account_id"]
+            src,
+            tenant,
+            header["journal_entry_id"],
+            lines,
+            invoice_id,
+            header["ap_control_account_id"],
+            header["subtotal"],
+            header["total_amount"],
         )
         line_mapping = {
             k: k
@@ -684,6 +697,7 @@ class HistoricalPayablesVerifier:
             "invoice_line_totals",
         )
         accounting = self._accounting(tenant, header, dest)
+        self._deferral_journals(tenant, header, outcome, dest)
         # Only immutable imported fields enter the replay evidence. Current owner
         # invoice status, obligations, events and settlements deliberately do not.
         facts = _fingerprint(
@@ -939,6 +953,57 @@ class HistoricalPayablesVerifier:
                 dimensions=dimensions,
             ),
         )
+
+    def _deferral_journals(
+        self, tenant: UUID, header: dict, outcome: tax_accounts.InvoiceTax, dest: sa.Connection
+    ) -> None:
+        """The legacy VAT-deferral journals the classification relied on must be in v2, POSTED and equal.
+
+        Their ids are in the fingerprint (``_deferral_evidence``); like ``_accounting`` for the invoice journal, the
+        source journal must be the invoice's POSTED deferral document and the destination must hold it POSTED with
+        the same totals and the same posted ledger lines (account, debit, credit).
+        """
+
+        for journal_id in outcome.deferral_journal_ids:
+            journal = _one(
+                _read(self.source, "journal_entry", key="journal_entry_id", value=journal_id),
+                "deferral_journal_missing",
+            )
+            _tenant([journal], tenant, "deferral_journal", "organization_id")
+            _require(
+                journal["source_module"] == "AP"
+                and journal["source_document_type"] == tax_accounts.DEFERRAL_DOCUMENT_TYPE
+                and _equal(journal["source_document_id"], header["invoice_id"])
+                and journal["status"] == "POSTED",
+                "deferral_journal_source",
+            )
+            target = _one(
+                _read(dest, "journal_entries", schema="mod_accounting", key="id", value=journal_id),
+                "destination_deferral_journal_missing",
+            )
+            _tenant([target], tenant, "destination_deferral_journal")
+            _require(target["status"] == "POSTED", "destination_deferral_journal_status")
+            _match(
+                journal,
+                target,
+                {key: key for key in ("currency_code", "exchange_rate", "entry_date", "posting_date")}
+                | dict(total_debit="total_debit", total_credit="total_credit"),
+                "deferral_journal",
+            )
+            _require(
+                target["source_document_id"] == f"{SOURCE_JOURNAL_REFERENCE}{journal['journal_entry_id']}",
+                "deferral_journal_source_document_id",
+            )
+            self._provenance(target, "deferral_journal")
+            ledger = _read(self.source, "posted_ledger_line", key="journal_entry_id", value=journal_id)
+            posted = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=journal_id)
+            _tenant(posted, tenant, "deferral_ledger")
+            _require(
+                sorted((_id(r["account_id"]), r["debit_amount"], r["credit_amount"]) for r in ledger)
+                == sorted((_id(r["account_id"]), r["debit"], r["credit"]) for r in posted)
+                and len(ledger) > 0,
+                "deferral_journal_ledger",
+            )
 
     def _provenance(self, row: dict, prefix: str) -> None:
         _require(row["source_owner"] == self.source_owner, prefix + "_source_owner")

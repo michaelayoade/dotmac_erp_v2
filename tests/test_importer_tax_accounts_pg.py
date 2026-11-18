@@ -25,7 +25,7 @@ def test_untaxed_negative_credit_note_does_not_abort_the_map_and_x_is_zero(engin
         c.exec_driver_sql(f"CREATE SCHEMA {schema}")
         for stmt in (
             "CREATE TABLE supplier_invoice (invoice_id uuid, organization_id uuid, journal_entry_id uuid, "
-            "invoice_type text, ap_control_account_id uuid)",
+            "invoice_type text, ap_control_account_id uuid, subtotal numeric, total_amount numeric)",
             "CREATE TABLE supplier_invoice_line (line_id uuid, invoice_id uuid, line_amount numeric, "
             "tax_amount numeric, expense_account_id uuid, tax_code_id uuid)",
             "CREATE TABLE tax_code (tax_code_id uuid, organization_id uuid, tax_type text, tax_paid_account_id uuid)",
@@ -42,8 +42,8 @@ def test_untaxed_negative_credit_note_does_not_abort_the_map_and_x_is_zero(engin
         c.execute(sa.text("INSERT INTO account VALUES (:p, NULL)"), dict(p=PAID))
         c.execute(
             sa.text(
-                "INSERT INTO supplier_invoice VALUES (:i, :o, NULL, 'INVOICE', NULL), "
-                "(:n, :o, NULL, 'CREDIT_NOTE', NULL)"
+                "INSERT INTO supplier_invoice VALUES (:i, :o, NULL, 'INVOICE', NULL, NULL, NULL), "
+                "(:n, :o, NULL, 'CREDIT_NOTE', NULL, NULL, NULL)"
             ),
             dict(i=INVOICE, n=CREDIT_NOTE, o=ORG),
         )
@@ -69,7 +69,7 @@ DEFERRAL = "SUPPLIER_INVOICE_VAT_DEFERRAL"
 DEFER_ACCT, CTRL = str(UUID(int=21)), str(UUID(int=50))
 
 
-def _deferral_schema(engine, *, deferral_debits, status="POSTED"):
+def _deferral_schema(engine, *, deferral_debits, status="POSTED", subtotal=100, total=110, posted=True, amount=110):
     """One taxed legacy-posted invoice (folded: Dr expense 110 / Cr 2000 110) and its deferral journal(s).
 
     ``deferral_debits`` is a list of the deferral journals' 1455 debit amounts (empty: no deferral journal).
@@ -83,7 +83,7 @@ def _deferral_schema(engine, *, deferral_debits, status="POSTED"):
         c.exec_driver_sql(f"SET LOCAL search_path TO {schema}")
         for stmt in (
             "CREATE TABLE supplier_invoice (invoice_id uuid, organization_id uuid, journal_entry_id uuid, "
-            "invoice_type text, ap_control_account_id uuid)",
+            "invoice_type text, ap_control_account_id uuid, subtotal numeric, total_amount numeric)",
             "CREATE TABLE supplier_invoice_line (line_id uuid, invoice_id uuid, line_amount numeric, "
             "tax_amount numeric, expense_account_id uuid, tax_code_id uuid)",
             "CREATE TABLE tax_code (tax_code_id uuid, organization_id uuid, tax_type text, tax_paid_account_id uuid)",
@@ -97,15 +97,17 @@ def _deferral_schema(engine, *, deferral_debits, status="POSTED"):
         c.execute(sa.text("INSERT INTO tax_code VALUES (:t, :o, 'VAT', :p)"), dict(t=TAX_CODE, o=ORG, p=PAID))
         c.execute(sa.text("INSERT INTO account VALUES (:p, :d), (:d, NULL)"), dict(p=PAID, d=DEFER_ACCT))
         c.execute(
-            sa.text("INSERT INTO supplier_invoice VALUES (:i, :o, :j, 'INVOICE', :c)"),
-            dict(i=INVOICE, o=ORG, j=journal, c=CTRL),
+            sa.text("INSERT INTO supplier_invoice VALUES (:i, :o, :j, 'INVOICE', :c, :sub, :tot)"),
+            dict(i=INVOICE, o=ORG, j=journal if posted else None, c=CTRL, sub=subtotal, tot=total),
         )
         c.execute(
             sa.text("INSERT INTO supplier_invoice_line VALUES (:l, :i, 100, 10, :e, :t)"),
             dict(l=str(UUID(int=2001)), i=INVOICE, e=EXP, t=TAX_CODE),
         )
-        c.execute(sa.text("INSERT INTO posted_ledger_line VALUES (:j, :e, 110, NULL)"), dict(j=journal, e=EXP))
-        c.execute(sa.text("INSERT INTO posted_ledger_line VALUES (:j, :c, NULL, 110)"), dict(j=journal, c=CTRL))
+        c.execute(sa.text("INSERT INTO posted_ledger_line VALUES (:j, :e, :a, NULL)"), dict(j=journal, e=EXP, a=amount))
+        c.execute(
+            sa.text("INSERT INTO posted_ledger_line VALUES (:j, :c, NULL, :a)"), dict(j=journal, c=CTRL, a=amount)
+        )
         for n, amount in enumerate(deferral_debits):
             dj = str(UUID(int=8000 + n))
             c.execute(
@@ -162,3 +164,18 @@ def test_not_posted_deferral_journal_is_ignored_and_counted(engine):
     _ref, counts = _run(engine, deferral_debits=["10"], status="DRAFT")
     assert counts["deferral_journal_not_posted"] == dict(lines=0, invoices=1)
     assert counts["A1D"]["invoices"] == 0 and counts["A2"]["invoices"] == 1
+
+
+def test_lines_exceeding_the_header_are_a3_with_their_own_reason(engine):
+    # Lines 100 + 10, header 90 / 100, legacy posted 100 and a deferral journal of 10: a header/line fault.
+    ref, counts = _run(engine, deferral_debits=["10"], subtotal=90, total=100, amount=100)
+    assert ref == EXP and counts["A1D"]["invoices"] == 0
+    assert counts["a3_reasons"]["invoice_lines_exceed_header"] == dict(lines=1, invoices=1)
+    assert counts["a3_reasons"]["deferral_combined_unbalanced"] == dict(lines=0, invoices=0)
+
+
+def test_unposted_invoice_with_a_posted_deferral_journal_is_counted_and_keeps_its_b1_ref(engine):
+    ref, counts = _run(engine, deferral_debits=["10"], posted=False)
+    assert ref == DEFER_ACCT  # the map still lands the B1 ref; the verifier path refuses the invoice
+    assert counts["deferral_on_unposted_invoice"] == dict(lines=1, invoices=1)
+    assert counts["B1"] == dict(lines=1, invoices=1) and counts["A1D"]["invoices"] == 0

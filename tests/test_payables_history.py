@@ -11,7 +11,11 @@ from sqlalchemy.orm import Session
 
 from erp_v2.importer.cli import _resolve_sources
 from erp_v2.importer.executor import execute_transform
-from erp_v2.importer.payables_history import HistoricalEvidenceError, HistoricalPayablesVerifier
+from erp_v2.importer.payables_history import (
+    SOURCE_JOURNAL_REFERENCE,
+    HistoricalEvidenceError,
+    HistoricalPayablesVerifier,
+)
 from erp_v2.importer.snapshot import SnapshotManifest
 from erp_v2.importer.transitions import run_transitions
 from erp_v2.importer.waves36 import ALL_WAVE_PAIRINGS, build_specs
@@ -897,8 +901,11 @@ def test_debit_on_another_codes_tax_account_keeps_the_invoice_out_of_a1(db):
         evidence(db)
 
 
-def _add_deferral_journal(db, debit, *, n=60, status="POSTED"):
-    """A legacy VAT-deferral journal of the invoice: Dr TAX ``debit`` / Cr EXP ``debit`` (copies of source rows)."""
+def _add_deferral_journal(db, debit, *, n=60, status="POSTED", land=True, dest_status="POSTED"):
+    """A legacy VAT-deferral journal of the invoice: Dr TAX ``debit`` / Cr EXP ``debit`` (copies of source rows).
+
+    ``land`` also writes it to the destination (journal and ledger lines, copies of the invoice journal's rows).
+    """
 
     source, tables = db[0], db[4]
     source.exec_driver_sql("PRAGMA query_only=0")
@@ -921,7 +928,46 @@ def _add_deferral_journal(db, debit, *, n=60, status="POSTED"):
         copy[side] = str(debit)
         copy["original_" + side] = str(debit)
         source.execute(ledger.insert(), [copy])
+        if land:
+            _land_deferral_ledger_line(db, n, offset, account, side, debit)
     source.commit()
+    if land:
+        _land_deferral_journal(db, row, n, debit, dest_status)
+
+
+def _land_deferral_journal(db, source_row, n, debit, status):
+    target, tables = db[1], db[4]
+    source = db[0]
+    source.execute(
+        tables[True, "journal_entry"]
+        .update()
+        .where(tables[True, "journal_entry"].c.journal_entry_id == str(UUID(int=n)))
+        .values(total_debit=str(debit), total_credit=str(debit))
+    )
+    dest = tables[False, "journal_entries"]
+    base = dict(target.execute(sa.select(dest)).mappings().first())
+    base.update(
+        id=str(UUID(int=n)),
+        status=status,
+        total_debit=str(debit),
+        total_credit=str(debit),
+        source_document_id=f"{SOURCE_JOURNAL_REFERENCE}{UUID(int=n)}",
+    )
+    target.execute(dest.insert(), [base])
+    target.commit()
+    source.commit()
+
+
+def _land_deferral_ledger_line(db, n, offset, account, side, debit):
+    target, tables = db[1], db[4]
+    dest = tables[False, "posted_ledger_lines"]
+    base = dict(target.execute(sa.select(dest).where(dest.c.account_id == EXP)).mappings().first())
+    column = "debit" if side == "debit_amount" else "credit"
+    base.update(id=str(UUID(int=n * 10 + offset)), journal_id=str(UUID(int=n)), account_id=account)
+    base.update(debit="0", credit="0", original_debit="0", original_credit="0")
+    base[column] = str(debit)
+    base["original_" + column] = str(debit)
+    target.execute(dest.insert(), [base])
 
 
 def test_deferral_journal_equal_to_the_vat_admits_as_a1d(db):
@@ -985,3 +1031,58 @@ def test_verifier_classification_reports_a1_expense_elsewhere(db):
     ]
     outcome, _ = module.invoice_tax(db[0], T, J, lines)
     assert outcome.klass == "A1" and outcome.expense_elsewhere
+
+
+def test_no_deferral_fingerprint_is_pinned(db):
+    """Adding the deferral rule must not re-key existing evidence: an invoice without a deferral journal keeps its
+    fingerprint byte for byte (the deferral keys are absent from the fingerprinted tax_accounts block)."""
+    taxed(db, "A2")
+    # Value recorded on origin/main 7f6a194 (before the deferral rule) for this exact scenario.
+    assert evidence(db).fingerprint() == "cv1:f95cd3c9ce5bad6fa50e691307381179a4623c34a5a69a72f8a413ac9e79a341"
+
+
+def test_deferral_journal_ids_enter_the_fingerprint_and_the_destination_must_hold_them_posted(db):
+    taxed(db, "A2", ref=TAX)
+    _add_deferral_journal(db, 15)
+    item = evidence(db)
+    from erp_v2.importer import payables_history as module
+
+    lines = [
+        dict(
+            line_id=str(UUID(int=11)),
+            line_amount=Decimal(100),
+            tax_amount=Decimal(15),
+            tax_code_id=CODE,
+            expense_account_id=EXP,
+        )
+    ]
+    outcome, _ = module.invoice_tax(db[0], T, J, lines, INVOICE, AP, Decimal(100), Decimal(115))
+    assert outcome.deferral_journal_ids == (str(UUID(int=60)),)
+    assert module._deferral_evidence(outcome)["deferral_journal_ids"] == [str(UUID(int=60))]
+    assert item.fingerprint() != "cv1:f95cd3c9ce5bad6fa50e691307381179a4623c34a5a69a72f8a413ac9e79a341"
+
+
+def test_deferral_journal_missing_from_the_destination_refuses(db):
+    taxed(db, "A2", ref=TAX)
+    _add_deferral_journal(db, 15, land=False)
+    with pytest.raises(HistoricalEvidenceError, match="destination_deferral_journal_missing"):
+        evidence(db)
+
+
+def test_deferral_journal_not_posted_in_the_destination_refuses(db):
+    taxed(db, "A2", ref=TAX)
+    _add_deferral_journal(db, 15, dest_status="DRAFT")
+    with pytest.raises(HistoricalEvidenceError, match="destination_deferral_journal_status"):
+        evidence(db)
+
+
+def test_deferral_journal_ledger_that_differs_in_the_destination_refuses(db):
+    taxed(db, "A2", ref=TAX)
+    _add_deferral_journal(db, 15)
+    dest = db[4][False, "posted_ledger_lines"]
+    db[1].execute(
+        dest.update().where(dest.c.journal_id == str(UUID(int=60)), dest.c.account_id == TAX).values(debit="14")
+    )
+    db[1].commit()
+    with pytest.raises(HistoricalEvidenceError, match="deferral_journal_ledger"):
+        evidence(db)
