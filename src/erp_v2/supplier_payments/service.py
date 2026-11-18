@@ -333,8 +333,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
         raise PaymentRefused("not_draft", "Only a draft supplier payment can be approved")
     _refuse_wht(payment)
     _require_payee_instruction(db, tenant.id, payment)
-    _require_payee_instruction(db, tenant.id, payment)
-    if _same(payment.prepared_by, actor):
+    if governance.dual_control(db, tenant.id) and _same(payment.prepared_by, actor):
         raise PaymentRefused("sod_approver_is_preparer", "You prepared this payment; another person must approve it")
     _refuse_approver_instruction_party(db, tenant.id, payment, actor)
     payables.approve_supplier_payment(

@@ -1384,7 +1384,7 @@ def test_policy_off_erp_checks_do_not_fire_and_the_owner_still_refuses_approve_b
     created = prepare(engine, env, open_obligation(engine, env))
     with pytest.raises(PaymentRefused) as exc:
         approve(engine, env, created.payment_id, who="preparer")
-    assert not exc.value.code.startswith("sod_")  # the owner (payables a5) refuses, not the ERP check
+    assert not exc.value.code.startswith("sod_"), exc.value.code  # the owner (payables a5) refuses, not the ERP check
     assert payment(engine, created.payment_id).status == SupplierPaymentStatus.DRAFT
 
 
