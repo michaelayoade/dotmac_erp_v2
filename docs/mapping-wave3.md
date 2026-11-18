@@ -117,14 +117,20 @@ bucket, so `legacy = carried + transformed + queued` (receipt `transforms.partit
 | `T-UNPOSTED-CORRECT` (D-M2) | never-posted invoices (DRAFT/SUBMITTED/APPROVED, no ledger lines) | VAT lines on the split account which must be 1455; a WHT-type tax removed from the line and the header so the total is the gross (the WHT is a payment-time fact, recorded in the bridge line); a taxed line without a valid code, an expense on a control or tax-role account, or a deferral journal already in the v2 ledger queues the invoice; no folded form lands |
 
 `import.fallback_expense_account` is a REQUIRED declared input (Finance F-1, `--import-params-json`): `execute`
-refuses, dry-run and apply, before any write when it is missing, not a UUID, unknown, inactive, non-postable, or a
-control (2000/2040/1410) or tax-role (1455/1440) account. A queued invoice is not landed: its header and every line
+refuses, dry-run and apply, before any write when it is missing or is not, in the DESTINATION `mod_accounting` chart, an
+account of the run's tenant that is active, posting-allowed, of expense class, and neither a control account
+(2000/2040/1410) nor a tax-role code (1455/1440). A queued invoice is not landed: its header and every line
 are named row exceptions `transform_queue:<reason>`, so the receipt is incomplete until Finance resolves it.
 
 **Parity.** Before B-3 a NULL-expense line never landed (`posting_account_ref` is required). The dest6 parity oracle
-for `mod_payables.supplier_invoice_lines` `written` is therefore dest6 plus the declared delta in the receipt
-(`transforms.parity.declared_written_delta_lines` = NULL-expense lines landed on the fallback or on the legacy GL
-account; expected 272 less any on a queued invoice). `not_landed_queued` names the rest. The itemised bridge is the
+is dest6 plus the declared NET deltas in the receipt, which can be negative:
+`declared_written_delta_lines` = NULL-expense lines landed (fallback or legacy GL account) minus the lines dest6 landed
+that a queued, not-landed invoice no longer lands; `declared_written_delta_headers` = minus the newly not-landed
+headers. `changed_header_values` counts landed headers whose values change (WHT removal, rounding), itemised in the
+side file. The partition universe is every source header id (line-less invoices included) and the source line count.
+An unposted invoice whose WHT was removed to gross lands but is also queued (`wht_payment_fact_pending`) until the a6
+WHT table carries the fact; rounding rounds the tax first and derives the subtotal from the 2-dp total, and
+`total_mismatch_after_transform` is counted in the queue. The itemised bridge is the
 mode-600 side file `<receipt>.transforms.json` (sha256 in the receipt).
 
 VAT is cash basis; deferred input VAT is released on payment by the B3 extension (follow-up, not here).

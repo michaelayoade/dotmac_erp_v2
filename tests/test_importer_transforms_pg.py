@@ -25,6 +25,7 @@ def u(n):
 
 
 ORG, EXP, PAID, VAT_CODE, WHT_CODE = u(1), u(10), u(20), u(77), u(78)
+TENANT = u(7)
 INPUT_TAX, FALLBACK = u(21), u(40)
 INV_NULL, INV_WHT, INV_QUEUE = u(1001), u(1002), u(1003)
 
@@ -46,6 +47,9 @@ def _snapshot(engine):
             "credit_amount numeric)",
             "CREATE TABLE journal_entry (journal_entry_id uuid, source_module text, source_document_type text, "
             "source_document_id uuid, status text)",
+            # stands in for the destination chart (mod_accounting accounts joined to their category)
+            "CREATE TABLE dest_chart (id uuid, tenant_id uuid, code text, is_active boolean, "
+            "posting_allowed boolean, account_class text)",
         ):
             c.exec_driver_sql(stmt)
         c.execute(
@@ -54,6 +58,13 @@ def _snapshot(engine):
                 "(:t,'1455',NULL,true,true), (:f,'5999',NULL,true,true), (:c,'2000',NULL,true,true)"
             ),
             dict(e=EXP, p=PAID, t=INPUT_TAX, f=FALLBACK, c=u(50)),
+        )
+        c.execute(
+            sa.text(
+                "INSERT INTO dest_chart VALUES (:e,:t,'5000',true,true,'EXPENSE'), (:f,:t,'5999',true,true,'EXPENSE'), "
+                "(:c,:t,'2000',true,true,'LIABILITY')"
+            ),
+            dict(e=EXP, f=FALLBACK, c=u(50), t=TENANT),
         )
         c.execute(
             sa.text("INSERT INTO tax_code VALUES (:v, :o, 'VAT', :p), (:w, :o, 'WITHHOLDING', :p)"),
@@ -84,12 +95,19 @@ def _snapshot(engine):
     return schema
 
 
-def test_null_expense_lines_land_wht_is_removed_and_the_partition_balances(engine):
+def test_null_expense_lines_land_wht_is_removed_and_the_partition_balances(engine, monkeypatch):
+    from erp_v2.importer import transforms
+
+    monkeypatch.setattr(
+        transforms,
+        "DEST_ACCOUNT_SQL",
+        "SELECT id, tenant_id, code, is_active, posting_allowed, account_class FROM dest_chart",
+    )
     schema = _snapshot(engine)
     try:
         with engine.connect() as source:
             source.exec_driver_sql(f"SET LOCAL search_path TO {schema}")
-            maps = EnrolmentMaps(source, source, transform_params=TransformParams(FALLBACK))
+            maps = EnrolmentMaps(source, source, transform_params=TransformParams(FALLBACK, TENANT))
             lines = maps.get("supplier_line_transforms")
             headers = maps.get("supplier_invoice_transforms")
             ledger = maps.transform_ledger()
@@ -109,6 +127,16 @@ def test_null_expense_lines_land_wht_is_removed_and_the_partition_balances(engin
     assert headers[key(1003)] == {"_refusal": "expense_account_is_control"}
     part = ledger.partition()
     assert part["balanced"] is True and part["legacy"] == {"invoices": 3, "lines": 6, "total": "477.5"}
-    assert part["buckets"]["QUEUE"]["invoices"] == 1 and part["buckets"]["TRANSFORM"]["invoices"] == 2
-    # parity: +2 lines land versus the pre-B-3 importer (which never landed a NULL-expense line)
-    assert ledger.parity()["declared_written_delta_lines"] == 2
+    assert part["buckets"]["QUEUE"]["invoices"] == 2 and part["buckets"]["TRANSFORM"]["invoices"] == 1
+    assert part["universe"] == {
+        "source_invoices": 3,
+        "source_lines": 6,
+        "each_invoice_in_exactly_one_bucket": True,
+        "line_count_matches_source": True,
+    }
+    # the WHT invoice lands at the gross but is queued until the a6 WHT table carries the fact
+    assert ledger.queue()["by_reason"] == {"expense_account_is_control": 1, "wht_payment_fact_pending": 1}
+    # parity: +2 NULL-expense lines land, -1 line the queued invoice no longer lands (dest6 landed it); -1 header
+    parity = ledger.parity()
+    assert (parity["declared_written_delta_lines"], parity["declared_written_delta_headers"]) == (1, -1)
+    assert parity["changed_header_values"] == 1

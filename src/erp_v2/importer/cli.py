@@ -752,7 +752,9 @@ def cmd_execute(args: argparse.Namespace) -> int:
     post_mints: tuple[MintResult, ...] = ()
     needs_transforms = bool(required_maps(executable) & TRANSFORM_MAP_NAMES)
     try:
-        transform_params = TransformParams.from_mapping(_json_arg(args.import_params_json, "--import-params-json"))
+        transform_params = TransformParams.from_mapping(
+            _json_arg(args.import_params_json, "--import-params-json"), run_constants.get("tenant_id")
+        )
     except TransformParamsError as exc:
         raise CliRefusal(f"{exc.code}: {PARAMS_HINT}; nothing written") from exc
     # connect(), not begin(): --apply commits per spec, and a commit

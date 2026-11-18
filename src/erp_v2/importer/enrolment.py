@@ -1154,7 +1154,7 @@ class EnrolmentMaps:
         if self._transforms is None:
             if self._transform_params is None:
                 raise TransformParamsError("fallback_expense_account_missing")
-            self._transforms = read_and_build(self._source, self._transform_params)
+            self._transforms = read_and_build(self._source, self._transform_params, self._dest)
         return self._transforms
 
     def transform_ledger(self):

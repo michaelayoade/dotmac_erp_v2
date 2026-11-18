@@ -27,6 +27,7 @@ from erp_v2.importer.transforms import (
     T_UNPOSTED_CORRECT,
     TRANSFORM,
     AccountFacts,
+    DestAccount,
     InvoiceFacts,
     TransformLedger,
     TransformParams,
@@ -63,6 +64,33 @@ ACCOUNTS = {
 }
 
 
+TENANT = uid(7)
+GOOD_TENANT = "11111111-1111-1111-1111-111111111111"  # the CLI manifest fixture
+OTHER_TENANT = uid(8)
+DEST = {
+    a: DestAccount(TENANT, f.code, f.active, f.postable, "EXPENSE" if f.code.startswith("5") else "LIABILITY")
+    for a, f in ACCOUNTS.items()
+}
+DEST[uid(70)] = DestAccount(OTHER_TENANT, "5300", True, True, "EXPENSE")
+DEST[uid(71)] = DestAccount(TENANT, "5400", True, False, "EXPENSE")
+DEST[uid(72)] = DestAccount(TENANT, "1200", True, True, "ASSET")
+DEST_ROWS = [
+    dict(
+        id=a,
+        tenant_id=f.tenant_id,
+        code=f.code,
+        is_active=f.active,
+        posting_allowed=f.postable,
+        account_class=f.account_class,
+    )
+    for a, f in DEST.items()
+]
+
+
+def params(account=None):
+    return TransformParams.from_mapping({"import.fallback_expense_account": account or FALLBACK}, TENANT)
+
+
 def vat(deferral=TAXACCT, paid=PAID, tax_type="VAT", org=ORG):
     return TaxCodeFacts(org, tax_type, paid, deferral)
 
@@ -86,13 +114,15 @@ def invoice(
     tax=None,
     total=None,
     deferral=None,
+    invoice_net=None,
+    control=None,
 ):
     """InvoiceFacts with the REAL classifier's outcome. Header defaults to the lines' sums."""
 
     sub_ = D(sub) if sub is not None else sum((x.line_amount for x in lines), D(0))
     tax_ = D(tax) if tax is not None else sum((x.tax_amount for x in lines), D(0))
     total_ = D(total) if total is not None else sub_ + tax_
-    outcome = classify_invoice(ORG, lines, ledger, deferral=deferral)
+    outcome = classify_invoice(ORG, lines, ledger, deferral=deferral, invoice_net=invoice_net, control_account=control)
     return InvoiceFacts(uid(9000 + n), ORG, status, sub_, tax_, total_, tuple(lines), outcome, items or {})
 
 
@@ -109,10 +139,10 @@ def rules(outcome):
 
 def test_fallback_account_is_a_required_declared_input():
     with pytest.raises(TransformParamsError) as exc:
-        TransformParams.from_mapping({}).validate(ACCOUNTS)
+        TransformParams.from_mapping({}, TENANT).validate(DEST)
     assert exc.value.code == "fallback_expense_account_missing"
     with pytest.raises(TransformParamsError) as exc:
-        TransformParams.from_mapping({"import.fallback_expense_account": "   "}).validate(ACCOUNTS)
+        TransformParams.from_mapping({"import.fallback_expense_account": "   "}, TENANT).validate(DEST)
     assert exc.value.code == "fallback_expense_account_missing"
 
 
@@ -126,11 +156,14 @@ def test_fallback_account_is_a_required_declared_input():
         (RELEASE, "fallback_expense_account_invalid:expense_account_is_tax_role"),
         (INACTIVE, "fallback_expense_account_invalid:account_inactive_or_not_postable"),
         (uid(999), "fallback_expense_account_invalid:account_unknown"),
+        (uid(70), "fallback_expense_account_invalid:account_other_tenant"),
+        (uid(71), "fallback_expense_account_invalid:account_inactive_or_not_postable"),
+        (uid(72), "fallback_expense_account_invalid:account_not_expense_class"),
     ],
 )
 def test_fallback_account_must_be_a_usable_expense_account(account, code):
     with pytest.raises(TransformParamsError) as exc:
-        TransformParams.from_mapping({"import.fallback_expense_account": account}).validate(ACCOUNTS)
+        params(account).validate(DEST)
     assert exc.value.code == code
 
 
@@ -138,9 +171,15 @@ def test_fallback_account_must_be_a_uuid_and_validates_to_canonical():
     with pytest.raises(TransformParamsError) as exc:
         TransformParams.from_mapping({"import.fallback_expense_account": "5999"})
     assert exc.value.code == "fallback_expense_account_not_a_uuid"
-    assert TransformParams.from_mapping({"import.fallback_expense_account": FALLBACK.upper()}).validate(ACCOUNTS) == (
-        FALLBACK
-    )
+    assert TransformParams.from_mapping({"import.fallback_expense_account": FALLBACK.upper()}, TENANT).validate(
+        DEST
+    ) == (FALLBACK)
+
+
+def test_fallback_validation_needs_the_run_tenant():
+    with pytest.raises(TransformParamsError) as exc:
+        TransformParams.from_mapping({"import.fallback_expense_account": FALLBACK}).validate(DEST)
+    assert exc.value.code == "fallback_expense_account_tenant_unknown"
 
 
 # ---- T-EXP-FALLBACK ----
@@ -313,7 +352,8 @@ def test_unposted_wht_line_has_the_wht_removed_so_the_total_is_the_gross():
         total="317.5",
     )
     out = run(inv)
-    assert out.bucket == TRANSFORM and out.lands
+    # landed at the gross, but counted as queued until the a6 WHT table carries the payment-time fact
+    assert out.bucket == QUEUE and out.lands and out.queue_reasons == ("wht_payment_fact_pending",)
     assert out.lines[lid(2)].tax_amount == D(0) and out.lines[lid(2)].tax_account_ref is None
     assert out.lines[lid(1)].tax_account_ref == TAXACCT
     assert (out.header["subtotal"], out.header["tax_amount"], out.header["total_amount"]) == (
@@ -408,7 +448,7 @@ def test_rules_compose_on_one_invoice_with_one_bridge_line_each():
         items={lid(3): "ITEM-1"},
     )
     out = run(inv)
-    assert out.bucket == TRANSFORM and out.lands
+    assert out.bucket == QUEUE and out.lands and "wht_payment_fact_pending" in out.queue_reasons
     assert rules(out) == sorted([T_EXP_FALLBACK, T_ROUND_2DP, T_ITEM_NONSTOCK, T_UNPOSTED_CORRECT])
     assert out.header["total_amount"] == D("160.00")
 
@@ -439,12 +479,12 @@ def test_every_invoice_is_in_exactly_one_bucket_and_the_partition_balances():
     part = ledger.partition()
     b = part["buckets"]
     assert part["balanced"] is True
-    assert (b[CARRY]["invoices"], b[TRANSFORM]["invoices"], b[QUEUE]["invoices"]) == (1, 4, 1)
+    assert (b[CARRY]["invoices"], b[TRANSFORM]["invoices"], b[QUEUE]["invoices"]) == (1, 3, 2)
     assert part["legacy"]["invoices"] == 6 and part["legacy"]["lines"] == 6
     legacy = D(part["legacy"]["total"])
     assert legacy == sum(D(b[k]["legacy_total"]) for k in b)
     # v2 side: landed total = landed legacy total + the itemised header deltas (WHT -10, rounding 12.345 -> 12.34)
-    landed_legacy = legacy - D(b[QUEUE]["legacy_total"])
+    landed_legacy = legacy - D("70")  # the one invoice that does not land
     assert D(part["v2_landed_total"]) == landed_legacy + D(part["header_delta_total"])
     assert D(part["header_delta_total"]) == D("-10")
     wht_rule = ledger.rules()[T_UNPOSTED_CORRECT]
@@ -462,7 +502,12 @@ def test_every_rule_has_a_receipt_row_and_each_application_is_itemised():
         {"rule", "scope", "invoice_id", "legacy_amount", "v2_amount", "delta", "fingerprint"} <= set(i) for i in items
     )
     assert sum(1 for i in items if i["rule"] == T_UNPOSTED_CORRECT) == 2  # the line and the header
-    assert ledger.queue() == {"invoices": 1, "landed": 0, "by_reason": {"expense_account_is_control": 1}}
+    assert ledger.queue() == {
+        "invoices": 2,
+        "landed": 1,
+        "by_reason": {"expense_account_is_control": 1, "wht_payment_fact_pending": 1},
+        "total_mismatch_after_transform": 0,
+    }
 
 
 def test_ledger_is_deterministic_and_the_itemised_file_is_owner_only(tmp_path):
@@ -491,7 +536,11 @@ def test_parity_delta_counts_the_null_expense_lines_that_now_land():
         "landed_on_fallback": 3,
         "landed_on_legacy_gl_account": 1,
         "not_landed_queued": 1,
-        "declared_written_delta_lines": 4,
+        "newly_not_landed_headers": 1,
+        "newly_not_landed_lines_dest6_landed": 1,  # line 6 (own expense account): dest6 landed it, B-3 queues it
+        "changed_header_values": 0,
+        "declared_written_delta_lines": 3,  # +4 NULL-expense lines landing, -1 line no longer landing
+        "declared_written_delta_headers": -1,
     }
 
 
@@ -532,17 +581,18 @@ def _rows():
             dict(account_id=a, account_code=f.code, is_active=f.active, is_posting_allowed=f.postable)
             for a, f in ACCOUNTS.items()
         ],
+        destination_accounts=DEST_ROWS,
     )
 
 
 def test_build_refuses_before_any_outcome_without_the_fallback():
     with pytest.raises(TransformParamsError) as exc:
-        build_transforms(params=TransformParams(None), **_rows())
+        build_transforms(params=TransformParams(None, TENANT), **_rows())
     assert exc.value.code == "fallback_expense_account_missing"
 
 
 def test_build_maps_a_line_and_its_header():
-    build = build_transforms(params=TransformParams(FALLBACK), **_rows())
+    build = build_transforms(params=params(), **_rows())
     (entry,) = build.line_map.values()
     assert entry["posting_account_ref"] == FALLBACK and entry["line_amount"] == D(100)
     (header,) = build.header_map.values()
@@ -588,7 +638,8 @@ def test_executor_lands_transformed_values_and_names_the_queued_rows():
     assert "line_amount" not in line_spec.column_map and "posting_account_ref" not in line_spec.column_map
     good, bad = uid(9001), uid(9002)
     build = build_transforms(
-        params=TransformParams(FALLBACK),
+        params=params(),
+        destination_accounts=DEST_ROWS,
         rows=[
             dict(
                 invoice_id=i,
@@ -727,6 +778,34 @@ def _cli_world(tmp_path, monkeypatch):
                 "posting_account_ref TEXT, tax_account_ref TEXT)"
             )
         )
+    # the destination chart (mod_accounting) is stood in by a plain table; the manifest's single tenant owns it
+    from erp_v2.importer import transforms as transforms_module
+
+    cli_tenant = GOOD_TENANT
+    with dst.begin() as c:
+        c.execute(
+            sa.text(
+                "CREATE TABLE chart_accounts (id TEXT, tenant_id TEXT, code TEXT, is_active INTEGER, "
+                "posting_allowed INTEGER, account_class TEXT)"
+            )
+        )
+        for a, f in DEST.items():
+            c.execute(
+                sa.text("INSERT INTO chart_accounts VALUES (:a, :t, :c, :ia, :ip, :k)"),
+                dict(
+                    a=a,
+                    t=cli_tenant if f.tenant_id == TENANT else f.tenant_id,
+                    c=f.code,
+                    ia=int(f.active),
+                    ip=int(f.postable),
+                    k=f.account_class,
+                ),
+            )
+    monkeypatch.setattr(
+        transforms_module,
+        "DEST_ACCOUNT_SQL",
+        "SELECT id, tenant_id, code, is_active, posting_allowed, account_class FROM chart_accounts",
+    )
     monkeypatch.setattr(cli, "_resolve_sources", lambda engine, pairings: ({"x"}, {}, {}, ()))
     monkeypatch.setattr(cli, "build_specs", lambda present, cols, dest: ((header_spec, line_spec), ()))
     monkeypatch.setenv("ERP_IMPORT_APPROVED", "1")
@@ -772,8 +851,17 @@ def test_cli_apply_lands_the_fallback_line_queues_the_other_and_receipts_the_bri
     data = json.loads(receipt.read_text())
     t = data["transforms"]
     assert t["ran"] and t["partition"]["balanced"] is True
-    assert t["queue"] == {"invoices": 1, "landed": 0, "by_reason": {"expense_account_is_control": 1}}
-    assert t["parity"]["declared_written_delta_lines"] == 1 and t["parity"]["null_expense_lines"] == 1
+    assert t["queue"] == {
+        "invoices": 1,
+        "landed": 0,
+        "by_reason": {"expense_account_is_control": 1},
+        "total_mismatch_after_transform": 0,
+    }
+    assert t["parity"]["newly_not_landed_headers"] == 1 and t["parity"]["declared_written_delta_headers"] == -1
+    assert t["partition"]["universe"]["each_invoice_in_exactly_one_bucket"] is True
+    # +1 NULL-expense line landing, -1 line (own account) that dest6 landed but the queued invoice no longer does
+    assert t["parity"]["declared_written_delta_lines"] == 0 and t["parity"]["null_expense_lines"] == 1
+    assert t["parity"]["landed_on_fallback"] == 1
     assert t["rules"][T_EXP_FALLBACK]["line"]["applications"] == 1
     assert {e["reason"] for e in data["exceptions"]} == {"transform_queue:expense_account_is_control"}
     side = tmp_path / t["itemised_file"]
@@ -784,3 +872,96 @@ def test_cli_apply_lands_the_fallback_line_queues_the_other_and_receipts_the_bri
             FALLBACK
         ]
         assert [r[0] for r in c.execute(sa.text("SELECT id FROM supplier_invoices"))] == [good]
+
+
+# ---- review fixes: A1D, GL untouched, universe, negative parity, rounding order ----
+
+
+def test_expense_posted_elsewhere_on_an_a1d_invoice_follows_the_legacy_gl_account():
+    from erp_v2.importer.tax_accounts import DeferralFacts
+
+    # invoice journal Dr ELSEWHERE 110 / Cr control 110; deferral journal Dr 1455 10 / Cr ELSEWHERE 10
+    deferral = DeferralFacts(({TAXACCT: D(10), ELSEWHERE: D(-10)},), 0, (uid(8000),))
+    inv = invoice(
+        [line(1, tax="10", code=vat())],
+        status="POSTED",
+        ledger={ELSEWHERE: D(110)},
+        invoice_net={ELSEWHERE: D(110), CTRL: D(-110)},
+        control=CTRL,
+        deferral=deferral,
+    )
+    assert inv.tax.klass == "A1D" and inv.tax.expense_elsewhere
+    out = run(inv)
+    assert out.lines[lid(1)].posting_account_ref == ELSEWHERE
+    assert out.lines[lid(1)].tax_account_ref == TAXACCT  # the legacy A1D split ref is history, unchanged
+    (bridge,) = out.bridge
+    assert (bridge.rule, bridge.legacy_account, bridge.v2_account) == (T_EXP_LEGACY, EXP, ELSEWHERE)
+
+
+def test_the_legacy_gl_rows_are_never_changed_by_the_transforms():
+    import copy
+
+    inputs = _rows()
+    inputs["ledger_rows"] = [
+        dict(journal_entry_id=uid(9100), account_id=ELSEWHERE, debit_amount="100", credit_amount=None)
+    ]
+    before = copy.deepcopy(inputs)
+    build_transforms(params=params(), **inputs)
+    assert inputs == before
+
+
+def test_line_less_invoices_are_in_the_partition_universe_and_a_missing_one_fails_the_proof():
+    inputs = _rows()
+    inputs["headers"].append(dict(invoice_id=uid(9050), status="DRAFT", subtotal="5", tax_amount="0", total_amount="5"))
+    build = build_transforms(params=params(), **inputs)
+    part = build.ledger.partition()
+    assert part["legacy"]["invoices"] == 2 and part["universe"]["source_invoices"] == 2
+    assert part["universe"]["each_invoice_in_exactly_one_bucket"] and part["balanced"] is True
+    assert part["buckets"]["CARRY"]["invoices"] == 1 and part["buckets"]["CARRY"]["lines"] == 0
+    # an outcome dropped from the ledger, a duplicated one, or a source line count that disagrees all unbalance it
+    ledger = build.ledger
+    dropped = TransformLedger(ledger.outcomes[:1], FALLBACK, ledger.source_invoice_ids, ledger.source_line_count)
+    assert dropped.partition()["balanced"] is False
+    doubled = TransformLedger(ledger.outcomes * 2, FALLBACK, ledger.source_invoice_ids, ledger.source_line_count)
+    assert doubled.partition()["balanced"] is False
+    extra_lines = TransformLedger(ledger.outcomes, FALLBACK, ledger.source_invoice_ids, ledger.source_line_count + 1)
+    assert extra_lines.partition()["balanced"] is False
+
+
+def test_parity_delta_is_negative_when_queued_invoices_outweigh_the_landed_null_lines():
+    outs = [
+        run(invoice([line(1, expense=CTRL), line(2, expense=EXP), line(3, expense=EXP2)], n=1, status="DRAFT")),
+        run(invoice([line(4, expense=None)], n=2, status="DRAFT")),
+    ]
+    parity = TransformLedger(tuple(outs), FALLBACK).parity()
+    assert parity["landed_on_fallback"] == 1 and parity["newly_not_landed_lines_dest6_landed"] == 3
+    assert parity["declared_written_delta_lines"] == -2 and parity["declared_written_delta_headers"] == -1
+
+
+def test_changed_header_values_are_listed():
+    wht = TaxCodeFacts(ORG, "WITHHOLDING", PAID, None)
+    ledger = TransformLedger(
+        (run(invoice([line(1, amount="200", tax="10", code=wht)], status="DRAFT", sub="200", tax="10", total="210")),),
+        FALLBACK,
+    )
+    (changed,) = ledger.changed_headers()
+    assert (
+        changed["legacy_total"] == "210"
+        and changed["v2_total"] == "200"
+        and ledger.parity()["changed_header_values"] == 1
+    )
+    assert ledger.itemised()["changed_headers"] == [changed]
+
+
+def test_rounding_keeps_the_two_decimal_header_total_by_rounding_tax_first():
+    # tax 7.504 -> 7.50; total 107.50 is preserved, so the subtotal is derived as 100.00 (not rounded independently)
+    inv = invoice([line(1, amount="100.00", tax="7.504", code=vat())], sub="99.996", tax="7.504", total="107.50")
+    out = run(inv)
+    assert out.bucket != QUEUE and out.header["total_amount"] == D("107.50")
+    assert out.header["tax_amount"] == D("7.50") and out.header["subtotal"] == D("100.00")
+
+
+def test_a_legacy_header_that_is_not_subtotal_plus_tax_is_counted_as_total_mismatch():
+    out = run(invoice([line(1, amount="10.005")], sub="10.01", total="11.00"))
+    assert out.bucket == QUEUE and not out.lands and out.queue_reason == "total_mismatch_after_transform"
+    assert TransformLedger((out,), FALLBACK).queue()["total_mismatch_after_transform"] == 1
