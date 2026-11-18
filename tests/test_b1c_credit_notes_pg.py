@@ -35,6 +35,11 @@ from erp_v2.web.revenue_services import RevenueActionError
 
 engine = bridge_pg.engine
 
+A6 = hasattr(payables, "declare_tax_deferral")
+# Taxed credits need the a6 owner (the 1455/1440 split); on the released a5 pin they are refused (see the a5 tests).
+needs_a6 = pytest.mark.skipif(not A6, reason="a taxed credit note needs payables a6; refused on a5")
+only_a5 = pytest.mark.skipif(A6, reason="a5-only: the taxed-credit refusal")
+
 MODELS = (CreditNote, CreditApplication, LiabilityEvent, AccountingReceipt, JournalEntry, JournalLine)
 
 
@@ -143,6 +148,7 @@ def ledger(engine, journal_id):
         }
 
 
+@needs_a6
 def test_approve_posts_dr_2000_cr_lines_and_tax_with_one_receipt_and_a_credit_event(engine):
     env = world(engine)
     iid, _ob = approved_invoice(engine, env)
@@ -170,6 +176,7 @@ def test_approve_posts_dr_2000_cr_lines_and_tax_with_one_receipt_and_a_credit_ev
     assert audit.is_success and audit.details["evidence_ref"] == "FIN-EXC-1" and audit.entity_id == str(cid)
 
 
+@needs_a6
 def test_the_submitter_may_approve_their_own_credit_note_there_is_no_compulsory_second_person(engine):
     env = world(engine)
     iid, _ob = approved_invoice(engine, env)
@@ -177,6 +184,7 @@ def test_the_submitter_may_approve_their_own_credit_note_there_is_no_compulsory_
     assert approve(engine, env, cid, who=0).replayed is False
 
 
+@needs_a6
 def test_replay_is_a_no_op(engine):
     env = world(engine)
     iid, _ob = approved_invoice(engine, env)
@@ -204,6 +212,7 @@ def test_applying_to_the_original_invoice_obligation_reduces_outstanding(engine)
     assert balance(engine, env) == Decimal("115")  # 215 - 100
 
 
+@needs_a6
 def test_default_apply_amount_is_the_whole_credit(engine):
     env = world(engine)
     iid, obligation = approved_invoice(engine, env)
@@ -256,6 +265,7 @@ def test_original_invoice_must_be_approved_and_match_supplier_and_currency(engin
     assert counts(engine, env) == before
 
 
+@needs_a6
 def test_evidence_reference_is_required_and_a_draft_is_not_approvable(engine):
     env = world(engine)
     iid, _ob = approved_invoice(engine, env)
@@ -325,6 +335,7 @@ def rewrite(engine, cid, **fields):
         db.commit()
 
 
+@needs_a6
 def test_v1_and_v2_are_enforced_again_at_approval(engine):
     env = world(engine)
     iid, _ob = approved_invoice(engine, env)
@@ -352,6 +363,7 @@ def test_v1_and_v2_are_enforced_again_at_approval(engine):
     refusal(engine, env, cid, "ap_control_unavailable")
 
 
+@needs_a6
 def test_closed_period_dimensions_and_missing_ledger_receipt_refuse_without_partial_state(engine):
     env = world(engine)
     iid, _ob = approved_invoice(engine, env)
@@ -411,6 +423,7 @@ def test_party_of_another_tenant_and_unknown_credit_note_are_refused(engine):
         assert exc.value.code == "not_found"
 
 
+@needs_a6
 def test_v2_a_control_account_is_refused_as_a_credit_line_or_tax_account(engine):
     env = world(engine)
     iid, _ob = approved_invoice(engine, env)
@@ -428,6 +441,7 @@ def test_v2_a_control_account_is_refused_as_a_credit_line_or_tax_account(engine)
     refusal(engine, env, cid, "line_account_is_control")
 
 
+@needs_a6
 def test_a_taxed_credit_note_must_name_its_original_invoice(engine):
     env = world(engine)
     approved_invoice(engine, env)
@@ -461,3 +475,56 @@ def test_a_credit_at_another_exchange_rate_than_the_original_is_not_applied(engi
     cid = draft(engine, env, tax="0", exchange_rate="2", original_invoice_id=str(iid))
     refusal(engine, env, cid, "apply_exchange_rate_differs", obligation_id=obligation)
     assert approve(engine, env, cid).applied_amount == 0
+
+
+def test_an_untaxed_credit_posts_and_applies_on_any_pin(engine):
+    env = world(engine)
+    iid, ob = approved_invoice(engine, env)
+    cid = draft(engine, env, number="CN-UT", quantity="1", price="100", tax="0", original_invoice_id=str(iid))
+    out = approve(engine, env, cid, obligation_id=ob, apply_amount="100")
+    assert ledger(engine, out.accounting_reference) == {"2000": (100, 0), "5000": (0, 100)}
+    assert out.applied_amount == 100 and out.application_reference is None
+    with Session(engine) as db:
+        assert db.get(PaymentObligation, ob).outstanding_amount == Decimal("115")
+    assert balance(engine, env) == Decimal("115")
+
+
+@only_a5
+def test_on_a5_a_taxed_credit_is_refused_at_the_draft_and_at_approval(engine):
+    env = world(engine)
+    iid, _ob = approved_invoice(engine, env)
+    draft_refused(engine, env, "credit_vat_split_requires_payables_a6", original_invoice_id=str(iid))
+    cid = draft(
+        engine, env, number="CN-A5", quantity="1", price="100", tax="0", submit=False, original_invoice_id=str(iid)
+    )
+    rewrite(engine, cid, tax_amount=Decimal("15"), tax_account_ref=str(env.tax_account))
+    with Session(engine) as db:
+        svc.submit_credit_note_draft(
+            db, tenant=db.get(Tenant, env.tenant_id), party=db.get(Party, env.party_ids[0]), credit_note_id=cid
+        )
+        db.commit()
+    refusal(engine, env, cid, "credit_vat_split_requires_payables_a6")
+    assert status(engine, cid) == CreditNoteStatus.SUBMITTED
+
+
+def test_an_input_tax_or_release_account_is_never_a_credit_lines_own_posting_account(engine):
+    env = world(engine)
+    approved_invoice(engine, env)
+    release = add_account(engine, env, "1440")
+    for target in (env.tax_account, release):  # 1455 and 1440, untaxed lines
+        draft_refused(engine, env, "line_account_is_tax_account", posting_account_id=str(target), tax="0")
+
+
+def test_the_application_account_check_allows_only_the_accounts_named_in_the_release_rows():
+    from types import SimpleNamespace
+
+    deferral, release, stray = str(uuid4()), str(uuid4()), str(uuid4())
+    rows = [SimpleNamespace(deferral_account_ref=deferral, release_account_ref=release)]
+    good = SimpleNamespace(
+        entries=[SimpleNamespace(account_ref=release), SimpleNamespace(account_ref=deferral.upper())]
+    )
+    svc._check_application_accounts(rows, good)
+    for bad in (stray, "2000"):
+        with pytest.raises(svc.CreditApprovalRefused) as exc:
+            svc._check_application_accounts(rows, SimpleNamespace(entries=[SimpleNamespace(account_ref=bad)]))
+        assert exc.value.code == "application_consequence_account_unexpected"

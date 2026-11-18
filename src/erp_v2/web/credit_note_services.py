@@ -61,6 +61,22 @@ from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
 from erp_v2.web.revenue_services import RevenueActionError, _account, _actor, _date, _decimal
 
+_A6 = CreditNoteTaxSplit is not None
+if _A6:  # fail closed: the a6 models without the a6 service functions is a broken install, never "no releases"
+    _missing = [
+        name
+        for name in (
+            "credit_application_tax_releases",
+            "build_credit_application_accounting_consequence",
+            "declare_tax_deferral",
+        )
+        if not hasattr(payables, name)
+    ]
+    if _missing:  # pragma: no cover
+        raise ImportError(
+            "payables a6 models are present but these service functions are missing: " + ", ".join(_missing)
+        )
+
 AUDIT_APPROVED_POSTED: Final = "erp.finance.supplier_credit_note.approved_posted"
 AUDIT_APPROVAL_REFUSED: Final = "erp.finance.supplier_credit_note.approval_refused"
 AUDIT_APPLIED: Final = "erp.finance.supplier_credit_note.applied"
@@ -141,6 +157,11 @@ def create_credit_note_draft(db: Session, *, tenant: Tenant, party: Party, value
             original = UUID(values["original_invoice_id"].strip())
         except ValueError as exc:
             raise RevenueActionError("The original invoice reference is not valid") from exc
+    if tax > 0 and not _A6:
+        raise RevenueActionError(
+            "A taxed credit note needs the payables VAT-release contract (a6), which is not installed",
+            "credit_vat_split_requires_payables_a6",
+        )
     if tax > 0 and original is None:
         raise RevenueActionError(
             "A taxed credit note must name its original invoice", "deferred_tax_credit_requires_invoice"
@@ -297,6 +318,21 @@ def _is_uuid(value: object) -> bool:
     return True
 
 
+def _check_application_accounts(rows, consequence) -> None:
+    """The application consequence may touch only the deferral and release accounts named in its release rows."""
+    allowed = {str(ref) for row in rows for ref in (row.deferral_account_ref, row.release_account_ref)}
+    for entry in consequence.entries:
+        ref = str(entry.account_ref)
+        if ref not in allowed and not any(
+            _is_uuid(a) and _is_uuid(ref) and same_account(ref, UUID(a)) for a in allowed
+        ):
+            raise CreditApprovalRefused(
+                "application_consequence_account_unexpected",
+                "The credit application's ledger entries touch an account that is not in its release rows; refer it "
+                "to the exceptions review",
+            )
+
+
 def _apply_and_post(
     db: Session,
     *,
@@ -320,12 +356,15 @@ def _apply_and_post(
         idempotency_expires_at=None,
         applied_at=now,
     )
-    releases = getattr(payables, "credit_application_tax_releases", None)  # a6 only
-    if releases is None or not releases(db, tenant.id, application.id):
+    if not _A6:  # a5: applications carry no VAT release
+        return application.id, None, False
+    rows = payables.credit_application_tax_releases(db, tenant.id, application.id)
+    if not rows:
         return application.id, None, False
     consequence = payables.build_credit_application_accounting_consequence(
         db, tenant_id=tenant.id, application_id=application.id
     )
+    _check_application_accounts(rows, consequence)
     approval_ref = f"erp.b1c:credit_application:{application.id}:actor:{actor}"
     posted = post_consequence(db, scope=scope, consequence=consequence, approval_ref=approval_ref, actor=actor, now=now)
     payables.record_accounting_receipt(
@@ -451,6 +490,12 @@ def _guarded(
             "dimensions_unsupported",
             "Lines " + ", ".join(map(str, with_dimensions)) + " carry cost-centre/project/segment dimensions, "
             "which cannot be posted yet; refer this credit note to the exceptions review",
+        )
+    if not _A6 and any(line.tax_amount > 0 for line in lines):
+        raise CreditApprovalRefused(
+            "credit_vat_split_requires_payables_a6",
+            "A taxed credit note needs the payables VAT-release contract (a6), which is not installed; "
+            "refer it to the exceptions review",
         )
     if credit.original_invoice_id is None and any(line.tax_amount > 0 for line in lines):
         raise CreditApprovalRefused(
