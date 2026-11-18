@@ -27,6 +27,7 @@ re-applying the current value is a no-op.
 |---|---|---|
 | 1 | Role-pair SoD at grant (incl. `finance_approver` + `treasury`) | off: counted `warnings.sod_conflict` in the receipt, grants proceed |
 | 2 | B1 submitter != approver | tenant policy read at approval |
+| 2b | Supplier credit-note approval (#65): submitter != approver (`sod_submitter_is_approver`) | tenant policy read at approval (no stamp column, so no `pending_stamped_off` entry) |
 | 3 | B1b approver != submitter / legacy approver (and the unknown/unresolved refusals) | tenant policy read at plan |
 | 4 | B2 manual journals: post and reversal separation | row stamp + CHECKs |
 | 5 | B3 supplier payments: approver, recorder, reverser, file issuer, instruction party | tenant policy read at each step |

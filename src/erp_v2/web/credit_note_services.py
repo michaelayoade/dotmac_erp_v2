@@ -56,6 +56,7 @@ except ImportError:  # pragma: no cover - exercised on the a5 pin
     CreditNoteTaxSplit = None  # type: ignore[assignment,misc]
     HistoricalCreditReceipt = None  # type: ignore[assignment,misc]
 
+from erp_v2.governance import policy as governance
 from erp_v2.ledger_roles import invoice_account_violation, same_account
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
@@ -476,6 +477,17 @@ def _guarded(
         raise CreditApprovalRefused(
             "receipt_exists", "A submitted credit note already has a ledger receipt; refer it for review"
         )
+    # D-9: separation of duties is a per-tenant policy, default OFF (read live, as B1 does; credit notes carry no
+    # stamp column). Policy ON: the submitter cannot approve their own credit note.
+    if governance.dual_control(db, tenant.id):
+        if not credit.submitted_by:
+            raise CreditApprovalRefused(
+                "submitter_unknown", "The submitter is not recorded, so separation of duties cannot hold"
+            )
+        if credit.submitted_by == actor:
+            raise CreditApprovalRefused(
+                "sod_submitter_is_approver", "You submitted this credit note; another person must approve it"
+            )
     evidence = _evidence(evidence_ref)
     lines = list(
         db.scalars(
