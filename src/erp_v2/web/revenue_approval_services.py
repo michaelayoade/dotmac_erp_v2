@@ -34,6 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.governance import policy as governance
 from erp_v2.ledger_roles import invoice_account_violation
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
@@ -131,10 +132,15 @@ def _guarded(db: Session, *, tenant: Tenant, party: Party, invoice_id: UUID, now
         raise ApprovalRefused("not_submitted", "Only a submitted supplier invoice can be approved")
     if receipt is not None:
         raise ApprovalRefused("receipt_exists", "A submitted invoice already has a ledger receipt; refer it for review")
-    if not invoice.submitted_by:
-        raise ApprovalRefused("submitter_unknown", "The submitter is not recorded, so separation of duties cannot hold")
-    if _submitter_party_id(db, tenant.id, invoice.submitted_by) == party.id:
-        raise ApprovalRefused("sod_submitter_is_approver", "You submitted this invoice; another person must approve it")
+    if governance.dual_control(db, tenant.id):
+        if not invoice.submitted_by:
+            raise ApprovalRefused(
+                "submitter_unknown", "The submitter is not recorded, so separation of duties cannot hold"
+            )
+        if _submitter_party_id(db, tenant.id, invoice.submitted_by) == party.id:
+            raise ApprovalRefused(
+                "sod_submitter_is_approver", "You submitted this invoice; another person must approve it"
+            )
     lines = list(
         db.scalars(
             select(SupplierInvoiceLine).where(

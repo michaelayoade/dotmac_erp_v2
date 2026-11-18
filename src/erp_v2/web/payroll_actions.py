@@ -22,6 +22,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from erp_v2.governance.policy import dual_control
+
 
 class PayrollActionError(ValueError):
     """A payroll form was refused without committing application state."""
@@ -129,7 +131,7 @@ def calculate_employee(
     run = db.scalar(select(PayrollRun).where(PayrollRun.tenant_id == tenant.id, PayrollRun.id == run_id))
     if run is None:
         raise PayrollActionError("Payroll run not found")
-    if run.created_by_id != party.id:
+    if dual_control(db, tenant.id) and run.created_by_id != party.id:
         raise PayrollActionError(
             "Only the person who created this run can enter its calculations; they cannot also approve it"
         )

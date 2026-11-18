@@ -26,6 +26,7 @@ from dotmac_payables.models import (
     LiabilityEvent,
     PaymentObligation,
 )
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW
 
@@ -179,6 +180,7 @@ def test_approve_posts_dr_2000_cr_lines_and_tax_with_one_receipt_and_a_credit_ev
 @needs_a6
 def test_the_submitter_may_approve_their_own_credit_note_there_is_no_compulsory_second_person(engine):
     env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)  # the default policy: no compulsory second person
     iid, _ob = approved_invoice(engine, env)
     cid = draft(engine, env, original_invoice_id=str(iid))  # submitted by party 0
     assert approve(engine, env, cid, who=0).replayed is False
@@ -528,3 +530,20 @@ def test_the_application_account_check_allows_only_the_accounts_named_in_the_rel
         with pytest.raises(svc.CreditApprovalRefused) as exc:
             svc._check_application_accounts(rows, SimpleNamespace(entries=[SimpleNamespace(account_ref=bad)]))
         assert exc.value.code == "application_consequence_account_unexpected"
+
+
+def test_policy_on_the_submitter_cannot_approve_their_own_credit_note(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    iid, _ob = approved_invoice(engine, env)
+    cid = draft(engine, env, quantity="1", price="100", tax="0", original_invoice_id=str(iid))  # submitted by party 0
+    refusal(engine, env, cid, "sod_submitter_is_approver", who=0)
+    assert status(engine, cid) == CreditNoteStatus.SUBMITTED
+
+
+def test_policy_on_another_person_can_still_approve(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    iid, _ob = approved_invoice(engine, env)
+    cid = draft(engine, env, quantity="1", price="100", tax="0", original_invoice_id=str(iid))
+    assert approve(engine, env, cid, who=1).replayed is False

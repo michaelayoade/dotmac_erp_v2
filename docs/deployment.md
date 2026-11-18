@@ -329,6 +329,13 @@ this does not authorize adjusting balances or switching traffic.
   and a guard trigger on `erp_payroll_payout_lines`). The e2 head in this section moves to it. No new
   permission, no role profile bump, no new environment variable.
 
+- Dual-control policy (D-9; `docs/dual-control-policy.md`) adds the head `e2_0022_dual_control_policy` (after
+  `e2_0021_payroll_payout_returns`): one table `erp_governance_policies` (RLS forced, runtime SELECT only) and a
+  `dual_control boolean NOT NULL DEFAULT true` column on six tables with database separation CHECKs, whose CHECKs
+  are rewritten as `NOT dual_control OR (...)`. Rows that exist before the migration stay strict. The e2 head in
+  this section moves to it. No new permission, role profile bump or environment variable; the policy is set only
+  by `python -m erp_v2.governance.cli`.
+
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
 depends on `bk_0001_banking`; its stamped head is absorbed by that lineage.

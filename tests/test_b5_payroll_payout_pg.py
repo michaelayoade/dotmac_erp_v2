@@ -36,6 +36,7 @@ from dotmac_payables.models import SupplierPayment, SupplierPaymentStatus
 from dotmac_payroll import service as payroll
 from dotmac_payroll.models import PayrollLiability, PayrollLiabilitySettlement
 from dotmac_people.models import Employee
+from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 from test_posting_bridge_pg import NOW, soft_close
 
@@ -162,7 +163,9 @@ def finalized(engine, env) -> UUID:
     return run_id
 
 
-def seed_instructions(engine, env, *, proposer="proposer", decider="decider", origin="manual", name="EMP", refs=None):
+def seed_instructions(
+    engine, env, *, proposer="proposer", decider="decider", origin="manual", name="EMP", refs=None, dual_control=True
+):
     with Session(engine) as db:
         for i, key in enumerate(refs or ("E1", "E2", "E3")):
             ref = env.emp[key]
@@ -187,6 +190,7 @@ def seed_instructions(engine, env, *, proposer="proposer", decider="decider", or
                     account_name=f"{name} {ref}",
                     status="approved",
                     origin=origin,
+                    dual_control=dual_control,
                     proposed_by_party_id=env.people[proposer] if manual else None,
                     proposed_at=NOW,
                     decided_by_party_id=env.people[decider],
@@ -1501,3 +1505,47 @@ def test_a_bank_whose_cash_gl_is_a_control_account_is_refused_for_payroll_too(en
     before = counts(engine, env)
     refused(lambda: prepare(engine, env, run_id), "cash_account_is_control")
     assert counts(engine, env) == before
+
+
+# --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
+# Payroll a5 still owns its own settlement separation until payroll a6; the ERP-side checks below are the ones
+# this policy controls, so the steps that stop at the ERP layer (approve, issue the file) use the same person.
+
+
+def test_policy_off_the_preparer_approves_the_instruction_party_acts_and_the_batch_is_stamped_off(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    seed_instructions(engine, env, proposer="approver", decider="approver", dual_control=False)
+    enable_file(engine, env)
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id)
+    assert batch_row(engine, out.batch_id).dual_control is False
+    assert all(line.dual_control is False for line in lines(engine, out.batch_id))
+    assert approve(engine, env, out.batch_id, who="preparer").replayed is False  # preparer approves
+    # the file is issued by the batch preparer (also an instruction party): none of the ERP refusals applies
+    assert generate(engine, env, out.batch_id, who="preparer") is not None
+    assert batch_row(engine, out.batch_id).status == "file_issued"
+
+
+def test_policy_on_stamps_true_and_the_refusals_still_fire(engine):
+    env = world(engine)  # the seed turns the policy ON
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id)
+    assert batch_row(engine, out.batch_id).dual_control is True
+    refused(lambda: approve(engine, env, out.batch_id, who="preparer"), "sod_approver_is_preparer")
+
+
+def test_check_distinct_people_is_rewritten_not_dual_control_or_predicate(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    sql = (
+        "UPDATE erp_payroll_payout_batches SET dual_control=:on, approved_by_party_id=:who, status='approved' "
+        "WHERE id=:id"
+    )
+    with Session(engine) as db, pytest.raises(sa.exc.IntegrityError) as err:  # on: the preparer is refused
+        db.execute(sa.text(sql), {"on": True, "who": env.people["preparer"], "id": batch_id})
+    assert "distinct_people" in str(err.value)
+    with Session(engine) as db:  # off: the database accepts the same person
+        db.execute(sa.text(sql), {"on": False, "who": env.people["preparer"], "id": batch_id})
+        db.rollback()

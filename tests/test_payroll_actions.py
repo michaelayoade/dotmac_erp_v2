@@ -13,9 +13,11 @@ from dotmac_kernel.money import Currency
 from dotmac_payroll import service
 from dotmac_payroll.contracts import PayComponentInput, PayRuleInput
 from dotmac_payroll.models import TENANT_MODELS, PayrollCalculation, PayrollCalculationLine, PayrollRun
+from dual_control_support import set_dual_control
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
+from erp_v2.governance.models import GovernancePolicy
 from erp_v2.web import payroll_actions as actions
 
 NOW = datetime(2026, 1, 31, tzinfo=UTC)
@@ -24,7 +26,9 @@ NOW = datetime(2026, 1, 31, tzinfo=UTC)
 @pytest.fixture
 def payroll():
     engine = create_engine("sqlite://", execution_options={"schema_translate_map": {"mod_payroll": None}})
-    Base.metadata.create_all(engine, tables=[Tenant.__table__, *(m.__table__ for m in TENANT_MODELS)])
+    Base.metadata.create_all(
+        engine, tables=[Tenant.__table__, GovernancePolicy.__table__, *(m.__table__ for m in TENANT_MODELS)]
+    )
     with Session(engine) as db:
         tenant = Tenant(slug="payroll", name="Payroll")
         other = Tenant(slug="other", name="Other")
@@ -238,10 +242,18 @@ def test_service_failure_after_flush_rolls_back_savepoint(payroll, monkeypatch):
 
 def test_only_the_run_creator_may_enter_calculations(payroll):
     db, tenant, _, _, run = payroll
+    set_dual_control(db, tenant.id, True)  # calculator = creator is a policy-ON check (D-9)
     stranger = SimpleNamespace(id=uuid4())
     with pytest.raises(actions.PayrollActionError, match="Only the person who created"):
         _calculate(db, tenant, run, party=stranger)
     assert _count(db, PayrollCalculation) == 0
+
+
+def test_policy_off_any_permitted_person_may_enter_calculations(payroll):
+    db, tenant, _, _, run = payroll  # no policy row: OFF by default
+    stranger = SimpleNamespace(id=uuid4())
+    assert _calculate(db, tenant, run, party=stranger).net_amount == Decimal("450.01")
+    assert _count(db, PayrollCalculation) == 1
 
 
 def test_draft_overlapping_a_non_cancelled_run_is_refused_but_cancelled_and_adjacent_are_not(payroll):

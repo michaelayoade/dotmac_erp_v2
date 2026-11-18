@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 from erp_v2.banking import recon_models as m
 from erp_v2.banking.recon_models import BankReconciliation, BankReconItem, BankReconMatch, BankReconMatchLine
 from erp_v2.cash_gl.models import CashAccountRepoint
+from erp_v2.governance import policy as governance
 from erp_v2.journals import models as journal_models
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
 
@@ -806,6 +807,7 @@ def open_reconciliation(
                 raise ReconRefused("baseline_required", "the account needs an approved baseline reconciliation first")
             row = BankReconciliation(
                 tenant_id=tenant_id,
+                dual_control=governance.dual_control(db, tenant_id),
                 account_id=account.id,
                 kind=m.KIND_BASELINE if baseline_date is not None else m.KIND_PERIODIC,
                 statement_id=statement.id,
@@ -920,9 +922,9 @@ def approve(
             if row.status != m.STATUS_PREPARED:
                 raise ReconRefused("state_refused", f"only a prepared reconciliation can be approved, not {row.status}")
             _recheck_gl(db, tenant_id, bank_account, row)
-            if actor == row.prepared_by_party_id:
+            if row.dual_control and actor == row.prepared_by_party_id:
                 raise ReconRefused("sod_preparer", "the preparer cannot approve their own reconciliation")
-            if actor in _participants(db, tenant_id, row):
+            if row.dual_control and actor in _participants(db, tenant_id, row):
                 raise ReconRefused(
                     "sod_participant", "the approver took part in opening, matching or itemizing this reconciliation"
                 )

@@ -30,6 +30,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from erp_v2.governance import policy as governance
 from erp_v2.payees.models import InstructionOrigin, InstructionStatus, PayeeBankInstruction, PayeeKind
 
 AUDIT_PROPOSED: Final = "erp.payees.bank_details.proposed"
@@ -293,6 +294,7 @@ def propose(
     row = PayeeBankInstruction(
         id=uuid4(),
         tenant_id=tenant_id,
+        dual_control=governance.dual_control(db, tenant_id),
         payee_kind=kind.value,
         payee_ref=ref,
         payee_label=label,
@@ -358,7 +360,7 @@ def approve(
         # A proposal with no proposer (an imported row) has no first person: approving it would be
         # one-person activation. Migrated rows are approved by the importer, not by approve().
         raise PayeeBankError("no_proposer", "an instruction with no proposer cannot be approved; propose it")
-    if row.proposed_by_party_id == approver_party_id:
+    if row.dual_control and row.proposed_by_party_id == approver_party_id:
         raise PayeeBankError("same_person", "the proposer cannot approve their own proposal")
     if resolve_payee(db, tenant_id, row.payee_kind, row.payee_ref) is None:
         raise PayeeBankError("unknown_payee", "payee is not a known supplier or employee in this tenant")

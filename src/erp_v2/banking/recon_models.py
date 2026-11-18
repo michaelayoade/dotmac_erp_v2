@@ -14,7 +14,7 @@ from typing import Final
 from uuid import UUID
 
 from dotmac_kernel.models import Base, TimestampMixin, uuid_pk
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, UniqueConstraint, Uuid, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, UniqueConstraint, Uuid, func, true
 from sqlalchemy.orm import Mapped, mapped_column
 
 from erp_v2.hr.models import _tenant_fk
@@ -59,6 +59,8 @@ class BankReconciliation(Base, TimestampMixin):
 
     id: Mapped[UUID] = uuid_pk()
     tenant_id: Mapped[UUID] = _tenant_fk()
+    # Stamped from the tenant policy at creation; DB default true keeps pre-e2_0022 rows strict (e2_0022).
+    dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     account_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     statement_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     gl_account_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
