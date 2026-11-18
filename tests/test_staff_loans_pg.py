@@ -810,15 +810,25 @@ def test_finalize_rechecks_after_a_balance_fell_between_approve_and_finalize(eng
     assert run_status(engine, run_id) == ("approved", 0)
 
 
-def test_recoveries_before_the_opening_date_are_already_inside_the_opening(engine):
-    # the opening is dated after the run's period (2026-01): the run's recovery is not deducted again
+def test_a_run_ending_on_or_before_the_opening_date_is_refused_not_silently_ignored(engine):
+    # the opening (2026-03-31) is dated after the run's period (2026-01): its recovery is already inside the
+    # opening balance, so the run is refused rather than recovering the same money twice
     env = b4_world(engine, openings={"E1": "10000", "E2": "5000"}, opening_date=date(2026, 3, 31))
+    run_id = b4.new_run(engine, env)
+    b4.batch(engine, env, run_id)
+    with pytest.raises(RunRefused) as exc:
+        b4.approve(engine, env, run_id)
+    assert exc.value.code == "recovery_before_loan_opening"
+    assert "E1" in str(exc.value) and run_status(engine, run_id) == ("draft", 0)
+
+
+def test_a_run_ending_after_the_opening_date_is_deducted_as_usual(engine):
+    env = b4_world(engine, openings={"E1": "10000", "E2": "5000"}, opening_date=date(2026, 1, 30))  # run ends 01-31
     run_id = b4.new_run(engine, env)
     b4.batch(engine, env, run_id)
     b4.approve(engine, env, run_id)
     b4.finalize(engine, env, run_id)
-    e1 = balance(engine, env, "E1")
-    assert (e1.recoveries, e1.balance, e1.opening_date) == (Decimal(0), Decimal(10000), date(2026, 3, 31))
+    assert balance(engine, env, "E1").balance == 0
 
 
 def test_a_run_without_internal_recovery_never_consults_the_loans(engine):
@@ -910,3 +920,234 @@ def test_the_database_backstops_the_policy_stamped_on_the_row(engine):
                 ),
                 {"i": created.entry_id},
             )
+
+
+# --- cancel ---------------------------------------------------------------------------------------
+
+
+def cancel(env, entry_id, reason="entered in error", who="preparer"):
+    return act(env, who, service.cancel_entry, entry_id=entry_id, reason=reason)
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_a_draft_or_approved_entry_can_be_cancelled_with_a_reason_and_never_posts(engine, approved):
+    env = world(engine)
+    created = advance(env)
+    if approved:
+        approve(env, created.entry_id)
+    done = cancel(env, created.entry_id, reason="  duplicate request  ")
+    stored = row(engine, created.entry_id)
+    assert stored.state == "cancelled" and stored.cancel_reason == "duplicate request"
+    assert stored.cancelled_by_party_id == env.people["preparer"] and stored.cancelled_at is not None
+    assert done.replayed is False and cancel(env, created.entry_id).replayed is True
+    assert len(audits(engine, env, service.AUDIT_CANCELLED)) == 1
+    refused(lambda: approve(env, created.entry_id), "not_draft")
+    refused(lambda: record(env, created.entry_id, ref="BANK-REF-1"), "not_approved")
+    assert counts(engine, env)["journals"] == 0 and balance(engine, env).balance == 0
+
+
+def test_cancel_needs_a_reason_and_a_recorded_entry_cannot_be_cancelled(engine):
+    env = world(engine)
+    created = advance(env)
+    refused(lambda: cancel(env, created.entry_id, reason="  "), "reason_required")
+    assert row(engine, created.entry_id).state == "draft"
+    approve(env, created.entry_id)
+    record(env, created.entry_id, ref="BANK-REF-1")
+    refused(lambda: cancel(env, created.entry_id), "not_cancellable")
+    assert row(engine, created.entry_id).state == "recorded"
+    assert any(a.details["code"] == "not_cancellable" for a in audits(engine, env, service.AUDIT_REFUSED))
+
+
+def test_a_cancelled_request_id_cannot_be_replayed_and_a_cancelled_entry_does_not_count(engine):
+    env = world(engine)
+    seed_gl_1410(engine, env, 1000)
+    request_id = uuid4()
+    created = act(
+        env,
+        "preparer",
+        service.prepare_opening,
+        request_id=request_id,
+        employee_ref="EMP-1",
+        amount=Decimal(900),
+        value_date=OPENING_DATE,
+        evidence_ref="S",
+    )
+    cancel(env, created.entry_id)
+    refused(
+        lambda: act(
+            env,
+            "preparer",
+            service.prepare_opening,
+            request_id=request_id,
+            employee_ref="EMP-1",
+            amount=Decimal(900),
+            value_date=OPENING_DATE,
+            evidence_ref="S",
+        ),
+        "request_cancelled",
+    )
+    assert position(engine, env).subledger_total == 0
+    again = opening(env, amount="900")  # headroom is intact: the cancelled draft reserved nothing
+    approve(env, again.entry_id)
+    record(env, again.entry_id)
+
+
+def test_the_database_makes_cancelled_final_and_requires_a_reason(engine):
+    env = world(engine)
+    created = advance(env)
+    with pytest.raises(DBAPIError):  # cancelled without who/when/reason
+        _raw(engine, "UPDATE erp_staff_loan_entries SET state = 'cancelled' WHERE id = :id", id=created.entry_id)
+    cancel(env, created.entry_id)
+    with pytest.raises(DBAPIError, match="final"):
+        _raw(engine, "UPDATE erp_staff_loan_entries SET state = 'draft' WHERE id = :id", id=created.entry_id)
+    done = posted_advance(env, ref="BANK-REF-9")
+    with pytest.raises(DBAPIError):  # recorded -> cancelled is refused by the trigger
+        _raw(
+            engine,
+            "UPDATE erp_staff_loan_entries SET state = 'cancelled', cancelled_by_party_id = prepared_by_party_id,"
+            " cancelled_at = now(), cancel_reason = 'x', recorded_by_party_id = NULL WHERE id = :id",
+            id=done.entry_id,
+        )
+
+
+# --- repayment ------------------------------------------------------------------------------------
+
+
+def repayment(env, *, amount, employee="EMP-1", who="preparer", value_date=VALUE_DATE):
+    return act(
+        env,
+        who,
+        service.prepare_repayment,
+        request_id=uuid4(),
+        employee_ref=employee,
+        amount=Decimal(amount),
+        bank_account_id=env.bank_id,
+        value_date=value_date,
+        evidence_ref="RECEIPT-1",
+    )
+
+
+def test_repayment_posts_dr_bank_cash_gl_cr_1410_and_lowers_the_balance(engine):
+    env = world(engine, instruction=False)  # no payee instruction is needed to RECEIVE money
+    seed_gl_1410(engine, env, 5000)
+    created = opening(env, amount="3000")
+    approve(env, created.entry_id)
+    record(env, created.entry_id)
+    rep = repayment(env, amount="1200.5")
+    assert row(engine, rep.entry_id).amount == Decimal("-1200.5")
+    approve(env, rep.entry_id)
+    done = record(env, rep.entry_id, ref="  bank  in-1 ")
+    assert lines(engine, done.journal_id) == {"1000": (Decimal("1200.5"), 0), "1410": (0, Decimal("1200.5"))}
+    assert row(engine, rep.entry_id).bank_reference == "BANK IN-1"
+    assert balance(engine, env).balance == Decimal("1799.5")
+    assert position(engine, env).difference == Decimal("2000")  # GL and subledger fell together
+
+
+def test_repayment_may_not_exceed_the_balance_and_needs_a_valid_reference(engine):
+    env = world(engine)
+    posted_advance(env, amount="500")
+    refused(lambda: repayment(env, amount="500.01"), "repayment_exceeds_balance")
+    ok = repayment(env, amount="500")
+    approve(env, ok.entry_id)
+    refused(lambda: record(env, ok.entry_id, ref=None), "bank_reference_invalid")
+    record(env, ok.entry_id, ref="BANK-IN-2")
+    assert balance(engine, env).balance == 0
+    refused(lambda: repayment(env, amount="0.01"), "repayment_exceeds_balance")
+    refused(lambda: repayment(env, amount="-5"), "invalid_amount")
+
+
+def test_repayment_shares_the_bank_reference_space_and_the_value_date_rule(engine):
+    env = world(engine)
+    posted_advance(env, amount="500", ref="SHARED-REF-7")
+    rep = repayment(env, amount="100", value_date=date(2026, 1, 20))
+    approve(env, rep.entry_id)
+    refused(lambda: record(env, rep.entry_id, ref="BANK-IN-3"), "value_date_future")
+    later = datetime(2026, 1, 20, tzinfo=UTC)
+    refused(lambda: record(env, rep.entry_id, ref="shared-ref-7", now=later), "bank_reference_reused")
+    record(env, rep.entry_id, ref="BANK-IN-3", now=later)
+    assert row(engine, rep.entry_id).state == "recorded"
+
+
+def test_repayment_follows_the_dual_control_policy(engine):
+    env = world(engine)
+    posted_advance(env, amount="500")
+    set_dual_control_engine(engine, env.tenant_id, True)
+    rep = repayment(env, amount="100")
+    refused(lambda: approve(env, rep.entry_id, who="preparer"), "sod_approver_is_preparer")
+    approve(env, rep.entry_id, who="approver")
+    refused(lambda: record(env, rep.entry_id, who="approver", ref="BANK-IN-4"), "sod_recorder_is_approver")
+    record(env, rep.entry_id, who="recorder", ref="BANK-IN-4")
+    assert row(engine, rep.entry_id).dual_control is True
+
+
+# --- control difference with a negative employee balance ------------------------------------------
+
+
+def seed_recorded_adjustment(engine, env, employee, amount):
+    with Session(engine) as db:
+        db.add(
+            StaffLoanEntry(
+                tenant_id=env.tenant_id,
+                request_id=uuid4(),
+                employee_ref=employee,
+                kind="adjustment",
+                amount=Decimal(amount),
+                evidence_ref="n",
+                value_date=VALUE_DATE,
+                offset_account_id=env.accounts["6100"],
+                journal_id=uuid4(),
+                state="recorded",
+                dual_control=False,
+                prepared_by_party_id=uuid4(),
+                prepared_at=NOW,
+                approved_by_party_id=uuid4(),
+                approved_at=NOW,
+                recorded_by_party_id=uuid4(),
+                recorded_at=NOW,
+            )
+        )
+        db.commit()
+
+
+def test_control_difference_is_refused_while_any_employee_balance_is_below_zero(engine):
+    env = world(engine)
+    seed_gl_1410(engine, env, 10000)
+    seed_recorded_adjustment(engine, env, "EMP-NEG", "-50")  # a fault: no loan behind it
+    refused(lambda: control_difference(env, amount="1"), "employee_balance_negative")
+    seed_recorded_adjustment(engine, env, "EMP-NEG", "50")  # repaired
+    assert control_difference(env, amount="1").replayed is False
+
+
+# --- the 805,000 route, end to end ---------------------------------------------------------------
+
+
+def test_the_805000_route_openings_within_the_gl_then_a_capped_write_off_ties_subledger_to_gl(engine):
+    """GL(1410) holds a net debit of 805,000 (legacy FY2025); the loan records prove far less.
+
+    Route: per-employee openings (never above the GL), then a control_difference write-off capped at
+    GL - subledger. Afterwards GL(1410) equals the subledger exactly.
+    """
+    env = world(engine)
+    seed_gl_1410(engine, env, 805000)
+    for employee, amount in (("EMP-A", "100000"), ("EMP-B", "150000.50"), ("EMP-C", "49999.50")):
+        created = opening(env, amount=amount, employee=employee)
+        approve(env, created.entry_id)
+        record(env, created.entry_id)
+    pos = position(engine, env)
+    assert (pos.gl_balance, pos.subledger_total, pos.difference) == (Decimal(805000), Decimal(300000), Decimal(505000))
+    # an opening can never push the subledger above the GL
+    refused(lambda: opening(env, amount="505000.01", employee="EMP-D"), "opening_exceeds_gl")
+    # the write-off is capped at the measured difference
+    refused(lambda: control_difference(env, amount="505000.01"), "control_difference_exceeds")
+    write_off = control_difference(env, amount="505000")
+    approve(env, write_off.entry_id)
+    done = record(env, write_off.entry_id)
+    assert lines(engine, done.journal_id) == {"6100": (Decimal(505000), 0), "1410": (0, Decimal(505000))}
+    pos = position(engine, env)
+    assert (pos.gl_balance, pos.subledger_total, pos.difference) == (Decimal(300000), Decimal(300000), Decimal(0))
+    assert {b: balance(engine, env, b).balance for b in ("EMP-A", "EMP-B", "EMP-C")} == {
+        "EMP-A": Decimal(100000),
+        "EMP-B": Decimal("150000.5"),
+        "EMP-C": Decimal("49999.5"),
+    }
+    refused(lambda: control_difference(env, amount="0.01"), "control_difference_exceeds")

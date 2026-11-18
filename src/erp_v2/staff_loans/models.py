@@ -1,19 +1,21 @@
-"""Staff loan entries (e2_0022_staff_loan_entries).
+"""Staff loan entries (e2_0023_staff_loan_entries).
 
 No Starter owner holds a loan balance, so this ERP table is the per-employee subledger behind the
-1410 control account. One row is one governed entry, in one of four kinds:
+1410 control account. One row is one governed entry, in one of five kinds:
 
 * ``opening``: a per-employee opening balance from Finance's schedule. Subledger only, no GL (the GL
   already holds the amount).
 * ``advance``: a new loan paid from a bank account. Dr 1410 / Cr the bank's cash GL, through the bridge.
 * ``adjustment``: Dr/Cr 1410 against an offset account for ONE employee, through the bridge.
+* ``repayment``: an employee repays a loan in cash. Dr the bank's cash GL / Cr 1410 (negative amount).
 * ``control_difference``: a write-off of the measured difference GL(1410) - subledger, Cr 1410 / Dr an
   offset account. It names no employee and does not touch the subledger.
 
 The amount is signed from the loan's point of view: positive raises the employee's balance (Dr 1410),
-negative lowers it (Cr 1410). Rows go draft -> approved -> recorded; the approver may be the preparer
-(no compulsory second person). The runtime role may update the lifecycle columns only; amounts and
-membership are immutable after insert.
+negative lowers it (Cr 1410). Rows go draft -> approved -> recorded. A draft or approved row may be cancelled
+(reason and audit record); a recorded row never is: correct it with an adjustment. The approver may be the
+preparer unless the tenant's dual-control policy, stamped on the row, is on. The runtime role may update the
+lifecycle columns only; amounts and membership are immutable after insert.
 """
 
 from __future__ import annotations
@@ -50,11 +52,13 @@ KIND_OPENING: Final = "opening"
 KIND_ADVANCE: Final = "advance"
 KIND_ADJUSTMENT: Final = "adjustment"
 KIND_CONTROL_DIFFERENCE: Final = "control_difference"
-KINDS: Final = (KIND_OPENING, KIND_ADVANCE, KIND_ADJUSTMENT, KIND_CONTROL_DIFFERENCE)
+KIND_REPAYMENT: Final = "repayment"
+KINDS: Final = (KIND_OPENING, KIND_ADVANCE, KIND_ADJUSTMENT, KIND_CONTROL_DIFFERENCE, KIND_REPAYMENT)
 DRAFT: Final = "draft"
 APPROVED: Final = "approved"
 RECORDED: Final = "recorded"
-STATES: Final = (DRAFT, APPROVED, RECORDED)
+CANCELLED: Final = "cancelled"
+STATES: Final = (DRAFT, APPROVED, RECORDED, CANCELLED)
 
 # Columns the runtime role may UPDATE (lifecycle only); shared with the migration.
 UPDATE_COLUMNS: Final = (
@@ -65,6 +69,9 @@ UPDATE_COLUMNS: Final = (
     "recorded_at",
     "bank_reference",
     "journal_id",
+    "cancelled_by_party_id",
+    "cancelled_at",
+    "cancel_reason",
     "updated_at",
 )
 _KINDS_SQL = ", ".join(f"'{k}'" for k in KINDS)
@@ -94,6 +101,7 @@ class StaffLoanEntry(Base):
         CheckConstraint(
             "(kind = 'opening' AND amount > 0 AND bank_account_id IS NULL AND offset_account_id IS NULL) OR "
             "(kind = 'advance' AND amount > 0 AND bank_account_id IS NOT NULL AND offset_account_id IS NULL) OR "
+            "(kind = 'repayment' AND amount < 0 AND bank_account_id IS NOT NULL AND offset_account_id IS NULL) OR "
             "(kind = 'adjustment' AND bank_account_id IS NULL AND offset_account_id IS NOT NULL) OR "
             "(kind = 'control_difference' AND amount < 0 AND bank_account_id IS NULL "
             "AND offset_account_id IS NOT NULL)",
@@ -103,13 +111,20 @@ class StaffLoanEntry(Base):
             "state <> 'approved' OR (approved_by_party_id IS NOT NULL AND approved_at IS NOT NULL)",
             name=f"ck_{TABLE}_approved",
         ),
+        CheckConstraint(
+            "state <> 'cancelled' OR (cancelled_by_party_id IS NOT NULL AND cancelled_at IS NOT NULL "
+            "AND cancel_reason IS NOT NULL AND length(btrim(cancel_reason)) > 0 "
+            "AND recorded_by_party_id IS NULL AND journal_id IS NULL AND bank_reference IS NULL)",
+            name=f"ck_{TABLE}_cancelled",
+        ),
         # A recorded row is complete: who, when, the GL journal (every kind except opening) and, for an
         # advance, the bank's evidence reference.
         CheckConstraint(
             "state <> 'recorded' OR (approved_by_party_id IS NOT NULL AND recorded_by_party_id IS NOT NULL "
             "AND recorded_at IS NOT NULL "
             "AND ((kind = 'opening' AND journal_id IS NULL) OR (kind <> 'opening' AND journal_id IS NOT NULL)) "
-            "AND (kind <> 'advance' OR (bank_reference IS NOT NULL AND length(btrim(bank_reference)) > 0)))",
+            "AND (kind NOT IN ('advance', 'repayment') "
+            "OR (bank_reference IS NOT NULL AND length(btrim(bank_reference)) > 0)))",
             name=f"ck_{TABLE}_recorded",
         ),
         # With dual control stamped on the row, the database refuses a self-approval or self-recording.
@@ -122,7 +137,9 @@ class StaffLoanEntry(Base):
             "AND recorded_by_party_id <> approved_by_party_id)",
             name=f"ck_{TABLE}_record_sod",
         ),
-        CheckConstraint("bank_reference IS NULL OR kind = 'advance'", name=f"ck_{TABLE}_bank_reference_kind"),
+        CheckConstraint(
+            "bank_reference IS NULL OR kind IN ('advance', 'repayment')", name=f"ck_{TABLE}_bank_reference_kind"
+        ),
         # Backstop for bank_reference.claim (which serialises and also checks B3/B5): one use per account.
         Index(
             f"uq_{TABLE}_bank_reference",
@@ -166,5 +183,8 @@ class StaffLoanEntry(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     recorded_by_party_id: Mapped[UUID | None] = mapped_column(Uuid())
     recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by_party_id: Mapped[UUID | None] = mapped_column(Uuid())
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_reason: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

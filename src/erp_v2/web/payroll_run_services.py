@@ -464,12 +464,20 @@ def check_loan_recovery(db: Session, run: PayrollRun) -> None:
     if not recovery:
         return
     staff_loans.lock_book(db, run.tenant_id)
-    over = [
-        ref
-        for ref, amount in sorted(recovery.items())
-        if amount
-        > staff_loans.employee_balance(db, tenant_id=run.tenant_id, employee_ref=ref, exclude_run_id=run.id).balance
-    ]
+    balances = {
+        ref: staff_loans.employee_balance(db, tenant_id=run.tenant_id, employee_ref=ref, exclude_run_id=run.id)
+        for ref in sorted(recovery)
+    }
+    # An opening is a balance as at its date, already net of earlier recoveries: a run ending on or before that
+    # date but finalized after it would recover the same money twice, so it is refused (not silently ignored).
+    early = [ref for ref, b in balances.items() if b.opening_date is not None and run.period_end <= b.opening_date]
+    if early:
+        raise RunRefused(
+            "recovery_before_loan_opening",
+            f"The run ends on or before the staff-loan opening date of: {_listed(early)}. That period's recovery "
+            "is already inside the opening balance; remove the recovery or correct the opening",
+        )
+    over = [ref for ref, amount in sorted(recovery.items()) if amount > balances[ref].balance]
     if over:
         raise RunRefused(
             "loan_recovery_exceeds_balance",

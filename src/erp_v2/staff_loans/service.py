@@ -1,12 +1,14 @@
 """Staff loan entries: prepare, approve, record (PR-3).
 
-Four kinds (see ``models``): an ``advance`` pays a new loan from a bank account (Dr 1410 / Cr the bank's cash
+Five kinds (see ``models``): an ``advance`` pays a new loan from a bank account (Dr 1410 / Cr the bank's cash
 GL); an ``opening`` carries an employee's existing balance into the subledger (no GL, the GL already holds
-it); an ``adjustment`` moves one employee's balance against an offset account; a ``control_difference``
+it); a ``repayment`` takes an employee's cash repayment (Dr the bank's cash GL / Cr 1410); an ``adjustment`` moves
+one employee's balance against an offset account; a ``control_difference``
 writes off part of the measured difference between GL(1410) and the subledger.
 
-Every kind goes draft -> approved -> recorded. There is NO compulsory second person by default: with the
-tenant's dual-control policy off (the default, ``erp_v2.governance``) the approver and recorder may be the
+Every kind goes draft -> approved -> recorded (a draft or approved entry can be cancelled with a reason).
+There is NO compulsory second person by default: with the tenant's dual-control policy off (the default,
+``erp_v2.governance``) the approver and recorder may be the
 preparer. The policy is stamped on the row at prepare. When on, the approver is not the preparer or the
 borrower's instruction proposer/decider and the recorder is neither preparer nor approver (CHECKs back this).
 Approval is always an explicit, audited action.
@@ -54,11 +56,13 @@ from erp_v2.posting.rules import PostingRefused
 from erp_v2.staff_loans import queries
 from erp_v2.staff_loans.models import (
     APPROVED,
+    CANCELLED,
     DRAFT,
     KIND_ADJUSTMENT,
     KIND_ADVANCE,
     KIND_CONTROL_DIFFERENCE,
     KIND_OPENING,
+    KIND_REPAYMENT,
     RECORDED,
     StaffLoanEntry,
 )
@@ -67,8 +71,9 @@ from erp_v2.supplier_payments.service import PaymentRefused, payer_references
 AUDIT_PREPARED: Final = "erp.finance.staff_loan_entry.prepared"
 AUDIT_APPROVED: Final = "erp.finance.staff_loan_entry.approved"
 AUDIT_RECORDED: Final = "erp.finance.staff_loan_entry.recorded"
+AUDIT_CANCELLED: Final = "erp.finance.staff_loan_entry.cancelled"
 AUDIT_REFUSED: Final = "erp.finance.staff_loan_entry.refused"
-AUDIT_ACTIONS: Final = (AUDIT_PREPARED, AUDIT_APPROVED, AUDIT_RECORDED, AUDIT_REFUSED)
+AUDIT_ACTIONS: Final = (AUDIT_PREPARED, AUDIT_APPROVED, AUDIT_RECORDED, AUDIT_CANCELLED, AUDIT_REFUSED)
 
 OWNER: Final = "erp"
 DOCUMENT_KIND: Final = "staff_loan_entry"
@@ -261,7 +266,7 @@ def _verify(db: Session, tenant_id: UUID, row: StaffLoanEntry) -> None:
     """Every business check for one entry, under the tenant's staff-loan lock. Used at prepare, approve, record."""
     queries.lock_book(db, tenant_id)
     _loan_account_id(db, tenant_id)
-    if row.kind == KIND_ADVANCE:
+    if row.kind in (KIND_ADVANCE, KIND_REPAYMENT):
         functional = _functional_currency(db, tenant_id)
         try:
             payer_references(
@@ -289,7 +294,16 @@ def _verify(db: Session, tenant_id: UUID, row: StaffLoanEntry) -> None:
             raise LoanRefused(
                 "adjustment_exceeds_balance", "The adjustment would take the employee's loan balance below zero"
             )
+        if row.kind == KIND_REPAYMENT and balance.balance + row.amount < 0:
+            raise LoanRefused("repayment_exceeds_balance", "The repayment exceeds the employee's loan balance")
     else:
+        negative = [b.employee_ref for b in queries.all_balances(db, tenant_id=tenant_id).values() if b.balance < 0]
+        if negative:
+            raise LoanRefused(
+                "employee_balance_negative",
+                "A write-off is refused while any employee's loan balance is below zero "
+                f"({len(negative)} employee(s)); correct those first, because the difference is not measurable",
+            )
         position = queries.book_position(db, tenant_id=tenant_id)
         if position.difference <= 0 or -row.amount > position.difference:
             raise LoanRefused(
@@ -311,7 +325,7 @@ def _verify_opening(db: Session, tenant_id: UUID, row: StaffLoanEntry, balance: 
             StaffLoanEntry.tenant_id == tenant_id,
             StaffLoanEntry.employee_ref == row.employee_ref,
             StaffLoanEntry.state == RECORDED,
-            StaffLoanEntry.kind.in_((KIND_ADVANCE, KIND_ADJUSTMENT)),
+            StaffLoanEntry.kind.in_((KIND_ADVANCE, KIND_ADJUSTMENT, KIND_REPAYMENT)),
             StaffLoanEntry.value_date < row.value_date,
         )
         .limit(1)
@@ -361,12 +375,14 @@ def _prepare(
     evidence = _clean_text(evidence_ref, code="evidence_required", label="The evidence reference", maximum=240)
     note = _clean_text(description, code="description_invalid", label="The description", maximum=500, required=False)
     stored_amount = _amount(amount, signed=kind in (KIND_ADJUSTMENT, KIND_CONTROL_DIFFERENCE))
-    if kind == KIND_CONTROL_DIFFERENCE:
-        stored_amount = -abs(stored_amount)  # a write-off credits 1410
+    if kind in (KIND_CONTROL_DIFFERENCE, KIND_REPAYMENT):
+        stored_amount = -abs(stored_amount)  # a write-off or a cash repayment credits 1410
     existing = db.scalar(
         select(StaffLoanEntry).where(StaffLoanEntry.tenant_id == tenant.id, StaffLoanEntry.request_id == request_id)
     )
     if existing is not None:
+        if existing.state == CANCELLED:
+            raise LoanRefused("request_cancelled", "This request was cancelled; start a new request")
         if not _same_request(
             existing,
             kind=kind,
@@ -467,11 +483,12 @@ def _fingerprint(tenant_id: UUID, row: StaffLoanEntry, accounts: list[tuple[str,
 
 def _consequence(db: Session, tenant_id: UUID, row: StaffLoanEntry, loan_id: UUID, functional: str) -> _Consequence:
     magnitude = abs(row.amount)
-    if row.kind == KIND_ADVANCE:
+    if row.kind in (KIND_ADVANCE, KIND_REPAYMENT):
         cash_ref, _ = payer_references(
             db, tenant_id=tenant_id, bank_account_id=_present(row.bank_account_id, "bank account"), currency=functional
         )
-        other, label = cash_ref, "Staff loan advance"
+        other = cash_ref
+        label = "Staff loan advance" if row.kind == KIND_ADVANCE else "Staff loan repayment"
     else:
         other = str(_offset_account(db, tenant_id, _present(row.offset_account_id, "offset account")).id)
         label = "Staff loan adjustment" if row.kind == KIND_ADJUSTMENT else "Staff loan control difference write-off"
@@ -492,7 +509,7 @@ def _record(
 ) -> EntryOutcome:
     row = _locked_entry(db, tenant.id, entry_id)
     if row.state == RECORDED:
-        if row.kind == KIND_ADVANCE:
+        if row.kind in (KIND_ADVANCE, KIND_REPAYMENT):
             try:
                 reference = bank_ref.normalize(bank_reference)
             except bank_ref.BankReferenceInvalid:
@@ -516,8 +533,9 @@ def _record(
     scope = TenantScope(tenant.id)
     actor = str(party.id)
     posted = None
-    if row.kind == KIND_ADVANCE:
-        _require_instruction(db, tenant.id, _present(row.employee_ref, "employee"))
+    if row.kind in (KIND_ADVANCE, KIND_REPAYMENT):
+        if row.kind == KIND_ADVANCE:
+            _require_instruction(db, tenant.id, _present(row.employee_ref, "employee"))
         bank_account_id = _present(row.bank_account_id, "bank account")
         try:
             reference = bank_ref.normalize(bank_reference)
@@ -533,7 +551,7 @@ def _record(
             ) from exc
         row.bank_reference = reference
     elif bank_reference is not None and bank_reference.strip():
-        raise LoanRefused("bank_reference_not_applicable", "Only an advance carries a bank reference")
+        raise LoanRefused("bank_reference_not_applicable", "Only an advance or a repayment carries a bank reference")
     if row.kind != KIND_OPENING:
         functional = _functional_currency(db, tenant.id)
         consequence = _consequence(db, tenant.id, row, _loan_account_id(db, tenant.id), functional)
@@ -566,6 +584,36 @@ def _record(
         },
     )
     return EntryOutcome(row.id, False, row.journal_id)
+
+
+# --- cancel --------------------------------------------------------------------------------------
+
+
+def _cancel(db: Session, *, tenant: Tenant, party: Party, entry_id: UUID, reason: str, now: datetime) -> EntryOutcome:
+    row = _locked_entry(db, tenant.id, entry_id)
+    if row.state == CANCELLED and row.cancelled_by_party_id == party.id:
+        return EntryOutcome(row.id, True)
+    if row.state not in (DRAFT, APPROVED):
+        raise LoanRefused(
+            "not_cancellable", "Only a draft or approved entry can be cancelled; correct a recorded one by adjustment"
+        )
+    cleaned = _clean_text(reason, code="reason_required", label="The reason", maximum=500)
+    row.state = CANCELLED
+    row.cancelled_by_party_id = party.id
+    row.cancelled_at = now
+    row.cancel_reason = cleaned
+    row.updated_at = now
+    db.flush()
+    _audit(
+        db,
+        tenant=tenant,
+        party=party,
+        entity_id=str(row.id),
+        action=AUDIT_CANCELLED,
+        success=True,
+        details={"kind": row.kind, "reason": cleaned, "prepared_by": str(row.prepared_by_party_id)},
+    )
+    return EntryOutcome(row.id, False)
 
 
 # --- public commands -----------------------------------------------------------------------------
@@ -796,4 +844,50 @@ def record_entry(
         work=lambda: _record(
             db, tenant=tenant, party=party, entry_id=entry_id, bank_reference=bank_reference, now=moment
         ),
+    )
+
+
+def cancel_entry(
+    db: Session, *, tenant: Tenant, party: Party, entry_id: UUID, reason: str, now: datetime | None = None
+) -> EntryOutcome:
+    """Cancel a draft or approved entry (mandatory reason, audited). A recorded entry is final."""
+    moment = now or datetime.now(UTC)
+    return _guard(
+        db,
+        tenant=tenant,
+        party=party,
+        entity_id=str(entry_id),
+        action="cancel",
+        work=lambda: _cancel(db, tenant=tenant, party=party, entry_id=entry_id, reason=reason, now=moment),
+    )
+
+
+def prepare_repayment(
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    request_id: UUID,
+    employee_ref: str,
+    amount: Decimal,
+    bank_account_id: UUID,
+    value_date: date,
+    evidence_ref: str,
+    description: str | None = None,
+    now: datetime | None = None,
+) -> EntryOutcome:
+    """An employee repays in cash (positive ``amount``): Dr the bank's cash GL / Cr 1410 at record."""
+    return _prepare_command(
+        db,
+        tenant=tenant,
+        party=party,
+        request_id=request_id,
+        kind=KIND_REPAYMENT,
+        employee_ref=employee_ref,
+        amount=amount,
+        value_date=value_date,
+        evidence_ref=evidence_ref,
+        description=description,
+        bank_account_id=bank_account_id,
+        now=now,
     )

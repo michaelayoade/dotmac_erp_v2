@@ -56,7 +56,7 @@ def test_the_feature_manifest_registers_the_audit_actions_and_no_routes():
     feature = next(f for f in ERP_FEATURES if f.name == "erp_staff_loans")
     assert tuple(feature.audit_actions) == service.AUDIT_ACTIONS
     assert not feature.web_routers
-    assert len(set(service.AUDIT_ACTIONS)) == 4
+    assert len(set(service.AUDIT_ACTIONS)) == 5
 
 
 def test_the_migration_follows_the_dual_control_policy_revision():
@@ -67,3 +67,8 @@ def test_the_migration_follows_the_dual_control_policy_revision():
 def test_the_runtime_role_updates_lifecycle_columns_only():
     assert set(models.UPDATE_COLUMNS).isdisjoint(migration._IMMUTABLE)
     assert {"amount", "kind", "employee_ref", "tenant_id"} <= set(migration._IMMUTABLE)
+
+
+def test_kinds_and_states_include_repayment_and_cancelled():
+    assert "repayment" in models.KINDS and "cancelled" in models.STATES
+    assert {"cancelled_by_party_id", "cancelled_at", "cancel_reason"} <= set(models.UPDATE_COLUMNS)
