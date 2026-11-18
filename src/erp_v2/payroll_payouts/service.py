@@ -308,11 +308,24 @@ def _current_instruction(db: Session, tenant_id: UUID, employee_ref: str) -> Pay
 def _refuse_instruction_party(
     db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine], person: object, *, code: str, role: str
 ) -> None:
-    """``person`` must not have proposed or decided any net-pay line's CURRENT instruction (legacy exempt)."""
-    if not batch.dual_control or batch.kind != KIND_NET_PAY or person is None:
+    """``person`` must not have proposed or decided any net-pay line's CURRENT instruction, or the statutory
+    destination's current instruction (legacy exempt). Only when the batch carries the dual-control policy."""
+    if not batch.dual_control or person is None:
         return
-    for line in lines:
-        instruction = _current_instruction(db, batch.tenant_id, line.beneficiary_ref)
+    if batch.kind == KIND_NET_PAY:
+        instructions = [_current_instruction(db, batch.tenant_id, line.beneficiary_ref) for line in lines]
+    else:
+        instructions = [
+            db.scalar(
+                select(PayeeBankInstruction).where(
+                    PayeeBankInstruction.tenant_id == batch.tenant_id,
+                    PayeeBankInstruction.payee_kind == PayeeKind.STATUTORY.value,
+                    PayeeBankInstruction.payee_ref == (batch.destination_ref or ""),
+                    PayeeBankInstruction.status == InstructionStatus.APPROVED.value,
+                )
+            )
+        ]
+    for instruction in instructions:
         if instruction is None or instruction.origin == InstructionOrigin.LEGACY_IMPORT.value:
             continue
         if _same(person, instruction.proposed_by_party_id) or _same(person, instruction.decided_by_party_id):
@@ -790,6 +803,8 @@ def _record(
             _refuse_instruction_party(
                 db, batch, lines, party.id, code="sod_recorder_is_instruction_party", role="recorder"
             )
+    else:  # statutory is never a file: the recorder is always the last independent check
+        _refuse_instruction_party(db, batch, lines, party.id, code="sod_recorder_is_instruction_party", role="recorder")
     if batch.status != FILE_ISSUED:  # FILE_ISSUED is covered by _check_file_destinations below
         _require_payee_instructions(db, batch, lines)
     try:

@@ -1611,3 +1611,32 @@ def test_check_distinct_people_is_rewritten_not_dual_control_or_predicate(engine
     with Session(engine) as db:  # off: the database accepts the same person
         db.execute(sa.text(sql), {"on": False, "who": env.people["preparer"], "id": batch_id})
         db.rollback()
+
+
+# --- statutory instruction-party SoD, gated by the per-tenant policy ---------------------------------------------
+
+
+@pytest.mark.parametrize("party", ["proposer", "decider"])
+def test_policy_on_statutory_approver_and_recorder_may_not_be_the_instruction_party(engine, party):
+    env = world(engine)  # policy ON in the test world
+    run_id = finalized(engine, env)
+    kw = {"proposer": "proposer", "decider": "decider"}
+    kw[party] = "approver"
+    seed_statutory_instruction(engine, env, "dest:PAYE", **kw)
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    assert batch_row(engine, batch_id).dual_control is True
+    refused(lambda: approve(engine, env, batch_id), "sod_approver_is_instruction_party")
+    approve(engine, env, batch_id, who="issuer")  # a different person may
+    refused(lambda: record(engine, env, batch_id, who="approver"), "sod_recorder_is_instruction_party")
+    assert record(engine, env, batch_id).replayed is False
+
+
+def test_policy_off_statutory_instruction_parties_may_approve_and_record(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    run_id = finalized(engine, env)
+    seed_statutory_instruction(engine, env, "dest:PAYE", proposer="approver", decider="approver")
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    assert batch_row(engine, batch_id).dual_control is False
+    approve(engine, env, batch_id)
+    assert record(engine, env, batch_id, who="approver").replayed is False
