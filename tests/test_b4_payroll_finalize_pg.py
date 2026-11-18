@@ -34,6 +34,7 @@ from dotmac_payroll.models import (
 )
 from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
+from staff_loan_helpers import seed_recorded_opening
 from test_posting_bridge_pg import NOW, seed, soft_close
 
 from erp_v2.assembly import assembly
@@ -559,6 +560,8 @@ def test_external_deduction_mapped_to_an_asset_account_is_refused_and_creates_no
 
 def test_internal_recovery_maps_to_asset_books_as_recovered_and_is_never_a_payable(engine):
     env = world(engine, paye_liability="1410", paye_mode="internal_recovery")
+    for employee in ("E1", "E2"):
+        seed_recorded_opening(engine, env.tenant_id, employee, "10000")  # a recovery needs a loan balance
     run_id = ready_to_finalize(engine, env)
     out = finalize(engine, env, run_id)
     with Session(engine) as db:

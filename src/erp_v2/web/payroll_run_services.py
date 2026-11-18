@@ -82,6 +82,7 @@ from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
 from erp_v2.posting import rules
 from erp_v2.posting.payroll import post_payroll_consequence
 from erp_v2.posting.rules import PostingRefused
+from erp_v2.staff_loans import queries as staff_loans
 from erp_v2.web import payroll_readiness
 from erp_v2.web.payroll_run_input import EMPTY, InputFileRefused, ParsedInput, parse_input_file
 
@@ -435,6 +436,56 @@ def check_mappings(db: Session, run: PayrollRun) -> UUID:
     return payable.id
 
 
+def check_loan_recovery(db: Session, run: PayrollRun) -> None:
+    """B4 loan check: an employee's internal recovery may not exceed that employee's staff-loan balance.
+
+    The balance is the staff-loan subledger balance (``erp_v2.staff_loans``) before this run, so a run that
+    recovers more than the employee owes is refused and nothing is posted. Takes the tenant's staff-loan lock
+    so a concurrent loan entry cannot change the balance between the check and the finalize.
+    """
+    rows = db.execute(
+        select(PayrollCalculation.employee_ref, PayrollCalculationLine.amount)
+        .join(
+            PayrollCalculation,
+            (PayrollCalculation.tenant_id == PayrollCalculationLine.tenant_id)
+            & (PayrollCalculation.id == PayrollCalculationLine.calculation_id),
+        )
+        .where(
+            PayrollCalculation.tenant_id == run.tenant_id,
+            PayrollCalculation.run_id == run.id,
+            PayrollCalculationLine.component_kind == "deduction",
+            PayrollCalculationLine.settlement_mode == "internal_recovery",
+            PayrollCalculationLine.amount > 0,
+        )
+    ).all()
+    recovery: dict[str, Decimal] = {}
+    for employee_ref, amount in rows:
+        recovery[employee_ref] = recovery.get(employee_ref, Decimal(0)) + amount
+    if not recovery:
+        return
+    staff_loans.lock_book(db, run.tenant_id)
+    balances = {
+        ref: staff_loans.employee_balance(db, tenant_id=run.tenant_id, employee_ref=ref, exclude_run_id=run.id)
+        for ref in sorted(recovery)
+    }
+    # An opening is a balance as at its date, already net of earlier recoveries: a run ending on or before that
+    # date but finalized after it would recover the same money twice, so it is refused (not silently ignored).
+    early = [ref for ref, b in balances.items() if b.opening_date is not None and run.period_end <= b.opening_date]
+    if early:
+        raise RunRefused(
+            "recovery_before_loan_opening",
+            f"The run ends on or before the staff-loan opening date of: {_listed(early)}. That period's recovery "
+            "is already inside the opening balance; remove the recovery or correct the opening",
+        )
+    over = [ref for ref, amount in sorted(recovery.items()) if amount > balances[ref].balance]
+    if over:
+        raise RunRefused(
+            "loan_recovery_exceeds_balance",
+            f"The loan recovery exceeds the staff-loan balance of: {_listed(over)}. "
+            "Record the employee's opening or advance first, or correct the recovery input",
+        )
+
+
 # --- batch calculate -----------------------------------------------------------------------------
 
 
@@ -642,6 +693,7 @@ def _guarded_approve(db: Session, *, tenant: Tenant, party: Party, run_id: UUID,
     check_evidence(db, run)
     check_roster_complete(db, run)
     check_mappings(db, run)
+    check_loan_recovery(db, run)
     payroll.approve_payroll_run(db, tenant_id=tenant.id, run_id=run.id, approved_by_id=party.id, approved_at=now)
     _audit(
         db,
@@ -767,6 +819,7 @@ def _guarded_finalize(db: Session, *, tenant: Tenant, party: Party, run_id: UUID
     check_evidence(db, run)
     check_roster_complete(db, run)
     payable_id = check_mappings(db, run)
+    check_loan_recovery(db, run)
     payroll.finalize_payroll_run(db, tenant_id=tenant.id, run_id=run.id, finalized_by_id=party.id, finalized_at=now)
     consequence = build_run_accounting_consequence(db, tenant_id=tenant.id, run_id=run.id)
     net_total = _net_total(db, run)

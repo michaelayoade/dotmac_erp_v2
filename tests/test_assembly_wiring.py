@@ -22,6 +22,7 @@ EXPECTED_MODULE_VERSIONS = {
     "erp_payee_bank": None,
     "erp_supplier_payments": None,
     "erp_payroll_payouts": None,
+    "erp_staff_loans": None,
     "erp_journals": None,
     "erp_banking_statements": None,
     "erp_banking_reconciliation": None,
