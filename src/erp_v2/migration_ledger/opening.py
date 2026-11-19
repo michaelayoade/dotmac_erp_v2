@@ -7,15 +7,19 @@
 
 Sign convention everywhere: net = debit - credit (an asset is positive, a liability negative).
 
-The CLI refuses unless the trial balance sums to zero AND every control account (2000, 2040, 1410, 1400) equals its
-recomputed subledger opening (from the legacy snapshot at the opening date, never a declared file) once the
-itemised IAS 8 movements are applied:
+Flip-gate profile ``as_is_v1`` (AS-IS-MIGRATION-REPLAN sections 1 and 4):
 
-    tb_net[code] + sum(ias8 movement on code) == subledger_net[code]
+* The trial balance is GENERATED from the legacy ledger snapshot at the opening date (``tb_from_legacy``, the same
+  ``legacy_ledger.recompute`` the bridge uses). A declared TB file is still sha-bound in the spec but is REFUSED if it
+  differs from the recomputed one (``opening_tb_differs_from_legacy``).
+* The CLI refuses only a trial balance that does not sum to zero. The opening control difference
+  (``tb_net[code] + ias8 movement - subledger_net[code]``, accounts 2000, 2040, 1410, 1400) is REPORT-ONLY: it is listed
+  per account as an E37 info item (``control_differences``); the flip holding reclass covers it. It is never a refusal.
+* IAS 8 is empty before the flip: the IAS 8 journal kind stays in ``apply_opening`` as a post-flip Finance tool, but
+  the operator CLI (the flip runbook door) calls ``require_no_ias8_before_flip`` and refuses any item.
 
-so a gap is always shown as a separate itemised IAS 8 item and never netted. Both journals are posted through
-accounting a2 directly (create + post) under their own source owners; the manual-journal control guard is for typed
-lines and is not the door here, which is why the control equality above is checked in this module instead.
+Both journals are posted through accounting a2 directly (create + post) under their own source owners; the
+manual-journal control guard is for typed lines and is not the door here.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from sqlalchemy.orm import Session
 from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
 from erp_v2.migration_ledger import models as m
 from erp_v2.migration_ledger.common import (
+    OPENING_PERIOD,
     ZERO,
     canonical_sha,
     day,
@@ -72,6 +77,7 @@ class OpeningInputs:
     subledger_sha256: str
     ias8: tuple[Ias8Item, ...]
     ias8_sha256: str
+    recomputed_tb_sha256: str | None = None  # canonical sha of the TB generated from the legacy snapshot
 
 
 # --- parsing ---------------------------------------------------------------------------------------------------
@@ -129,6 +135,40 @@ def parse_ias8(raw: object) -> tuple[Ias8Item, ...]:
     return tuple(sorted(items, key=lambda i: i.item_id))
 
 
+# --- the generated TB (profile as_is_v1) ---------------------------------------------------------------------
+
+
+def tb_from_legacy(legacy_net: dict[tuple[str, str], Decimal]) -> dict[str, Decimal]:
+    """The opening TB: the OPENING-period nets of ``legacy_ledger.recompute(..., opening_as_of=D)`` per account code
+    (P&L already rolled into 3100 there). Zero nets are omitted."""
+    return {code: net for (code, period), net in sorted(legacy_net.items()) if period == OPENING_PERIOD and net != 0}
+
+
+def tb_canonical_sha(tb: dict[str, Decimal]) -> str:
+    return canonical_sha([[code, fmt(net)] for code, net in sorted(tb.items()) if net != 0])
+
+
+def tb_file_body(as_of: date, tb: dict[str, Decimal]) -> dict[str, Any]:
+    """The generated TB in the ``parse_tb`` schema (one non-negative side per account)."""
+    rows = [
+        {"account_code": code, "debit": fmt(net if net > 0 else ZERO), "credit": fmt(-net if net < 0 else ZERO)}
+        for code, net in sorted(tb.items())
+        if net != 0
+    ]
+    return {"version": 1, "as_of": as_of.isoformat(), "rows": rows}
+
+
+def require_declared_tb_matches(declared: dict[str, Decimal], generated: dict[str, Decimal]) -> None:
+    """A declared TB is refused if it differs from the one recomputed from the legacy snapshot."""
+    if {c: n for c, n in declared.items() if n != 0} != {c: n for c, n in generated.items() if n != 0}:
+        refuse("opening_tb_differs_from_legacy", "regenerate the TB with gen-tb; never declare one that differs")
+
+
+def require_no_ias8_before_flip(inputs: OpeningInputs) -> None:
+    if inputs.ias8:
+        refuse("ias8_not_allowed_before_flip", "IAS 8 corrections are a post-flip Finance tool (profile as_is_v1)")
+
+
 # --- the pure proof -------------------------------------------------------------------------------------------
 
 
@@ -152,6 +192,12 @@ def opening_proof(inputs: OpeningInputs) -> dict[str, Any]:
             "ties": corrected == inputs.subledger[code],
         }
     zero_sum = total == 0
+    # E37 info items: D-level opening control differences, listed and never refused (the flip holding covers them)
+    differences = [
+        {"account": code, "difference": c["difference"], "class": "E37"}
+        for code, c in controls.items()
+        if not c["ties"]
+    ]
     return {
         "tb_accounts": len(inputs.tb),
         "tb_net_total": fmt(total),
@@ -159,15 +205,16 @@ def opening_proof(inputs: OpeningInputs) -> dict[str, Any]:
         "control_accounts": controls,
         "ias8_items": len(inputs.ias8),
         "ias8_net_total": fmt(sum((i.amount for i in inputs.ias8), ZERO)),
-        "ok": zero_sum and all(c["ties"] for c in controls.values()),
+        "control_differences": differences,
+        "control_differences_report_only": True,
+        "ok": zero_sum,
     }
 
 
 def require_proof(proof: dict[str, Any]) -> None:
+    """Only the zero-sum TB is a refusal; the control differences are report-only (see ``control_differences``)."""
     if not proof["zero_sum"]:
         refuse("opening_tb_not_zero_sum")
-    if not all(c["ties"] for c in proof["control_accounts"].values()):
-        refuse("opening_control_not_subledger")
 
 
 def plan_sha256(inputs: OpeningInputs, proof: dict[str, Any]) -> str:
@@ -177,6 +224,7 @@ def plan_sha256(inputs: OpeningInputs, proof: dict[str, Any]) -> str:
             "tb_sha256": inputs.tb_sha256,
             "subledger_sha256": inputs.subledger_sha256,
             "ias8_sha256": inputs.ias8_sha256,
+            "recomputed_tb_sha256": inputs.recomputed_tb_sha256,
             "proof": proof,
         }
     )

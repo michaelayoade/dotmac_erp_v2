@@ -1,6 +1,7 @@
 """B-9 migration ledger, pure parts: opening proof, bridge partition, register adapters, migration shape."""
 
 import re
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -69,20 +70,57 @@ def test_a_sub_kobo_imbalance_is_refused_too():
     assert not opening.opening_proof(inputs(rows))["zero_sum"]
 
 
-def test_opening_refuses_when_a_control_account_differs_from_its_subledger():
+def test_an_opening_control_difference_is_report_only_never_a_refusal():
     sub = {**SUBLEDGER, "2000": D("-399.00")}  # the subledger holds 1.00 less than the TB
     proof = opening.opening_proof(inputs(sub=sub))
-    assert not proof["ok"] and proof["zero_sum"]
+    assert proof["ok"] and proof["zero_sum"] and proof["control_differences_report_only"]
     assert proof["control_accounts"]["2000"]["difference"] == "-1.000000"
-    assert refusal(opening.require_proof, proof) == "opening_control_not_subledger"
+    assert proof["control_differences"] == [{"account": "2000", "difference": "-1.000000", "class": "E37"}]
+    opening.require_proof(proof)  # no refusal
+
+
+def test_a_tied_opening_lists_no_control_differences():
+    assert opening.opening_proof(inputs())["control_differences"] == []
+
+
+def test_the_tb_is_generated_from_the_legacy_opening_period_and_a_differing_declared_tb_is_refused():
+    legacy = {
+        ("1000", "OPENING"): D("100.00"),
+        ("3100", "OPENING"): D("-100.00"),
+        ("1000", "2026-01"): D("5.00"),  # not the opening period
+        ("2000", "OPENING"): D("0"),
+    }
+    tb = opening.tb_from_legacy(legacy)
+    assert tb == {"1000": D("100.00"), "3100": D("-100.00")}
+    body = opening.tb_file_body(date(2025, 12, 31), tb)
+    as_of, parsed = opening.parse_tb(body, SHA)  # the generated file round-trips through the strict parser
+    assert as_of == date(2025, 12, 31) and parsed == tb
+    opening.require_declared_tb_matches(tb, dict(tb))
+    assert (
+        refusal(opening.require_declared_tb_matches, {**tb, "1000": D("100.01")}, tb)
+        == "opening_tb_differs_from_legacy"
+    )
+    assert refusal(opening.require_declared_tb_matches, {"1000": D("100.00")}, tb) == "opening_tb_differs_from_legacy"
+    assert opening.tb_canonical_sha(tb) == opening.tb_canonical_sha({**tb, "9999": D("0")})
+
+
+def test_ias8_is_empty_before_the_flip():
+    opening.require_no_ias8_before_flip(inputs())
+    assert refusal(opening.require_no_ias8_before_flip, inputs(ias8=[ias8_item("I1", "2000", "1.00")])) == (
+        "ias8_not_allowed_before_flip"
+    )
 
 
 def test_an_itemised_ias8_movement_closes_the_control_gap_and_only_exactly():
     sub = {**SUBLEDGER, "2000": D("-399.00")}
+
     # the IAS 8 journal moves 2000 by +1.00 net (a debit), so TB -400 + 1 = -399 = the subledger
-    assert opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "1.00")]))["ok"]
-    assert not opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "0.99")]))["ok"]
-    assert not opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "-1.00")]))["ok"]
+    def ties(amount):
+        return opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", amount)]))["control_accounts"][
+            "2000"
+        ]["ties"]
+
+    assert ties("1.00") and not ties("0.99") and not ties("-1.00")  # the IAS 8 arithmetic stays (post-flip tool)
 
 
 def test_every_control_account_must_have_a_recomputed_subledger_opening():
@@ -93,7 +131,8 @@ def test_every_control_account_must_have_a_recomputed_subledger_opening():
 def test_a_missing_control_account_in_the_tb_counts_as_zero_and_must_tie():
     rows = [r for r in GOOD_TB if r[0] != "1410"] + [("3100", "0", "300.00")]
     rows = [r for r in rows if not (r[0] == "3100" and r[2] == "350.00")]
-    assert not opening.opening_proof(inputs(rows))["ok"]  # 1410 subledger is 50, TB has none
+    proof = opening.opening_proof(inputs(rows))
+    assert proof["ok"] and not proof["control_accounts"]["1410"]["ties"]  # 1410 subledger is 50, TB has none: reported
 
 
 def test_tb_and_ias8_parsing_is_strict():
@@ -387,11 +426,20 @@ def test_the_class_list_is_the_plan_inventory_ids_and_carries_the_plan_sha():
     import os
     import re
 
-    from erp_v2.migration_ledger.classes import CLASSES, PLAN_SHA256
+    from erp_v2.migration_ledger.classes import (
+        AS_IS_CLASSES,
+        CLASSES,
+        INVENTORY_CLASSES,
+        INVENTORY_PLAN_SHA256,
+        PLAN_SHA256,
+    )
 
+    assert PLAN_SHA256 == "a28adf06752c43cd69481830c1b0e8d02a36f94a3bbe3c2ce35443d46b28de54"  # AS-IS-MIGRATION-REPLAN
+    assert AS_IS_CLASSES == ("E35", "E36a", "E36b", "E37", "E38")
+    assert CLASSES == (*INVENTORY_CLASSES, *AS_IS_CLASSES) and len(CLASSES) == len(set(CLASSES)) == 51
     assert (
-        len(CLASSES) == len(set(CLASSES)) == 46
-        and PLAN_SHA256 == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"
+        len(INVENTORY_CLASSES) == 46
+        and INVENTORY_PLAN_SHA256 == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"
     )
     plan = Path(
         os.environ.get(
@@ -403,13 +451,22 @@ def test_the_class_list_is_the_plan_inventory_ids_and_carries_the_plan_sha():
     if not plan.exists():
         pytest.skip("the private plan file is not available (CI); the constant is pinned by its sha above")
     data = plan.read_bytes()
-    assert hashlib.sha256(data).hexdigest() == PLAN_SHA256, "the plan changed: re-derive the class list"
+    assert hashlib.sha256(data).hexdigest() == INVENTORY_PLAN_SHA256, "the plan changed: re-derive the class list"
     ids = re.findall(r"^\| (E\d+[a-z]?) ", data.decode(), flags=re.M)
-    assert tuple(ids) == CLASSES
+    assert tuple(ids) == INVENTORY_CLASSES
 
 
 def test_the_gate_control_lists_are_code_constants():
     from erp_v2 import ledger_roles
 
     assert ledger_roles.GATE_TIE_CODES == ("1400", "1410", "2000", "2040", "2045")
-    assert ledger_roles.GATE_ZERO_CODES == ("2030",) and ledger_roles.GATE_WHT_CODES == ("2110",)
+    assert ledger_roles.REPORT_ZERO_CODES == ("2030",) and ledger_roles.REPORT_WHT_CODES == ("2110",)
+    assert not hasattr(ledger_roles, "GATE_ZERO_CODES") and not hasattr(ledger_roles, "GATE_WHT_CODES")
+    from erp_v2.migration_ledger import ledger_check
+
+    assert ledger_check.GATE_PROFILE == "as_is_v1"
+    assert ledger_check.control_lists() == {
+        "tie": ["1400", "1410", "2000", "2040", "2045"],
+        "report_zero": ["2030"],
+        "report_wht": ["2110"],
+    }

@@ -278,6 +278,12 @@ def control_lists() -> dict[str, list[str]]:
     return ledger_check.control_lists()
 
 
+def gate_profile() -> str:
+    from erp_v2.migration_ledger import ledger_check
+
+    return ledger_check.GATE_PROFILE
+
+
 def compute(
     inputs: Inputs,
     *,
@@ -372,6 +378,7 @@ def compute(
             "ias8_sha256": ias8_sha,
             "import_itemised_sha256": import_sha,
         },
+        "gate_profile": gate_profile(),
         "control_lists": control_lists(),
         "rounding_account_code": inputs.rounding_account_code,
         "rounding_residue_by_period": {p: fmt(v) for p, v in residue.items()},

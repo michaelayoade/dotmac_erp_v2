@@ -18,7 +18,10 @@ resolved while its fingerprint is unchanged (fingerprinted decisions carry over,
 facts changed; an open item whose source was loaded but no longer lists it is reported as an orphan and stays open
 (never silently dropped). Finance resolves the rest with ``resolve`` and an evidence sha.
 
-Flip gate: passes only when the open count is 0 AND the latest bridge version is signed.
+Flip gate (profile ``as_is_v1``, AS-IS-MIGRATION-REPLAN section 4): the open work-queue count and the class coverage
+are REPORTS, not gates (Michael's as-is ruling: Finance works the queue after the flip). It passes only when the
+latest bridge version is signed (and was built under this profile), the recomputed ledger equals it and has not moved,
+and every gated control tie holds. The profile is a code constant; no setting can relax it.
 """
 
 from __future__ import annotations
@@ -428,10 +431,21 @@ def counts(db: Session, tenant: UUID) -> dict[str, Any]:
     }
 
 
+# Section-4 gate checks that need owners not on main yet. They are not silently skipped: the gate output lists them,
+# and the control ties that depend on them (1400, 2045) already refuse by name until the owners are pinned.
+PROFILE_CHECKS_PENDING: Final = (
+    "completeness_per_module_currency",  # needs the per-module legacy = landed + held census (B-13/B-14/#72)
+    "holding_ties",  # B-14 (e2_0030 holdings)
+    "prepayment_tie_r1",  # billing a13 (R1)
+    "setup_keyed_accounts_and_periods",  # B-10-lite keyed accounts
+    "writer_role_m1",  # #72
+)
+
+
 def gate(db: Session, tenant: UUID) -> dict[str, Any]:
-    """The flip gate: open count 0, every class covered, the latest bridge signed (body re-hashed), the recomputed v2
-    ledger equal to the bridge and unmoved since signature, and every control account tied (or named-unavailable,
-    which refuses)."""
+    """The flip gate, profile ``as_is_v1``: the latest bridge signed under this profile (body re-hashed), the
+    recomputed v2 ledger equal to the bridge and unmoved since signature, and every gated control account tied (or
+    named-unavailable, which refuses). The open count, class coverage, 2030, 2110 are reported only."""
     from erp_v2.migration_ledger import ledger_check
 
     c = counts(db, tenant)
@@ -440,10 +454,7 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
     signed = False
     version = sha = None
     reasons: list[str] = []
-    if c["open"] != 0:
-        reasons.append("open_exceptions")
-    if not cov["complete"]:
-        reasons.append("class_coverage_incomplete")
+    reports: dict[str, Any] = {}
     if row is None:
         reasons.append("no_bridge_version")
     else:
@@ -456,6 +467,8 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
         if not signed:
             reasons.append("latest_bridge_not_signed")
         else:
+            if body.get("gate_profile") != ledger_check.GATE_PROFILE:
+                reasons.append("gate_profile_changed_since_signature")
             if ledger_check.difference_rows(db, tenant, body):
                 reasons.append("v2_ledger_differs_from_bridge")
             state = ledger_check.ledger_state(db, tenant)
@@ -465,9 +478,19 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
             if body.get("control_lists") != state["control_lists"]:
                 reasons.append("control_lists_changed_since_signature")
             reasons.extend(v["reason"] for v in state["controls"].values() if not v["ok"])
+            reports = state["reports"]
     return {
         "passed": not reasons,
+        "profile": ledger_check.GATE_PROFILE,
         "reasons": reasons,
+        "profile_checks_pending": list(PROFILE_CHECKS_PENDING),
+        "reports": {
+            "open_count": c["open"],
+            "resolved_count": c["resolved"],
+            "open_by_class": c["open_by_class"],
+            "classes_missing": cov["missing"],
+            "report_balances": reports,
+        },
         "open_count": c["open"],
         "resolved_count": c["resolved"],
         "open_by_class": c["open_by_class"],
