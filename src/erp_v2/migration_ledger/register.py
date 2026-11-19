@@ -14,7 +14,7 @@ Sources (each adapter is a pure function from a receipt or rows to ``Fact``s):
   E35 ``doc:<id>`` (the DRAFT / SUBMITTED AR invoices: an H-DOC work item, no GL), E35
   ``ar_unapplied_credit_note:<id>`` (a credit note kept out of the billing manifest: party, document number,
   amount; Finance applies or issues it after the flip), E36a ``custgap:<cust>:<ccy>`` / ``gljournal:<id>`` (GL that
-  has no billing counterpart, listed under ``gl_gaps`` when the GL attribution is supplied) and E36b
+  has no billing counterpart, from the receipt's ``gl_attribution`` when the destination chart was supplied) and E36b
   ``variance:<source key>`` (a stored-balance difference billing records at the seal; memo basis).
 * ``admission_reviews`` (database rows of B-1 decisions): a decision that waived a ``requires_correcting_journal``
   check (E08) or whose action is not executed here (void, supplier credit, reopen, ias8_post) is open; a plain
@@ -174,7 +174,7 @@ def from_ar_census(body: Any) -> list[Fact]:
     if not isinstance(body, dict) or body.get("kind") != "ar-census" or not isinstance(body.get("census_sha256"), str):
         refuse("invalid_ar_census")
     census_sha = body["census_sha256"]
-    for name in ("excluded_partitions", "unapplied_credit_notes", "unposted_documents", "variances", "gl_gaps"):
+    for name in ("excluded_partitions", "unapplied_credit_notes", "unposted_documents", "variances"):
         if not isinstance(body.get(name, []), list):
             refuse("invalid_ar_census")
     facts: list[Fact] = []
@@ -214,11 +214,28 @@ def from_ar_census(body: Any) -> list[Fact]:
             f"doc:{text(item['key'], 'invalid_ar_census', 255)}",
             {"holding": "H-DOC", "status": item.get("status"), "amount_minor": item.get("gross_minor")},
         )
-    for item in body.get("gl_gaps", []):
-        key = text(item.get("key"), "invalid_ar_census", 255)
-        if not key.startswith(("custgap:", "gljournal:")):
+    attribution = body.get("gl_attribution")
+    if attribution is not None:
+        if not isinstance(attribution, dict):
             refuse("invalid_ar_census")
-        add(AR_CLASS_GL_GAP, key, {"amount_minor": item.get("amount_minor"), "holding": "H-SUB"})
+        for item in attribution.get("parties", []):
+            if int(item["custgap_minor"]) != 0:  # GL not explained by the carried or refused items of this party
+                cust, ccy = (
+                    text(item["customer"], "invalid_ar_census", 255),
+                    text(item["currency"], "invalid_ar_census", 3),
+                )
+                add(
+                    AR_CLASS_GL_GAP,
+                    f"custgap:{cust}:{ccy}",
+                    {"amount_minor": int(item["custgap_minor"]), "holding": "H-SUB", "currency": ccy},
+                )
+        for item in attribution.get("unattributed", []):  # includes shared journals (flagged), never split
+            journal = text(item["gljournal_id"], "invalid_ar_census", 255)
+            add(
+                AR_CLASS_GL_GAP,
+                f"gljournal:{journal}",
+                {"amount_minor": int(item["amount_minor"]), "holding": "H-SUB", "shared": bool(item.get("shared"))},
+            )
     for item in body.get("variances", []):
         add(
             AR_CLASS_VARIANCE,

@@ -63,12 +63,22 @@ def test_the_census_carries_the_credit_note_partition_while_the_inexact_one_is_e
     assert census.credit_note_only_partitions == (("cust-4", "NGN"),)
 
 
-def test_gl_gaps_are_e36a_and_only_known_prefixes_are_accepted():
+def test_gl_attribution_gaps_are_e36a_items():
     _, body = _receipt()
-    body["gl_gaps"] = [{"key": "custgap:cust-9:NGN", "amount_minor": 5}, {"key": "gljournal:j-1", "amount_minor": 7}]
+    body["gl_attribution"] = {
+        "parties": [
+            {"customer": "cust-1", "currency": "NGN", "custgap_minor": 0},
+            {"customer": "cust-9", "currency": "NGN", "custgap_minor": 5},
+        ],
+        "unattributed": [
+            {"gljournal_id": "j-1", "amount_minor": 7},
+            {"gljournal_id": "j-2", "amount_minor": 1, "shared": True},
+        ],
+    }
     facts = [f for f in register.from_ar_census(body) if f.class_code == "E36a"]
-    assert sorted(f.legacy_key for f in facts) == ["custgap:cust-9:NGN", "gljournal:j-1"]
-    body["gl_gaps"] = [{"key": "other:1"}]
+    assert sorted(f.legacy_key for f in facts) == ["custgap:cust-9:NGN", "gljournal:j-1", "gljournal:j-2"]
+    assert [f.detail["shared"] for f in facts if f.legacy_key.startswith("gljournal")] == [False, True]
+    body["gl_attribution"] = "x"
     with pytest.raises(LedgerRefused):
         register.from_ar_census(body)
 

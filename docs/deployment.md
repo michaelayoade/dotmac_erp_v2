@@ -348,6 +348,14 @@ this does not authorize adjusting balances or switching traffic.
   Written only by the operator CLIs `opening_cli`, `bridge_report` and `exceptions_register`. No new permission,
   role profile bump or environment variable for the serving runtime. The operator switch
   `ERP_MIGRATION_LEDGER_APPLY=1` is read by the CLIs only.
+- AR opening admissions (`docs/mapping-billing.md`) adds the head `e2_0029_ar_opening_admissions` (chained after
+  `e2_0028_migration_ledger`; `e2_0030` is reserved for B-14 holdings): `erp_ar_opening_admissions` (RLS forced,
+  runtime SELECT only, immutable rows, downgrade refuses with rows) and the NOLOGIN role
+  `erp_billing_opening_writer` with exactly the billing R5 grants. The migration grants NO membership of that role
+  (not to the pipeline migrator): Michael grants the operator `WITH SET TRUE, INHERIT FALSE` for the window only and
+  revokes it after the seal. It refuses an existing role with login, superuser, bypassrls, createrole, createdb,
+  replication or any membership, and PostgreSQL below 15. The migration role needs CREATEROLE only if the role does
+  not exist yet. Membership is cluster-global: confirm the ERP cluster is not the CP cluster first.
 - Statutory payees (PR-4b; `docs/payee-bank-instructions.md`) adds the head `e2_0024_statutory_payees` (after
   `e2_0023_staff_loan_entries`): one CHECK on `payee_bank_instructions` widened to allow kind `statutory`. The e2
   head in this section moves to it. Before the first statutory remittance Finance proposes and approves one

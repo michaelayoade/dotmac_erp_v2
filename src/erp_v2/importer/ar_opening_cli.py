@@ -458,7 +458,7 @@ def _sha(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_inputs(args, source_url: str):
+def _load_inputs(args, source_url: str, ar_account_ids=None):
     """Read the three legacy tables + customers on a READ ONLY connection and build the census."""
 
     from erp_v2.importer.ar_census import build_census, load_legacy_rows
@@ -479,6 +479,11 @@ def _load_inputs(args, source_url: str):
             )
             rows = load_legacy_rows(source, cutoff)
             customers = [dict(r) for r in source.execute(sa.text(CUSTOMER_SQL)).mappings()]
+            gl_rows = None
+            if ar_account_ids:
+                from erp_v2.importer.ar_attribution import load_gl_rows
+
+                gl_rows = load_gl_rows(source, ar_account_ids)
     finally:
         engine.dispose()
     from dotmac_billing.contracts import PartyDocumentSnapshotV1, PostalAddressSnapshotV1
@@ -498,7 +503,27 @@ def _load_inputs(args, source_url: str):
         customer_snapshot=snapshot,
         seller=seller,
     )
-    return manifest, rows, customers, census, snapshot, seller
+    return manifest, rows, customers, census, snapshot, seller, gl_rows
+
+
+def _ar_control_account_ids(destination_url: str, tenant: UUID) -> list[str]:
+    """Ids of the destination account coded 1400 (legacy account ids are v2 account ids). Read only."""
+
+    from dotmac_accounting.models import Account
+
+    from erp_v2.importer.identity_cli import _safe_engine
+
+    engine = _safe_engine(destination_url)
+    try:
+        with Session(engine) as db, db.begin():
+            db.execute(sa.text("SET TRANSACTION READ ONLY"))
+            _set_tenant(db, tenant)
+            return [
+                str(i)
+                for i in db.scalars(sa.select(Account.id).where(Account.tenant_id == tenant, Account.code == "1400"))
+            ]
+    finally:
+        engine.dispose()
 
 
 def _capture(manifest, params):
@@ -538,9 +563,30 @@ def _run(args) -> dict:
         "DATABASE_URL" not in os.environ and "PLATFORM_DATABASE_URL" not in os.environ,
         "serving_database_materials_forbidden",
     )
-    manifest, rows, _customers, census, snapshot, seller = _load_inputs(args, source_url)
+    ar_accounts = None
+    if args.command == "census" and destination_url:
+        from erp_v2.importer.identity_cli import _manifest as _read_manifest
+
+        extent = _read_manifest(Path(args.manifest).read_bytes()).tenant_extent
+        _require(len(extent) == 1, "single_tenant_extent_required")
+        ar_accounts = _ar_control_account_ids(destination_url, UUID(extent[0]))
+    manifest, rows, _customers, census, snapshot, seller, gl_rows = _load_inputs(args, source_url, ar_accounts)
     if args.command == "census":
-        return census.receipt()
+        receipt = census.receipt()
+        if gl_rows is not None:  # B-14 input: per-customer legacy 1400 attribution (needs the destination chart)
+            from erp_v2.importer.ar_attribution import build_attribution
+
+            lines, owners = gl_rows
+            receipt.update(
+                build_attribution(
+                    census,
+                    gl_lines=lines,
+                    journal_owners=owners,
+                    invoice_types={str(i["invoice_id"]): str(i.get("invoice_type") or "") for i in rows["invoices"]},
+                    functional_currency=args.functional_currency,
+                )
+            )
+        return receipt
     _require(bool(destination_url), "operator_database_materials_required")
     tenant = UUID(manifest.tenant_extent[0])
     scope = TenantScope(tenant)
@@ -633,6 +679,7 @@ def main(argv=None) -> int:
     parser.add_argument("--approved-plan-sha256")
     parser.add_argument("--coupled-watermark", default="")
     parser.add_argument("--applied-by", default="ar_opening_cli")
+    parser.add_argument("--functional-currency", default="NGN", help="currency of journals no document owns")
     args = parser.parse_args(argv)
     try:
         if args.command in ("mint", "apply"):

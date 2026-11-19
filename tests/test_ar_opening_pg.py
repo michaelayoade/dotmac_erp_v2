@@ -273,14 +273,40 @@ def test_provision_import_seal_with_the_restricted_writer_and_zero_gl(engine):
     }
 
 
-def test_policy_off_cannot_be_bound_on_the_pinned_a12_and_nothing_is_provisioned(engine):
+def test_dual_control_is_bound_explicitly_from_the_policy_and_read_back(engine):
+    """a12 (pinned) has no per-window dual_control: policy OFF is refused, nothing provisioned. On a13 the explicit
+    policy value is bound at provision and the read-back equals it (run locally against the a13 source)."""
+
+    from dotmac_billing.opening_window_contracts import OpeningWindowV1
+
+    a13 = "dual_control" in OpeningWindowV1.__dataclass_fields__
     w = _world(engine)
     plan, oid = _plan(engine, w)
-    with pytest.raises(OperatorRefusal, match="window_dual_control_unbindable_pin_billing_a13"):
-        _apply(engine, w, plan, oid, dual=False)
+    if not a13:
+        with pytest.raises(OperatorRefusal, match="window_dual_control_unbindable_pin_billing_a13"):
+            _apply(engine, w, plan, oid, dual=False)
+        with Session(engine) as db:
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
+            assert get_opening_window(db, scope=w.scope) is None
+        return
+    with pytest.raises(OperatorRefusal, match="authority_dual_control_differs_from_policy"):
+        apply_opening(
+            engine,
+            assembly=w.asm,
+            authority=_authority(w, oid, "on"),
+            plan=plan,
+            approved_plan_sha256=plan["plan_sha256"],
+            occurred_at=NOW,
+            applied_by="tester",
+            coupled_watermark=FENCE,
+            dual_control=False,
+            env={"ERP_AR_OPENING_APPLY": "1"},
+        )
+    receipt = _apply(engine, w, plan, oid, dual=False)
+    assert receipt["sealed"] and receipt["dual_control"] == "off"
     with Session(engine) as db:
         db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
-        assert get_opening_window(db, scope=w.scope) is None
+        assert get_opening_window(db, scope=w.scope).dual_control == "off"
 
 
 def test_apply_refuses_a_plan_whose_variances_are_not_the_manifests(engine):
