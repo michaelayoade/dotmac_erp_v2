@@ -66,6 +66,8 @@ from erp_v2.ledger_roles import (
     account_id_for_code,
     control_codes_among,
 )
+from erp_v2.migration_ledger import rounding_verify
+from erp_v2.migration_ledger.common import LedgerRefused
 
 MANUAL_OWNER: Final = "erp.manual"
 MANUAL_KIND: Final = "manual_journal"
@@ -78,6 +80,10 @@ SOURCE_APPLICATION: Final = "dotmac_erp"
 # fault is re-verified.
 LEDGER_FAULT_KIND: Final = "ledger_fault_correction"
 _LEDGER_FAULT_NAMESPACE: Final = UUID("5f0b6d2e-7c1a-4b43-9d58-3a9c2e61f0a7")
+# The second GL-only correction kind (B-9, ruling v1640): the per-period rounding-residue clearing on 2000. Its source
+# identity is ``<bridge sha256>:<YYYY-MM>`` and the guard re-verifies its amount against the latest bridge version.
+ROUNDING_KIND: Final = rounding_verify.ROUNDING_KIND
+_ROUNDING_NAMESPACE: Final = UUID("c2a9e1d4-3b58-4f70-8a16-5d7e0b4c9f23")
 CONTROL_ROUTES: Final = {
     AP_CONTROL_CODE: "a supplier invoice (adjustment invoice) or supplier credit note",
     PAYROLL_PAYABLE_CODE: "a payroll run, an adjustment component in the next run, or a payout return",
@@ -149,6 +155,17 @@ class LedgerFaultCorrection:
     control_code: str
     offset_account_id: UUID
     posting_date: date
+    evidence_ref: str
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class RoundingCorrection:
+    """The Finance-declared inputs of a rounding correction; the amount and sides come from the bridge."""
+
+    bridge_sha256: str
+    period: str  # YYYY-MM of the invoices carrying the T-ROUND-2DP residue
+    rounding_account_code: str | None
     evidence_ref: str
     description: str
 
@@ -382,6 +399,18 @@ def _is_ledger_fault_journal(journal: JournalEntry) -> bool:
     return journal.source_owner == MANUAL_OWNER and journal.source_document_kind == LEDGER_FAULT_KIND
 
 
+def _is_rounding_journal(journal: JournalEntry) -> bool:
+    return journal.source_owner == MANUAL_OWNER and journal.source_document_kind == ROUNDING_KIND
+
+
+def _verify_rounding(db: Session, tenant_id: UUID, journal: JournalEntry) -> None:
+    """Unconditional, like the ledger-fault re-verification: no policy may switch it off."""
+    try:
+        rounding_verify.verify(db, tenant_id, journal)
+    except LedgerRefused as exc:
+        raise JournalRefused(exc.code, exc.detail) from exc
+
+
 def _control_guard(
     db: Session,
     tenant_id: UUID,
@@ -403,6 +432,10 @@ def _control_guard(
     if journal is not None and _is_ledger_fault_journal(journal):
         if not reversal:
             _verify_ledger_fault(db, tenant_id, journal)
+        return
+    if journal is not None and _is_rounding_journal(journal):
+        if not reversal:
+            _verify_rounding(db, tenant_id, journal)
         return
     _refuse_control(codes)
 
@@ -677,6 +710,169 @@ def prepare_ledger_fault_correction(
                 evidence_ref=evidence,
                 ledger_fault_source=source.id,
                 control_code=command.control_code,
+            )
+            return _outcome(row)
+    except _REFUSABLE as exc:
+        raise _map(exc) from exc
+
+
+# --- rounding-residue correction (B-9, ruling v1640) -------------------------
+
+
+def _rounding_posting_date(db: Session, tenant_id: UUID, period: str) -> date:
+    """The invoices' period if it is open, otherwise the first open period (the start date of either)."""
+    year, month = int(period[:4]), int(period[5:])
+    in_period = _periods_for(db, tenant_id, date(year, month, 1))
+    if len(in_period) == 1 and in_period[0].status == PeriodStatus.OPEN and not in_period[0].is_adjustment:
+        return in_period[0].start_date
+    first_open = db.scalar(
+        select(FiscalPeriod)
+        .where(
+            FiscalPeriod.tenant_id == tenant_id,
+            FiscalPeriod.status == PeriodStatus.OPEN,
+            FiscalPeriod.is_adjustment.is_(False),
+        )
+        .order_by(FiscalPeriod.start_date)
+        .limit(1)
+    )
+    if first_open is None:
+        raise JournalRefused("period_closed", "there is no open period for the rounding correction")
+    return first_open.start_date
+
+
+def prepare_rounding_correction(
+    db: Session, *, tenant_id: UUID, actor: UUID, command: RoundingCorrection, now: datetime | None = None
+) -> Outcome:
+    """Prepare the ONE system-built Dr/Cr 2000 correction of a period's T-ROUND-2DP residue (preparer step).
+
+    The amount and sides are derived from the latest sha-bound bridge version (never typed); the rounding account
+    is a required declared input. At most one live correction exists per (bridge sha, period): a repeat replays when
+    identical, anything else is a named refusal. It then follows the normal request / approve / post path; the
+    control guard re-verifies the amount against the bridge at request and at approval.
+    """
+    moment = _now(now)
+    evidence = _text(command.evidence_ref, "evidence reference", 255)
+    description = _text(command.description, "description", 2000)
+    if not command.rounding_account_code or not command.rounding_account_code.strip():
+        raise JournalRefused("rounding_account_required", "Finance must name the rounding account")
+    try:
+        key = rounding_verify.key_for(command.bridge_sha256, command.period)
+    except LedgerRefused as exc:
+        raise JournalRefused(exc.code, exc.detail) from exc
+    try:
+        _actor(db, tenant_id, actor)
+        with db.begin_nested():
+            try:
+                body = rounding_verify.load_bridge(db, tenant_id, command.bridge_sha256)
+            except LedgerRefused as exc:
+                raise JournalRefused(exc.code, exc.detail) from exc
+            if body.get("rounding_account_code") != command.rounding_account_code:
+                raise JournalRefused("rounding_account_mismatch", "the declared account is not the bridge's")
+            rounding_id = account_id_for_code(db, tenant_id, command.rounding_account_code)
+            ap_id = account_id_for_code(db, tenant_id, AP_CONTROL_CODE)
+            if rounding_id is None or ap_id is None:
+                raise JournalRefused("rounding_account_required", "the rounding account does not exist")
+            if rounding_id == ap_id or control_codes_among(db, tenant_id, {rounding_id}):
+                raise JournalRefused("offset_is_control_account", "the rounding account must not be a control account")
+            history = db.execute(
+                select(ManualJournal, JournalEntry)
+                .join(
+                    JournalEntry,
+                    (JournalEntry.tenant_id == ManualJournal.tenant_id) & (JournalEntry.id == ManualJournal.journal_id),
+                )
+                .where(
+                    ManualJournal.tenant_id == tenant_id,
+                    JournalEntry.source_owner == MANUAL_OWNER,
+                    JournalEntry.source_document_kind == ROUNDING_KIND,
+                    JournalEntry.source_document_id == key,
+                )
+            ).all()
+            live = [(row, entry) for row, entry in history if row.state not in (m.STATE_REJECTED, m.STATE_REVERSED)]
+            amount_due = rounding_verify.due(db, tenant_id, body, command.period)
+            if live:
+                row, entry = live[0]
+                if row.state in (m.STATE_PREPARED, m.STATE_POST_REQUESTED):
+                    _verify_rounding(db, tenant_id, entry)
+                if entry.reference != evidence:
+                    raise JournalRefused(
+                        "rounding_correction_active",
+                        "a correction for this bridge and period exists with a different evidence reference",
+                    )
+                return _outcome(row, replayed=True)
+            if amount_due == 0:
+                raise JournalRefused("rounding_nothing_due", "no residue is outstanding for this period")
+            posting_date = _rounding_posting_date(db, tenant_id, command.period)
+            _require_open_period(db, tenant_id, posting_date, JournalKind.STANDARD)
+            version = str(max((int(entry.source_version) for _row, entry in history), default=0) + 1)
+            request_id = uuid5(_ROUNDING_NAMESPACE, f"{key}:{version}")
+            debit = amount_due > 0  # amount_due is the 2000 net (Dr - Cr) the correction must carry
+            amount = abs(amount_due)
+            lines = (
+                JournalLineInput(ap_id, amount if debit else Decimal(0), Decimal(0) if debit else amount, None),
+                JournalLineInput(rounding_id, Decimal(0) if debit else amount, amount if debit else Decimal(0), None),
+            )
+            currency = functional_currency(db, tenant_id)
+            fingerprint = _fingerprint(
+                {
+                    "key": key,
+                    "version": version,
+                    "posting_date": posting_date.isoformat(),
+                    "evidence_ref": evidence,
+                    "currency": currency,
+                    "lines": [[str(x.account_id), str(x.debit), str(x.credit)] for x in lines],
+                }
+            )
+            journal = accounting.create_journal(
+                db,
+                scope=_scope(tenant_id),
+                command=CreateJournal(
+                    number="RR-" + request_id.hex[:24].upper(),
+                    kind=JournalKind.STANDARD,
+                    entry_date=posting_date,
+                    posting_date=posting_date,
+                    currency_code=currency,
+                    exchange_rate=Decimal(1),
+                    description=description,
+                    reference=evidence,
+                    source=SourceIdentity(
+                        owner=MANUAL_OWNER,
+                        document_kind=ROUNDING_KIND,
+                        document_id=key,
+                        version=version,
+                        fingerprint=fingerprint,
+                    ),
+                    lines=lines,
+                ),
+                idempotency_key=f"erp.manual:{request_id}:create",
+                idempotency_expires_at=None,
+                recorded_at=moment,
+            )
+            if journal.status != JournalStatus.DRAFT:
+                raise JournalRefused("journal_state_refused", journal.status.value.lower())
+            row = ManualJournal(
+                tenant_id=tenant_id,
+                dual_control=governance.dual_control(db, tenant_id),
+                journal_id=journal.id,
+                origin=m.ORIGIN_MANUAL,
+                state=m.STATE_PREPARED,
+                evidence_ref=evidence,
+                prepared_by_party_id=actor,
+                prepared_at=moment,
+            )
+            db.add(row)
+            db.flush()
+            _audit(
+                db,
+                tenant_id=tenant_id,
+                actor=actor,
+                action=AUDIT_PREPARED,
+                entity_type="manual_journal",
+                entity_id=str(row.id),
+                journal_id=journal.id,
+                number=journal.number,
+                evidence_ref=evidence,
+                rounding_bridge=command.bridge_sha256,
+                rounding_period=command.period,
             )
             return _outcome(row)
     except _REFUSABLE as exc:
