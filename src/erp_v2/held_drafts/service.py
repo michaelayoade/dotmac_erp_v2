@@ -63,6 +63,8 @@ class Scope:
     fy_start: date
     fy_end: date
     filed_vat_months: frozenset[str] = frozenset()
+    # Independent legacy-side count of held drafts (14,271 on g9) the partition must equal.
+    expected_held_total: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,7 @@ class Plan:
     population_ids: frozenset[UUID]
     population_amount: Decimal
     out_of_scope_before_fy: int
+    excluded_legacy_status: int = 0
 
     @property
     def sha256(self) -> str:
@@ -132,12 +135,12 @@ def _legacy_records(legacy: sa.Connection, ids: list[UUID]) -> dict[UUID, Legacy
         for row in legacy.execute(
             _in(
                 "SELECT journal_entry_id AS id, source_module AS module, source_document_type AS doc_type, "
-                "CAST(source_document_id AS TEXT) AS doc_id FROM gl.journal_entry "
+                "CAST(source_document_id AS TEXT) AS doc_id, status FROM gl.journal_entry "
                 "WHERE journal_entry_id IN :ids"
             ),
             {"ids": chunk},
         ):
-            out[UUID(str(row.id))] = LegacyRecord(row.module, row.doc_type, row.doc_id)
+            out[UUID(str(row.id))] = LegacyRecord(row.module, row.doc_type, row.doc_id, row.status)
     return out
 
 
@@ -184,8 +187,17 @@ def _twins(
     return {key: [Twin(j, posted[j]) for j in sorted(ids, key=str) if j in posted] for key, ids in by_doc.items()}
 
 
-def _resolve_bank_gls(db: Session, tenant_id: UUID) -> dict[UUID, UUID]:
-    """bank account id -> its cash GL account id (a canonical id or a declared code; unresolved ones are absent)."""
+def _resolve_bank_gls(db: Session, tenant_id: UUID) -> tuple[dict[UUID, UUID], frozenset[UUID]]:
+    """(bank account id -> cash GL, GLs that must queue).
+
+    Uses the reconciliation resolver's own refusal semantics (``recon_service.resolve_gl_account``): a bank account
+    whose cash GL is shared with another bank account, or was re-pointed away, is refused there, so its GL is
+    ``unsafe`` here and every fee key on it queues. A reference that resolves to no account is simply absent.
+    """
+    from dotmac_banking.models import BankAccount
+
+    from erp_v2.banking.recon_service import ReconRefused, resolve_gl_account
+
     accounts = {
         r.code: r.id
         for r in db.execute(
@@ -194,18 +206,23 @@ def _resolve_bank_gls(db: Session, tenant_id: UUID) -> dict[UUID, UUID]:
     }
     ids = set(accounts.values())
     out: dict[UUID, UUID] = {}
-    for row in db.execute(
-        sa.text("SELECT id, cash_account_ref FROM mod_banking.bank_accounts WHERE tenant_id = :t"), {"t": tenant_id}
-    ):
-        ref = (row.cash_account_ref or "").strip()
+    unsafe: set[UUID] = set()
+    for bank in db.scalars(sa.select(BankAccount).where(BankAccount.tenant_id == tenant_id)):
+        try:
+            out[bank.id] = resolve_gl_account(db, tenant_id, bank)
+            continue
+        except ReconRefused as refused:
+            if refused.code not in ("shared_cash_gl", "retired_cash_gl"):
+                continue  # no usable cash GL reference at all: nothing of ours to match on
+        ref = (bank.cash_account_ref or "").strip()
         try:
             parsed = UUID(ref)
         except ValueError:
             parsed = None
         resolved = parsed if parsed is not None and str(parsed) == ref and parsed in ids else accounts.get(ref)
         if resolved is not None:
-            out[row.id] = resolved
-    return out
+            unsafe.add(resolved)
+    return out, frozenset(unsafe)
 
 
 def _statement_keys(
@@ -243,8 +260,6 @@ def _posted_fees(db: Session, scope: Scope, bank_gls: frozenset[UUID]) -> dict[t
             "AND je.source_document_kind = 'BANK_FEE' "
             "AND COALESCE(je.posting_date, je.entry_date) BETWEEN :a AND :b "
             "AND jl.account_id IN :gls "
-            "AND NOT EXISTS (SELECT 1 FROM public.erp_held_draft_decisions d WHERE d.tenant_id = je.tenant_id "
-            "AND d.journal_id = je.id) "
             "GROUP BY je.id, COALESCE(je.posting_date, je.entry_date), jl.account_id"
         ).bindparams(sa.bindparam("gls", expanding=True)),
         {
@@ -308,17 +323,69 @@ def scope_sha256(scope: Scope) -> str:
     )
 
 
+def _legacy_held_ids(legacy: sa.Connection, scope: Scope) -> set[UUID]:
+    """The held population as the LEGACY snapshot sees it: DRAFT, SUBMITTED or APPROVED journals in the fiscal year."""
+    return {
+        UUID(str(r))
+        for r in legacy.scalars(
+            sa.text(
+                "SELECT journal_entry_id FROM gl.journal_entry "
+                "WHERE status IN ('DRAFT', 'SUBMITTED', 'APPROVED') "
+                "AND COALESCE(posting_date, entry_date) BETWEEN :a AND :b"
+            ),
+            {"a": scope.fy_start, "b": scope.fy_end},
+        )
+    }
+
+
+# Legacy document tables read for the unapproved-reversal rule (the document's own status). The table and column
+# names are the legacy AR schema as named in the pairing notes; the status is only read, never trusted blindly:
+# anything but PAID, POSTED or PARTIALLY_PAID (or a missing document) queues the draft.
+_DOCUMENT_TABLES = {
+    "INVOICE": (
+        "SELECT CAST(invoice_id AS TEXT) AS doc_id, status FROM ar.invoice WHERE CAST(invoice_id AS TEXT) IN :ids"
+    ),
+    "CUSTOMER_PAYMENT": (
+        "SELECT CAST(payment_id AS TEXT) AS doc_id, status FROM ar.customer_payment "
+        "WHERE CAST(payment_id AS TEXT) IN :ids"
+    ),
+}
+
+
+def _document_statuses(
+    legacy: sa.Connection, documents: set[tuple[str, str, str]]
+) -> dict[tuple[str, str, str], str | None]:
+    out: dict[tuple[str, str, str], str | None] = {d: None for d in documents}
+    for doc_type, sql in _DOCUMENT_TABLES.items():
+        ids = sorted({doc_id for _m, t, doc_id in documents if t == doc_type})
+        for chunk in _chunks(ids):
+            for row in legacy.execute(_in(sql), {"ids": chunk}):
+                out[("AR", doc_type, row.doc_id)] = row.status
+    return out
+
+
 def build_plan(db: Session, legacy: sa.Connection, scope: Scope) -> Plan:
-    """Read-only: gather the evidence and decide every held draft; decided drafts keep their recorded decision."""
-    drafts = _drafts(db, scope)
+    """Read-only: gather the evidence and decide every held draft; decided drafts keep their recorded decision.
+
+    A destination DRAFT enters the held population only when the legacy snapshot says DRAFT, SUBMITTED or APPROVED
+    (a draft the legacy record shows as anything else is not a held draft); a draft with no legacy record is kept
+    (and queued) so the independent partition proof, which counts the legacy side, flags the difference.
+    """
+    all_drafts = _drafts(db, scope)
+    legacy_records = _legacy_records(legacy, sorted((d.journal_id for d in all_drafts), key=str))
+    drafts = [
+        d
+        for d in all_drafts
+        if d.journal_id not in legacy_records or legacy_records[d.journal_id].status in rules.HELD_LEGACY_STATUSES
+    ]
+    excluded = len(all_drafts) - len(drafts)
     by_id = {d.journal_id: d for d in drafts}
-    legacy_records = _legacy_records(legacy, sorted(by_id, key=str))
-    bank_gl = _resolve_bank_gls(db, scope.tenant_id)
+    bank_gl, unsafe_gl_ids = _resolve_bank_gls(db, scope.tenant_id)
     bank_gl_ids = frozenset(bank_gl.values())
     documents = {
         (r.module, r.doc_type, r.doc_id)
-        for r in legacy_records.values()
-        if r.module == rules.SOURCE_AR and r.doc_type in rules.AR_TYPES and r.doc_id and r.doc_id.strip()
+        for j, r in legacy_records.items()
+        if j in by_id and r.module == rules.SOURCE_AR and r.doc_type in rules.AR_TYPES and r.doc_id and r.doc_id.strip()
     }
     evidence = Evidence(
         legacy=legacy_records,
@@ -326,6 +393,8 @@ def build_plan(db: Session, legacy: sa.Connection, scope: Scope) -> Plan:
         statement=_statement_keys(db, scope, bank_gl),
         posted_fees=_posted_fees(db, scope, bank_gl_ids),
         twins=_twins(db, legacy, scope.tenant_id, documents),
+        unsafe_gl_ids=unsafe_gl_ids,
+        document_status=_document_statuses(legacy, documents),
     )
     first = rules.decide(drafts, evidence)
     blockers = _post_blockers(db, scope, by_id, {d.journal_id for d in first if d.outcome == OUTCOME_POSTED})
@@ -347,32 +416,21 @@ def build_plan(db: Session, legacy: sa.Connection, scope: Scope) -> Plan:
         frozenset(d.journal_id for d in decisions),
         population_amount,
         int(before or 0),
+        excluded,
     )
 
 
 # --- partition proof -----------------------------------------------------------------------------------------
 
 
-def partition_proof(db: Session, scope: Scope, decisions: tuple[Decision, ...]) -> dict[str, Any]:
-    """posted + voided + queued = held, by journal id, with the total derived independently in SQL."""
-    held_ids = set(
-        db.scalars(
-            sa.text(
-                "SELECT je.id FROM mod_accounting.journal_entries je "
-                "WHERE je.tenant_id = :t AND je.source_owner = :owner "
-                "AND COALESCE(je.posting_date, je.entry_date) BETWEEN :a AND :b AND (je.status = 'DRAFT' "
-                "OR EXISTS (SELECT 1 FROM public.erp_held_draft_decisions d WHERE d.tenant_id = je.tenant_id "
-                "AND d.journal_id = je.id))"
-            ),
-            {"t": scope.tenant_id, "owner": LEGACY_OWNER, "a": scope.fy_start, "b": scope.fy_end},
-        )
-    )
-    held_ids |= {
-        r
-        for r in db.scalars(
-            sa.select(HeldDraftDecision.journal_id).where(HeldDraftDecision.tenant_id == scope.tenant_id)
-        )
-    }
+def partition_proof(legacy: sa.Connection, scope: Scope, decisions: tuple[Decision, ...]) -> dict[str, Any]:
+    """posted + voided + queued = held, by journal id.
+
+    The held set and its total come from the LEGACY snapshot (journals the legacy ERP holds as DRAFT, SUBMITTED or
+    APPROVED in the fiscal year), not from a re-read of the destination, and must also equal the count the operator
+    declared in the spec (``expected_held_total``, 14,271 on g9).
+    """
+    held_ids = _legacy_held_ids(legacy, scope)
     buckets: dict[str, list[Decision]] = {o: [] for o in OUTCOMES}
     for d in decisions:
         buckets[d.outcome].append(d)
@@ -381,15 +439,21 @@ def partition_proof(db: Session, scope: Scope, decisions: tuple[Decision, ...]) 
     disjoint = sum(len(v) for v in ids.values()) == len(union)
     counts = {o: len(items) for o, items in buckets.items()}
     amounts = {o: str(rules.quantize(sum((d.amount for d in items), Decimal(0)))) for o, items in buckets.items()}
+    expected_ok = scope.expected_held_total is not None and scope.expected_held_total == len(held_ids)
     return {
         "held_total": len(held_ids),
+        "held_total_source": "legacy_snapshot",
+        "expected_held_total": scope.expected_held_total,
+        "matches_expected_held_total": expected_ok,
         "counts": counts,
         "amounts": amounts,
         "amount_total": str(rules.quantize(sum((d.amount for d in decisions), Decimal(0)))),
         "sum_of_buckets": sum(counts.values()),
         "disjoint": disjoint,
         "ids_equal_held": union == held_ids,
-        "ok": disjoint and union == held_ids and sum(counts.values()) == len(held_ids),
+        "decisions_not_in_legacy_held": len(union - held_ids),
+        "legacy_held_without_decision": len(held_ids - union),
+        "ok": disjoint and union == held_ids and sum(counts.values()) == len(held_ids) and expected_ok,
         "bucket_id_sha256": {o: rules.sha256_json(sorted(map(str, v))) for o, v in ids.items()},
     }
 

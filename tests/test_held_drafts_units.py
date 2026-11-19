@@ -80,11 +80,47 @@ def test_bank_fee_without_statement_evidence_queues():
     assert {(d.outcome, d.reason_code) for d in decisions} == {(OUTCOME_QUEUED, "no_statement_evidence")}
 
 
-def test_bank_fee_with_more_posted_than_statement_queues_as_a_finding_on_the_posted_journals():
+def test_bank_fee_with_more_posted_than_statement_voids_the_excess_and_raises_an_e17_finding():
+    drafts = [fee(1), fee(2)]
+    ev = evidence(drafts, s=1, p=4)
+    decisions = rules.decide(drafts, ev)
+    assert {(d.outcome, d.reason_code) for d in decisions} == {(OUTCOME_VOIDED, "duplicate_of_posted_fee_excess")}
+    findings = rules.e17_findings(decisions)
+    assert len(findings) == 1  # one finding per key, however many drafts sit on it
+    assert findings[0]["finding"] == "E17" and findings[0]["excess_posted_fee_journals"] == 3
+    assert findings[0]["posted_fee_journals"] == 4 and findings[0]["statement_lines"] == 1
+    assert findings[0]["drafts_voided"] == 2
+    assert findings[0]["posted_journal_ids_sha256"] == rules.ids_sha256(ev.posted_fees[KEY])
+
+
+def test_no_finding_when_posted_does_not_exceed_the_statement():
     drafts = [fee(1)]
-    decisions = rules.decide(drafts, evidence(drafts, s=1, p=3))
-    assert decisions[0].outcome == OUTCOME_QUEUED and decisions[0].reason_code == "posted_exceeds_statement"
-    assert len(decisions[0].evidence["posted_journal_ids"]) == 3
+    assert rules.e17_findings(rules.decide(drafts, evidence(drafts, s=2, p=2))) == []
+
+
+def test_evidence_carries_a_count_and_digest_of_every_id_not_a_prefix():
+    drafts = [fee(1)]
+    ev = evidence(drafts, s=25, p=25)
+    d = rules.decide(drafts, ev)[0]
+    assert d.evidence["statement_lines"] == 25
+    assert d.evidence["statement_line_ids_sha256"] == rules.ids_sha256(ev.statement[KEY])
+    assert d.evidence["posted_journal_ids_sha256"] == rules.ids_sha256(ev.posted_fees[KEY])
+    assert not any(isinstance(v, list) for v in d.evidence.values())
+
+
+def test_a_key_on_a_shared_or_repointed_cash_gl_queues():
+    draft = fee(1)
+    ev = evidence([draft], s=3, p=0)
+    unsafe = Evidence(
+        legacy=ev.legacy,
+        bank_gl_ids=frozenset(),
+        statement=ev.statement,
+        posted_fees=ev.posted_fees,
+        twins={},
+        unsafe_gl_ids=frozenset({BANK}),
+    )
+    d = rules.decide([draft], unsafe)[0]
+    assert (d.outcome, d.reason_code) == (OUTCOME_QUEUED, "bank_gl_unresolved")
 
 
 def test_bank_fee_that_is_not_a_single_bank_line_queues():
@@ -155,6 +191,62 @@ def test_ar_twin_on_other_accounts_queues():
     draft = ar(1)
     twin = {uuid4(): (Decimal(100), Decimal(0)), uuid4(): (Decimal(0), Decimal(100))}
     assert rules.decide([draft], twin_ev([draft], twin))[0].reason_code == "twin_amount_differs"
+
+
+def mirror_ev(draft, status, twin_lines=None, doc="D-1", kind="INVOICE"):
+    ev = twin_ev(
+        [draft], twin_lines if twin_lines is not None else {k: (c, d) for k, (d, c) in draft.lines.items()}, doc, kind
+    )
+    return Evidence(
+        **{**{f: getattr(ev, f) for f in ev.__dataclass_fields__}, "document_status": {("AR", kind, doc): status}}
+    )
+
+
+@pytest.mark.parametrize("status", ["PAID", "POSTED", "PARTIALLY_PAID"])
+def test_an_exact_mirror_of_a_posted_twin_on_a_live_document_voids_as_unapproved_reversal(status):
+    draft = ar(1)
+    d = rules.decide([draft], mirror_ev(draft, status))[0]
+    assert (d.outcome, d.reason_code, d.rule_id) == (
+        OUTCOME_VOIDED,
+        "unapproved_reversal_of_live_document",
+        rules.RULE_AR_REVERSAL,
+    )
+    assert (
+        d.evidence["document_status"] == status and d.evidence["twin_journal_id"] and d.evidence["document_id"] == "D-1"
+    )
+    assert d.evidence["mirror_proof"]["mirror_sha256"] and d.evidence["mirror_proof"]["accounts"] == 2
+
+
+@pytest.mark.parametrize("status", ["CANCELLED", "VOID", "DRAFT", None])
+def test_a_mirror_of_a_document_that_is_not_live_queues(status):
+    draft = ar(1)
+    d = rules.decide([draft], mirror_ev(draft, status))[0]
+    assert (d.outcome, d.reason_code) == (OUTCOME_QUEUED, "reversal_document_not_live")
+
+
+def test_a_near_mirror_queues():
+    draft = ar(1)
+    off_by_one = {k: (c + (1 if c else 0), d) for k, (d, c) in draft.lines.items()}
+    assert rules.decide([draft], mirror_ev(draft, "PAID", off_by_one))[0].reason_code == "twin_amount_differs"
+    extra_account = {**{k: (c, d) for k, (d, c) in draft.lines.items()}, uuid4(): (Decimal(1), Decimal(0))}
+    assert rules.decide([draft], mirror_ev(draft, "PAID", extra_account))[0].reason_code == "twin_amount_differs"
+
+
+def test_the_equal_amount_rule_still_wins_over_the_mirror_rule():
+    draft = ar(1)
+    d = rules.decide([draft], mirror_ev(draft, "PAID", dict(draft.lines)))[0]
+    assert d.reason_code == "already_posted_duplicate"
+
+
+def test_is_mirror_is_exact_and_not_symmetric_noise():
+    a, b = uuid4(), uuid4()
+    assert rules.is_mirror(
+        {a: (Decimal(5), Decimal(0)), b: (Decimal(0), Decimal(5))},
+        {a: (Decimal(0), Decimal(5)), b: (Decimal(5), Decimal(0))},
+    )
+    assert not rules.is_mirror({}, {})
+    same = {a: (Decimal(5), Decimal(0)), b: (Decimal(0), Decimal(5))}
+    assert not rules.is_mirror(same, same)
 
 
 def test_ar_without_a_posted_twin_or_document_queues():
@@ -259,6 +351,7 @@ def spec(**changes):
         "requester_party_id": str(uuid4()),
         "approver_party_id": str(uuid4()),
         "filed_vat_months": ["2026-03"],
+        "expected_held_total": 14271,
     }
     base.update(changes)
     return base
@@ -267,6 +360,7 @@ def spec(**changes):
 def test_spec_parses_and_binds_the_rules_version():
     scope, parties = parse_spec(json.dumps(spec()).encode())
     assert scope.fy_start == date(2026, 1, 1) and scope.filed_vat_months == {"2026-03"}
+    assert scope.expected_held_total == 14271
     assert set(parties) == {"requester", "approver"}
 
 
@@ -282,6 +376,8 @@ def test_spec_parses_and_binds_the_rules_version():
         ({"requester_party_id": "x"}, "invalid_requester_party_id"),
         ({"version": 2}, "invalid_spec_schema"),
         ({"extra": 1}, "invalid_spec_schema"),
+        ({"expected_held_total": "14271"}, "invalid_expected_held_total"),
+        ({"expected_held_total": -1}, "invalid_expected_held_total"),
     ],
 )
 def test_spec_refusals(changes, code):

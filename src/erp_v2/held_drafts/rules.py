@@ -1,15 +1,21 @@
 """The published held-draft rules, as pure functions over plain data (no database).
 
-Michael's ruling (v1537): a rule-matched void counts as "reviewed against source". Two rules may void; every
-other draft goes to the Finance queue, to be decided one by one.
+Michael's rulings (v1537, v1606): a rule-matched void counts as "reviewed against source". Three rules may void;
+every other draft goes to the Finance queue, to be decided one by one.
 
 * ``R-BANK-FEE`` (legacy BANKING / BANK_FEE): the draft has exactly one line on a bank cash GL. Group by the key
-  (bank cash GL, date, amount). With S statement lines and P POSTED fee journals on the key and D drafts,
-  ``postable = min(D, max(0, S - P))``. S = 0 queues (``no_statement_evidence``); P > S queues (a finding on the
-  POSTED journals, ``posted_exceeds_statement``). Otherwise the first ``postable`` drafts (by number, id) go to the
-  B2 posting path and the rest are voided ``duplicate_of_posted_fee``.
+  (bank cash GL, date, amount). With S statement lines, P POSTED fee journals (including any this tool posted) and
+  D drafts on the key: S = 0 queues (``no_statement_evidence``); P > S voids every draft
+  ``duplicate_of_posted_fee_excess`` and raises an E17 finding (P - S possibly over-posted fee journals) for Finance;
+  otherwise ``postable = min(D, max(0, S - P))``: the first ``postable`` drafts (by number, id) go to the B2
+  posting path and the rest are voided ``duplicate_of_posted_fee``. A key on a shared or re-pointed cash GL queues
+  (``bank_gl_unresolved``), the same refusal as ``recon_service.resolve_gl_account``.
 * ``R-AR-TWIN`` (legacy AR / INVOICE or CUSTOMER_PAYMENT): a POSTED twin exists for the same document. Equal
   per-account amounts void it ``already_posted_duplicate``; different amounts queue ``twin_amount_differs``.
+* ``R-AR-UNAPPROVED-REVERSAL``: the draft is the EXACT sign mirror of a POSTED twin (same accounts, debit and
+  credit swapped) and the legacy document is still live (PAID, POSTED or PARTIALLY_PAID): void
+  ``unapproved_reversal_of_live_document``. A mirror of a document that is not live queues
+  (``reversal_document_not_live``); anything not an exact mirror queues.
 * ``R-QUEUE``: anything else queues.
 
 ``RULES_SHA256`` binds the exact rule text and thresholds; a plan is only applied by code with the same sha.
@@ -32,10 +38,13 @@ from erp_v2.held_drafts.models import (
     OUTCOME_VOIDED,
     VOID_ALREADY_POSTED_DUPLICATE,
     VOID_DUPLICATE_OF_POSTED_FEE,
+    VOID_DUPLICATE_OF_POSTED_FEE_EXCESS,
+    VOID_UNAPPROVED_REVERSAL,
 )
 
 RULE_BANK_FEE: Final = "R-BANK-FEE"
 RULE_AR_TWIN: Final = "R-AR-TWIN"
+RULE_AR_REVERSAL: Final = "R-AR-UNAPPROVED-REVERSAL"
 RULE_QUEUE: Final = "R-QUEUE"
 
 SOURCE_BANKING: Final = "BANKING"
@@ -50,7 +59,10 @@ Q_MISMATCH: Final = "legacy_record_mismatch"
 Q_WORKFLOW: Final = "workflow_in_progress"
 Q_NOT_SINGLE_BANK_LINE: Final = "not_single_bank_line"
 Q_NO_STATEMENT: Final = "no_statement_evidence"
-Q_POSTED_EXCEEDS: Final = "posted_exceeds_statement"
+Q_BANK_GL_UNRESOLVED: Final = "bank_gl_unresolved"
+Q_REVERSAL_NOT_LIVE: Final = "reversal_document_not_live"
+LIVE_DOCUMENT_STATUSES: Final = ("PAID", "POSTED", "PARTIALLY_PAID")
+HELD_LEGACY_STATUSES: Final = ("DRAFT", "SUBMITTED", "APPROVED")
 Q_NO_DOCUMENT: Final = "no_document_reference"
 Q_NO_TWIN: Final = "twin_missing"
 Q_TWIN_DIFFERS: Final = "twin_amount_differs"
@@ -68,7 +80,9 @@ RULES_DEFINITION: Final = {
             "P": "POSTED BANK_FEE journals on the key (excluding journals posted by this tool)",
             "order": ["number", "id"],
             "void": VOID_DUPLICATE_OF_POSTED_FEE,
-            "queue": [Q_NO_STATEMENT, Q_POSTED_EXCEEDS, Q_NOT_SINGLE_BANK_LINE],
+            "excess": "P > S (S >= 1): void every draft as duplicate_of_posted_fee_excess + E17 finding",
+            "void_excess": VOID_DUPLICATE_OF_POSTED_FEE_EXCESS,
+            "queue": [Q_NO_STATEMENT, Q_NOT_SINGLE_BANK_LINE, Q_BANK_GL_UNRESOLVED],
         },
         RULE_AR_TWIN: {
             "match": "legacy AR/INVOICE or AR/CUSTOMER_PAYMENT with a document id",
@@ -77,8 +91,16 @@ RULES_DEFINITION: Final = {
             "void": VOID_ALREADY_POSTED_DUPLICATE,
             "queue": [Q_NO_DOCUMENT, Q_NO_TWIN, Q_TWIN_DIFFERS],
         },
+        RULE_AR_REVERSAL: {
+            "match": "AR draft that is the exact sign mirror of a POSTED twin; legacy document status live",
+            "mirror": "same accounts, debit and credit swapped, per-account functional totals",
+            "live": list(LIVE_DOCUMENT_STATUSES),
+            "void": VOID_UNAPPROVED_REVERSAL,
+            "queue": [Q_REVERSAL_NOT_LIVE],
+        },
         RULE_QUEUE: {"match": "every other draft", "queue": [Q_NO_RULE, Q_NO_LEGACY, Q_MISMATCH, Q_WORKFLOW]},
     },
+    "held_population": {"legacy_status": list(HELD_LEGACY_STATUSES)},
     "post": "B2 legacy-held path in the original period; refusal (closed period, control account) queues",
 }
 RULES_SHA256: Final = hashlib.sha256(
@@ -114,6 +136,7 @@ class LegacyRecord:
     module: str | None
     doc_type: str | None
     doc_id: str | None
+    status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +156,10 @@ class Evidence:
     posted_fees: dict[tuple[UUID, date, Decimal], list[UUID]]
     # (module, type, doc id) -> POSTED twins in v2, ordered by journal id
     twins: dict[tuple[str, str, str], list[Twin]]
+    # cash GL accounts of bank accounts the resolver refuses (shared or re-pointed): keys on them queue
+    unsafe_gl_ids: frozenset[UUID] = frozenset()
+    # (module, type, doc id) -> legacy document status (None when the document is not found)
+    document_status: dict[tuple[str, str, str], str | None] = field(default_factory=dict)
     # a post pre-check supplied by the caller (period open, control accounts): reason code or None
     post_blockers: dict[UUID, str] = field(default_factory=dict)
 
@@ -166,8 +193,9 @@ def _queue(draft: Draft, rule: str, reason: str, **evidence: object) -> Decision
     return Decision(draft.journal_id, rule, OUTCOME_QUEUED, reason, draft.amount, dict(evidence))
 
 
-def _cap(ids: list[UUID], n: int = 10) -> list[str]:
-    return [str(i) for i in sorted(ids)[:n]]
+def ids_sha256(ids) -> str:
+    """Count-independent digest of a set of ids (sorted), so evidence need not store every id."""
+    return sha256_json(sorted(str(i) for i in ids))
 
 
 def _bank_key(draft: Draft, bank_gl_ids: frozenset[UUID]) -> tuple[UUID, date, Decimal] | None:
@@ -188,6 +216,16 @@ def amounts_equal(a: dict[UUID, tuple[Decimal, Decimal]], b: dict[UUID, tuple[De
     return norm(a) == norm(b)
 
 
+def is_mirror(draft: dict[UUID, tuple[Decimal, Decimal]], twin: dict[UUID, tuple[Decimal, Decimal]]) -> bool:
+    """The draft is the exact sign mirror of the twin: same accounts, debit and credit swapped, non-empty."""
+
+    def norm(lines):
+        return {k: (quantize(d), quantize(c)) for k, (d, c) in lines.items() if quantize(d) or quantize(c)}
+
+    a, b = norm(draft), norm(twin)
+    return bool(a) and a == {k: (c, d) for k, (d, c) in b.items()} and a != b
+
+
 def decide(drafts: list[Draft], evidence: Evidence) -> list[Decision]:
     """One decision per draft (exactly one bridge line each). Deterministic for the same inputs."""
     decisions: dict[UUID, Decision] = {}
@@ -206,9 +244,11 @@ def decide(drafts: list[Draft], evidence: Evidence) -> list[Decision]:
             )
             continue
         if legacy.module == SOURCE_BANKING and legacy.doc_type == TYPE_BANK_FEE:
-            key = _bank_key(draft, evidence.bank_gl_ids)
+            key = _bank_key(draft, evidence.bank_gl_ids | evidence.unsafe_gl_ids)
             if key is None:
                 decisions[draft.journal_id] = _queue(draft, RULE_BANK_FEE, Q_NOT_SINGLE_BANK_LINE)
+            elif key[0] in evidence.unsafe_gl_ids:
+                decisions[draft.journal_id] = _queue(draft, RULE_BANK_FEE, Q_BANK_GL_UNRESOLVED)
             else:
                 bank_groups[key].append(draft)
             continue
@@ -223,18 +263,49 @@ def decide(drafts: list[Draft], evidence: Evidence) -> list[Decision]:
                 decisions[draft.journal_id] = _queue(draft, RULE_AR_TWIN, Q_NO_TWIN, **base)
                 continue
             equal = sorted((t for t in twins if amounts_equal(draft.lines, t.lines)), key=lambda t: str(t.journal_id))
-            if not equal:
-                decisions[draft.journal_id] = _queue(
-                    draft, RULE_AR_TWIN, Q_TWIN_DIFFERS, twin_journal_ids=_cap([t.journal_id for t in twins]), **base
+            if equal:
+                decisions[draft.journal_id] = Decision(
+                    draft.journal_id,
+                    RULE_AR_TWIN,
+                    OUTCOME_VOIDED,
+                    VOID_ALREADY_POSTED_DUPLICATE,
+                    draft.amount,
+                    {"twin_journal_id": str(equal[0].journal_id), "twins_posted": len(twins), **base},
                 )
                 continue
+            mirrors = sorted((t for t in twins if is_mirror(draft.lines, t.lines)), key=lambda t: str(t.journal_id))
+            if not mirrors:
+                decisions[draft.journal_id] = _queue(
+                    draft,
+                    RULE_AR_TWIN,
+                    Q_TWIN_DIFFERS,
+                    twins_posted=len(twins),
+                    twin_journal_ids_sha256=ids_sha256([t.journal_id for t in twins]),
+                    **base,
+                )
+                continue
+            status = evidence.document_status.get(doc_key)
+            mirror = mirrors[0]
+            proof = {
+                "accounts": len(mirror.lines),
+                "debit_total": str(quantize(sum((d for d, _c in draft.lines.values()), Decimal(0)))),
+                "credit_total": str(quantize(sum((c for _d, c in draft.lines.values()), Decimal(0)))),
+                "mirror_sha256": sha256_json(
+                    sorted([str(k), str(quantize(d)), str(quantize(c))] for k, (d, c) in draft.lines.items())
+                ),
+            }
+            reversal = {
+                "twin_journal_id": str(mirror.journal_id),
+                "document_id": legacy.doc_id,
+                "document_status": status,
+                "mirror_proof": proof,
+                **base,
+            }
+            if status not in LIVE_DOCUMENT_STATUSES:
+                decisions[draft.journal_id] = _queue(draft, RULE_AR_REVERSAL, Q_REVERSAL_NOT_LIVE, **reversal)
+                continue
             decisions[draft.journal_id] = Decision(
-                draft.journal_id,
-                RULE_AR_TWIN,
-                OUTCOME_VOIDED,
-                VOID_ALREADY_POSTED_DUPLICATE,
-                draft.amount,
-                {"twin_journal_id": str(equal[0].journal_id), "twins_posted": len(twins), **base},
+                draft.journal_id, RULE_AR_REVERSAL, OUTCOME_VOIDED, VOID_UNAPPROVED_REVERSAL, draft.amount, reversal
             )
             continue
         decisions[draft.journal_id] = _queue(draft, RULE_QUEUE, Q_NO_RULE, legacy_type=legacy.doc_type or "")
@@ -254,14 +325,24 @@ def decide(drafts: list[Draft], evidence: Evidence) -> list[Decision]:
             for draft in group:
                 decisions[draft.journal_id] = _queue(draft, RULE_BANK_FEE, Q_NO_STATEMENT, **base)
             continue
+        base_ev = {
+            **base,
+            "statement_line_ids_sha256": ids_sha256(statement_ids),
+            "posted_journal_ids_sha256": ids_sha256(posted_ids),
+        }
         if p > s:
+            # E17: P - S posted fee journals have no statement line (possible over-posting); Finance corrects them.
             for draft in group:
-                decisions[draft.journal_id] = _queue(
-                    draft, RULE_BANK_FEE, Q_POSTED_EXCEEDS, posted_journal_ids=_cap(posted_ids), **base
+                decisions[draft.journal_id] = Decision(
+                    draft.journal_id,
+                    RULE_BANK_FEE,
+                    OUTCOME_VOIDED,
+                    VOID_DUPLICATE_OF_POSTED_FEE_EXCESS,
+                    draft.amount,
+                    {**base_ev, "excess_posted_fee_journals": p - s},
                 )
             continue
         postable = min(d, max(0, s - p))
-        base_ev = {**base, "statement_line_ids": _cap(statement_ids), "posted_journal_ids": _cap(posted_ids)}
         for index, draft in enumerate(group):  # group is already ordered by (number, id)
             if index < postable:
                 blocker = evidence.post_blockers.get(draft.journal_id)
@@ -286,6 +367,33 @@ def decide(drafts: list[Draft], evidence: Evidence) -> list[Decision]:
     if set(decisions) != {d.journal_id for d in drafts}:
         raise RuntimeError("held-draft rules produced a different set of decisions than drafts")
     return [decisions[d.journal_id] for d in sorted(drafts, key=lambda d: (d.number, str(d.journal_id)))]
+
+
+def e17_findings(decisions: list[Decision]) -> list[dict[str, object]]:
+    """One finding per key where POSTED fee journals exceed statement lines (derived from the decisions' evidence).
+
+    ``excess_posted_fee_journals`` is P - S; ``posted_journal_ids_sha256`` digests all P posted journals on the key
+    (the excess ones cannot be told apart from the matched ones, so Finance reviews the set).
+    """
+    found: dict[str, dict[str, object]] = {}
+    for d in decisions:
+        if d.reason_code != VOID_DUPLICATE_OF_POSTED_FEE_EXCESS:
+            continue
+        key = str(d.evidence["key_sha256"])
+        entry = found.setdefault(
+            key,
+            {
+                "finding": "E17",
+                "key_sha256": key,
+                "statement_lines": d.evidence["statement_lines"],
+                "posted_fee_journals": d.evidence["posted_fee_journals"],
+                "excess_posted_fee_journals": d.evidence["excess_posted_fee_journals"],
+                "posted_journal_ids_sha256": d.evidence["posted_journal_ids_sha256"],
+                "drafts_voided": 0,
+            },
+        )
+        entry["drafts_voided"] = int(entry["drafts_voided"]) + 1  # type: ignore[call-overload]
+    return [found[k] for k in sorted(found)]
 
 
 def plan_sha256(decisions: list[Decision], *, rules_sha256: str = RULES_SHA256) -> str:

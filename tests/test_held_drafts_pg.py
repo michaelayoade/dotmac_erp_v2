@@ -50,11 +50,15 @@ def legacy_schema(engine):
         c.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS gl")
         c.exec_driver_sql(
             "CREATE TABLE gl.journal_entry (journal_entry_id uuid PRIMARY KEY, status text, source_module text, "
-            "source_document_type text, source_document_id uuid)"
+            "source_document_type text, source_document_id uuid, entry_date date, posting_date date)"
         )
+        c.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS ar")
+        c.exec_driver_sql("CREATE TABLE ar.invoice (invoice_id uuid PRIMARY KEY, status text)")
+        c.exec_driver_sql("CREATE TABLE ar.customer_payment (payment_id uuid PRIMARY KEY, status text)")
     yield
     with engine.begin() as c:
         c.exec_driver_sql("DROP SCHEMA gl CASCADE")
+        c.exec_driver_sql("DROP SCHEMA ar CASCADE")
 
 
 _counter = {"n": 0}
@@ -66,6 +70,9 @@ def _n() -> int:
 
 
 def world(engine, *, dual: bool | None = False) -> SimpleNamespace:
+    with engine.begin() as c:  # the legacy snapshot is single-tenant: one world at a time
+        for table in ("gl.journal_entry", "ar.invoice", "ar.customer_payment"):
+            c.exec_driver_sql(f"DELETE FROM {table}")  # noqa: S608
     env = seed(engine)
     set_dual_control_engine(engine, env.tenant_id, bool(dual))
     with Session(engine) as db:
@@ -115,8 +122,26 @@ def world(engine, *, dual: bool | None = False) -> SimpleNamespace:
         db.commit()
     env.statement_id = statement_id
     env.lines = 0
-    env.scope = Scope(env.tenant_id, FY_START, FY_END)
+    env.overrides = {}
     return env
+
+
+def held_count(engine, env) -> int:
+    """The legacy-side count of held drafts (computed on the test's own, independent path)."""
+    kw = {"fy_start": FY_START, "fy_end": FY_END, **env.overrides}
+    with engine.connect() as c:
+        return c.scalar(
+            sa.text(
+                "SELECT count(*) FROM gl.journal_entry WHERE status IN ('DRAFT', 'SUBMITTED', 'APPROVED') "
+                "AND posting_date BETWEEN :a AND :b"
+            ),
+            {"a": kw["fy_start"], "b": kw["fy_end"]},
+        )
+
+
+def scope(engine, env) -> Scope:
+    kw = {"fy_start": FY_START, "fy_end": FY_END, "filed": frozenset(), **env.overrides}
+    return Scope(env.tenant_id, kw["fy_start"], kw["fy_end"], kw["filed"], held_count(engine, env))
 
 
 def statement_lines(engine, env, count, *, amount="5", direction="debit", day=DAY):
@@ -154,7 +179,8 @@ def journal(
     credit="1000",
     day=DAY,
     with_legacy=True,
-    extra_debit=None,
+    legacy_status=None,
+    doc_status=None,
 ):
     """A legacy-erp journal (DRAFT or POSTED) and its legacy snapshot row."""
     number = _n()
@@ -198,9 +224,17 @@ def journal(
     if with_legacy:
         with engine.begin() as c:
             c.execute(
-                sa.text("INSERT INTO gl.journal_entry VALUES (:j, :s, :m, :t, :d)"),
-                {"j": journal_id, "s": status, "m": module, "t": doc_type, "d": document},
+                sa.text("INSERT INTO gl.journal_entry VALUES (:j, :s, :m, :t, :d, :day, :day)"),
+                {"j": journal_id, "s": legacy_status or status, "m": module, "t": doc_type, "d": document, "day": day},
             )
+            if doc_status:  # the legacy AR document itself (shared by the draft and its twin: insert once)
+                table, column = (
+                    ("ar.invoice", "invoice_id") if doc_type == "INVOICE" else ("ar.customer_payment", "payment_id")
+                )
+                c.execute(
+                    sa.text(f"INSERT INTO {table} ({column}, status) VALUES (:d, :s) ON CONFLICT DO NOTHING"),  # noqa: S608
+                    {"d": document, "s": doc_status},
+                )
     return SimpleNamespace(id=journal_id, document=document)
 
 
@@ -208,8 +242,18 @@ def fee(engine, env, status="DRAFT", **kw):
     return journal(engine, env, kind="BANK_FEE", module="BANKING", doc_type="BANK_FEE", status=status, **kw)
 
 
-def ar_pair(engine, env, *, twin_amount="100", amount="100", kind="INVOICE"):
-    draft = journal(engine, env, kind=kind, module="AR", doc_type=kind, amount=amount, debit="1400", credit="4000")
+def ar_pair(engine, env, *, twin_amount="100", amount="100", kind="INVOICE", mirror=False, doc_status="PAID"):
+    draft = journal(
+        engine,
+        env,
+        kind=kind,
+        module="AR",
+        doc_type=kind,
+        amount=amount,
+        debit="4000" if mirror else "1400",
+        credit="1400" if mirror else "4000",
+        doc_status=doc_status,
+    )
     twin = journal(
         engine,
         env,
@@ -232,10 +276,10 @@ def requester_approver(env):
 def plan_and_apply(engine, env, *, planned_by="operator-a", applied_by="operator-b", dual=False):
     requester, approver = requester_approver(env)
     with Session(engine) as db, engine.connect() as legacy:
-        plan = service.build_plan(db, legacy, env.scope)
+        plan = service.build_plan(db, legacy, scope(engine, env))
         result = service.apply_plan(
             db,
-            env.scope,
+            scope(engine, env),
             plan,
             ApplyInputs(plan.sha256, "c" * 64, planned_by, applied_by, requester, approver, dual),
         )
@@ -288,7 +332,7 @@ def census(engine, env):
     other = [
         journal(engine, env, kind="BANK_RECONCILIATION", module="BANKING", doc_type="BANK_RECONCILIATION"),
         journal(engine, env, kind="EXPENSE", module="EXPENSE", doc_type="EXPENSE_CLAIM"),
-        journal(engine, env, kind="JOURNAL", module="GL", doc_type="JOURNAL", with_legacy=False),
+        journal(engine, env, kind="JOURNAL", module="GL", doc_type="JOURNAL"),
     ]
     return SimpleNamespace(
         k1=k1, k2=k2, k3=k3, k4=k4, ar_ok=ar_ok, ar_pay_ok=ar_pay_ok, ar_differs=ar_differs, ar_alone=ar_alone,
@@ -302,10 +346,10 @@ def test_census_scenario_partitions_every_draft_into_exactly_one_bridge_line(eng
     all_drafts = [*world_.k1, *world_.k2, *world_.k3, *world_.k4, world_.ar_ok, world_.ar_pay_ok, world_.ar_differs]
     all_drafts += [world_.ar_alone, *world_.other]
     with Session(engine) as db, engine.connect() as legacy:
-        plan = service.build_plan(db, legacy, env.scope)
-        before = service.partition_proof(db, env.scope, plan.decisions)
+        plan = service.build_plan(db, legacy, scope(engine, env))
+        before = service.partition_proof(legacy, scope(engine, env), plan.decisions)
     # K1: 1 posts + 3 void; K2: 2 void; K3, K4 queue; two AR void; differing twin, no twin and three others queue.
-    assert counts(plan) == {"posted": 1, "voided": 7, "queued": 7}
+    assert counts(plan) == {"posted": 1, "voided": 8, "queued": 6}
     assert before["ok"] and before["held_total"] == len(all_drafts) == 15
     assert sum(before["counts"].values()) == before["held_total"]
 
@@ -317,9 +361,10 @@ def test_census_scenario_partitions_every_draft_into_exactly_one_bridge_line(eng
     for journal_id, row in rows.items():
         by_outcome.setdefault(row.outcome, []).append(journal_id)
         assert state[journal_id] == {"voided": "VOID", "posted": "POSTED", "queued": "DRAFT"}[row.outcome]
-    assert {k: len(v) for k, v in by_outcome.items()} == {"posted": 1, "voided": 7, "queued": 7}
+    assert {k: len(v) for k, v in by_outcome.items()} == {"posted": 1, "voided": 8, "queued": 6}
     assert {r.reason_code for r in rows.values() if r.outcome == "voided"} == {
         "duplicate_of_posted_fee",
+        "duplicate_of_posted_fee_excess",
         "already_posted_duplicate",
     }
     # Fee voids are evidenced by the key and counts; AR voids by the twin's journal id.
@@ -327,11 +372,12 @@ def test_census_scenario_partitions_every_draft_into_exactly_one_bridge_line(eng
     assert fee_void.evidence["statement_lines"] == 1 and fee_void.evidence["posted_fee_journals"] == 1
     assert rows[world_.ar_ok.id].evidence["twin_journal_id"]
     assert rows[world_.k3[0].id].reason_code == "no_statement_evidence"
-    assert rows[world_.k4[0].id].reason_code == "posted_exceeds_statement"
+    assert rows[world_.k4[0].id].reason_code == "duplicate_of_posted_fee_excess"
+    assert rows[world_.k4[0].id].outcome == "voided"
     assert rows[world_.ar_differs.id].reason_code == "twin_amount_differs"
     assert rows[world_.ar_alone.id].reason_code == "twin_missing"
     assert rows[world_.other[0].id].reason_code == "no_published_rule"
-    assert rows[world_.other[2].id].reason_code == "no_legacy_record"
+    assert rows[world_.other[2].id].reason_code == "no_published_rule"
 
     with Session(engine) as db:
         events = db.scalar(
@@ -340,9 +386,10 @@ def test_census_scenario_partitions_every_draft_into_exactly_one_bridge_line(eng
             .where(PeriodEvent.tenant_id == env.tenant_id, PeriodEvent.event_kind == "JOURNAL_VOID")
         )
         posted_rows = db.scalars(sa.select(ManualJournal).where(ManualJournal.tenant_id == env.tenant_id)).all()
-        proof = service.partition_proof(db, env.scope, plan.decisions)
-        check = service.status_check(db, env.scope)
-    assert events == 7  # every void went through the accounting a2 governed void
+        with engine.connect() as legacy:
+            proof = service.partition_proof(legacy, scope(engine, env), plan.decisions)
+        check = service.status_check(db, scope(engine, env))
+    assert events == 8  # every void went through the accounting a2 governed void
     assert len(posted_rows) == 1 and posted_rows[0].origin == "legacy_held" and posted_rows[0].state == "POSTED"
     assert proof["ok"] and check["mismatches"] == 0
 
@@ -365,7 +412,7 @@ def test_rerun_is_a_no_op_and_the_plan_sha_is_stable(engine):
             ),
             {"t": env.tenant_id},
         )
-    assert idem == 7
+    assert idem == 8
 
 
 def test_plan_writes_nothing(engine):
@@ -373,7 +420,7 @@ def test_plan_writes_nothing(engine):
     census(engine, env)
     with Session(engine) as db, engine.connect() as legacy:
         db.execute(sa.text("SET TRANSACTION READ ONLY"))
-        service.build_plan(db, legacy, env.scope)
+        service.build_plan(db, legacy, scope(engine, env))
         db.rollback()
     assert decisions(engine, env) == {}
     assert set(statuses(engine, env).values()) == {"DRAFT", "POSTED"}
@@ -418,7 +465,7 @@ def test_a_b2_refusal_at_apply_queues_with_the_refusal_code(engine, monkeypatch)
     statement_lines(engine, env, 1)
     draft = fee(engine, env)
     with Session(engine) as db, engine.connect() as legacy:
-        plan = service.build_plan(db, legacy, env.scope)
+        plan = service.build_plan(db, legacy, scope(engine, env))
         assert counts(plan) == {"posted": 1}
         from erp_v2.journals import service as journals
 
@@ -428,7 +475,7 @@ def test_a_b2_refusal_at_apply_queues_with_the_refusal_code(engine, monkeypatch)
         monkeypatch.setattr(journals, "request_legacy_post", refuse)
         requester, approver = requester_approver(env)
         result = service.apply_plan(
-            db, env.scope, plan, ApplyInputs(plan.sha256, "c" * 64, "a", "b", requester, approver, False)
+            db, scope(engine, env), plan, ApplyInputs(plan.sha256, "c" * 64, "a", "b", requester, approver, False)
         )
     assert result["refusals"] == {"posted:period_closed": 1}
     row = decisions(engine, env)[draft.id]
@@ -454,7 +501,7 @@ def test_filed_vat_month_with_a_tax_account_queues_the_post(engine):
         db.commit()
     statement_lines(engine, env, 1)
     draft = fee(engine, env, debit="1455")
-    env.scope = Scope(env.tenant_id, FY_START, FY_END, frozenset({"2026-01"}))
+    env.overrides = {"filed": frozenset({"2026-01"})}
     plan_and_apply(engine, env)
     row = decisions(engine, env)[draft.id]
     assert row.reason_code == "post_blocked" and row.evidence["blocker"] == "vat_month_filed"
@@ -478,12 +525,12 @@ def test_a_draft_already_in_the_b2_workflow_is_queued_not_decided_twice(engine):
 
 def test_drafts_dated_before_the_fiscal_year_are_out_of_scope(engine):
     env = world(engine)
-    env.scope = Scope(env.tenant_id, date(2026, 1, 5), FY_END)
+    env.overrides = {"fy_start": date(2026, 1, 5)}
     old = fee(engine, env, day=date(2026, 1, 2))
     statement_lines(engine, env, 1)
     fee(engine, env)
     with Session(engine) as db, engine.connect() as legacy:
-        plan = service.build_plan(db, legacy, env.scope)
+        plan = service.build_plan(db, legacy, scope(engine, env))
     assert len(plan.decisions) == 1 and plan.out_of_scope_before_fy == 1
     plan_and_apply(engine, env)
     assert old.id not in decisions(engine, env) and statuses(engine, env)[old.id] == "DRAFT"
@@ -495,10 +542,10 @@ def test_drift_after_the_plan_changes_the_sha(engine):
     fee(engine, env, status="POSTED")
     fee(engine, env)
     with Session(engine) as db, engine.connect() as legacy:
-        first = service.build_plan(db, legacy, env.scope).sha256
+        first = service.build_plan(db, legacy, scope(engine, env)).sha256
     statement_lines(engine, env, 1)  # more statement evidence after the plan: the decision would change
     with Session(engine) as db, engine.connect() as legacy:
-        assert service.build_plan(db, legacy, env.scope).sha256 != first
+        assert service.build_plan(db, legacy, scope(engine, env)).sha256 != first
 
 
 def test_decision_rows_are_immutable_and_the_runtime_role_cannot_write_them(engine):
@@ -578,10 +625,144 @@ def test_migration_downgrade_refuses_while_decisions_exist(engine):
             transaction.rollback()
 
 
+def test_unapproved_reversal_of_a_live_document_voids_with_per_draft_evidence(engine):
+    env = world(engine)
+    live, twin_live = ar_pair(engine, env, mirror=True, doc_status="PARTIALLY_PAID")
+    dead, _ = ar_pair(engine, env, mirror=True, doc_status="CANCELLED")
+    near, _ = ar_pair(engine, env, mirror=True, amount="99", doc_status="PAID")
+    plan_and_apply(engine, env)
+    rows = decisions(engine, env)
+    row = rows[live.id]
+    assert (row.outcome, row.reason_code, row.rule_id) == (
+        "voided",
+        "unapproved_reversal_of_live_document",
+        "R-AR-UNAPPROVED-REVERSAL",
+    )
+    assert row.evidence["twin_journal_id"] == str(twin_live.id)
+    assert row.evidence["document_id"] == str(live.document) and row.evidence["document_status"] == "PARTIALLY_PAID"
+    assert row.evidence["mirror_proof"]["mirror_sha256"]
+    assert (rows[dead.id].outcome, rows[dead.id].reason_code) == ("queued", "reversal_document_not_live")
+    assert rows[near.id].reason_code == "twin_amount_differs"  # not an exact mirror
+    state = statuses(engine, env)
+    assert (state[live.id], state[dead.id], state[near.id]) == ("VOID", "DRAFT", "DRAFT")
+
+
+def test_posted_exceeding_statement_voids_the_excess_and_the_plan_carries_the_e17_finding(
+    engine, monkeypatch, tmp_path
+):
+    env = world(engine)
+    statement_lines(engine, env, 1, amount="8")
+    posted = [fee(engine, env, status="POSTED", amount="8") for _ in range(3)]
+    drafts = [fee(engine, env, amount="8") for _ in range(2)]
+    spec = write_spec(engine, tmp_path, env)
+    _, plan = cli_plan(engine, monkeypatch, tmp_path, env, spec)
+    assert plan["outcomes"] == {"posted": 0, "voided": 2, "queued": 0}
+    (finding,) = plan["e17_findings"]
+    assert finding["finding"] == "E17" and finding["excess_posted_fee_journals"] == 2
+    assert finding["posted_fee_journals"] == 3 and finding["statement_lines"] == 1 and finding["drafts_voided"] == 2
+    assert finding["posted_journal_ids_sha256"] == rules.ids_sha256([p.id for p in posted])
+    plan_and_apply(engine, env)
+    assert {decisions(engine, env)[d.id].reason_code for d in drafts} == {"duplicate_of_posted_fee_excess"}
+
+
+def test_only_legacy_draft_submitted_or_approved_journals_are_held(engine):
+    env = world(engine)
+    statement_lines(engine, env, 1)
+    submitted = fee(engine, env, legacy_status="SUBMITTED", amount="9")
+    approved = fee(engine, env, legacy_status="APPROVED", amount="9")
+    other = fee(engine, env, legacy_status="REJECTED", amount="9")
+    with Session(engine) as db, engine.connect() as legacy:
+        plan = service.build_plan(db, legacy, scope(engine, env))
+    ids = {d.journal_id for d in plan.decisions}
+    assert ids == {submitted.id, approved.id} and plan.excluded_legacy_status == 1 and other.id not in ids
+
+
+def test_the_partition_proof_counts_the_legacy_side_not_the_destination(engine):
+    env = world(engine)
+    statement_lines(engine, env, 1)
+    fee(engine, env)
+    missing = fee(engine, env, with_legacy=False)  # a destination DRAFT the legacy snapshot does not hold
+    with Session(engine) as db, engine.connect() as legacy:
+        plan = service.build_plan(db, legacy, scope(engine, env))
+        proof = service.partition_proof(legacy, scope(engine, env), plan.decisions)
+    assert missing.id in {d.journal_id for d in plan.decisions}
+    assert proof["held_total_source"] == "legacy_snapshot" and proof["held_total"] == 1
+    assert proof["decisions_not_in_legacy_held"] == 1 and proof["ok"] is False
+    # and a legacy held draft the destination lacks breaks it the other way
+    with engine.begin() as c:
+        c.execute(
+            sa.text("INSERT INTO gl.journal_entry VALUES (:j, 'DRAFT', 'GL', 'JOURNAL', :d, :day, :day)"),
+            {"j": uuid4(), "d": uuid4(), "day": DAY},
+        )
+    with Session(engine) as db, engine.connect() as legacy:
+        proof = service.partition_proof(
+            legacy, scope(engine, env), service.build_plan(db, legacy, scope(engine, env)).decisions
+        )
+    assert proof["legacy_held_without_decision"] == 1 and proof["ok"] is False
+
+
+def test_the_declared_legacy_count_must_match(engine):
+    env = world(engine)
+    statement_lines(engine, env, 1)
+    fee(engine, env, status="POSTED")
+    fee(engine, env)
+    good = scope(engine, env)
+    with Session(engine) as db, engine.connect() as legacy:
+        plan = service.build_plan(db, legacy, good)
+        assert service.partition_proof(legacy, good, plan.decisions)["ok"]
+        wrong = Scope(good.tenant_id, good.fy_start, good.fy_end, good.filed_vat_months, 14271)
+        assert not service.partition_proof(legacy, wrong, plan.decisions)["ok"]
+
+
+def test_a_replan_after_an_interrupted_apply_counts_the_posts_already_made(engine):
+    env = world(engine)
+    statement_lines(engine, env, 3)
+    fee(engine, env, status="POSTED")
+    first = [fee(engine, env) for _ in range(2)]
+    plan, _ = plan_and_apply(engine, env)
+    assert counts(plan) == {"posted": 2}  # S - P = 2 may post
+    late = fee(engine, env)  # another draft on the key shows up after the apply
+    with Session(engine) as db, engine.connect() as legacy:
+        replan = service.build_plan(db, legacy, scope(engine, env))
+    mine = {d.journal_id: d for d in replan.decisions}
+    assert mine[late.id].outcome == "voided"  # the two posts count in P: no third post on a key already full
+    assert {mine[d.id].outcome for d in first} == {"posted"}
+
+
+def test_keys_on_a_shared_cash_gl_queue_with_the_reconciliation_refusal_semantics(engine):
+    env = world(engine)
+    statement_lines(engine, env, 2)
+    fee(engine, env, status="POSTED")
+    draft = fee(engine, env)
+    with Session(engine) as db:
+        first = db.scalar(sa.select(BankAccount).where(BankAccount.tenant_id == env.tenant_id))
+        db.add(
+            BankAccount(
+                id=uuid4(),
+                tenant_id=env.tenant_id,
+                institution_id=first.institution_id,
+                account_code="OP2",
+                account_name="Second",
+                account_identifier="id-2",
+                account_type_code="current",
+                currency_code="USD",
+                minor_units=2,
+                cash_account_ref="1000",  # the same cash GL
+                status="active",
+            )
+        )
+        db.commit()
+    plan_and_apply(engine, env)
+    row = decisions(engine, env)[draft.id]
+    assert (row.outcome, row.reason_code) == ("queued", "bank_gl_unresolved")
+    assert statuses(engine, env)[draft.id] == "DRAFT"
+
+
 # --- the CLI end to end, with the dual-control policy ----------------------------------------------------------
 
 
-def write_spec(tmp_path, env, *, same_party=False):
+def write_spec(engine, tmp_path, env, *, same_party=False, expected=None):
+    expected = held_count(engine, env) if expected is None else expected
     requester, approver = requester_approver(env)
     path = tmp_path / f"spec-{uuid4().hex[:6]}.json"
     path.write_text(
@@ -596,6 +777,7 @@ def write_spec(tmp_path, env, *, same_party=False):
                 "requester_party_id": str(requester),
                 "approver_party_id": str(requester if same_party else approver),
                 "filed_vat_months": [],
+                "expected_held_total": expected,
             }
         )
     )
@@ -630,12 +812,12 @@ def cli_apply(engine, monkeypatch, tmp_path, env, spec, plan_receipt, plan, oper
 def test_cli_plan_then_apply_end_to_end_with_private_receipts(engine, monkeypatch, tmp_path):
     env = world(engine, dual=False)
     census(engine, env)
-    spec = write_spec(tmp_path, env)
+    spec = write_spec(engine, tmp_path, env)
     plan_receipt, plan = cli_plan(engine, monkeypatch, tmp_path, env, spec)
     assert (os.stat(plan_receipt).st_mode & 0o777) == 0o600
     text = plan_receipt.read_text()
     assert str(env.tenant_id) not in text and "postgresql" not in text
-    assert plan["outcomes"] == {"posted": 1, "voided": 7, "queued": 7} and plan["partition_proof"]["ok"]
+    assert plan["outcomes"] == {"posted": 1, "voided": 8, "queued": 6} and plan["partition_proof"]["ok"]
     assert len(plan["bridge_lines"]) == 15 and {"rule_id", "outcome", "amount", "evidence_sha256"} <= set(
         plan["bridge_lines"][0]
     )
@@ -663,7 +845,7 @@ def test_cli_apply_refuses_when_the_world_drifted_after_the_plan(engine, monkeyp
     statement_lines(engine, env, 1)
     fee(engine, env, status="POSTED")
     fee(engine, env)
-    spec = write_spec(tmp_path, env)
+    spec = write_spec(engine, tmp_path, env)
     plan_receipt, plan = cli_plan(engine, monkeypatch, tmp_path, env, spec)
     statement_lines(engine, env, 1)  # evidence changed after the reviewed plan
     code, receipt = cli_apply(engine, monkeypatch, tmp_path, env, spec, plan_receipt, plan)
@@ -675,7 +857,7 @@ def test_dual_control_off_lets_one_operator_and_one_party_do_both_steps(engine, 
     env = world(engine, dual=False)
     statement_lines(engine, env, 2)
     fee(engine, env)
-    spec = write_spec(tmp_path, env, same_party=True)
+    spec = write_spec(engine, tmp_path, env, same_party=True)
     plan_receipt, plan = cli_plan(engine, monkeypatch, tmp_path, env, spec, operator="operator-a")
     code, receipt = cli_apply(engine, monkeypatch, tmp_path, env, spec, plan_receipt, plan, operator="operator-a")
     assert code == 0, receipt.read_text()
@@ -690,11 +872,11 @@ def test_dual_control_on_requires_two_operators_and_two_parties(engine, monkeypa
     statement_lines(engine, env, 2)
     fee(engine, env)
     draft = fee(engine, env, amount="5")
-    spec = write_spec(tmp_path, env)
+    spec = write_spec(engine, tmp_path, env)
     plan_receipt, plan = cli_plan(engine, monkeypatch, tmp_path, env, spec, operator="operator-a")
     code, receipt = cli_apply(engine, monkeypatch, tmp_path, env, spec, plan_receipt, plan, operator="operator-a")
     assert code == 2 and json.loads(receipt.read_text())["refusal"] == "dual_control_same_operator"
-    same_party = write_spec(tmp_path, env, same_party=True)
+    same_party = write_spec(engine, tmp_path, env, same_party=True)
     pr2, plan2 = cli_plan(engine, monkeypatch, tmp_path, env, same_party, operator="operator-a")
     code, receipt = cli_apply(engine, monkeypatch, tmp_path, env, same_party, pr2, plan2, operator="operator-b")
     assert code == 2 and json.loads(receipt.read_text())["refusal"] == "dual_control_same_party"

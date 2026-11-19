@@ -7,7 +7,8 @@ the Finance queue. See ``erp_v2.held_drafts.rules`` for the exact rules and ``RU
 
     {"version": 1, "tenant_id": "<uuid>", "fiscal_year_start": "YYYY-MM-DD", "fiscal_year_end": "YYYY-MM-DD",
      "rules_sha256": "<RULES_SHA256 of the reviewed rules>", "evidence_ref": "<who/why, <=255>",
-     "requester_party_id": "<uuid>", "approver_party_id": "<uuid>", "filed_vat_months": ["YYYY-MM", ...]}
+     "requester_party_id": "<uuid>", "approver_party_id": "<uuid>", "filed_vat_months": ["YYYY-MM", ...],
+     "expected_held_total": <legacy-side count, 14271 on g9>}
 
     python -m erp_v2.held_drafts.cli plan  --spec S.json --receipt P.json --operator-ref <who>
     ERP_HELD_DRAFTS_APPLY=1 python -m erp_v2.held_drafts.cli apply --spec S.json --plan-receipt P.json \
@@ -50,6 +51,7 @@ _SPEC_KEYS = {
     "requester_party_id",
     "approver_party_id",
     "filed_vat_months",
+    "expected_held_total",
 }
 
 
@@ -118,9 +120,12 @@ def parse_spec(raw_bytes: bytes) -> tuple[Scope, dict[str, Any]]:
         not isinstance(m, str) or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", m) for m in months
     ):
         _refuse("invalid_filed_vat_months")
+    expected = raw["expected_held_total"]
+    if type(expected) is not int or expected < 0:
+        _refuse("invalid_expected_held_total")
     requester = _uuid(raw["requester_party_id"], "invalid_requester_party_id")
     approver = _uuid(raw["approver_party_id"], "invalid_approver_party_id")
-    return Scope(tenant, start, end, frozenset(months)), {"requester": requester, "approver": approver}
+    return Scope(tenant, start, end, frozenset(months), expected), {"requester": requester, "approver": approver}
 
 
 def _operator(value: str | None) -> str:
@@ -141,6 +146,8 @@ def _summary(plan, proof: dict[str, Any]) -> dict[str, Any]:
         "rules_sha256": rules.RULES_SHA256,
         "scope_sha256": plan.scope_sha256,
         "held_total": proof["held_total"],
+        "excluded_legacy_status_not_held": plan.excluded_legacy_status,
+        "e17_findings": rules.e17_findings(list(plan.decisions)),
         "pending": len(plan.pending),
         "pre_fiscal_year_drafts_out_of_scope": plan.out_of_scope_before_fy,
         "outcomes": proof["counts"],
@@ -234,7 +241,7 @@ def _run(args) -> dict[str, Any]:
                     ):
                         _refuse("another_apply_in_progress")
                 plan = service.build_plan(db, legacy, scope)
-                proof = service.partition_proof(db, scope, plan.decisions)
+                proof = service.partition_proof(legacy, scope, plan.decisions)
                 out = {
                     "mode": args.mode,
                     "spec_sha256": spec_sha,
@@ -269,7 +276,7 @@ def _run(args) -> dict[str, Any]:
                     ),
                 )
                 final = service.build_plan(db, legacy, scope)
-                final_proof = service.partition_proof(db, scope, final.decisions)
+                final_proof = service.partition_proof(legacy, scope, final.decisions)
                 check = service.status_check(db, scope)
                 db.rollback()  # read-only from here; everything above was committed in batches
                 out.update(
