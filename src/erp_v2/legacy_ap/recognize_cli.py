@@ -543,6 +543,7 @@ def run_cohort(
     bindings: dict | None = None,
     now: datetime | None = None,
     plan_sink=None,
+    transform_manifest=None,
 ) -> dict:
     """Core of both modes; caller owns the transaction and (for plan) its READ ONLY setting."""
     from dotmac_kernel.cache import TenantScope
@@ -567,7 +568,7 @@ def run_cohort(
     )
     _require(held is not None, "approver_lacks_finance_approver")
     evidence_ref = evidence_reference(list_sha256)
-    verifier = ApprovedInvoiceVerifier(source, manifest, evidence_ref)
+    verifier = ApprovedInvoiceVerifier(source, manifest, evidence_ref, transform_manifest=transform_manifest)
     if apply:
         # One apply at a time per list, taken BEFORE the plan is built: a concurrent identical apply
         # waits here, then classifies every invoice as already done (a no-op), instead of planning
@@ -662,6 +663,14 @@ def _run(args) -> dict:
     if args.apply:
         _require(bool(re.fullmatch(r"[0-9a-f]{64}", args.reviewed_plan_sha256 or "")), "reviewed_plan_required")
     _require(version("dotmac-payables") == REQUIRED_PAYABLES_VERSION, "released_payables_version_required")
+    transform_manifest = None
+    if getattr(args, "transform_manifest", None) is not None:
+        from erp_v2.legacy_ap.transform_manifest import TransformManifest, TransformManifestError
+
+        try:
+            transform_manifest = TransformManifest.load(args.transform_manifest)
+        except TransformManifestError as exc:
+            raise RecognizeRefusal(str(exc)) from exc
     bindings = dict(
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         list_sha256=args.list_sha256,
@@ -670,6 +679,7 @@ def _run(args) -> dict:
         tenant_id=str(tenant),
         approver_party_id=str(actor),
         source_owner="legacy-erp",
+        **({"transform_manifest_sha256": transform_manifest.sha256} if transform_manifest else {}),
     )
     source_engine = _safe_engine(source_url)
     try:
@@ -702,6 +712,7 @@ def _run(args) -> dict:
                         reviewed_digest=args.reviewed_plan_sha256,
                         bindings=bindings,
                         plan_sink=lambda payload: _dump(args.plan_fd, payload),
+                        transform_manifest=transform_manifest,
                     )
         finally:
             destination_engine.dispose()
@@ -730,6 +741,7 @@ def main(argv=None) -> int:
     parser.add_argument("--approver-party-id", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--reviewed-plan-sha256")
+    parser.add_argument("--transform-manifest", type=Path, help="the importer's .transforms.json (B-3), optional")
     args = parser.parse_args(argv)
     try:
         _require(_authorized(args), "explicit_apply_authorization_required")

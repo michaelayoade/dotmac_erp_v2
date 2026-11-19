@@ -55,10 +55,12 @@ from erp_v2.importer.payables_history import (
     invoice_tax,
     load_review,
     require_line_tax_account,
+    transform_facts,
 )
 from erp_v2.importer.payables_reconciliation import _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
-from erp_v2.importer.tax_accounts import DEFERRAL_DOCUMENT_TYPE
+from erp_v2.importer.tax_accounts import DEFERRAL_DOCUMENT_TYPE, canonical
+from erp_v2.legacy_ap.transform_manifest import InvoiceTransform, TransformManifest
 
 SOURCE_OWNER = "legacy-erp"
 FACTS_DOMAIN = "erp.payables.recognition-facts.v1"
@@ -89,6 +91,24 @@ def _linked_rows(src: sa.Connection, name: str, schema: str, conditions: dict[st
     return src.execute(sa.select(sa.func.count()).select_from(table).where(sa.or_(*clauses))).scalar_one()
 
 
+def _item_line_ids(src: sa.Connection, invoice_id: UUID) -> set[str]:
+    """Ids of the invoice lines carrying an inventory item (legacy ``item_id``)."""
+    table = _reflect(src, "supplier_invoice_line", "ap" if src.dialect.name == "postgresql" else None)
+    for column in ("item_id", "invoice_id", "line_id"):
+        if column not in table.c:
+            raise HistoricalEvidenceError(f"source_column_missing:supplier_invoice_line.{column}")
+    rows = src.execute(
+        sa.select(table.c.line_id).where(_hex_in(table.c.invoice_id, [invoice_id]), table.c.item_id.is_not(None))
+    )
+    return {str(row[0]) for row in rows}
+
+
+def item_link_explained(src: sa.Connection, invoice_id: UUID, found: InvoiceTransform | None) -> bool:
+    """No item-linked line, or every one is a T-ITEM-NONSTOCK application of the transform manifest."""
+    ids = _item_line_ids(src, invoice_id)
+    return not ids or (found is not None and found.items_explained(ids))
+
+
 def _items(src: sa.Connection, invoice_id: UUID) -> int:
     """Invoice lines carrying an inventory item (legacy ``item_id``)."""
     table = _reflect(src, "supplier_invoice_line", "ap" if src.dialect.name == "postgresql" else None)
@@ -108,6 +128,10 @@ class ApprovedInvoiceVerifier:
     evidence_reference: str
     source_owner: str = SOURCE_OWNER
     transforms: tuple[tuple[str, str], ...] = ()
+    transform_manifest: TransformManifest | None = None  # the importer's transform manifest (B-3)
+
+    def invoice_transform(self, invoice_id: UUID) -> InvoiceTransform | None:
+        return self.transform_manifest.for_invoice(invoice_id) if self.transform_manifest is not None else None
 
     def command(
         self, evidence: ApprovedInvoiceRecognitionEvidence, *, recognized_by: str, approval_reference: str
@@ -152,9 +176,10 @@ class ApprovedInvoiceVerifier:
         with destination.no_autoflush:
             connection = destination.connection()
             _require(_database(connection) == manifest.destination_database, "destination_database")
+            found = self.invoice_transform(invoice_id)
             gate = WaiverGate(
                 load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=RECOGNITION_DECISIONS),
-                dict(self.transforms),
+                {**dict(self.transforms), **(found.waivable_checks() if found else {})},
             )
             try:
                 result = self._evidence(tenant, invoice_id, connection, gate)
@@ -258,7 +283,8 @@ class ApprovedInvoiceVerifier:
                 )
             }
         )
-        _match(header, target, mapping, "header")
+        found = self.invoice_transform(invoice_id)
+        _match(found.header_values(header) if found else header, target, mapping, "header")
         for name in ("invoice_date", "received_date"):
             # Legacy dates may arrive as date or ISO text; compare as calendar days.
             _require(
@@ -278,7 +304,7 @@ class ApprovedInvoiceVerifier:
             "source_procurement_link",
         )
         line_ids = [row["line_id"] for row in lines]
-        _require(_items(src, invoice_id) == 0, "source_item_link")
+        _require(item_link_explained(src, invoice_id, found), "source_item_link")
         _require(
             _linked_rows(
                 src,
@@ -294,10 +320,15 @@ class ApprovedInvoiceVerifier:
         # No legacy GL footprint (checked above), so the snapshot rule applies: B1 split / B2 folded.
         outcome, tax_evidence = invoice_tax(src, tenant, None, lines)
         for original, imported in _pair(lines, targets, "line_id", "invoice_line"):
-            _match(original, imported, line_mapping, "invoice_line")
-            derived = require_line_tax_account(outcome, original["line_id"], imported)
-            # A folded taxed line is a WHT line keyed as additive tax; it must never be posted as cost.
-            _require(derived.klass != "B2", "folded_tax_line_requires_review")
+            _match(found.line_values(original) if found else original, imported, line_mapping, "invoice_line")
+            derived = require_line_tax_account(outcome, original["line_id"], imported, found)
+            # A folded taxed line is a WHT line keyed as additive tax; it must never be posted as cost. A line the
+            # importer transformed (D-M2: WHT removed, landed with no tax) is explained by the transform manifest.
+            landed = found.lines.get(canonical(original["line_id"]) or "") if found else None
+            _require(
+                derived.klass != "B2" or (landed is not None and landed["tax_amount"] == 0),
+                "folded_tax_line_requires_review",
+            )
         gate.require(
             _sum([row["line_amount"] for row in lines]) == header["subtotal"]
             and _sum([row["tax_amount"] for row in lines]) == header["tax_amount"],
@@ -313,6 +344,7 @@ class ApprovedInvoiceVerifier:
                 destination_header=_project(target, DESTINATION_HEADER),
                 destination_lines=_project_rows(targets, DESTINATION_INVOICE_LINE, "id"),
                 gl=dict(journals=0, ledger_lines=gl_line_count),
+                **({"transform_manifest": transform_facts(found, self.transform_manifest)} if found else {}),
                 tax_accounts=dict(
                     invoice_class=outcome.klass,
                     a1_expense_elsewhere=outcome.expense_elsewhere,

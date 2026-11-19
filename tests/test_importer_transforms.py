@@ -965,3 +965,43 @@ def test_a_legacy_header_that_is_not_subtotal_plus_tax_is_counted_as_total_misma
     out = run(invoice([line(1, amount="10.005")], sub="10.01", total="11.00"))
     assert out.bucket == QUEUE and not out.lands and out.queue_reason == "total_mismatch_after_transform"
     assert TransformLedger((out,), FALLBACK).queue()["total_mismatch_after_transform"] == 1
+
+
+# ---- the manifest the verifiers read, and the payment schedule that must follow the landed total ----
+
+
+def test_landed_manifest_round_trips_into_the_verifier_view():
+    from erp_v2.legacy_ap.transform_manifest import TransformManifest
+
+    wht = TaxCodeFacts(ORG, "WITHHOLDING", PAID, None)
+    inv = invoice([line(1, amount="200", tax="10", code=wht)], status="APPROVED", sub="200", tax="10", total="210")
+    ledger = TransformLedger((run(inv), run(invoice([line(2, amount="5")], n=2, status="DRAFT"))), FALLBACK)
+    landed = ledger.itemised()["landed"]
+    assert list(landed) == [inv.invoice_id]  # the carried invoice is not in the manifest
+    manifest = TransformManifest.from_itemised(ledger.itemised())
+    found = manifest.for_invoice(inv.invoice_id)
+    assert (
+        found.rules == {T_UNPOSTED_CORRECT}
+        and found.header["total_amount"] == D(200)
+        and found.header["tax_amount"] == 0
+    )
+    source = {"line_id": lid(1), "expense_account_id": EXP, "line_amount": D(200), "tax_amount": D(10)}
+    assert found.line_values(source)["tax_amount"] == D(0)
+    assert found.landed_tax_ref(lid(1)) == (True, None) and found.landed_tax_ref(lid(9)) == (False, None)
+
+
+def test_the_payment_schedule_follows_the_landed_total():
+    import json
+
+    from erp_v2.importer.transforms import TransformBuild
+
+    key = UUID(int=9001).hex
+    maps = EnrolmentMaps(None, None, transform_params=params())
+    maps._transforms = TransformBuild(
+        {},
+        {key: {"subtotal": D(300), "tax_amount": D("7.5"), "total_amount": D("307.5")}},
+        TransformLedger((), FALLBACK),
+    )
+    schedule = {key: {"payment_schedule": json.dumps([{"due_date": "2026-01-31", "amount": "317.5"}])}}
+    maps._align_schedule_with_transforms(schedule)
+    assert json.loads(schedule[key]["payment_schedule"]) == [{"due_date": "2026-01-31", "amount": "307.5"}]

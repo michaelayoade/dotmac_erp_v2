@@ -275,6 +275,7 @@ class InvoiceOutcome:
     lines: Mapping[str, LineOutcome]
     bridge: tuple[BridgeLine, ...]
     queue_reasons: tuple[str, ...] = ()  # every queue reason (a landed invoice can carry several)
+    header_changed: bool = False  # the landed header values differ from legacy
 
     @property
     def header_delta(self) -> Decimal:
@@ -561,6 +562,7 @@ def transform_invoice(
     }
     all_bridge = tuple(b for k in key_of for b in line_notes[k]) + tuple(bridge)
     v2_total = header["total_amount"]
+    header_changed = header != {"subtotal": sub, "tax_amount": tax_h, "total_amount": total}
     if wht_removed:
         # Landed at the gross, but a payment of it would skip the WHT: counted as queued until the a6 WHT table
         # carries the payment-time fact, so the invoice is never paid gross unnoticed.
@@ -577,9 +579,20 @@ def transform_invoice(
             lines_out,
             all_bridge,
             tuple(landed_queue),
+            header_changed,
         )
     return InvoiceOutcome(
-        iid, TRANSFORM if all_bridge else CARRY, legacy_total, v2_total, True, None, header, lines_out, all_bridge
+        iid,
+        TRANSFORM if all_bridge else CARRY,
+        legacy_total,
+        v2_total,
+        True,
+        None,
+        header,
+        lines_out,
+        all_bridge,
+        (),
+        header_changed,
     )
 
 
@@ -721,6 +734,36 @@ class TransformLedger:
             "total_mismatch_after_transform": reasons.get(Q_TOTAL, 0),
         }
 
+    def landed(self) -> dict[str, Any]:
+        """The transform manifest the verifiers read: per landed invoice a transform touched, the rules, the changed
+        header values, the landed values of every transformed line, and its item-linked lines. Transforms are kept
+        apart from Finance waivers: this is the importer's own record of what it changed and why."""
+
+        out: dict[str, Any] = {}
+        for o in self.outcomes:
+            if not o.lands:
+                continue
+            lines = {
+                k: {
+                    "posting_account_ref": ln.posting_account_ref,
+                    "tax_account_ref": ln.tax_account_ref,
+                    "line_amount": _fmt(ln.line_amount),
+                    "tax_amount": _fmt(ln.tax_amount),
+                }
+                for k, ln in o.lines.items()
+                if ln.transformed
+            }
+            items = sorted(b.line_id for b in o.bridge if b.rule == T_ITEM_NONSTOCK and b.line_id)
+            if not (o.header_changed or lines or items):
+                continue
+            out[o.invoice_id] = {
+                "rules": sorted({b.rule for b in o.bridge}),
+                "header": {f: _fmt(v) for f, v in o.header.items()} if o.header_changed else {},
+                "lines": lines,
+                "item_lines": items,
+            }
+        return out
+
     def changed_headers(self) -> list[dict[str, Any]]:
         """Landed invoices whose header values differ from legacy (WHT removal, rounding): the changed values the
         dest6 header parity must expect."""
@@ -816,6 +859,7 @@ class TransformLedger:
             "bridge_lines": self.bridge_lines(),
             "queue": self.queue_items(),
             "changed_headers": self.changed_headers(),
+            "landed": self.landed(),
             "fallback_account": self.fallback_account,
         }
 

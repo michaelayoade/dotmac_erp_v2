@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from erp_v2.importer import admission_waivers, tax_accounts
 from erp_v2.importer.payables_reconciliation import _money, _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
+from erp_v2.legacy_ap.transform_manifest import InvoiceTransform, TransformManifest
 
 ADMISSION = frozenset({"admit_residual", "admit_with_waivers"})
 STATUS_WAIVERS = frozenset({"inconsistent_status_pair", "legacy_journal_link_unposted"})
@@ -512,14 +513,39 @@ def _deferral_evidence(outcome: tax_accounts.InvoiceTax) -> dict:
     )
 
 
-def require_line_tax_account(outcome: tax_accounts.InvoiceTax, line_id: object, imported: dict) -> tax_accounts.LineTax:
-    """The destination ref must equal the derived ref exactly (untaxed lines: NULL)."""
+def transform_facts(found: InvoiceTransform, manifest: TransformManifest) -> dict:
+    """Fingerprint evidence of the importer transforms that explain this invoice (separate from ``review``)."""
+    return dict(
+        manifest_sha256=manifest.sha256,
+        rules=sorted(found.rules),
+        header=sorted((k, format(v, "f")) for k, v in found.header.items()),
+        lines=sorted(
+            (
+                k,
+                v["posting_account_ref"],
+                v["tax_account_ref"],
+                format(v["line_amount"], "f"),
+                format(v["tax_amount"], "f"),
+            )
+            for k, v in found.lines.items()
+        ),
+        item_lines=sorted(found.item_lines),
+    )
+
+
+def require_line_tax_account(
+    outcome: tax_accounts.InvoiceTax, line_id: object, imported: dict, transform=None
+) -> tax_accounts.LineTax:
+    """The destination ref must equal the derived ref exactly (untaxed lines: NULL). A line the importer transformed
+    (``transform``: an ``InvoiceTransform`` of the transform manifest) must carry the ref the manifest names."""
 
     derived = outcome.lines[tax_accounts.canonical(line_id)]
     actual = imported["tax_account_ref"]
+    explained, landed = transform.landed_tax_ref(line_id) if transform is not None else (False, None)
+    expected = landed if explained else derived.ref
     _require(
-        (actual is None and derived.ref is None)
-        or (actual is not None and derived.ref is not None and _id(actual) == derived.ref),
+        (actual is None and expected is None)
+        or (actual is not None and expected is not None and _id(actual) == expected),
         "invoice_line_tax_account",
     )
     return derived
@@ -695,6 +721,16 @@ class HistoricalPayablesVerifier:
     # (waivable check name, transform rule id) pairs from the importer transform manifest (#68); a failure the
     # transform fixed needs no waiver. Empty until the transform manifest is wired in.
     transforms: tuple[tuple[str, str], ...] = ()
+    # The importer's transform manifest (B-3): per-invoice rules and landed values. A destination that differs from the
+    # source is accepted only where the manifest names the same values; kept apart from Finance waivers.
+    transform_manifest: TransformManifest | None = None
+
+    def invoice_transform(self, invoice_id: UUID) -> InvoiceTransform | None:
+        return self.transform_manifest.for_invoice(invoice_id) if self.transform_manifest is not None else None
+
+    def gate_for(self, review: ReviewFacts | None, invoice_id: UUID) -> WaiverGate:
+        found = self.invoice_transform(invoice_id)
+        return WaiverGate(review, {**dict(self.transforms), **(found.waivable_checks() if found else {})})
 
     @staticmethod
     def command(evidence: HistoricalUnpaidInvoiceEvidence) -> HistoricalUnpaidInvoiceCommand:
@@ -735,9 +771,8 @@ class HistoricalPayablesVerifier:
         with destination.no_autoflush:
             connection = destination.connection()
             _require(_database(connection) == manifest.destination_database, "destination_database")
-            gate = WaiverGate(
-                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=ADMISSION),
-                dict(self.transforms),
+            gate = self.gate_for(
+                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=ADMISSION), invoice_id
             )
             try:
                 result = self._evidence(tenant, invoice_id, connection, gate)
@@ -868,7 +903,9 @@ class HistoricalPayablesVerifier:
                 )
             }
         )
-        _match(header, target, mapping, "header")
+        found = self.invoice_transform(invoice_id)
+        effective = found.header_values(header) if found else header
+        _match(effective, target, mapping, "header")
         _require(target["supplier_name_snapshot"] == name, "header_supplier_name_snapshot")
         # The legacy approval request is optional evidence, never a fabricated stamp.
         _require(_equal(target["approval_reference"], header["approval_request_id"]), "header_approval_reference")
@@ -886,7 +923,7 @@ class HistoricalPayablesVerifier:
         )
         _require(
             _day(schedule[0]["due_date"], "header_due_date") == due
-            and _amount(schedule[0]["amount"], "header_schedule_amount") == header["total_amount"],
+            and _amount(schedule[0]["amount"], "header_schedule_amount") == effective["total_amount"],
             "header_payment_schedule",
         )
         lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
@@ -925,12 +962,12 @@ class HistoricalPayablesVerifier:
                 and original["quantity"] > 0,
                 "source_invoice_line_amounts",
             )
-            _match(original, imported, line_mapping, "invoice_line")
+            _match(found.line_values(original) if found else original, imported, line_mapping, "invoice_line")
             _require(
                 original["po_line_id"] is None and original["goods_receipt_line_id"] is None,
                 "unsupported_procurement_link",
             )
-            require_line_tax_account(outcome, original["line_id"], imported)
+            require_line_tax_account(outcome, original["line_id"], imported, found)
             dimensions = sorted(
                 [[code, _id(original[col])] for code, col in DIMENSIONS[1:] if original[col] is not None]
             )
@@ -981,6 +1018,7 @@ class HistoricalPayablesVerifier:
                     codes=tax_evidence,
                 ),
                 **gate.facts(),
+                **({"transform_manifest": transform_facts(found, self.transform_manifest)} if found else {}),
             ),
         )
         common = dict(

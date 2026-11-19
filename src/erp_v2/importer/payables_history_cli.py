@@ -353,6 +353,14 @@ def _run(args) -> dict:
     _require(snapshot_sha == manifest.snapshot_sha256, "snapshot_digest_mismatch")
     tenant, ids = _cohort(cohort_bytes, manifest)
     reviewed = _reviewed(args)
+    transform_manifest = None
+    if getattr(args, "transform_manifest", None) is not None:
+        from erp_v2.legacy_ap.transform_manifest import TransformManifest, TransformManifestError
+
+        try:
+            transform_manifest = TransformManifest.load(args.transform_manifest)
+        except TransformManifestError as exc:
+            raise OperatorRefusal(str(exc)) from exc
     bindings = dict(
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         cohort_sha256=hashlib.sha256(cohort_bytes).hexdigest(),
@@ -362,6 +370,7 @@ def _run(args) -> dict:
         source_database=manifest.source_database,
         destination_database=manifest.destination_database,
         source_owner="legacy-erp",
+        **({"transform_manifest_sha256": transform_manifest.sha256} if transform_manifest else {}),
     )
     _require(_installed_payables_version() == REQUIRED_PAYABLES_VERSION, "released_payables_version_required")
     scope_type, verifier_type, admit, command_type = _dependencies()
@@ -378,7 +387,9 @@ def _run(args) -> dict:
                     source.scalar(sa.text("SELECT current_database()")) == manifest.source_database,
                     "source_database_mismatch",
                 )
-                verifier = verifier_type(source, manifest)
+                verifier = verifier_type(
+                    source, manifest, **({"transform_manifest": transform_manifest} if transform_manifest else {})
+                )
                 with Session(destination_engine) as session, session.begin():
                     if not args.apply:
                         session.execute(sa.text("SET TRANSACTION READ ONLY"))
@@ -425,6 +436,7 @@ def main(argv=None) -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--reviewed-plan", type=Path)
     parser.add_argument("--reviewed-plan-sha256")
+    parser.add_argument("--transform-manifest", type=Path, help="the importer's .transforms.json (B-3), optional")
     args = parser.parse_args(argv)
     try:
         _require(_authorized(args), "explicit_apply_authorization_required")

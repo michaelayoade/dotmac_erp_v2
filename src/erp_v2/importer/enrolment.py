@@ -1187,7 +1187,23 @@ class EnrolmentMaps:
                 self._cache[name], self._tax_account_classes = _build_supplier_line_tax_accounts(self._source)
             else:
                 self._cache[name] = builder(self._source, self._dest)
+                if name == "supplier_payment_schedule" and self._transform_params is not None:
+                    self._align_schedule_with_transforms(self._cache[name])
         return self._cache[name]
+
+    def _align_schedule_with_transforms(self, schedule: dict[Any, dict[str, Any]]) -> None:
+        """The single-instalment schedule must sum to the LANDED total: where a transform changed the header total
+        (T-ROUND-2DP, T-UNPOSTED-CORRECT WHT removal) the instalment is the transformed total, never the legacy one."""
+
+        for key, total in self.transforms().header_map.items():
+            entry = schedule.get(key)
+            new_total = total.get("total_amount") if isinstance(total, dict) else None
+            if entry is None or not isinstance(new_total, Decimal):
+                continue
+            rows = json.loads(entry["payment_schedule"])
+            if rows and Decimal(rows[0]["amount"]) != new_total:
+                rows[0]["amount"] = format(new_total, "f")
+                entry["payment_schedule"] = json.dumps(rows)
 
     def for_spec(self, spec: TransformSpec) -> dict[str, dict[Any, Any]]:
         return {name: self.get(name) for name in sorted(required_maps((spec,)))}
