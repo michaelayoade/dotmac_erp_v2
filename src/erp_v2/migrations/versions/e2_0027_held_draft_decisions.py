@@ -4,7 +4,7 @@ Additive: one new table, no change to any existing object. RLS forced; the runti
 operator CLI writes as the migration role). A trigger refuses UPDATE and DELETE even for the owner role. The
 downgrade refuses while any decision exists.
 
-Revision chain: e2_0024 (current main head; the coordinator re-chains at merge: e2_0026 -> this -> e2_0028).
+Revision chain: e2_0026 (current main head) -> this -> e2_0028 (B-9).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from alembic import op
 from erp_v2.held_drafts.models import OUTCOMES, TABLE, VOID_REASONS
 
 revision = "e2_0027_held_draft_decisions"
-down_revision = "e2_0024_statutory_payees"
+down_revision = "e2_0026_admission_reviews"
 branch_labels = None
 depends_on = None
 
