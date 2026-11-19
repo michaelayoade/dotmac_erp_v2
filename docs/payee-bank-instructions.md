@@ -129,3 +129,18 @@ Declared delta for the re-freeze run 'g' (dest6 + B8):
    is a census result at run 'g'; blockers count employees not yet imported / over-long fields.
 4. GL, AP reconciliation, identity and payroll parity are unaffected (no accounting or payables
    writes). No payment, bank call or external effect.
+
+## Statutory payees (PR-4b, migration `e2_0024_statutory_payees`)
+
+FIRS, the state revenue services and the pension administrators are payees of kind `statutory`, keyed by the
+payroll external beneficiary ref (for example `dest:PENSION_ER`). `e2_0024` widens `ck_payee_bank_instructions_kind`
+to `('supplier','employee','statutory')` (additive; downgrade refuses while a statutory row exists).
+
+- `resolve_payee`: the ref must be the `liability_destination_ref` of a pay component or structure rule of the tenant,
+  or the beneficiary ref of an external component liability. The label is the component name, never caller text;
+  unknown or other-tenant refs are refused (`unknown_payee`).
+- Same lifecycle (propose, approve, supersede, revoke) and the same per-tenant two-person policy as every other kind
+  (default off; the row records `dual_control`).
+- B5: a statutory batch needs an approved instruction for its destination at approve and record
+  (`statutory_payee_instruction_required`). Setup: Finance proposes and approves one instruction per authority used
+  before the first statutory remittance.

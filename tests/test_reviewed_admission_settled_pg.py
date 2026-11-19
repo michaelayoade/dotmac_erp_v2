@@ -96,3 +96,35 @@ def test_one_legacy_journal_never_backs_two_invoices_even_with_a_waiver(engine, 
     plan = scene.run([first, second], apply=False)
     assert plan["refusals_by_reason"] == {"legacy_evidence:source_journal_shared": 2}
     assert plan["counts"]["eligible"] == 0
+
+
+def test_replaying_a_settled_admission_does_not_trip_the_shared_journal_check_against_its_own_records(engine, setup):
+    """After admission the destination holds the invoice's receipt and settlement records naming journals; the
+    invoice's own rows must never count as a second document backing the journal."""
+    from dotmac_payables.models import HistoricalInvoiceReceipt, HistoricalSettlementRecord
+
+    env, scene = setup
+    iid = scene.add("AP-1")
+    scene.build()
+    scene.plan_then_apply([iid])
+    with Session(engine) as db:
+        assert (
+            db.scalar(
+                sa.select(sa.func.count())
+                .select_from(HistoricalInvoiceReceipt)
+                .where(HistoricalInvoiceReceipt.tenant_id == env.tenant_id)
+            )
+            == 1
+        )
+        assert (
+            db.scalar(
+                sa.select(sa.func.count())
+                .select_from(HistoricalSettlementRecord)
+                .where(HistoricalSettlementRecord.tenant_id == env.tenant_id)
+            )
+            == 1
+        )
+    again = scene.run([iid], apply=False)  # re-runs the verifier against the now-populated destination
+    assert again["counts"] == dict(requested=1, eligible=0, already_done=1, refused=0)
+    rerun = scene.run([iid], apply=True, digest=again["plan_digest"])
+    assert rerun["applied"] == 0 and rerun["refusals_by_reason"] == {}

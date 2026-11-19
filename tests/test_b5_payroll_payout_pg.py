@@ -46,6 +46,7 @@ from erp_v2.disbursement import bank_reference as bank_ref
 from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import DisbursementFileReceipt
 from erp_v2.journals.routes import journals_web_feature
+from erp_v2.payees import service as payee_service
 from erp_v2.payees.models import PayeeBankInstruction
 from erp_v2.payroll_payouts import service as svc
 from erp_v2.payroll_payouts.models import PayrollPayoutBatch, PayrollPayoutLine
@@ -200,6 +201,26 @@ def seed_instructions(
                 )
             )
         db.commit()
+
+
+def seed_statutory_instruction(engine, env, ref, *, proposer="proposer", decider="decider"):
+    """A real statutory payee instruction: proposed and approved through the payee service."""
+    with Session(engine) as db:
+        row = payee_service.propose(
+            db,
+            tenant_id=env.tenant_id,
+            proposer_party_id=env.people[proposer],
+            payee_kind="statutory",
+            payee_ref=ref,
+            bank_code="058",
+            bank_name="Example Bank",
+            account_number="0123456789",
+            account_name="Example Authority",
+            evidence_ref="letter-1",
+        )
+        payee_service.approve(db, tenant_id=env.tenant_id, instruction_id=row.id, approver_party_id=env.people[decider])
+        db.commit()
+        return row.id
 
 
 def act(engine, env, who, fn, **kw):
@@ -1022,9 +1043,9 @@ def test_missing_instruction_refuses_the_file(engine):
 # --- statutory remittances: recorded the same way, never a file ------------------
 
 
-def test_statutory_remittance_fails_closed_until_statutory_payees_exist(engine):
-    """Michael (v1531): statutory remittances are NOT exempt from V3. No statutory payee instruction exists
-    yet (a separate follow-up), so a statutory batch can be prepared but never approved or recorded."""
+def test_statutory_remittance_fails_closed_without_an_approved_statutory_instruction(engine):
+    """Michael (v1531): statutory remittances are NOT exempt from V3. Without an approved statutory payee
+    instruction a statutory batch can be prepared but never approved or recorded."""
     env = world(engine)
     enable_file(engine, env)
     run_id = finalized(engine, env)
@@ -1037,6 +1058,43 @@ def test_statutory_remittance_fails_closed_until_statutory_payees_exist(engine):
     assert counts(engine, env) == before
     assert batch_row(engine, out.batch_id).status == "draft"
     refused(lambda: generate(engine, env, out.batch_id), "statutory_no_file")
+
+
+def test_statutory_batch_passes_with_an_approved_instruction_and_records_its_evidence(engine):
+    env = world(engine)
+    enable_file(engine, env)
+    run_id = finalized(engine, env)
+    out = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE")
+    refused(lambda: approve(engine, env, out.batch_id), "statutory_payee_instruction_required")
+    instruction_id = seed_statutory_instruction(engine, env, "dest:PAYE")
+    approve(engine, env, out.batch_id)
+    assert batch_row(engine, out.batch_id).status == "approved"
+    refused(lambda: generate(engine, env, out.batch_id), "statutory_no_file")
+    assert record(engine, env, out.batch_id).replayed is False
+    assert batch_row(engine, out.batch_id).status == "recorded"
+    details = audits(engine, env, svc.AUDIT_RECORDED)[-1].details
+    assert details["payee_instruction_id"] == str(instruction_id)
+    assert details["account_last4"] == "6789" and details["destination_ref"] == "dest:PAYE"
+    assert "0123456789" not in str(details)
+
+
+def test_statutory_instruction_is_per_destination_and_record_refuses_once_it_is_revoked(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    seed_statutory_instruction(engine, env, "dest:PAYE")
+    other = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PENSION_ER").batch_id
+    refused(lambda: approve(engine, env, other), "statutory_payee_instruction_required")  # other authority: none
+    paye = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    approve(engine, env, paye)
+    with Session(engine) as db:
+        db.execute(
+            sa.update(PayeeBankInstruction)
+            .where(PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.payee_kind == "statutory")
+            .values(status="revoked", revoked_at=NOW, revoked_by_party_id=env.people["decider"])
+        )
+        db.commit()
+    refused(lambda: record(engine, env, paye), "statutory_payee_instruction_required")
+    assert batch_row(engine, paye).status == "approved"
 
 
 def test_statutory_batch_needs_one_destination_and_never_takes_net_pay(engine):
@@ -1486,7 +1544,9 @@ def test_v3_record_refuses_when_an_instruction_is_gone_and_no_file_was_issued(en
     refused(lambda: record(engine, env, batch_id), "payee_instruction_required")
     assert counts(engine, env) == before
     seed_instructions(engine, env, refs=("E2",), origin="legacy_import", decider="approver")
-    assert record(engine, env, batch_id).replayed is False
+    # a re-created instruction is a different one from the one the batch was approved against
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_changed")
+    assert counts(engine, env) == before
 
 
 def test_v3_statutory_batches_fail_closed_with_their_own_code(engine):
@@ -1553,3 +1613,140 @@ def test_check_distinct_people_is_rewritten_not_dual_control_or_predicate(engine
     with Session(engine) as db:  # off: the database accepts the same person
         db.execute(sa.text(sql), {"on": False, "who": env.people["preparer"], "id": batch_id})
         db.rollback()
+
+
+# --- statutory instruction-party SoD, gated by the per-tenant policy ---------------------------------------------
+
+
+@pytest.mark.parametrize("party", ["proposer", "decider"])
+def test_policy_on_statutory_approver_and_recorder_may_not_be_the_instruction_party(engine, party):
+    env = world(engine)  # policy ON in the test world
+    run_id = finalized(engine, env)
+    kw = {"proposer": "proposer", "decider": "decider"}
+    kw[party] = "approver"
+    seed_statutory_instruction(engine, env, "dest:PAYE", **kw)
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    assert batch_row(engine, batch_id).dual_control is True
+    refused(lambda: approve(engine, env, batch_id), "sod_approver_is_instruction_party")
+    approve(engine, env, batch_id, who="issuer")  # a different person may
+    refused(lambda: record(engine, env, batch_id, who="approver"), "sod_recorder_is_instruction_party")
+    assert record(engine, env, batch_id).replayed is False
+
+
+def test_policy_off_statutory_instruction_parties_may_approve_and_record(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    run_id = finalized(engine, env)
+    seed_statutory_instruction(engine, env, "dest:PAYE", proposer="approver", decider="approver")
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    assert batch_row(engine, batch_id).dual_control is False
+    approve(engine, env, batch_id)
+    assert record(engine, env, batch_id, who="approver").replayed is False
+
+
+# --- the approved instruction is pinned on the line at approve (net pay and statutory) ---------------------------
+
+
+def _replace_current_instruction(engine, env, kind, ref):
+    """A new approved instruction supersedes the current one (as a real approve would)."""
+    with Session(engine) as db:
+        old = db.scalar(
+            sa.select(PayeeBankInstruction).where(
+                PayeeBankInstruction.tenant_id == env.tenant_id,
+                PayeeBankInstruction.payee_kind == kind,
+                PayeeBankInstruction.payee_ref == ref,
+                PayeeBankInstruction.status == "approved",
+            )
+        )
+        old.status = "superseded"
+        db.flush()
+        db.add(
+            PayeeBankInstruction(
+                tenant_id=env.tenant_id,
+                payee_kind=kind,
+                payee_ref=ref,
+                payee_label="relabelled",
+                bank_code="058",
+                bank_name="Other Bank",
+                account_number="9876543210",
+                account_last4="3210",
+                account_name="Other",
+                status="approved",
+                origin="legacy_import",
+                dual_control=False,
+                proposed_at=NOW,
+                decided_by_party_id=env.people["decider"],
+                decided_at=NOW,
+                approved_at=NOW,
+            )
+        )
+        db.commit()
+
+
+def test_approve_pins_the_instruction_id_on_every_net_pay_line_and_record_refuses_a_change(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    with Session(engine) as db:
+        pinned = {ln.beneficiary_ref: ln.payee_instruction_id for ln in lines(engine, batch_id)}
+        current = {
+            r.payee_ref: r.id
+            for r in db.scalars(
+                sa.select(PayeeBankInstruction).where(
+                    PayeeBankInstruction.tenant_id == env.tenant_id, PayeeBankInstruction.status == "approved"
+                )
+            )
+        }
+    assert all(pinned[ref] == current[ref] for ref in pinned) and len(pinned) == 3
+    _replace_current_instruction(engine, env, "employee", env.emp["E1"])
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_changed")
+    assert batch_row(engine, batch_id).status == "approved"
+
+
+def test_statutory_record_refuses_when_the_instruction_was_replaced_after_approval(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    instruction_id = seed_statutory_instruction(engine, env, "dest:PAYE")
+    batch_id = prepare(engine, env, run_id, kind="statutory", destination_ref="dest:PAYE").batch_id
+    approve(engine, env, batch_id)
+    assert {ln.payee_instruction_id for ln in lines(engine, batch_id)} == {instruction_id}
+    _replace_current_instruction(engine, env, "statutory", "dest:PAYE")
+    refused(lambda: record(engine, env, batch_id), "payee_instruction_changed")
+
+
+def test_the_pinned_instruction_is_write_once_in_the_database(engine):
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    with Session(engine) as db:
+        with pytest.raises(sa.exc.DBAPIError):
+            db.execute(
+                sa.update(PayrollPayoutLine)
+                .where(PayrollPayoutLine.batch_id == batch_id)
+                .values(payee_instruction_id=uuid4())
+            )
+            db.flush()
+        db.rollback()
+
+
+def test_the_e2_0024_downgrade_refuses_while_a_payout_line_holds_a_pinned_instruction(engine):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from erp_v2.migrations.versions import e2_0024_statutory_payees as migration
+
+    env = world(engine)
+    run_id = finalized(engine, env)
+    batch_id = prepare(engine, env, run_id).batch_id
+    approve(engine, env, batch_id)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            with Operations.context(MigrationContext.configure(connection)):
+                with pytest.raises(RuntimeError, match="pinned payee instruction"):
+                    migration.downgrade()
+        finally:
+            transaction.rollback()
+    assert all(ln.payee_instruction_id is not None for ln in lines(engine, batch_id))

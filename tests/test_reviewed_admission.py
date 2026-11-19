@@ -415,40 +415,95 @@ def test_unposted_header_without_a_journal_link_is_not_a_link_waiver(db):
         evidence(db)
 
 
-def with_payment_id_column(db):
-    """The allocation table of a snapshot that identifies the payment of each allocation."""
+PAYMENT, PAYMENT_JOURNAL = str(UUID(int=77)), str(UUID(int=78))
+
+
+def with_payments(db, *payments):
+    """A snapshot that identifies each allocation's payment: (status, journal id or None) per payment."""
     db[0].exec_driver_sql("PRAGMA query_only=0")
-    db[0].exec_driver_sql("DROP TABLE payment_allocation")
+    db[0].exec_driver_sql("DROP TABLE IF EXISTS payment_allocation")
     db[0].exec_driver_sql("CREATE TABLE payment_allocation (invoice_id TEXT, payment_id TEXT)")
+    db[0].exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS supplier_payment (payment_id TEXT, status TEXT, journal_entry_id TEXT)"
+    )
+    for number, (status, journal) in enumerate(payments):
+        pay = str(UUID(int=77 + number * 10))
+        db[0].exec_driver_sql("INSERT INTO payment_allocation VALUES (?, ?)", (INVOICE, pay))
+        db[0].exec_driver_sql("INSERT INTO supplier_payment VALUES (?, ?, ?)", (pay, status, journal))
 
 
-def test_allocation_waiver_admits_a_header_with_a_zero_allocation(db):
-    with_payment_id_column(db)
-    db[0].exec_driver_sql("INSERT INTO payment_allocation (invoice_id) VALUES (?)", (INVOICE,))
+def payment_journal_line(db, account, debit):
+    """A posted ledger line of the payment's journal with NO source_document_id (legacy leaves it empty on many
+    journals): it can be found only through the payment's own journal link."""
+    ledger = db[4][True, "posted_ledger_line"]
+    row = dict(db[0].execute(sa.select(ledger).where(ledger.c.account_id == AP)).mappings().first())
+    row.update(
+        ledger_line_id=str(UUID(int=79)),
+        journal_entry_id=PAYMENT_JOURNAL,
+        source_document_id=None,
+        account_id=account,
+        debit_amount=debit,
+        credit_amount="0",
+    )
+    db[0].execute(ledger.insert().values(**row))
+
+
+def test_allocation_waiver_admits_when_the_payment_is_unposted(db):
+    with_payments(db, ("DRAFT", None))
     with pytest.raises(HistoricalEvidenceError, match="source_allocations"):
         evidence(db)
     add_review(db, waived=("source_allocations",))
     assert evidence(db).allocation_count == 0
 
 
-def test_allocation_waiver_is_refused_when_the_payment_posted_to_the_control_account(db):
-    """The payment-GL check stays mandatory: the waiver never hides a posted effect on 2000."""
-    with_payment_id_column(db)
-    pay = str(UUID(int=77))
-    db[0].exec_driver_sql("INSERT INTO payment_allocation VALUES (?, ?)", (INVOICE, pay))
+def test_allocation_waiver_admits_when_the_payments_journal_does_not_debit_the_control_account(db):
+    with_payments(db, ("CLEARED", PAYMENT_JOURNAL))
+    payment_journal_line(db, EXP, "40")
     add_review(db, waived=("source_allocations",))
-    ledger = db[4][True, "posted_ledger_line"]
-    row = dict(db[0].execute(sa.select(ledger).where(ledger.c.account_id == AP)).mappings().first())
-    row.update(ledger_line_id=str(UUID(int=78)), source_document_id=pay, debit_amount="40", credit_amount="0")
-    db[0].execute(ledger.insert().values(**row))
+    assert evidence(db).allocation_count == 0
+
+
+def test_allocation_waiver_is_refused_when_the_payment_debited_the_control_account_without_a_source_document(db):
+    """The payment-GL check stays mandatory and finds the ledger through the payment's journal link."""
+    with_payments(db, ("CLEARED", PAYMENT_JOURNAL))
+    payment_journal_line(db, AP, "40")  # source_document_id is NULL on this line
+    add_review(db, waived=("source_allocations",))
     with pytest.raises(HistoricalEvidenceError, match="allocation_payment_gl_effect"):
         evidence(db)
 
 
-def test_allocation_waiver_is_refused_when_the_snapshot_cannot_identify_the_payment(db):
-    db[0].exec_driver_sql("PRAGMA query_only=0")
-    db[0].execute(db[4][True, "payment_allocation"].insert().values(invoice_id=INVOICE))  # no payment_id column
+@pytest.mark.parametrize(
+    "payments",
+    [
+        [("CLEARED", None)],  # posts to the GL but no journal link
+        [("CLEARED", PAYMENT_JOURNAL)],  # journal link but no ledger lines found: not proven
+        [("DRAFT", None), ("CLEARED", PAYMENT_JOURNAL)],  # one unproven allocation is enough to refuse
+    ],
+)
+def test_allocation_waiver_needs_positive_proof_for_every_payment(db, payments):
+    with_payments(db, *payments)
     add_review(db, waived=("source_allocations",))
+    with pytest.raises(HistoricalEvidenceError, match="allocation_payment_gl_unproven"):
+        evidence(db)
+
+
+def test_allocation_waiver_is_refused_when_the_payment_row_or_id_is_missing_or_the_snapshot_lacks_the_tables(db):
+    # no payment_id column, no supplier_payment table
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(db[4][True, "payment_allocation"].insert().values(invoice_id=INVOICE))
+    add_review(db, waived=("source_allocations",))
+    with pytest.raises(HistoricalEvidenceError, match="allocation_payment_gl_unproven"):
+        evidence(db)
+    # payment_id present but NULL, then pointing at a payment row that does not exist
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].exec_driver_sql("DROP TABLE payment_allocation")
+    with_payments(db)
+    db[0].exec_driver_sql("INSERT INTO payment_allocation (invoice_id) VALUES (?)", (INVOICE,))
+    with pytest.raises(HistoricalEvidenceError, match="allocation_payment_gl_unproven"):
+        evidence(db)
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].exec_driver_sql("DELETE FROM payment_allocation")
+    db[0].exec_driver_sql("INSERT INTO payment_allocation VALUES (?, ?)", (INVOICE, PAYMENT))
     with pytest.raises(HistoricalEvidenceError, match="allocation_payment_gl_unproven"):
         evidence(db)
 
@@ -616,3 +671,24 @@ def test_without_the_table_every_verifier_stays_strict(db):
     break_line_totals(db)
     with pytest.raises(HistoricalEvidenceError, match="invoice_line_totals"):
         evidence(db)
+
+
+def test_unpaid_admission_writes_one_reviewed_admission_audit_event_per_reviewed_invoice(db, monkeypatch):
+    """The unpaid-admission CLI audits like settled admission and B1b: only invoices that honoured a decision."""
+    import dotmac_kernel.audit as kernel_audit
+
+    from erp_v2.importer import payables_history_cli as cli_unpaid
+
+    written = []
+    monkeypatch.setattr(kernel_audit, "write_audit_event", lambda session, **kw: written.append(kw))
+    cli_unpaid._audit_reviewed(db[2], scope(), db[3], UUID(INVOICE), "cv1:" + "a" * 64)
+    assert written == []  # no decision on file: nothing to audit
+    break_line_totals(db)
+    add_review(db, waived=("line_totals",))
+    cli_unpaid._audit_reviewed(db[2], scope(), db[3], UUID(INVOICE), "cv1:" + "a" * 64)
+    (event,) = written
+    assert event["action"] == "erp.finance.supplier_invoice.legacy_unpaid_admitted"
+    assert event["entity_id"] == INVOICE and event["tenant_id"] == UUID(T)
+    details = event["details"]
+    assert details["waived_checks"] == ["line_totals"] and details["legacy_header_status"] == "POSTED/POSTED"
+    assert details["requires_correcting_journal"] is False and details["decision_file_sha"] == "f" * 64

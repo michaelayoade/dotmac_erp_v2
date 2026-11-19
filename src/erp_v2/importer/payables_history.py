@@ -311,19 +311,45 @@ def admission_notes(src: sa.Connection, invoice_id: UUID, review: ReviewFacts | 
 
 def _allocations_without_control_effect(src: sa.Connection, invoice_id: UUID, control: object) -> None:
     """Never waivable: waiving ``source_allocations`` must not hide a payment that posted to the AP control
-    account. Every allocation's payment must be identified and have no posted debit to the control account;
-    if the snapshot cannot prove that, the waiver is refused."""
-    table = _reflect(
-        src, "payment_allocation", SOURCE_SCHEMAS["payment_allocation"] if src.dialect.name == "postgresql" else None
-    )
-    _require("payment_id" in table.c, "allocation_payment_gl_unproven")
-    for alloc in _read(src, "payment_allocation", key="invoice_id", value=invoice_id, fields=["payment_id"]):
-        if alloc["payment_id"] is None:
-            continue
-        for line in _read(src, "posted_ledger_line", key="source_document_id", value=alloc["payment_id"]):
-            _require(
-                not (_equal(line["account_id"], control) and line["debit_amount"] != 0), "allocation_payment_gl_effect"
+    account. Positive proof is required for EVERY allocation: its payment row exists and is either not CLEARED
+    (the only status that posts to the GL), or is CLEARED, has a journal link, the journal's posted ledger lines
+    are found by that link (never by ``source_document_id``, which legacy leaves empty on many journals) and none
+    debits the control account. Anything else is ``allocation_payment_gl_unproven``."""
+    try:
+        table = _reflect(
+            src,
+            "payment_allocation",
+            SOURCE_SCHEMAS["payment_allocation"] if src.dialect.name == "postgresql" else None,
+        )
+        _require("payment_id" in table.c, "allocation_payment_gl_unproven")
+        allocations = _read(src, "payment_allocation", key="invoice_id", value=invoice_id, fields=["payment_id"])
+        for alloc in allocations:
+            _require(alloc["payment_id"] is not None, "allocation_payment_gl_unproven")
+            payments = _read(
+                src,
+                "supplier_payment",
+                key="payment_id",
+                value=alloc["payment_id"],
+                fields=["payment_id", "status", "journal_entry_id"],
             )
+            _require(len(payments) == 1, "allocation_payment_gl_unproven")
+            payment = payments[0]
+            if payment["status"] != "CLEARED":
+                continue
+            _require(payment["journal_entry_id"] is not None, "allocation_payment_gl_unproven")
+            lines = _read(src, "posted_ledger_line", key="journal_entry_id", value=payment["journal_entry_id"])
+            _require(bool(lines), "allocation_payment_gl_unproven")
+            _require(
+                not any(_equal(line["account_id"], control) and line["debit_amount"] != 0 for line in lines),
+                "allocation_payment_gl_effect",
+            )
+    except (sa.exc.NoSuchTableError, sa.exc.NoSuchColumnError, KeyError, HistoricalEvidenceError) as exc:
+        if isinstance(exc, HistoricalEvidenceError) and exc.reason in (
+            "allocation_payment_gl_effect",
+            "allocation_payment_gl_unproven",
+        ):
+            raise
+        raise HistoricalEvidenceError("allocation_payment_gl_unproven") from exc
 
 
 def _journal_not_shared(src: sa.Connection, dest: sa.Connection, journal_id: object, invoice_id: object) -> None:

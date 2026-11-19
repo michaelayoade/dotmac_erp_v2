@@ -300,7 +300,7 @@ def test_downgrade_refuses_while_decisions_exist(engine, setup):
             transaction.rollback()
     with engine.connect() as c:
         assert c.scalar(sa.text("SELECT to_regclass('public.erp_admission_reviews')")) is not None
-    assert migration.revision == "e2_0026_admission_reviews" and migration.down_revision == "e2_0023_staff_loan_entries"
+    assert migration.revision == "e2_0026_admission_reviews" and migration.down_revision == "e2_0024_statutory_payees"
     # with no rows it drops (inside a rolled-back transaction: the shared schema is untouched)
     with engine.connect() as connection:
         transaction = connection.begin()
@@ -317,7 +317,10 @@ def test_downgrade_refuses_while_decisions_exist(engine, setup):
 
 
 def zero_allocation(legacy, iid):
-    legacy.allocations.append(dict(invoice_id=str(iid)))
+    """An allocation of an unposted legacy payment: the only kind a waiver may admit."""
+    pay = str(uuid4())
+    legacy.allocations.append(dict(invoice_id=str(iid), payment_id=pay))
+    legacy.payments.append(dict(payment_id=pay, status="DRAFT", journal_entry_id=None))
 
 
 def test_a_waived_check_admits_the_invoice_through_b1b_and_the_audit_names_the_waiver(engine, setup):
@@ -379,12 +382,13 @@ def test_a_waiver_the_invoice_does_not_need_is_refused_and_another_decision_bloc
 def test_allocation_waiver_never_hides_a_payment_posted_to_the_control_account(engine, setup):
     env, legacy = setup
     iid = imported(engine, env)
-    pay = str(uuid4())
+    pay, journal = str(uuid4()), str(uuid4())
     legacy.allocations.append(dict(invoice_id=str(iid), payment_id=pay))
-    legacy.ledger.append(
+    legacy.payments.append(dict(payment_id=pay, status="CLEARED", journal_entry_id=journal))
+    legacy.ledger.append(  # no source_document_id: found only through the payment's journal link
         dict(
             ledger_line_id=str(uuid4()),
-            source_document_id=pay,
+            journal_entry_id=journal,
             account_id=str(env.accounts["2000"]),
             debit_amount="10",
             credit_amount="0",
@@ -394,6 +398,17 @@ def test_allocation_waiver_never_hides_a_payment_posted_to_the_control_account(e
     record(engine, env, [row(iid, waived=("source_allocations",))])
     plan = legacy.run(engine, (iid,), apply=False)
     assert plan["refusals_by_reason"] == {"legacy_evidence:allocation_payment_gl_effect": 1}
+
+
+def test_allocation_waiver_with_an_unposted_payment_admits_through_b1b(engine, setup):
+    env, legacy = setup
+    iid = imported(engine, env)
+    pay = str(uuid4())
+    legacy.allocations.append(dict(invoice_id=str(iid), payment_id=pay))
+    legacy.payments.append(dict(payment_id=pay, status="DRAFT", journal_entry_id=None))
+    legacy.build((iid,))
+    record(engine, env, [row(iid, waived=("source_allocations",))])
+    assert legacy.run(engine, (iid,), apply=False)["counts"]["eligible"] == 1
 
 
 # --- IAS 8 posting mode (D-M5) ------------------------------------------------------------------------------------

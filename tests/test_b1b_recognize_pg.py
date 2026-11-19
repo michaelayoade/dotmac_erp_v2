@@ -51,6 +51,7 @@ SOURCE_TABLES = {
     "organization": READ_FIELDS["organization"],
     "tax_code": READ_FIELDS["tax_code"],
     "account": READ_FIELDS["account"],
+    "supplier_payment": ["payment_id", "status", "journal_entry_id"],
     "inventory_transaction": ["source_document_type", "source_document_id", "source_document_line_id"],
 }
 BOOLEANS = {"is_prepayment", "is_reversal"}
@@ -120,6 +121,7 @@ class Legacy:
         self.ledger: list[dict] = []
         self.journals: list[dict] = []
         self.allocations: list[dict] = []
+        self.payments: list[dict] = []
         self.inventory: list[dict] = []
         self.line_overrides: dict[UUID, dict] = {}
         # Legacy tax configuration behind the taxed lines: "paid" (tax-paid account = the destination tax
@@ -217,6 +219,7 @@ class Legacy:
                 ("supplier_invoice", headers),
                 ("supplier_invoice_line", lines),
                 ("payment_allocation", self.allocations),
+                ("supplier_payment", self.payments),
                 ("journal_entry", self.journals),
                 ("posted_ledger_line", self.ledger),
                 ("inventory_transaction", self.inventory),

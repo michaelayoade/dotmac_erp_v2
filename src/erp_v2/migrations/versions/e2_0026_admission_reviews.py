@@ -5,9 +5,7 @@ are written by the operator CLI (migration identity) and are append-only (the da
 DELETE even for the owner role). The CHECK constraints hold the closed vocabulary, the one-waiver rule
 (D-M3), the sha shapes and, where the tenant policy is on, the dual-control separation.
 
-Revision chain (merge order): e2_0023 -> e2_0024 (statutory payees) -> e2_0025 (reserved) -> this revision.
-Until those land, down_revision is e2_0023_staff_loan_entries (the current main head); the coordinator
-re-chains at merge time (EXPECTED_HEADS, docs and tests change in the same commit).
+Revision chain: e2_0023 -> e2_0024 (statutory payees) -> this revision (e2_0025 is unused).
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from erp_v2.importer.admission_waivers import DECISIONS, WAIVABLE_CHECKS
 
 revision = "e2_0026_admission_reviews"
-down_revision = "e2_0023_staff_loan_entries"
+down_revision = "e2_0024_statutory_payees"
 branch_labels = None
 depends_on = None
 

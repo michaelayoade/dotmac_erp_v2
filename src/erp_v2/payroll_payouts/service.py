@@ -308,11 +308,24 @@ def _current_instruction(db: Session, tenant_id: UUID, employee_ref: str) -> Pay
 def _refuse_instruction_party(
     db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine], person: object, *, code: str, role: str
 ) -> None:
-    """``person`` must not have proposed or decided any net-pay line's CURRENT instruction (legacy exempt)."""
-    if not batch.dual_control or batch.kind != KIND_NET_PAY or person is None:
+    """``person`` must not have proposed or decided any net-pay line's CURRENT instruction, or the statutory
+    destination's current instruction (legacy exempt). Only when the batch carries the dual-control policy."""
+    if not batch.dual_control or person is None:
         return
-    for line in lines:
-        instruction = _current_instruction(db, batch.tenant_id, line.beneficiary_ref)
+    if batch.kind == KIND_NET_PAY:
+        instructions = [_current_instruction(db, batch.tenant_id, line.beneficiary_ref) for line in lines]
+    else:
+        instructions = [
+            db.scalar(
+                select(PayeeBankInstruction).where(
+                    PayeeBankInstruction.tenant_id == batch.tenant_id,
+                    PayeeBankInstruction.payee_kind == PayeeKind.STATUTORY.value,
+                    PayeeBankInstruction.payee_ref == (batch.destination_ref or ""),
+                    PayeeBankInstruction.status == InstructionStatus.APPROVED.value,
+                )
+            )
+        ]
+    for instruction in instructions:
         if instruction is None or instruction.origin == InstructionOrigin.LEGACY_IMPORT.value:
             continue
         if _same(person, instruction.proposed_by_party_id) or _same(person, instruction.decided_by_party_id):
@@ -345,18 +358,29 @@ def _refuse_returner(
         )
 
 
-def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]) -> None:
-    """V3: every net-pay line's employee has an approved payee bank instruction, whatever the file setting.
-
-    A statutory remittance goes to a destination chosen on the batch (``dest:...``), for which no payee
-    instruction exists yet, so it fails closed until statutory payees exist (separate follow-up).
-    """
-    if batch.kind != KIND_NET_PAY:
+def _statutory_destination(db: Session, batch: PayrollPayoutBatch) -> payee_service.PaymentDestination:
+    """V3 for a statutory remittance: its single destination (``dest:...``) needs an APPROVED statutory instruction."""
+    try:
+        return payee_service.destination_for_payment(
+            db, tenant_id=batch.tenant_id, payee_kind=PayeeKind.STATUTORY.value, payee_ref=batch.destination_ref or ""
+        )
+    except payee_service.PayeeBankError as exc:
         raise PayoutRefused(
             "statutory_payee_instruction_required",
-            "A statutory remittance needs an approved payee instruction for its destination, and statutory "
-            "payees are not available yet; refer it to Finance",
-        )
+            "A statutory remittance needs an approved payee instruction for its destination; "
+            "propose and approve one first",
+        ) from exc
+
+
+def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]) -> None:
+    """V3: every net-pay line's employee, or a statutory batch's destination, has an approved payee instruction.
+
+    Net pay is checked whatever the file setting. A statutory remittance goes to the single destination
+    chosen on the batch (``dest:...``), which must have an approved ``statutory`` instruction.
+    """
+    if batch.kind != KIND_NET_PAY:
+        _statutory_destination(db, batch)
+        return
     for line in lines:
         try:
             payee_service.destination_for_payment(
@@ -367,6 +391,30 @@ def _require_payee_instructions(db: Session, batch: PayrollPayoutBatch, lines: S
                 "payee_instruction_required",
                 "A payee in this batch has no approved bank instruction; propose and approve one first",
             ) from exc
+
+
+def _current_instruction_ids(
+    db: Session, batch: PayrollPayoutBatch, lines: Sequence[PayrollPayoutLine]
+) -> dict[UUID, UUID]:
+    """Line id -> the CURRENT approved payee instruction id (statutory: the destination's, for every line)."""
+    out: dict[UUID, UUID] = {}
+    statutory = None
+    for line in lines:
+        try:
+            if batch.kind == KIND_NET_PAY:
+                destination = payee_service.destination_for_payment(
+                    db, tenant_id=batch.tenant_id, payee_kind=PayeeKind.EMPLOYEE.value, payee_ref=line.beneficiary_ref
+                )
+            else:
+                statutory = statutory or _statutory_destination(db, batch)
+                destination = statutory
+        except payee_service.PayeeBankError as exc:
+            raise PayoutRefused(
+                "payee_instruction_unavailable",
+                "A payee has no approved bank instruction any more; cancel the batch and prepare it again",
+            ) from exc
+        out[line.id] = destination.instruction_id
+    return out
 
 
 def _file_receipts(db: Session, tenant_id: UUID, lines: Sequence[PayrollPayoutLine]) -> list[DisbursementFileReceipt]:
@@ -557,6 +605,8 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, batch_id: UUID, now: 
     _require_payee_instructions(db, batch, lines)
     _refuse_instruction_party(db, batch, lines, party.id, code="sod_approver_is_instruction_party", role="approver")
     _refuse_returner(db, batch, lines, party.id, code="sod_approver_is_returner", role="approver")
+    for line_id, instruction_id in _current_instruction_ids(db, batch, lines).items():
+        next(line for line in lines if line.id == line_id).payee_instruction_id = instruction_id
     batch.status = APPROVED
     batch.approved_by_party_id = party.id
     batch.approved_at = now
@@ -779,6 +829,8 @@ def _record(
             _refuse_instruction_party(
                 db, batch, lines, party.id, code="sod_recorder_is_instruction_party", role="recorder"
             )
+    else:  # statutory is never a file: the recorder is always the last independent check
+        _refuse_instruction_party(db, batch, lines, party.id, code="sod_recorder_is_instruction_party", role="recorder")
     if batch.status != FILE_ISSUED:  # FILE_ISSUED is covered by _check_file_destinations below
         _require_payee_instructions(db, batch, lines)
     try:
@@ -813,6 +865,13 @@ def _record(
             role="file issuer",
         )
         _check_file_destinations(db, batch, lines)
+    for line_id, instruction_id in _current_instruction_ids(db, batch, lines).items():
+        approved_against = next(line for line in lines if line.id == line_id).payee_instruction_id
+        if approved_against != instruction_id:
+            raise PayoutRefused(
+                "payee_instruction_changed",
+                "A payee's bank instruction changed after the batch was approved; cancel and prepare it again",
+            )
     functional = _functional_currency(db, tenant.id)
     if batch.currency_code != functional:
         raise PayoutRefused("non_functional_currency", "Payouts are in the tenant functional currency only")
@@ -861,6 +920,14 @@ def _record(
     batch.bank_reference = reference
     batch.updated_at = now
     db.flush()
+    evidence: dict[str, object] = {}
+    if batch.kind == KIND_STATUTORY:  # V3 binds the destination's account to the record (never the full number)
+        destination = _statutory_destination(db, batch)
+        evidence = {
+            "payee_instruction_id": str(destination.instruction_id),
+            "destination_ref": batch.destination_ref,
+            "account_last4": destination.account_number[-4:],
+        }
     _audit(
         db,
         tenant=tenant,
@@ -869,6 +936,7 @@ def _record(
         action=AUDIT_RECORDED,
         success=True,
         details={
+            **evidence,
             "number": batch.number,
             "kind": batch.kind,
             "bank_reference": reference,
