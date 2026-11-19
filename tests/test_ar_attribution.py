@@ -187,7 +187,7 @@ def test_posted_after_cutoff_rows_are_held_at_their_gl_signed_amount():
 
 
 def test_every_held_entry_carries_its_customer_and_currency():
-    _census_, a = _attr()
+    _, a = _attr()
     assert a["held"], "the fixture must produce held items of every reason"
     reasons = {h["reason"].split(":")[0] for h in a["held"]}
     assert {"ar_unapplied_credit_note", "partition_held", "doc_unposted"} <= reasons
