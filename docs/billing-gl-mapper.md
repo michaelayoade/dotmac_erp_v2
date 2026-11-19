@@ -33,10 +33,11 @@ the residual line on the settlement source system's cash account.
 | Fact | Disposition |
 |---|---|
 | V1 settlement_accepted | POST L + cash (Dr cash / Cr prepayment) |
-| V1 allocation / deallocation / reallocation | POST L (Dr prepayment / Cr 1400); empty effects NO_GL `lane_neutral` |
+| V1 allocation / deallocation / reallocation | POST L (Dr prepayment / Cr 1400) + the VAT release / un-release (rev 2); empty effects and no VAT NO_GL `lane_neutral` |
 | V1 refund | POST L + cash |
-| V1 reversal | POST L, + cash when the reversed fact is settlement-family; predecessor must be POSTED |
-| V1 invoice_issued, credit_note_issued | BLOCK `invoice_mapping_not_built` (rev 2) |
+| V1 reversal | POST L, + cash when the reversed fact is settlement-family; predecessor must be POSTED. A void of an invoice or credit note is the exact negation of the predecessor's posted journal and VAT movements (rev 2) |
+| V1 invoice_issued | POST: Dr 1400 grand total / Cr revenue per line / Cr deferral per treatment (rev 2) |
+| V1 credit_note_issued | POST: Dr revenue / Dr deferral min(t, R) / Dr current the rest / Cr 1400; closes out the deferral when open reaches 0 (rev 2) |
 | V2, V3 | BLOCK `fact_contract_unreadable` (no public getter) |
 | V4/V5 imported | SKIP `opening_gl_carried` if committed at or before the seal, else BLOCK `opening_fact_after_seal` |
 | V4/V5 import reversed | SKIP before the seal, BLOCK `opening_unwind_post_seal` after |
@@ -82,3 +83,32 @@ BLOCKED/WAITING fact occurred in it.
 
 Every window up to now - settle closed; 0 BLOCKED/WAITING; 0 REFUSED V6; every pre-seal fact SKIP; no POSTED row before
 F10.
+
+## Rev 2: invoices, credit notes and cash-basis output VAT (e2_0033)
+
+Ruling (2026-11-18): output VAT is deferred on 1455 at issue and released to 1440 on payment AND on application of an
+advance. All of it is in the same one-journal-per-fact door; there is no new posting kind.
+
+- **Accounts.** Revenue: ERP's `erp_ar_line_accounts` per (document, line), no fallback (missing:
+  BLOCK `revenue_account_unmapped`). VAT: setting `billing_gl.tax_accounts` (treatment -> {current 1440, deferral 1455});
+  a treatment with tax that is unmapped blocks `tax_account_unmapped`. Cash for source `erp_v2.ar` is
+  `erp_ar_receipts.cash_account_id` of the settlement; other sources use `billing_gl.cash_account`.
+- **Invoice.** Before posting, the line accounts must equal the document fact exactly, line by line and in total
+  (`line_accounts_mismatch`); no rounding is absorbed. It creates a VAT position per treatment (D = tax, open = total).
+- **Release.** A settlement or advance application of d against a document releases
+  `min(R, HALF_EVEN(d x D / T))` from 1455 to 1440; the settlement that brings the document to 0 takes all of R.
+  A deallocation un-releases exactly that allocation's net release (full) or the same formula capped at it (partial);
+  a credit-note close-out is reversed first.
+- **Credit note.** Dr 1455 min(t, R), Dr 1440 the rest; if the invoice's open amount reaches 0 the remaining deferral
+  is closed out to 1440 (D-A6-9).
+- **Invariants** (database trigger backstop plus an in-transaction assertion; the mapper never clamps): 0 <= R <= D,
+  0 <= open <= T, open = 0 implies R = 0 (`vat_invariant`).
+- **Tables (W6).** `erp_billing_vat_positions` / `erp_billing_vat_movements`: append-only, FORCE RLS, `app_user` SELECT
+  and INSERT only. The downgrade refuses while rows exist.
+- **Migrated invoices (Q1).** `python -m erp_v2.billing_gl vat-opening plan|apply` (migration role, 0600 receipt, plan
+  sha) loads each carried open invoice's remaining deferral = legacy 1455 credit less the attributed reclass. A result
+  below 0, above the tax or unattributable is an E38 report item and is not loaded; a payment on such an invoice (or on any
+  imported document without a position) blocks `vat_position_missing`. The legacy extraction that feeds the input file is a
+  separate reader step.
+- **Gate.** `checks.ready` also requires `billing_gl.tax_accounts` to map every treatment to a current and a deferral
+  account and 0 BLOCKED VAT facts.

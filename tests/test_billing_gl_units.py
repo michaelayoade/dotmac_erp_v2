@@ -262,6 +262,7 @@ def _settings(**kw) -> MapperSettings:
     base = {
         "enabled": False,
         "cash_accounts": {"integrator": CASH},
+        "tax_accounts": {},
         "posting_timezone": "Africa/Lagos",
         "closed_period_policy": "next_open_period",
         "settle_seconds": 300,
@@ -280,6 +281,7 @@ def test_map_digest_tracks_mapping_values_only() -> None:
     assert _settings(prepaid_funding_account=FUND).map_digest != base
     assert _settings(cash_accounts={"integrator": OPEN_CASH}).map_digest != base
     assert _settings(closed_period_policy="hold").map_digest != base
+    assert _settings(tax_accounts={"standard": {"current": CASH, "deferral": FUND}}).map_digest != base
 
 
 def test_period_bounds_read_in_the_posting_timezone() -> None:

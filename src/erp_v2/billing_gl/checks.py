@@ -70,7 +70,33 @@ def facts_incomplete(db: Session, tenant_id: UUID, start: date, end: date) -> bo
     return any(period_blockers(db, tenant_id, start, end, timezone).values())
 
 
-def ready(db: Session, tenant_id: UUID, *, now: datetime, settle_seconds: int, seal_at: datetime | None) -> dict:
+VAT_REASONS: Final = (
+    "tax_account_unmapped",
+    "revenue_account_unmapped",
+    "line_accounts_mismatch",
+    "vat_position_missing",
+    "vat_invariant",
+    "vat_allocation_unresolved",
+    "invoice_document_unresolved",
+)
+
+
+def tax_accounts_mapped(tax_accounts: dict[str, dict[str, str]]) -> bool:
+    """Rev 2 gate input: at least one treatment, each with both a current (1440) and a deferral (1455) account."""
+    return bool(tax_accounts) and all(
+        isinstance(v, dict) and v.get("current") and v.get("deferral") for v in tax_accounts.values()
+    )
+
+
+def ready(
+    db: Session,
+    tenant_id: UUID,
+    *,
+    now: datetime,
+    settle_seconds: int,
+    seal_at: datetime | None,
+    tax_accounts: dict[str, dict[str, str]] | None = None,
+) -> dict:
     """The B15.7 gate inputs. Each failing input is listed; ``ready`` is true only when none fails.
 
     1. every window up to now - settle exists and is closed; 2. 0 BLOCKED/WAITING; 3. 0 REFUSED V6;
@@ -118,7 +144,18 @@ def ready(db: Session, tenant_id: UUID, *, now: datetime, settle_seconds: int, s
         .select_from(FactPosting)
         .where(FactPosting.tenant_id == tenant_id, FactPosting.disposition == "POSTED")
     )
+    vat_blocked = db.scalar(
+        select(func.count())
+        .select_from(FactPosting)
+        .where(
+            FactPosting.tenant_id == tenant_id,
+            FactPosting.disposition.in_(PENDING),
+            FactPosting.reason.in_(VAT_REASONS),
+        )
+    )
     report = {
+        "vat_blocked": vat_blocked or 0,
+        "tax_accounts_mapped": tax_accounts_mapped(tax_accounts or {}),
         "unclosed_windows": unclosed or 0,
         "windows_behind": last_closed is None or last_closed < horizon_day,
         "blocked_or_waiting": pending or 0,
@@ -133,6 +170,8 @@ def ready(db: Session, tenant_id: UUID, *, now: datetime, settle_seconds: int, s
         or report["refused_v6"]
         or report["pre_seal_not_skip"]
         or report["posted"]
+        or report["vat_blocked"]
+        or not report["tax_accounts_mapped"]
     )
     return report
 
