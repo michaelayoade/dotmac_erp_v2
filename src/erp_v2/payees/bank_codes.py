@@ -1,51 +1,48 @@
-"""Bank code list and NUBAN check-digit rule for the bulk payee command (B-11).
+"""Bank reference for the bulk payee command (B-11): a sha-bound file supplied and confirmed by Finance.
 
-The code list is deliberately closed: a code outside it is refused as ``unknown_bank_code`` and Finance either
-corrects the row or has the list extended in a reviewed change. Codes are the CBN institution codes: the
-three-digit commercial-bank codes and the five/six-digit codes of the common mobile-money and microfinance
-institutions. Finance must confirm the list against the bank letters before the first apply.
+ERP v2 holds no reusable bank reference: ``dotmac_banking.BankInstitution`` is a per-tenant table (code, name,
+clearing code, status) with no NUBAN applicability and nothing in ERP v2 populates it. So the code list comes
+from a file Finance confirms and the operator binds by sha256::
 
-NUBAN (CBN standard): ten digits, the last is a check digit over ``bank code (3) + first nine digits``
-with weights 3,7,3,3,7,3,3,7,3,3,7,3. The check is only defined for three-digit bank codes; the longer
-institution codes are validated by format only.
+    {"version": 1, "banks": [{"code": "058", "name": "<bank name>", "nuban_check": "check_digit|format_only"}]}
+
+``check_digit``: the CBN NUBAN check digit (weights 3,7,3,3,7,3,3,7,3,3,7,3 over bank code(3) + first nine digits)
+is applied; it is only definable for three-digit codes. ``format_only``: ten digits, nothing more.
+A code absent from the file is refused as ``unknown_bank_code``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from dataclasses import dataclass
 from typing import Final
 
-BANK_NAMES: Final[dict[str, str]] = {
-    "011": "First Bank of Nigeria",
-    "023": "Citibank Nigeria",
-    "030": "Heritage Bank",
-    "032": "Union Bank of Nigeria",
-    "033": "United Bank for Africa",
-    "035": "Wema Bank",
-    "044": "Access Bank",
-    "050": "Ecobank Nigeria",
-    "057": "Zenith Bank",
-    "058": "Guaranty Trust Bank",
-    "063": "Access Bank (Diamond)",
-    "068": "Standard Chartered Bank Nigeria",
-    "070": "Fidelity Bank",
-    "076": "Polaris Bank",
-    "082": "Keystone Bank",
-    "100": "SunTrust Bank Nigeria",
-    "101": "Providus Bank",
-    "102": "Titan Trust Bank",
-    "103": "Globus Bank",
-    "214": "First City Monument Bank",
-    "215": "Unity Bank",
-    "221": "Stanbic IBTC Bank",
-    "232": "Sterling Bank",
-    "301": "Jaiz Bank",
-    "50211": "Kuda Microfinance Bank",
-    "50515": "Moniepoint Microfinance Bank",
-    "999991": "PalmPay",
-    "999992": "OPay",
-}
-
 _WEIGHTS: Final = (3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3)
+_SHA = re.compile(r"[0-9a-f]{64}")
+_CODE = re.compile(r"[0-9]{3,6}")
+MODES: Final = ("check_digit", "format_only")
+MAX_BANKS = 2000
+
+
+class BankReferenceError(ValueError):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True, slots=True)
+class BankReference:
+    sha256: str
+    banks: dict[str, tuple[str, str]]  # code -> (name, nuban_check)
+
+    def name(self, code: str) -> str | None:
+        found = self.banks.get(code)
+        return None if found is None else found[0]
+
+    def valid_nuban(self, bank_code: str, account_number: str) -> bool:
+        return valid_nuban(bank_code, account_number, check_digit=self.banks[bank_code][1] == "check_digit")
 
 
 def nuban_check_digit(bank_code: str, serial9: str) -> int:
@@ -53,9 +50,49 @@ def nuban_check_digit(bank_code: str, serial9: str) -> int:
     return (10 - total % 10) % 10
 
 
-def valid_nuban(bank_code: str, account_number: str) -> bool:
+def valid_nuban(bank_code: str, account_number: str, *, check_digit: bool) -> bool:
     if len(account_number) != 10 or not account_number.isascii() or not account_number.isdigit():
         return False
-    if len(bank_code) != 3:
-        return True  # check digit defined for three-digit codes only
+    if not check_digit:
+        return True
     return nuban_check_digit(bank_code, account_number[:9]) == int(account_number[9])
+
+
+def parse_bank_reference(raw: bytes | None, expected_sha256: str | None) -> BankReference:
+    if raw is None or not expected_sha256:
+        raise BankReferenceError("bank_reference_required")
+    if not _SHA.fullmatch(expected_sha256) or hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise BankReferenceError("bank_reference_digest_mismatch")
+
+    def unique(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise BankReferenceError("duplicate_json_key")
+            out[key] = value
+        return out
+
+    try:
+        data = json.loads(raw, object_pairs_hook=unique)
+    except BankReferenceError:
+        raise
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BankReferenceError("invalid_bank_reference") from exc
+    if not isinstance(data, dict) or set(data) != {"version", "banks"} or data["version"] != 1:
+        raise BankReferenceError("invalid_bank_reference")
+    banks = data["banks"]
+    if not isinstance(banks, list) or not 1 <= len(banks) <= MAX_BANKS:
+        raise BankReferenceError("invalid_bank_reference")
+    out: dict[str, tuple[str, str]] = {}
+    for bank in banks:
+        if not isinstance(bank, dict) or set(bank) != {"code", "name", "nuban_check"}:
+            raise BankReferenceError("invalid_bank_reference")
+        code, name, mode = bank["code"], bank["name"], bank["nuban_check"]
+        if not (isinstance(code, str) and _CODE.fullmatch(code)) or code in out:
+            raise BankReferenceError("invalid_bank_reference")
+        if not (isinstance(name, str) and name.strip() and name == name.strip() and len(name) <= 120):
+            raise BankReferenceError("invalid_bank_reference")
+        if mode not in MODES or (mode == "check_digit" and len(code) != 3):
+            raise BankReferenceError("invalid_bank_reference")
+        out[code] = (name, mode)
+    return BankReference(expected_sha256, out)

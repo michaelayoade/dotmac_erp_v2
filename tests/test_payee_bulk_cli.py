@@ -18,10 +18,27 @@ from sqlalchemy.orm import Session
 
 from erp_v2.governance.models import GovernancePolicy
 from erp_v2.payees import bulk_cli, service
-from erp_v2.payees.bank_codes import nuban_check_digit, valid_nuban
+from erp_v2.payees.bank_codes import (
+    BankReferenceError,
+    nuban_check_digit,
+    parse_bank_reference,
+    valid_nuban,
+)
 from erp_v2.payees.models import PayeeBankInstruction
 from erp_v2.payees.routes import payee_bank_feature
 
+BANKS_RAW = json.dumps(
+    {
+        "version": 1,
+        "banks": [
+            {"code": "058", "name": "Example Bank", "nuban_check": "check_digit"},
+            {"code": "50211", "name": "Example Fintech", "nuban_check": "format_only"},
+            {"code": "044", "name": "Format Only Bank", "nuban_check": "format_only"},
+        ],
+    }
+).encode()
+BANKS_SHA = hashlib.sha256(BANKS_RAW).hexdigest()
+BANKS = parse_bank_reference(BANKS_RAW, BANKS_SHA)
 PROPOSER = uuid4()
 EMP = str(uuid4())
 
@@ -81,7 +98,7 @@ def make_file(tenant, rows, **over):
 
 
 def go(db, tenant, rows, *, apply=True, approve=False, operator="op-1"):
-    return bulk_cli.run(db, make_file(tenant, rows), apply=apply, operator_ref=operator, approve=approve)
+    return bulk_cli.run(db, make_file(tenant, rows), BANKS, apply=apply, operator_ref=operator, approve=approve)
 
 
 def instructions(db, status=None):
@@ -92,10 +109,33 @@ def instructions(db, status=None):
 
 
 def test_check_digit_rule():
-    assert valid_nuban("058", GOOD1)
-    assert not valid_nuban("058", GOOD1[:9] + str((int(GOOD1[9]) + 1) % 10))
-    assert not valid_nuban("058", "12345")
-    assert valid_nuban("50211", "1234567890")  # long institution codes are format-checked only
+    assert valid_nuban("058", GOOD1, check_digit=True)
+    assert not valid_nuban("058", GOOD1[:9] + str((int(GOOD1[9]) + 1) % 10), check_digit=True)
+    assert not valid_nuban("058", "12345", check_digit=False)
+    assert valid_nuban("50211", "1234567890", check_digit=False)
+
+
+def test_check_digit_only_where_the_reference_marks_it_applicable():
+    bad = GOOD1[:9] + str((int(GOOD1[9]) + 1) % 10)
+    assert BANKS.valid_nuban("058", GOOD1) and not BANKS.valid_nuban("058", bad)
+    assert BANKS.valid_nuban("044", bad)  # format_only: the same wrong digit passes
+    assert BANKS.valid_nuban("50211", "1234567890")
+    assert not BANKS.valid_nuban("044", "12345")
+
+
+def test_bank_reference_is_required_sha_bound_and_strict():
+    for raw, sha, reason in [
+        (None, None, "bank_reference_required"),
+        (BANKS_RAW, None, "bank_reference_required"),
+        (BANKS_RAW, "0" * 64, "bank_reference_digest_mismatch"),
+    ]:
+        with pytest.raises(BankReferenceError, match=reason):
+            parse_bank_reference(raw, sha)
+    bad = json.dumps({"version": 1, "banks": [{"code": "50211", "name": "X", "nuban_check": "check_digit"}]}).encode()
+    with pytest.raises(BankReferenceError, match="invalid_bank_reference"):
+        parse_bank_reference(bad, hashlib.sha256(bad).hexdigest())
+    with pytest.raises(bulk_cli.BulkRefusal, match="bank_reference_required"):
+        bulk_cli.load_bank_reference(None, None)
 
 
 def test_plan_writes_nothing_and_apply_proposes_each_row(env):
@@ -109,7 +149,8 @@ def test_plan_writes_nothing_and_apply_proposes_each_row(env):
     assert {i.status for i in instructions(db)} == {"proposed"}
     supplier = next(i for i in instructions(db) if i.payee_ref == "sup-1")
     assert supplier.evidence_ref == "signed-letter-2026-11-01 | callback:call-2026-11-02"
-    assert supplier.bank_name == "Guaranty Trust Bank"
+    assert supplier.bank_name == "Example Bank"
+    assert done["bank_reference_sha256"] == BANKS_SHA
 
 
 def test_unknown_payee_refused_and_nothing_written(env):
@@ -121,7 +162,7 @@ def test_unknown_payee_refused_and_nothing_written(env):
     # the writer itself also refuses a not-fully-eligible file
     f = make_file(tenant, [row(), row("supplier", "nobody", GOOD2)])
     with pytest.raises(bulk_cli.BulkRefusal, match="file_not_fully_eligible"):
-        bulk_cli.apply_rows(db, f, bulk_cli.classify(db, f), operator_ref="op-1", approve=False)
+        bulk_cli.apply_rows(db, f, bulk_cli.classify(db, f, BANKS), banks=BANKS, operator_ref="op-1", approve=False)
     assert instructions(db) == []
 
 
@@ -129,6 +170,7 @@ def test_unknown_payee_refused_and_nothing_written(env):
     "over,reason",
     [
         ({"bank_code": "999"}, "unknown_bank_code"),
+        ({"bank_code": "044", "account_number": "12345"}, "invalid_nuban"),
         ({"account_number": GOOD1[:9] + str((int(GOOD1[9]) + 1) % 10)}, "invalid_nuban"),
         ({"account_number": "12345"}, "invalid_nuban"),
         ({"callback_ref": None}, "callback_ref_required"),
@@ -228,14 +270,24 @@ def test_receipt_is_0600_and_no_full_account_number_reaches_stdout_receipt_or_au
     src.write_bytes(raw)
     os.chmod(src, 0o600)
     sha = hashlib.sha256(raw).hexdigest()
+    ref = tmp_path / "banks.json"
+    ref.write_bytes(BANKS_RAW)
+    refargs = ["--bank-reference", str(ref), "--bank-reference-sha256", BANKS_SHA]
 
     def fake_run(args):
         file = bulk_cli.parse_file(bulk_cli.read_private_file(args.file), args.file_sha256)
-        return bulk_cli.run(db, file, apply=args.apply, operator_ref=args.operator_ref, approve=args.approve)
+        return bulk_cli.run(
+            db,
+            file,
+            bulk_cli.load_bank_reference(args.bank_reference, args.bank_reference_sha256),
+            apply=args.apply,
+            operator_ref=args.operator_ref,
+            approve=args.approve,
+        )
 
     monkeypatch.setattr(bulk_cli, "_run", fake_run)
     receipt = tmp_path / "r.json"
-    code = bulk_cli.main(["--file", str(src), "--file-sha256", sha, "--receipt", str(receipt)])
+    code = bulk_cli.main(["--file", str(src), "--file-sha256", sha, "--receipt", str(receipt), *refargs])
     assert code == 3  # one row refused
     assert oct(receipt.stat().st_mode & 0o777) == "0o600"
     text = receipt.read_text() + capsys.readouterr().out
@@ -244,7 +296,7 @@ def test_receipt_is_0600_and_no_full_account_number_reaches_stdout_receipt_or_au
     for number in (GOOD1, GOOD2, GOOD3):
         assert number not in text
     # an existing receipt is never overwritten
-    assert bulk_cli.main(["--file", str(src), "--file-sha256", sha, "--receipt", str(receipt)]) == 2
+    assert bulk_cli.main(["--file", str(src), "--file-sha256", sha, "--receipt", str(receipt), *refargs]) == 2
 
     # apply the eligible subset: nothing PII in audit details either
     ok_doc = dict(doc, rows=doc["rows"][:2])
@@ -256,7 +308,7 @@ def test_receipt_is_0600_and_no_full_account_number_reaches_stdout_receipt_or_au
     code = bulk_cli.main(
         [
             "--file", str(src), "--file-sha256", hashlib.sha256(ok_raw).hexdigest(), "--receipt", str(receipt2),
-            "--apply", "--operator-ref", "op-1",
+            "--apply", "--operator-ref", "op-1", *refargs,
         ]
     )  # fmt: skip
     assert code == 0

@@ -14,8 +14,10 @@ Finance file (JSON, at most 1500 rows, mode 0600, duplicate keys refused, bound 
                "callback_ref": "<call-back verification ref>"  <- REQUIRED for supplier rows}]}
 
 Rules (all refuse the whole file; apply writes nothing unless every row is eligible):
+* the bank reference (code, name, NUBAN check applicability; see ``bank_codes``) is REQUIRED, sha-bound, and its
+  sha256 is recorded in the receipt; no reference, no run;
 * unknown payee (employee id, supplier ref, or a statutory ref that does not resolve), unknown bank code,
-  invalid NUBAN (format and check digit) are refused per row;
+  invalid NUBAN (format, plus the check digit where the reference marks it applicable) are refused per row;
 * supplier rows need ``callback_ref``: supplier bank changes need a call-back verification. It is stored in the
   instruction evidence (``<evidence_ref> | callback:<callback_ref>``, at most 240 characters) because there is
   no separate column and no migration;
@@ -25,7 +27,8 @@ Rules (all refuse the whole file; apply writes nothing unless every row is eligi
 * ``--approve`` approves each new proposal in the same run, only when the tenant dual-control policy is OFF
   and ``--operator-ref`` is given; with the policy ON it is refused (approval stays a second person in the UI).
 
-    python -m erp_v2.payees.bulk_cli --file F.json --file-sha256 S --receipt R.json \
+    python -m erp_v2.payees.bulk_cli --file F.json --file-sha256 S --bank-reference B.json --bank-reference-sha256 T \
+        --receipt R.json \
         [--apply --operator-ref <who>] [--approve]
 
 Apply needs ``--apply``, ERP_IMPORT_APPROVED=1 and ERP_IMPORT_APPLY_OK=1. The DSN is environment-only
@@ -48,7 +51,7 @@ from pathlib import Path
 from uuid import UUID
 
 from erp_v2.payees import service
-from erp_v2.payees.bank_codes import BANK_NAMES, valid_nuban
+from erp_v2.payees.bank_codes import BankReference, BankReferenceError, parse_bank_reference
 from erp_v2.payees.models import InstructionStatus, PayeeBankInstruction, PayeeKind
 from erp_v2.payees.service import PayeeBankError
 
@@ -131,6 +134,17 @@ def read_private_file(path: Path) -> bytes:
         return stream.read()
 
 
+def load_bank_reference(path: Path | None, sha256: str | None) -> BankReference:
+    try:
+        raw = None if path is None else path.read_bytes()
+    except OSError as exc:
+        raise BulkRefusal("bank_reference_required") from exc
+    try:
+        return parse_bank_reference(raw, sha256)
+    except BankReferenceError as exc:
+        raise BulkRefusal(exc.reason) from exc
+
+
 def _json(raw: bytes) -> dict:
     def unique(pairs):
         result = {}
@@ -185,14 +199,13 @@ def parse_file(raw: bytes, expected_sha256: str) -> PayeeFile:
     return PayeeFile(tenant, proposer, ref, expected_sha256, tuple(parsed))
 
 
-def classify_row(db, tenant_id: UUID, row: PayeeRow) -> str:
+def classify_row(db, tenant_id: UUID, row: PayeeRow, banks: BankReference) -> str:
     """One outcome per row, read-only: 'new' | 'replace' | 'unchanged' | a refusal reason."""
     import sqlalchemy as sa
 
-    bank_name = BANK_NAMES.get(row.bank_code)
-    if bank_name is None:
+    if banks.name(row.bank_code) is None:
         return "unknown_bank_code"
-    if not valid_nuban(row.bank_code, row.account_number):
+    if not banks.valid_nuban(row.bank_code, row.account_number):
         return "invalid_nuban"
     if row.kind == PayeeKind.SUPPLIER.value and row.callback_ref is None:
         return "callback_ref_required"
@@ -219,11 +232,13 @@ def classify_row(db, tenant_id: UUID, row: PayeeRow) -> str:
 _OK = ("new", "replace", "unchanged")
 
 
-def classify(db, file: PayeeFile) -> list[tuple[PayeeRow, str]]:
-    return [(row, classify_row(db, file.tenant_id, row)) for row in file.rows]
+def classify(db, file: PayeeFile, banks: BankReference) -> list[tuple[PayeeRow, str]]:
+    return [(row, classify_row(db, file.tenant_id, row, banks)) for row in file.rows]
 
 
-def apply_rows(db, file: PayeeFile, outcomes, *, operator_ref: str | None, approve: bool) -> Counter:
+def apply_rows(
+    db, file: PayeeFile, outcomes, *, banks: BankReference, operator_ref: str | None, approve: bool
+) -> Counter:
     """Propose (and, with --approve and the policy off, approve) every eligible row in the caller's transaction."""
     _require(all(reason in _OK for _row, reason in outcomes), "file_not_fully_eligible")
     import sqlalchemy as sa
@@ -258,7 +273,7 @@ def apply_rows(db, file: PayeeFile, outcomes, *, operator_ref: str | None, appro
             payee_kind=row.kind,
             payee_ref=row.ref,
             bank_code=row.bank_code,
-            bank_name=BANK_NAMES[row.bank_code],
+            bank_name=banks.banks[row.bank_code][0],
             account_number=row.account_number,
             account_name=row.account_name,
             evidence_ref=row.evidence,
@@ -276,7 +291,16 @@ def apply_rows(db, file: PayeeFile, outcomes, *, operator_ref: str | None, appro
     return written
 
 
-def receipt_of(file: PayeeFile, outcomes, *, mode: str, dual: bool, approve: bool, written: Counter | None = None):
+def receipt_of(
+    file: PayeeFile,
+    outcomes,
+    *,
+    banks: BankReference,
+    mode: str,
+    dual: bool,
+    approve: bool,
+    written: Counter | None = None,
+):
     """Counts, digests and per-row (row number, kind, outcome, last four digits). Nothing else about a payee."""
     counts = Counter(reason for _row, reason in outcomes)
     refused = {k: v for k, v in counts.items() if k not in _OK}
@@ -285,6 +309,7 @@ def receipt_of(file: PayeeFile, outcomes, *, mode: str, dual: bool, approve: boo
         mode=mode,
         production_ready=False,
         file_sha256=file.sha256,
+        bank_reference_sha256=banks.sha256,
         dual_control=dual,
         approve_requested=approve,
         counts=dict(
@@ -304,7 +329,7 @@ def receipt_of(file: PayeeFile, outcomes, *, mode: str, dual: bool, approve: boo
     )
 
 
-def run(db, file: PayeeFile, *, apply: bool, operator_ref: str | None, approve: bool) -> dict:
+def run(db, file: PayeeFile, banks: BankReference, *, apply: bool, operator_ref: str | None, approve: bool) -> dict:
     """Core of both modes; the caller owns the transaction (plan is rolled back by the caller)."""
     import sqlalchemy as sa
 
@@ -324,14 +349,14 @@ def run(db, file: PayeeFile, *, apply: bool, operator_ref: str | None, approve: 
     if approve:
         _require(bool(operator_ref), "operator_ref_required")
         _require(not dual, "approve_refused_dual_control_on")
-    outcomes = classify(db, file)
+    outcomes = classify(db, file, banks)
     if not apply:
-        return receipt_of(file, outcomes, mode="plan", dual=dual, approve=approve)
+        return receipt_of(file, outcomes, banks=banks, mode="plan", dual=dual, approve=approve)
     if any(reason not in _OK for _row, reason in outcomes):
         # Fail closed and whole-file: nothing is written, and the receipt says why (counts, never values).
-        return receipt_of(file, outcomes, mode="apply_refused", dual=dual, approve=approve)
-    written = apply_rows(db, file, outcomes, operator_ref=operator_ref, approve=approve)
-    return receipt_of(file, outcomes, mode="apply", dual=dual, approve=approve, written=written)
+        return receipt_of(file, outcomes, banks=banks, mode="apply_refused", dual=dual, approve=approve)
+    written = apply_rows(db, file, outcomes, banks=banks, operator_ref=operator_ref, approve=approve)
+    return receipt_of(file, outcomes, banks=banks, mode="apply", dual=dual, approve=approve, written=written)
 
 
 def _authorized(args) -> bool:
@@ -352,6 +377,7 @@ def _run(args) -> dict:
     _require(operator_ref is None or len(operator_ref) <= 120, "operator_ref_required")
     _require(not (args.apply or args.approve) or operator_ref is not None, "operator_ref_required")
     file = parse_file(read_private_file(args.file), args.file_sha256)
+    banks = load_bank_reference(args.bank_reference, args.bank_reference_sha256)
     import sqlalchemy as sa
     from dotmac_kernel.audit_actions import (
         AuditActionRegistry,
@@ -373,7 +399,7 @@ def _run(args) -> dict:
         with Session(engine) as db, db.begin():
             if not args.apply:
                 db.execute(sa.text("SET TRANSACTION READ ONLY"))
-            return run(db, file, apply=args.apply, operator_ref=operator_ref, approve=args.approve)
+            return run(db, file, banks, apply=args.apply, operator_ref=operator_ref, approve=args.approve)
     finally:
         engine.dispose()
 
@@ -387,6 +413,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m erp_v2.payees.bulk_cli")
     parser.add_argument("--file", required=True, type=Path)
     parser.add_argument("--file-sha256", required=True)
+    parser.add_argument("--bank-reference", type=Path, help="Finance-confirmed bank reference file")
+    parser.add_argument("--bank-reference-sha256")
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--operator-ref")
     parser.add_argument("--apply", action="store_true")
