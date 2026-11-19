@@ -764,7 +764,16 @@ def cmd_execute(args: argparse.Namespace) -> int:
     # rollback on dry-run.
     with source_engine.connect() as source_conn, dest_engine.connect() as dest_conn:
         _set_search_path(source_conn, source_schemas)
-        enrolment = EnrolmentMaps(source_conn, dest_conn, mint_context=mint_context, transform_params=transform_params)
+        enrolment = EnrolmentMaps(
+            source_conn,
+            dest_conn,
+            mint_context=mint_context,
+            transform_params=transform_params,
+            transform_binding={
+                "snapshot_sha256": manifest.snapshot_sha256,
+                "candidate_revision": manifest.candidate_revision,
+            },
+        )
         if needs_transforms:
             # Refuse BEFORE any write: the Finance-named fallback expense account is a required declared input,
             # and the snapshot-wide transform build is read-only (apply commits per spec).

@@ -1,42 +1,48 @@
 # ruff: noqa: F811  (the imported `db` fixture is used by name)
 """B-3 transform manifest through the verifier gate (unpaid admission; SQLite fixture of the historical suite).
 
-Four combinations per the ruling: transform alone, waiver alone, transform plus waiver, and a transform that does
-not cover the failure (still refused). Transforms and waivers stay separate in the evidence.
+The verifier RE-DERIVES each invoice's transform from the snapshot with the declared fallback account and requires
+manifest == re-derived == destination. Combinations per the ruling: transform alone, waiver alone, transform plus
+waiver, a transform that does not cover the failure, and a forged manifest (refused).
 """
 
+import json
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-from test_payables_history import INVOICE, db, evidence  # noqa: F401
+from test_payables_history import EXP, INVOICE, T, db, evidence  # noqa: F401
 from test_reviewed_admission import add_review, break_line_totals
 
 from erp_v2.importer.payables_history import HistoricalEvidenceError
-from erp_v2.importer.transforms import T_EXP_LEGACY, T_ROUND_2DP
+from erp_v2.importer.transforms import T_EXP_FALLBACK, T_ROUND_2DP, canonical_digest
 from erp_v2.legacy_ap.transform_manifest import InvoiceTransform, TransformManifest, TransformManifestError
 
-LEGACY_GL = str(UUID(int=0x5100))  # the account the transform landed the line on
+FALLBACK = str(UUID(int=0x5999))  # the declared fallback expense account
+FORGED = str(UUID(int=0x5100))
+SNAPSHOT = "d" * 64  # the snapshot of the historical-evidence fixture manifest
 
 
 def line_id(db):
     table = db[4][True, "supplier_invoice_line"]
-    return db[0].execute(table.select()).mappings().one()["line_id"]
+    return str(UUID(str(db[0].execute(table.select()).mappings().one()["line_id"])))
 
 
-def land_on_legacy_account(db):
-    """The importer landed the line on the legacy GL account instead of the line's own expense account."""
-    db[1].execute(db[4][False, "supplier_invoice_lines"].update().values(posting_account_ref=LEGACY_GL))
+def null_expense(db):
+    """Legacy left the line without an expense account; the importer landed it on the declared fallback."""
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(db[4][True, "supplier_invoice_line"].update().values(expense_account_id=None))
+    db[1].execute(db[4][False, "supplier_invoice_lines"].update().values(posting_account_ref=FALLBACK))
 
 
-def manifest(db, *, amount="100", account=LEGACY_GL, rules=(T_EXP_LEGACY,), invoice_id=INVOICE):
+def body(db, *, amount="100", account=FALLBACK, rules=(T_EXP_FALLBACK,), invoice_id=INVOICE, **binding):
     landed = {
         "rules": sorted(rules),
         "header": {},
         "lines": {
-            str(UUID(str(line_id(db)))): {
+            line_id(db): {
                 "posting_account_ref": account,
                 "tax_account_ref": None,
                 "line_amount": amount,
@@ -45,24 +51,43 @@ def manifest(db, *, amount="100", account=LEGACY_GL, rules=(T_EXP_LEGACY,), invo
         },
         "item_lines": [],
     }
-    return TransformManifest.from_itemised({"landed": {invoice_id: landed}})
+    return {
+        "binding": {"snapshot_sha256": SNAPSHOT, **binding},
+        "bridge_lines": [],
+        "queue": [],
+        "changed_headers": [],
+        "landed": {invoice_id: landed},
+        "fallback_account": FALLBACK,
+    }
+
+
+def verified(db, data, *, fallback=FALLBACK):
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    if not db[0].exec_driver_sql("SELECT name FROM sqlite_master WHERE name='account'").first():
+        db[0].exec_driver_sql(
+            "CREATE TABLE account (account_id TEXT, deferral_pair_account_id TEXT, account_code TEXT, "
+            "is_active INTEGER, is_posting_allowed INTEGER)"
+        )
+        db[0].exec_driver_sql("INSERT INTO account VALUES (?, NULL, '5000', 1, 1)", (EXP,))
+    db[0].exec_driver_sql("PRAGMA query_only=1")
+    verifier = replace(
+        db[3], transform_manifest=TransformManifest.from_itemised(data), fallback_expense_account=fallback
+    )
+    return verifier.evidence(scope=SimpleNamespace(tenant_id=UUID(T)), invoice_id=UUID(INVOICE), destination=db[2])
 
 
 def test_without_a_manifest_a_transformed_line_is_refused(db):
-    land_on_legacy_account(db)
+    null_expense(db)
     with pytest.raises(HistoricalEvidenceError, match="invoice_line_posting_account_ref"):
         evidence(db)
 
 
-def test_transform_alone_admits_without_a_waiver_and_is_recorded_apart_from_waivers(db):
-    baseline = evidence(db).fingerprint()
-    land_on_legacy_account(db)
-    item = _evidence_with(db, manifest(db))
-    assert item.total_amount == Decimal("100") and item.fingerprint() != baseline
-    # no review row exists: the transform needed no waiver and tripped no waiver_not_needed
-    verifier = replace(db[3], transform_manifest=manifest(db))
-    gate = verifier.gate_for(None, UUID(INVOICE))
-    assert gate.facts() == {}  # nothing waived, and nothing transformed until a check is actually fixed by one
+def test_transform_alone_admits_without_a_waiver_and_changes_the_fingerprint(db):
+    null_expense(db)
+    item = verified(db, body(db))
+    assert item.total_amount == Decimal("100")
+    # no review row exists: a transform needed no waiver and tripped no waiver_not_needed
+    assert item.fingerprint().startswith("cv1:")
 
 
 def test_waiver_alone_still_works_and_does_not_need_a_manifest(db):
@@ -73,49 +98,65 @@ def test_waiver_alone_still_works_and_does_not_need_a_manifest(db):
 
 def test_transform_plus_waiver_admits_and_both_are_part_of_the_fingerprint(db):
     break_line_totals(db)  # source and destination line = 99, header 100: a line_totals failure
-    land_on_legacy_account(db)
-    # neither alone admits: the waiver cannot explain the moved account, the transform cannot explain the totals
+    null_expense(db)
     with pytest.raises(HistoricalEvidenceError, match="invoice_line_posting_account_ref"):
-        evidence(db)
+        evidence(db)  # a waiver cannot explain the moved account
     with pytest.raises(HistoricalEvidenceError, match="invoice_line_totals"):
-        _evidence_with(db, manifest(db, amount="99"))
+        verified(db, body(db, amount="99"))  # a transform cannot explain the totals
     add_review(db, waived=("line_totals",))
-    both = _evidence_with(db, manifest(db, amount="99"))
-    other = _evidence_with(db, manifest(db, amount="99", rules=(T_EXP_LEGACY, T_ROUND_2DP)))
-    assert both.total_amount == Decimal("100") and both.fingerprint() != other.fingerprint()
+    both = verified(db, body(db, amount="99"))
+    assert both.total_amount == Decimal("100")
+    review = db[3].review(scope=SimpleNamespace(tenant_id=UUID(T)), invoice_id=UUID(INVOICE), destination=db[2])
+    assert review.waived == ("line_totals",)
 
 
-def test_a_transform_does_not_cover_a_failure_it_did_not_fix(db):
-    break_line_totals(db)
-    land_on_legacy_account(db)
-    with pytest.raises(HistoricalEvidenceError, match="invoice_line_totals"):
-        _evidence_with(db, manifest(db, amount="99"))  # no waiver: the transform explains the account, not the totals
+def test_a_forged_manifest_over_an_edited_destination_line_is_refused(db):
+    """The destination line was edited and a manifest names the edit: re-derivation says no rule produces it."""
+    db[1].execute(db[4][False, "supplier_invoice_lines"].update().values(posting_account_ref=FORGED))
+    with pytest.raises(HistoricalEvidenceError, match="transform_manifest_mismatch"):
+        verified(db, body(db, account=FORGED))
 
 
-def test_a_manifest_naming_other_values_than_the_destination_is_refused(db):
-    land_on_legacy_account(db)
-    other = str(UUID(int=0x5200))
-    with pytest.raises(HistoricalEvidenceError, match="invoice_line_posting_account_ref"):
-        _evidence_with(db, manifest(db, account=other))
-    with pytest.raises(HistoricalEvidenceError, match="invoice_line_posting_account_ref"):
-        _evidence_with(db, manifest(db, invoice_id=str(UUID(int=0xBEEF))))  # a manifest for another invoice
+def test_a_manifest_that_claims_a_rule_the_snapshot_does_not_support_is_refused(db):
+    with pytest.raises(HistoricalEvidenceError, match="transform_manifest_mismatch"):
+        verified(db, body(db, rules=(T_ROUND_2DP,), account=FALLBACK))  # nothing in the source to transform
+
+
+def test_manifest_bindings_must_match_the_verifier(db):
+    null_expense(db)
+    other_snapshot = body(db)
+    other_snapshot["binding"]["snapshot_sha256"] = "e" * 64
+    with pytest.raises(HistoricalEvidenceError, match="transform_manifest_snapshot"):
+        verified(db, other_snapshot)
+    with pytest.raises(HistoricalEvidenceError, match="transform_fallback_account"):
+        verified(db, body(db), fallback=FORGED)  # the declared fallback is not the one the manifest was built with
+    with pytest.raises(HistoricalEvidenceError, match="transform_fallback_account"):
+        verified(db, body(db), fallback=None)
+
+
+def test_the_manifest_file_must_hash_to_the_receipts_itemised_sha256(db, tmp_path):
+    null_expense(db)
+    data = body(db)
+    path = tmp_path / "r.json.transforms.json"
+    path.write_text(json.dumps(data, indent=1, sort_keys=True))
+    good = canonical_digest(data)
+    assert TransformManifest.load(path, good).sha256 == good
+    with pytest.raises(TransformManifestError, match="transform_manifest_digest_mismatch"):
+        TransformManifest.load(path, "0" * 64)
+    with pytest.raises(TransformManifestError, match="transform_manifest_receipt_sha256_required"):
+        TransformManifest.load(path, None)
+    data["landed"][INVOICE]["lines"][line_id(db)]["posting_account_ref"] = FORGED  # edited after the import
+    path.write_text(json.dumps(data))
+    with pytest.raises(TransformManifestError, match="transform_manifest_digest_mismatch"):
+        TransformManifest.load(path, good)
 
 
 def test_round_2dp_maps_to_the_scale_check_and_nothing_else():
-    rounded = InvoiceTransform(frozenset({T_ROUND_2DP}))
-    assert rounded.waivable_checks() == {"source_amount_scale": T_ROUND_2DP}
-    assert InvoiceTransform(frozenset({T_EXP_LEGACY})).waivable_checks() == {}
+    assert InvoiceTransform(frozenset({T_ROUND_2DP})).waivable_checks() == {"source_amount_scale": T_ROUND_2DP}
+    assert InvoiceTransform(frozenset({T_EXP_FALLBACK})).waivable_checks() == {}
 
 
 def test_a_malformed_manifest_is_refused():
-    for data in ({}, {"landed": []}, {"landed": {INVOICE: {"rules": []}}}):
+    for data in ({}, {"landed": []}, {"landed": {}}, {"landed": {}, "binding": {}, "fallback_account": "x"}):
         with pytest.raises(TransformManifestError):
             TransformManifest.from_itemised(data)
-
-
-def _evidence_with(db, tm):
-    db[0].exec_driver_sql("PRAGMA query_only=1")
-    verifier = replace(db[3], transform_manifest=tm)
-    from test_payables_history import T
-
-    return verifier.evidence(scope=SimpleNamespace(tenant_id=UUID(T)), invoice_id=UUID(INVOICE), destination=db[2])

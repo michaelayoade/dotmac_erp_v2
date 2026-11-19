@@ -318,6 +318,21 @@ def _destination_preflight(session, tenant: UUID, empty_tables: tuple[str, ...] 
         _require(rows == 0, "destination_payables_history_not_empty")
 
 
+def _fallback_account(args) -> str:
+    """The declared ``import.fallback_expense_account`` (the importer's params file), bound in the plan: the
+    verifier re-derives every transform with it."""
+    from erp_v2.importer.transforms import TransformParams, TransformParamsError
+
+    try:
+        raw = json.loads(Path(args.import_params_json).read_text()) if args.import_params_json else None
+        found = TransformParams.from_mapping(raw if isinstance(raw, dict) else None).fallback_expense_account
+    except (OSError, ValueError, TransformParamsError) as exc:
+        raise OperatorRefusal("transform_fallback_account") from exc
+    if found is None:
+        raise OperatorRefusal("transform_fallback_account")
+    return found
+
+
 def _authorized(args) -> bool:
     return not args.apply or (
         os.environ.get("ERP_IMPORT_APPROVED") == "1" and os.environ.get("ERP_IMPORT_APPLY_OK") == "1"
@@ -353,12 +368,15 @@ def _run(args) -> dict:
     _require(snapshot_sha == manifest.snapshot_sha256, "snapshot_digest_mismatch")
     tenant, ids = _cohort(cohort_bytes, manifest)
     reviewed = _reviewed(args)
-    transform_manifest = None
+    transform_manifest, fallback = None, None
     if getattr(args, "transform_manifest", None) is not None:
         from erp_v2.legacy_ap.transform_manifest import TransformManifest, TransformManifestError
 
         try:
-            transform_manifest = TransformManifest.load(args.transform_manifest)
+            transform_manifest = TransformManifest.load(
+                args.transform_manifest, getattr(args, "transform_manifest_sha256", None)
+            )
+            fallback = _fallback_account(args)
         except TransformManifestError as exc:
             raise OperatorRefusal(str(exc)) from exc
     bindings = dict(
@@ -370,7 +388,11 @@ def _run(args) -> dict:
         source_database=manifest.source_database,
         destination_database=manifest.destination_database,
         source_owner="legacy-erp",
-        **({"transform_manifest_sha256": transform_manifest.sha256} if transform_manifest else {}),
+        **(
+            {"transform_manifest_sha256": transform_manifest.sha256, "fallback_expense_account": fallback}
+            if transform_manifest
+            else {}
+        ),
     )
     _require(_installed_payables_version() == REQUIRED_PAYABLES_VERSION, "released_payables_version_required")
     scope_type, verifier_type, admit, command_type = _dependencies()
@@ -388,7 +410,13 @@ def _run(args) -> dict:
                     "source_database_mismatch",
                 )
                 verifier = verifier_type(
-                    source, manifest, **({"transform_manifest": transform_manifest} if transform_manifest else {})
+                    source,
+                    manifest,
+                    **(
+                        {"transform_manifest": transform_manifest, "fallback_expense_account": fallback}
+                        if transform_manifest
+                        else {}
+                    ),
                 )
                 with Session(destination_engine) as session, session.begin():
                     if not args.apply:
@@ -436,6 +464,12 @@ def main(argv=None) -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--reviewed-plan", type=Path)
     parser.add_argument("--reviewed-plan-sha256")
+    parser.add_argument(
+        "--transform-manifest-sha256", help="the import receipt's itemised_sha256 (required with --transform-manifest)"
+    )
+    parser.add_argument(
+        "--import-params-json", type=Path, help="the importer's params file (declares the fallback account)"
+    )
     parser.add_argument("--transform-manifest", type=Path, help="the importer's .transforms.json (B-3), optional")
     args = parser.parse_args(argv)
     try:

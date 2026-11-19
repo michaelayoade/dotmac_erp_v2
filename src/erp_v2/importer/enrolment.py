@@ -1132,8 +1132,10 @@ class EnrolmentMaps:
         *,
         mint_context: MintContext | None = None,
         transform_params: TransformParams | None = None,
+        transform_binding: Mapping[str, str] | None = None,
     ) -> None:
         self._transform_params = transform_params
+        self._transform_binding = dict(transform_binding or {})
         self._transforms: TransformBuild | None = None
         self._source = source_connection
         self._dest = destination_connection
@@ -1154,7 +1156,7 @@ class EnrolmentMaps:
         if self._transforms is None:
             if self._transform_params is None:
                 raise TransformParamsError("fallback_expense_account_missing")
-            self._transforms = read_and_build(self._source, self._transform_params, self._dest)
+            self._transforms = read_and_build(self._source, self._transform_params, self._dest, self._transform_binding)
         return self._transforms
 
     def transform_ledger(self):

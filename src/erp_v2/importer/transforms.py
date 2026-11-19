@@ -282,6 +282,26 @@ class InvoiceOutcome:
         return sum((b.delta for b in self.bridge if b.scope == "header"), ZERO)
 
 
+def canonical_digest(body: Mapping[str, Any]) -> str:
+    """THE digest of an itemised body (the whole of it, binding included): canonical JSON, sorted keys. The import
+    receipt's ``itemised_sha256`` and ``TransformManifest.sha256`` are both this function over the same body."""
+
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def legacy_account_facts(row: Mapping[str, object]) -> AccountFacts:
+    """A legacy ``account`` row as the rules see it (shared by the importer and the verifiers' re-derivation). A NULL
+    flag is read as set: the legacy columns are NOT NULL, so NULL only appears in a partial fixture."""
+
+    code = row.get("account_code")
+    return AccountFacts(
+        None if code is None else str(code),
+        row.get("is_active") is not False and str(row.get("is_active")).lower() not in ("0", "false", "f"),
+        row.get("is_posting_allowed") is not False
+        and str(row.get("is_posting_allowed")).lower() not in ("0", "false", "f"),
+    )
+
+
 def _dec(value: object) -> Decimal | None:
     if value is None:
         return None
@@ -643,6 +663,7 @@ class TransformLedger:
     # None (unit tests of single rules) skips the universe checks and says so in the partition.
     source_invoice_ids: tuple[str, ...] | None = None
     source_line_count: int | None = None
+    binding: Mapping[str, str] = field(default_factory=dict)  # snapshot sha256 / candidate revision of the run
 
     def partition(self) -> dict[str, Any]:
         """legacy = carried + transformed + queued, by invoice count, line count and legacy amount (header total /
@@ -856,6 +877,7 @@ class TransformLedger:
 
     def itemised(self) -> dict[str, Any]:
         return {
+            "binding": dict(self.binding),
             "bridge_lines": self.bridge_lines(),
             "queue": self.queue_items(),
             "changed_headers": self.changed_headers(),
@@ -864,7 +886,7 @@ class TransformLedger:
         }
 
     def itemised_sha256(self) -> str:
-        return hashlib.sha256(json.dumps(self.itemised(), sort_keys=True).encode()).hexdigest()
+        return canonical_digest(self.itemised())
 
     def write_itemised(self, path: Path) -> None:
         """The full itemised bridge file, owner-only (mode 600). Raises OSError on failure."""
@@ -919,17 +941,11 @@ def build_transforms(
     account_rows: Iterable[Mapping[str, object]],
     params: TransformParams,
     destination_accounts: Iterable[Mapping[str, object]],
+    binding: Mapping[str, str] | None = None,
 ) -> TransformBuild:
     """Pure over already-read rows. Raises ``TransformParamsError`` (missing/unusable fallback) before any outcome."""
 
-    accounts = {
-        canonical(r["account_id"]) or "": AccountFacts(
-            None if r.get("account_code") is None else str(r["account_code"]),
-            bool(r.get("is_active", True)),
-            bool(r.get("is_posting_allowed", True)),
-        )
-        for r in account_rows
-    }
+    accounts = {canonical(r["account_id"]) or "": legacy_account_facts(r) for r in account_rows}
     chart = destination_chart(destination_accounts)
     fallback = params.validate(chart)
     classes = classify_snapshot(rows, ledger_rows, global_accounts, deferral_rows)
@@ -996,7 +1012,7 @@ def build_transforms(
     return TransformBuild(
         line_map,
         header_map,
-        TransformLedger(tuple(outcomes), fallback, tuple(source_ids), len(rows)),
+        TransformLedger(tuple(outcomes), fallback, tuple(source_ids), len(rows), dict(binding or {})),
         class_counts(classes.values()),
     )
 
@@ -1009,7 +1025,12 @@ def _header_changed(outcome: InvoiceOutcome, facts: InvoiceFacts) -> bool:
     )
 
 
-def read_and_build(source: sa.Connection, params: TransformParams, destination: sa.Connection) -> TransformBuild:
+def read_and_build(
+    source: sa.Connection,
+    params: TransformParams,
+    destination: sa.Connection,
+    binding: Mapping[str, str] | None = None,
+) -> TransformBuild:
     """Read the legacy snapshot (read-only, legacy names via the search_path) and the destination chart (read-only),
     and build the transforms."""
 
@@ -1032,6 +1053,7 @@ def read_and_build(source: sa.Connection, params: TransformParams, destination: 
         rows(ACCOUNT_SQL),
         params,
         [dict(r) for r in destination.execute(sa.text(DEST_ACCOUNT_SQL)).mappings()],
+        binding,
     )
 
 
@@ -1050,7 +1072,9 @@ __all__ = [
     "TransformParamsError",
     "account_problem",
     "build_transforms",
+    "canonical_digest",
     "destination_chart",
+    "legacy_account_facts",
     "read_and_build",
     "transform_invoice",
 ]

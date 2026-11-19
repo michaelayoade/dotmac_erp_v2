@@ -865,6 +865,10 @@ def test_cli_apply_lands_the_fallback_line_queues_the_other_and_receipts_the_bri
     assert t["rules"][T_EXP_FALLBACK]["line"]["applications"] == 1
     assert {e["reason"] for e in data["exceptions"]} == {"transform_queue:expense_account_is_control"}
     side = tmp_path / t["itemised_file"]
+    from erp_v2.legacy_ap.transform_manifest import TransformManifest
+
+    # the receipt's digest and the manifest's are the same canonical digest of the file, binding included
+    assert TransformManifest.load(side, t["itemised_sha256"]).snapshot_sha256 == "a" * 64
     assert stat.S_IMODE(os.stat(side).st_mode) == 0o600
     assert json.loads(side.read_text())["bridge_lines"][0]["rule"] == T_EXP_FALLBACK
     with dst.connect() as c:
@@ -975,10 +979,16 @@ def test_landed_manifest_round_trips_into_the_verifier_view():
 
     wht = TaxCodeFacts(ORG, "WITHHOLDING", PAID, None)
     inv = invoice([line(1, amount="200", tax="10", code=wht)], status="APPROVED", sub="200", tax="10", total="210")
-    ledger = TransformLedger((run(inv), run(invoice([line(2, amount="5")], n=2, status="DRAFT"))), FALLBACK)
+    ledger = TransformLedger(
+        (run(inv), run(invoice([line(2, amount="5")], n=2, status="DRAFT"))),
+        FALLBACK,
+        binding={"snapshot_sha256": "a" * 64},
+    )
     landed = ledger.itemised()["landed"]
     assert list(landed) == [inv.invoice_id]  # the carried invoice is not in the manifest
     manifest = TransformManifest.from_itemised(ledger.itemised())
+    assert manifest.sha256 == ledger.itemised_sha256()  # ONE canonical digest, over the whole body
+    assert manifest.snapshot_sha256 == "a" * 64 and manifest.fallback_account == FALLBACK
     found = manifest.for_invoice(inv.invoice_id)
     assert (
         found.rules == {T_UNPOSTED_CORRECT}

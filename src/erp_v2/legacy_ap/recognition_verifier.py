@@ -54,6 +54,7 @@ from erp_v2.importer.payables_history import (
     _tenant,
     invoice_tax,
     load_review,
+    rederive_transform,
     require_line_tax_account,
     transform_facts,
 )
@@ -129,6 +130,7 @@ class ApprovedInvoiceVerifier:
     source_owner: str = SOURCE_OWNER
     transforms: tuple[tuple[str, str], ...] = ()
     transform_manifest: TransformManifest | None = None  # the importer's transform manifest (B-3)
+    fallback_expense_account: str | None = None  # declared, bound in the plan; the transforms are re-derived with it
 
     def invoice_transform(self, invoice_id: UUID) -> InvoiceTransform | None:
         return self.transform_manifest.for_invoice(invoice_id) if self.transform_manifest is not None else None
@@ -283,7 +285,7 @@ class ApprovedInvoiceVerifier:
                 )
             }
         )
-        found = self.invoice_transform(invoice_id)
+        found = rederive_transform(self, tenant, invoice_id, header)
         _match(found.header_values(header) if found else header, target, mapping, "header")
         for name in ("invoice_date", "received_date"):
             # Legacy dates may arrive as date or ISO text; compare as calendar days.
