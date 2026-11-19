@@ -369,7 +369,14 @@ def build_census(
                 row = CensusRow("invoice", key, CLOSED, "void", origin, None, gross, None)
             else:
                 row = CensusRow(
-                    "invoice", key, NOT_RECEIVABLE, f"unposted_{status.lower() or 'unknown'}", origin, None, gross, None
+                    "invoice",
+                    key,
+                    NOT_RECEIVABLE,
+                    f"unposted_{status.lower() or 'unknown'}",
+                    origin,
+                    party,
+                    gross,
+                    None,
                 )
             put(row)
         elif issued > cutoff:
@@ -405,7 +412,14 @@ def build_census(
                 row = CensusRow("payment", key, CLOSED, "void", origin, None, gross, None)
             else:
                 row = CensusRow(
-                    "payment", key, NOT_RECEIVABLE, f"unposted_{status.lower() or 'unknown'}", origin, None, gross, None
+                    "payment",
+                    key,
+                    NOT_RECEIVABLE,
+                    f"unposted_{status.lower() or 'unknown'}",
+                    origin,
+                    party,
+                    gross,
+                    None,
                 )
             put(row)
         elif _as_dt(pay["payment_date"]) > cutoff:

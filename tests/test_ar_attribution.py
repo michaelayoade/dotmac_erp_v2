@@ -184,3 +184,15 @@ def test_posted_after_cutoff_rows_are_held_at_their_gl_signed_amount():
     assert held == {"late-1": ("row_after_cutoff", 4000), "late-cn": ("row_after_cutoff", -2500)}
     (party,) = a["parties"]
     assert party["gl_minor"] == 11500 and party["custgap_minor"] == 0  # 100 carried + 40 - 25 explained
+
+
+def test_every_held_entry_carries_its_customer_and_currency():
+    _census_, a = _attr()
+    assert a["held"], "the fixture must produce held items of every reason"
+    reasons = {h["reason"].split(":")[0] for h in a["held"]}
+    assert {"ar_unapplied_credit_note", "partition_held", "doc_unposted"} <= reasons
+    for h in a["held"]:
+        assert h["customer"] and h["currency"] == "NGN", h  # B-14 refuses census_held_party_unknown otherwise
+        assert {"reason", "legacy_key", "amount_minor"} <= set(h)
+    by_key = {h["legacy_key"]: h["customer"] for h in a["held"]}
+    assert by_key["cn-1"] == "cust-1" and by_key["partition:cust-2:NGN"] == "cust-2" and by_key["draft-1"] == "cust-3"

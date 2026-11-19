@@ -124,6 +124,8 @@ def build_attribution(
             held[party].append(
                 {
                     "reason": "ar_unapplied_credit_note",
+                    "customer": party[0],
+                    "currency": party[1],
                     "legacy_key": row.key,
                     "amount_minor": _held_amount(row, invoice_types),
                 }
@@ -132,6 +134,8 @@ def build_attribution(
             held[party].append(
                 {
                     "reason": "row_after_cutoff",
+                    "customer": party[0],
+                    "currency": party[1],
                     "legacy_key": row.key,
                     "amount_minor": _held_amount(row, invoice_types),
                 }
@@ -143,12 +147,21 @@ def build_attribution(
         held[excluded.partition].append(
             {
                 "reason": f"partition_held:{reasons}",
+                "customer": excluded.partition[0],
+                "currency": excluded.partition[1],
                 "legacy_key": f"partition:{excluded.partition[0]}:{excluded.partition[1]}",
                 "amount_minor": gl.get(excluded.partition, 0),
             }
         )
     unposted = [
-        {"reason": "doc_unposted", "legacy_key": r.key, "amount_minor": 0, "gross_minor": r.gross_minor}
+        {
+            "reason": "doc_unposted",
+            "customer": r.partition[0] if r.partition else None,
+            "currency": r.partition[1] if r.partition else None,
+            "legacy_key": r.key,
+            "amount_minor": 0,
+            "gross_minor": r.gross_minor,
+        }
         for r in census.rows
         if r.bucket == NOT_RECEIVABLE and r.reason.startswith("unposted_")
     ]
