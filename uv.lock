@@ -301,7 +301,7 @@ wheels = [
 
 [[package]]
 name = "dotmac-billing"
-version = "0.1.0a11"
+version = "0.1.0a12"
 source = { registry = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" }
 dependencies = [
     { name = "alembic" },
@@ -309,9 +309,8 @@ dependencies = [
     { name = "dotmac-kernel" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-billing/0.1.0a11/dotmac_billing-0.1.0a11.tar.gz", hash = "sha256:5d14695e306c904cd11c44cfedd6bb149e52e8bc086ae7fda553660413073d98" }
 wheels = [
-    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-billing/0.1.0a11/dotmac_billing-0.1.0a11-py3-none-any.whl", hash = "sha256:c5f6ec2871b83be0d2bfa1a35f084229134e038bd4a186dc8b16a053384d692b" },
+    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-billing/0.1.0a12/dotmac_billing-0.1.0a12-py3-none-any.whl", hash = "sha256:b22df6f360295c94b34934a103ecadf2209aa2ecd08c8743d5c5181b3fb73f4b" },
 ]
 
 [[package]]
@@ -441,7 +440,7 @@ requires-dist = [
     { name = "dotmac-approvals", specifier = "==0.1.0a9", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-assets", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-banking", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
-    { name = "dotmac-billing", specifier = "==0.1.0a11", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
+    { name = "dotmac-billing", specifier = "==0.1.0a12", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-collections", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-commercial-agreements", specifier = "==0.1.0a4", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-customers", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },

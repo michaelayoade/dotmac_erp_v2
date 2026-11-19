@@ -55,13 +55,13 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "ap_0003_withdrawals",  # approvals 0.1.0a9
     "as_0001_assets",  # assets 0.1.0a1
     "ay_0001_analytics",  # analytics 0.1.0a1
-    "bi_0014_opening_variance_ledger",  # billing 0.1.0a11
+    "bi_0017_open_documents_index",  # billing 0.1.0a12
     "bk_0001_banking",  # banking 0.1.0a1
     "cg_0002_approval_withdrawals",  # commercial-agreements 0.1.0a4
     "cl_0001_collections",  # collections 0.1.0a1
     "cu_0001_customer_accounts",  # customers 0.1.0a1
     "do_0001_documents",  # documents 0.1.0a1
-    "e2_0030_migration_holdings",  # assembly e2 head, B-14 holdings (after e2_0029 AR opening admissions, #72)
+    "e2_0030_migration_holdings",  # assembly e2 head: B-14 holdings (after e2_0029 AR opening admissions, #72)
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1
     "ex_0001_expenses",  # expenses 0.1.0a1
     "fi_0002_selectable_planes",  # files 0.1.0a7
@@ -88,6 +88,7 @@ _ABSORBED_HEADS: tuple[str, ...] = (
     "0030_credential_tenant_key",
     "pe_0001_people_directory",
     "bk_0001_banking",  # e2_0013 depends on banking tables
+    "bi_0017_open_documents_index",  # e2_0029 depends on the billing opening tables (grants to the writer role)
 )
 EXPECTED_STAMPED_HEADS: tuple[str, ...] = tuple(h for h in EXPECTED_HEADS if h not in _ABSORBED_HEADS)
 

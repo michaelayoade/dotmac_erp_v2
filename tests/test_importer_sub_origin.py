@@ -25,8 +25,8 @@ from erp_v2.importer.sub_origin import (
 # Pairings whose source is a tagged legacy table, with the policy chosen.
 EXPECTED_POLICIES = {
     ("mod_payments.payment_confirmations", "public.customer_payment"): SubOriginPolicy.EXCLUDE,
-    ("mod_customers.customer_accounts", "public.customer"): SubOriginPolicy.EXCLUDE,
-    ("mod_customers.customer_profiles", "public.customer"): SubOriginPolicy.EXCLUDE,
+    ("mod_customers.customer_accounts", "public.customer"): SubOriginPolicy.INCLUDE,
+    ("mod_customers.customer_profiles", "public.customer"): SubOriginPolicy.INCLUDE,
 }
 
 
@@ -41,6 +41,8 @@ def test_every_pairing_over_a_tagged_table_declares_a_policy() -> None:
 def test_policies_are_only_declared_where_they_make_sense() -> None:
     for pairing in _ALL_PAIRINGS:
         if pairing.sub_origin is SubOriginPolicy.EXCLUDE:
+            assert is_sub_origin_table(pairing.source), pairing.destination
+        if pairing.sub_origin is SubOriginPolicy.INCLUDE:
             assert is_sub_origin_table(pairing.source), pairing.destination
         if pairing.sub_origin is SubOriginPolicy.NOT_APPLICABLE:
             assert not is_sub_origin_table(pairing.source), pairing.destination
@@ -71,6 +73,9 @@ def test_spec_refuses_exclude_without_column_and_column_without_policy() -> None
     undeclared = _cust_spec(policy=None)
     assert not undeclared.executable and "sub_origin_policy_undeclared:dotmac_sub_id" in undeclared.missing_required
     assert _cust_spec().executable
+    assert _cust_spec(policy=SubOriginPolicy.INCLUDE).executable
+    include_no_col = _cust_spec(columns=("customer_id", "name"), policy=SubOriginPolicy.INCLUDE)
+    assert not include_no_col.executable and "sub_origin_column:dotmac_sub_id" in include_no_col.missing_required
     assert _cust_spec(columns=("customer_id", "name"), policy=SubOriginPolicy.NOT_APPLICABLE).executable
 
 

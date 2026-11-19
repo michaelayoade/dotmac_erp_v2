@@ -37,7 +37,7 @@ EXPECTED_MODULE_VERSIONS = {
     "approvals": "0.1.0a9",
     "assets": "0.1.0a1",
     "banking": "0.1.0a1",
-    "billing": "0.1.0a11",
+    "billing": "0.1.0a12",
     "collections": "0.1.0a1",
     "commercial_agreements": "0.1.0a4",
     "customers": "0.1.0a1",

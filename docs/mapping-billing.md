@@ -81,3 +81,48 @@ revocation and target readers remain unwired. The default preview still
 reports `verifier_unavailable` and `importable=False`; adoption alone
 does not qualify rehearsal or activate imports. The 2026-10-12 Billing
 freeze and no repair/backfill rule remain in force.
+
+## AR opening admission (AS-IS rework of #72): billing a12 pinned, a13 follow-up
+
+Pin `dotmac-billing==0.1.0a12` (head `bi_0017_open_documents_index`). **Follow-up: pin a13** (R1 + `bi_0018` +
+`bi_0019`, Starter #1111) in the composition PR; a13 is not released (no tag) at the time of this rework. The code
+is written to run on both: the a13 behaviour was exercised locally against the a13 source tree, a12 is what CI pins.
+
+a12/a13 bind ONE window to ONE complete `OpeningManifestV2`; every command carries the whole manifest and its
+`partition` (customer x currency) only selects. `ar_opening_cli` runs census -> mint -> plan -> apply (provision as
+app_admin, import every partition and seal as the restricted NOLOGIN `erp_billing_opening_writer` created by
+`e2_0029`). The opening posts no GL.
+
+Billing owner's a13 answers (paths under Starter `packages/dotmac-billing/src/dotmac_billing/`):
+
+- **P-1 = NO.** A customer x currency partition is the smallest holdable unit: any held or blocking row refuses the
+  whole manifest (`manifest_noncarryable_row`, `opening_variance_validation.py:127-132`); no variance reason accepts
+  source kind `credit_note` (`opening_variance_contracts.py:107-157`); a `customer_credit` variance is refused for a
+  customer with cash lots (`opening_variance_validation.py:149-157`). So no row is held inside billing. An
+  **unapplied credit note** (no allocation links) is simply not part of the manifest: its partition is carried, the
+  note is a register work item (E35 key `ar_unapplied_credit_note:<id>`: party, document number, amount) and part of
+  the itemised per-party GL-minus-subledger difference on 1400 that the B-14 holding reclass moves to the AR holding
+  account. A credit note with allocation links, and every other dependency blocker, still excludes the whole
+  partition (E35 `partition:`; its GL goes to holding).
+- **P-2 = YES.** Open items with `unknown_unverified` collection evidence count in R1 `collectible_receivable_minor`
+  (`control_position.py:176-188`); tie them into AR control. No special-casing (no due date, no dunning until
+  verified).
+- **P-3 = YES.** `stored_balance`, `document_residual` and `rebuild` variances are memo basis: no accounting fact, never
+  suspense (`opening_variance.py:173-176`); they resolve only by `evidence_confirmed`. `apply` has no allow-variances
+  switch: it proceeds only when every variance is listed in the plan (sha-bound) and equals the manifest's own; each
+  becomes an E36b item (register source `ar_census`). Recognise / confirm are post-flip, as app_user.
+
+Other rules: customers are the imported wave-4 `customer_accounts` (`SubOriginPolicy.INCLUDE`; the account id is the
+legacy customer id); the mint creates billing accounts only and refuses `customer_not_imported`. The window binds the
+ERP two-person policy (#62) as a13's per-window `dual_control`, passed explicitly and read back; on a12 only policy ON
+can be honoured (OFF is refused). T1: `t1_credit_by_currency(manifest)` is the Sigma cash-lot residual of the sealed
+manifest per currency (the seam for B-14's `ar_opening_credit`; cross-check against R1 only while the writer fence
+is held). T2/T3 are the B-15 mapper, not here. M3 `batch_controls` is NOT built (see the PR description).
+
+Writer role (R5): `e2_0029` creates `erp_billing_opening_writer` (or verifies an existing one: login, superuser,
+bypassrls, createrole, createdb, replication or any membership is refused; PostgreSQL below 15 is refused) and grants
+exactly the R5 list (20 INSERT tables, 9 SELECT-only, `UPDATE(generation)` on `opening_windows`, `UPDATE(id)` on
+`billing_accounts`, kernel `idempotency_records` / `outbox_events` SELECT+INSERT). It grants NO membership, not to the
+migrator. The operator's `SET ROLE` membership is a Michael root step for the window only
+(`GRANT erp_billing_opening_writer TO <operator> WITH SET TRUE, INHERIT FALSE`), revoked after the seal with the
+writer's INSERT grants (runbook F9).
