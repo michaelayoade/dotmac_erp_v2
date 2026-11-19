@@ -368,7 +368,8 @@ def test_migration_revision_and_chain():
 
     assert migration.revision == "e2_0028_migration_ledger"
     assert migration.down_revision == "e2_0027_held_draft_decisions"  # #69 merged before this build started
-    assert "e2_0028_migration_ledger" in EXPECTED_HEADS
+    assert "e2_0032_ar_producer" in EXPECTED_HEADS  # stacked: B-16 (e2_0032) is the e2 head
+    assert "e2_0028_migration_ledger" not in EXPECTED_HEADS
     assert "e2_0027_held_draft_decisions" not in EXPECTED_HEADS  # linear chain: one e2 head
 
 

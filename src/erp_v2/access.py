@@ -68,6 +68,14 @@ _NEW_PERMISSIONS: Final[dict[str, tuple[str, str]]] = {
         "finance_approver",
     ),
     "erp.finance.supplier_payments.approve": ("Approve supplier payment proposals.", "finance_approver"),
+    "erp.finance.receivables.prepare": (
+        "Prepare customer invoices, credit notes and receipts (drafts).",
+        "finance_preparer",
+    ),
+    "erp.finance.receivables.post": (
+        "Issue invoices and credit notes, post receipts, apply credit, deallocate, reverse and void.",
+        "finance_approver",
+    ),
     "erp.banking.reconciliation.approve": ("Approve bank reconciliations.", "finance_approver"),
     # Cash GL split: re-point a bank account's cash GL. Same P0 role pair as journals
     # (finance_preparer proposes, finance_approver approves; SoD keeps them two people).

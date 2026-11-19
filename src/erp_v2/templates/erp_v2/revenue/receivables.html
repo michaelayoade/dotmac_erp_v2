@@ -3,11 +3,11 @@
 {% block content %}
 <h1>Receivables</h1>
 <p><a href="/finance">Finance</a> · <a href="/finance/supplier-invoices">Supplier invoices</a></p>
-<p>Invoice issuance is unavailable until commercial, tax and due-date evidence is connected. Collection allocation is unavailable until the confirmation and allocation workflow is connected.</p>
+<p><a href="/finance/receivables/invoices/new">New invoice</a> · <a href="/finance/receivables/receipts/new">New receipt</a> · <a href="/finance/receivables/drafts">Open drafts</a></p>
 <h2>Billing documents</h2>
 <p>Showing up to 100 most recent documents. Document totals are original amounts, not outstanding balances.</p>
 <table><thead><tr><th>Number</th><th>Account</th><th>Kind</th><th>Status</th><th>Issued at</th><th>Due at</th><th>Currency</th><th>Document total</th></tr></thead>
-<tbody>{% for d in documents %}<tr><td>{{ d.document_number or 'Draft' }}</td><td>{{ billing_accounts.get(d.billing_account_id, d.billing_account_id) }}</td><td>{{ d.document_kind }}</td><td>{{ d.lifecycle }}</td><td>{{ d.issued_at or '—' }}</td><td>{{ d.due_at or '—' }}</td><td>{{ d.currency }}</td><td>{{ d.grand_total }}</td></tr>
+<tbody>{% for d in documents %}<tr><td>{% if d.document_number %}<a href="/finance/receivables/documents/{{ d.id }}">{{ d.document_number }}</a>{% else %}Draft{% endif %}</td><td>{{ billing_accounts.get(d.billing_account_id, d.billing_account_id) }}</td><td>{{ d.document_kind }}</td><td>{{ d.lifecycle }}</td><td>{{ d.issued_at or '—' }}</td><td>{{ d.due_at or '—' }}</td><td>{{ d.currency }}</td><td>{{ d.grand_total }}</td></tr>
 {% else %}<tr><td colspan="8">No billing documents.</td></tr>{% endfor %}</tbody></table>
 <h2>Confirmed receipts</h2>
 <p>Showing up to 100 most recent receipts. Receipt amounts do not indicate remaining allocatable credit.</p>

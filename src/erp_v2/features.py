@@ -9,6 +9,7 @@ from dotmac_kernel.features import FeatureManifest
 
 from erp_v2.academy_sync.routes import academy_sync_feature
 from erp_v2.access import access_feature
+from erp_v2.ar.routes import receivables_producer_feature
 from erp_v2.banking.recon_routes import banking_recon_feature
 from erp_v2.banking.routes import banking_web_feature
 from erp_v2.banking.statement_routes import banking_statements_feature
@@ -33,6 +34,7 @@ ERP_FEATURES: tuple[FeatureManifest, ...] = (
     academy_sync_feature,
     erp_web_feature,
     revenue_web_feature,
+    receivables_producer_feature,
     revenue_approval_feature,
     credit_note_feature,
     legacy_reentry_feature,
