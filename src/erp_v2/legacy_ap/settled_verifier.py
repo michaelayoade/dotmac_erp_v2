@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import partial
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -345,7 +346,9 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             debit == _sum([r["credit_amount"] for r in ledger]) == journal["total_debit"] == journal["total_credit"],
             "payment_ledger_unbalanced",
         )
-        proof = journal_proof(journal, ledger, self.history_cutoff, _require)
+        proof = journal_proof(
+            journal, ledger, self.history_cutoff, _require, partial(self._opening_posted, dest, tenant)
+        )
         excluded = proof is not None
         destination_rows = _read(dest, "journal_entries", schema="mod_accounting", key="id", value=jid)
         if excluded:

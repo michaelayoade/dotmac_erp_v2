@@ -1102,17 +1102,31 @@ def _cutoff(monkeypatch, day):
     monkeypatch.setattr(HistoricalPayablesVerifier, "history_cutoff", property(lambda self: day))
 
 
+def _add_opening(db, day="2025-12-31", status="POSTED", owner="erp.opening"):
+    """The B-9 opening journal in v2 (a copy of the landed invoice journal row, owned by ``erp.opening``)."""
+    target = db[1]
+    table = db[4][False, "journal_entries"]
+    base = dict(target.execute(sa.select(table)).mappings().first())
+    base.update(id=str(UUID(int=777)), source_owner=owner, status=status, posting_date=day)
+    target.execute(table.insert(), [base])
+    target.commit()
+
+
 def _empty_destination_journals(db):
     for name in ("journal_entries", "journal_lines", "posted_ledger_lines"):
-        db[1].execute(db[4][False, name].delete())
+        table = db[4][False, name]
+        db[1].execute(table.delete().where(table.c.id != str(UUID(int=777))))  # keep the opening, if any
     db[1].commit()
 
 
 def test_a_cutoff_excluded_invoice_journal_is_proven_on_the_snapshot_and_asserted_absent_in_v2(db, monkeypatch):
+    _add_opening(db)
+    _empty_destination_journals(db)
     with pytest.raises(HistoricalEvidenceError, match="destination_journal_missing"):  # no cutoff: still required
-        _empty_destination_journals(db)
         evidence(db)
     _cutoff(monkeypatch, date(2025, 12, 31))  # the fixture journal and its ledger lines are dated 2025-01-02
+    _add_opening(db)
+    _empty_destination_journals(db)
     item = evidence(db)
     assert item.total_amount == Decimal("100")
     scope = SimpleNamespace(tenant_id=UUID(T))
@@ -1123,6 +1137,7 @@ def test_a_cutoff_excluded_invoice_journal_is_proven_on_the_snapshot_and_asserte
 
 def test_a_cutoff_excluded_journal_that_is_present_in_v2_refuses(db, monkeypatch):
     _cutoff(monkeypatch, date(2025, 12, 31))
+    _add_opening(db)
     with pytest.raises(HistoricalEvidenceError, match="cutoff_journal_present_in_destination"):
         evidence(db)
 
@@ -1137,6 +1152,7 @@ def test_a_cutoff_before_the_journal_date_takes_the_ordinary_path(db, monkeypatc
 
 def test_a_cutoff_excluded_journal_whose_ledger_is_on_the_other_side_or_undated_refuses(db, monkeypatch):
     _cutoff(monkeypatch, date(2025, 12, 31))
+    _add_opening(db)
     _empty_destination_journals(db)
     ledger = db[4][True, "posted_ledger_line"]
     db[0].exec_driver_sql("PRAGMA query_only=0")
@@ -1149,3 +1165,47 @@ def test_a_cutoff_excluded_journal_whose_ledger_is_on_the_other_side_or_undated_
     db[0].commit()
     with pytest.raises(HistoricalEvidenceError, match="journal_ledger_line_undated"):
         evidence(db)
+
+
+@pytest.mark.parametrize(
+    "opening", [None, dict(day="2025-12-30"), dict(status="DRAFT"), dict(owner="legacy-erp")], ids=lambda o: str(o)
+)
+def test_the_cutoff_proof_needs_a_posted_opening_dated_exactly_the_cutoff(db, monkeypatch, opening):
+    """A journal absent from v2 is only 'closed' if the opening that carries it is posted as of the cutoff."""
+    _cutoff(monkeypatch, date(2025, 12, 31))
+    if opening is not None:
+        _add_opening(db, **opening)
+    _empty_destination_journals(db)
+    with pytest.raises(HistoricalEvidenceError, match="cutoff_opening_not_posted"):
+        evidence(db)
+
+
+def test_a_cutoff_excluded_deferral_journal_is_proven_on_the_snapshot_and_asserted_absent(db, monkeypatch):
+    taxed(db, "A2", ref=TAX)
+    _add_deferral_journal(db, 15, land=False)  # dated 2025-01-02, in the opening, not in v2
+    _cutoff(monkeypatch, date(2025, 12, 31))
+    _add_opening(db)
+    _empty_destination_journals(db)
+    assert evidence(db).total_amount == Decimal("115")
+    # the same deferral journal present in v2 is refused: it must be absent
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    _land_deferral_journal(db, None, 60, 15, "POSTED")
+    with pytest.raises(HistoricalEvidenceError, match="cutoff_deferral_journal_present_in_destination"):
+        evidence(db)
+
+
+def test_the_cutoff_is_parsed_from_a_real_manifest_binding_without_any_patching(db):
+    from erp_v2.legacy_ap.transform_manifest import TransformManifest, TransformManifestError
+
+    def manifest(**binding):
+        return TransformManifest.from_itemised(
+            {"binding": {"snapshot_sha256": "a" * 64, **binding}, "landed": {}, "fallback_account": str(UUID(int=5))}
+        )
+
+    tm = manifest(history_cutoff="2025-12-31")
+    assert tm.history_cutoff == date(2025, 12, 31)
+    assert replace(db[3], transform_manifest=tm).history_cutoff == date(2025, 12, 31)
+    assert manifest().history_cutoff is None and db[3].history_cutoff is None
+    for bad in ("2025-13-45", "yesterday", ""):
+        with pytest.raises(TransformManifestError):
+            manifest(history_cutoff=bad)

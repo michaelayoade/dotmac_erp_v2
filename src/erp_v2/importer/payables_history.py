@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -818,6 +819,20 @@ class HistoricalPayablesVerifier:
         """The importer's receipt cutoff (B-13), from the hash-bound transform manifest binding; None when absent."""
         return self.transform_manifest.history_cutoff if self.transform_manifest is not None else None
 
+    def _opening_posted(self, dest: sa.Connection, tenant: UUID) -> bool:
+        """The B-9 opening journal (owner ``erp.opening``) is POSTED in v2 and dated exactly the manifest cutoff."""
+        cutoff = self.history_cutoff
+        if cutoff is None:
+            return False
+        for row in _read(dest, "journal_entries", schema="mod_accounting", key="source_owner", value="erp.opening"):
+            if (
+                _equal(row["tenant_id"], tenant)
+                and row["status"] == "POSTED"
+                and _day(row["posting_date"], "opening_posting_date") == cutoff
+            ):
+                return True
+        return False
+
     def invoice_transform(self, invoice_id: UUID) -> InvoiceTransform | None:
         """The manifest's entry, UNVERIFIED (used only to open the gate); ``rederive_transform`` verifies it."""
         return self.transform_manifest.for_invoice(invoice_id) if self.transform_manifest is not None else None
@@ -1191,7 +1206,9 @@ class HistoricalPayablesVerifier:
             "unsupported_currency",
         )
         ledger = _read(self.source, "posted_ledger_line", key="journal_entry_id", value=journal_id)
-        proof = journal_proof(journal, ledger, self.history_cutoff, _require)
+        proof = journal_proof(
+            journal, ledger, self.history_cutoff, _require, partial(self._opening_posted, dest, tenant)
+        )
         excluded = proof is not None
         destination_rows = _read(dest, "journal_entries", schema="mod_accounting", key="id", value=journal_id)
         if excluded:
@@ -1402,7 +1419,12 @@ class HistoricalPayablesVerifier:
             ledger = _read(self.source, "posted_ledger_line", key="journal_entry_id", value=journal_id)
             posted = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=journal_id)
             destination_rows = _read(dest, "journal_entries", schema="mod_accounting", key="id", value=journal_id)
-            if journal_proof(journal, ledger, self.history_cutoff, _require) is not None:
+            if (
+                journal_proof(
+                    journal, ledger, self.history_cutoff, _require, partial(self._opening_posted, dest, tenant)
+                )
+                is not None
+            ):
                 # B-13: the deferral journal is in the opening TB (proven on the snapshot), absent from v2.
                 _require(not destination_rows, "cutoff_deferral_journal_present_in_destination")
                 _require(not posted, "cutoff_deferral_ledger_present_in_destination")

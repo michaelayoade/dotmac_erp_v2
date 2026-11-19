@@ -6,7 +6,8 @@ trial balance, NOT in v2. The verifiers therefore substitute the evidence for it
 * PROVEN on the snapshot with the same predicate the importer used (``COALESCE(posting_date, entry_date) <= cutoff``)
   and the receipt's cutoff (bound in the transform manifest binding): the journal is dated on or before it AND it has
   posted ledger lines, every one dated on or before it (so it is in the opening TB);
-* ASSERTED ABSENT in v2: no journal, journal line or posted ledger line for it exists in the destination.
+* ASSERTED ABSENT in v2: no journal, journal line or posted ledger line for it exists in the destination;
+* the B-9 opening that carries it is POSTED in v2 with ``posting_date`` equal to the cutoff (one read, every path).
 
 A journal dated after the cutoff takes the ordinary path (and a journal whose ledger lines are on the other side of
 the cutoff than the journal itself is refused). An undated journal is refused: it is neither provably closed nor
@@ -31,7 +32,11 @@ def _as_date(value: object) -> date | None:
 
 
 def journal_proof(
-    journal: dict[str, Any], ledger: list[dict[str, Any]], cutoff: date | None, require: Any
+    journal: dict[str, Any],
+    ledger: list[dict[str, Any]],
+    cutoff: date | None,
+    require: Any,
+    opening_posted: Any = None,
 ) -> dict[str, Any] | None:
     """The cutoff evidence for this journal, or None when it is not cutoff-excluded (ordinary path).
 
@@ -47,6 +52,9 @@ def journal_proof(
         require(all(d > cutoff for d in ledger_days), "journal_straddles_history_cutoff")
         return None
     require(bool(ledger) and all(d <= cutoff for d in ledger_days), "journal_straddles_history_cutoff")
+    # "Absent from v2" is only evidence of "closed" if the opening that holds it is actually posted, as of the cutoff:
+    # otherwise a journal missing for another reason (a refused row, a run with another cutoff) would be accepted.
+    require(opening_posted is not None and opening_posted(), "cutoff_opening_not_posted")
     debit = sum((Decimal(r["debit_amount"]) for r in ledger), Decimal(0))
     credit = sum((Decimal(r["credit_amount"]) for r in ledger), Decimal(0))
     return {
