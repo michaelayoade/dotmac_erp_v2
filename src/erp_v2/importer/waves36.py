@@ -667,14 +667,14 @@ WAVE4_PAIRINGS: Final[tuple[Pairing, ...]] = (
         "mod_customers.customer_accounts",
         "public.customer",
         renames={"account_number": "customer_code", "display_name": "legal_name"},
-        sub_origin=SubOriginPolicy.EXCLUDE,  # pending Michael's M11 ruling on Sub customers
+        sub_origin=SubOriginPolicy.INCLUDE,  # as-is ruling: the AR opening reuses these accounts
         note="status from is_active/credit_hold at rehearsal; credit/tax/banking detail lands in customer_profiles",
     ),
     Pairing(
         "mod_customers.customer_profiles",
         "public.customer",
         renames={"account_id": "customer_id"},
-        sub_origin=SubOriginPolicy.EXCLUDE,  # pending Michael's M11 ruling on Sub customers
+        sub_origin=SubOriginPolicy.INCLUDE,  # as-is ruling: the AR opening reuses these accounts
         note="second spec from the same legacy row (profile columns split); "
         "account_id is the preserved customer UUID (customer_accounts.id)",
     ),
