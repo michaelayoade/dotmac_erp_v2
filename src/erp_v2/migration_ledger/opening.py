@@ -77,7 +77,8 @@ class OpeningInputs:
     subledger_sha256: str
     ias8: tuple[Ias8Item, ...]
     ias8_sha256: str
-    recomputed_tb_sha256: str | None = None  # canonical sha of the TB generated from the legacy snapshot
+    recomputed_tb_sha256: str  # canonical sha of the TB generated from the legacy snapshot (mandatory binding)
+    import_receipt_sha256: str  # sha of the importer execute receipt whose history cutoff equals ``as_of`` (B-13)
 
 
 # --- parsing ---------------------------------------------------------------------------------------------------
@@ -164,6 +165,28 @@ def require_declared_tb_matches(declared: dict[str, Decimal], generated: dict[st
         refuse("opening_tb_differs_from_legacy", "regenerate the TB with gen-tb; never declare one that differs")
 
 
+def parse_import_receipt(raw: object) -> date:
+    """The history cutoff of the B-13 importer EXECUTE receipt (applied and complete). ``history_cutoff`` is read as an
+    ISO date string or as the receipt section ``{"history_cutoff": "<date>", ...}`` (the shape #74 emits today)."""
+    if not isinstance(raw, dict) or raw.get("kind") != "execute" or raw.get("dry_run") is not False:
+        refuse("invalid_import_receipt", "an applied importer execute receipt is required")
+    if raw.get("complete") is not True:
+        refuse("import_receipt_incomplete")
+    cutoff = raw.get("history_cutoff")
+    if isinstance(cutoff, dict):
+        cutoff = cutoff.get("history_cutoff")
+    if not isinstance(cutoff, str):
+        refuse("import_receipt_history_cutoff_missing")
+    return day(cutoff, "import_receipt_history_cutoff_invalid")
+
+
+def require_as_of_matches_cutoff(as_of: date, cutoff: date) -> None:
+    """D must be the import's history cutoff: otherwise the opening and the imported ledger overlap or leave a gap, and
+    the bridge would only show it AFTER the irreversible opening post."""
+    if as_of != cutoff:
+        refuse("opening_as_of_differs_from_history_cutoff")
+
+
 def require_no_ias8_before_flip(inputs: OpeningInputs) -> None:
     if inputs.ias8:
         refuse("ias8_not_allowed_before_flip", "IAS 8 corrections are a post-flip Finance tool (profile as_is_v1)")
@@ -225,6 +248,7 @@ def plan_sha256(inputs: OpeningInputs, proof: dict[str, Any]) -> str:
             "subledger_sha256": inputs.subledger_sha256,
             "ias8_sha256": inputs.ias8_sha256,
             "recomputed_tb_sha256": inputs.recomputed_tb_sha256,
+            "import_receipt_sha256": inputs.import_receipt_sha256,
             "proof": proof,
         }
     )
@@ -440,6 +464,10 @@ def _record(
         )
     )
     db.flush()
+
+
+# P-7 (pending, before B-14): the opening posts functional currency only, so foreign-currency control positions at D are
+# not in the opening journal; the per-currency ties (``control_ties_per_currency``) and the B-14 holding depend on it.
 
 
 def apply_opening(db: Session, tenant: UUID, inputs: OpeningInputs, apply: ApplyInputs) -> dict[str, Any]:

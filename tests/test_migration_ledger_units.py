@@ -45,7 +45,7 @@ SUBLEDGER = {"2000": D("-400.00"), "2040": D("-100.00"), "1410": D("50.00"), "14
 
 def inputs(tb_rows=GOOD_TB, sub=SUBLEDGER, ias8=()):
     as_of, tb = opening.parse_tb(tb_file(tb_rows), SHA)
-    return opening.OpeningInputs(as_of, tb, SHA, dict(sub), SHA, tuple(ias8), SHA)
+    return opening.OpeningInputs(as_of, tb, SHA, dict(sub), SHA, tuple(ias8), SHA, SHA, SHA)
 
 
 def ias8_item(item_id, code, amount):
@@ -102,6 +102,25 @@ def test_the_tb_is_generated_from_the_legacy_opening_period_and_a_differing_decl
     )
     assert refusal(opening.require_declared_tb_matches, {"1000": D("100.00")}, tb) == "opening_tb_differs_from_legacy"
     assert opening.tb_canonical_sha(tb) == opening.tb_canonical_sha({**tb, "9999": D("0")})
+
+
+def test_the_import_receipt_cutoff_is_read_both_shapes_and_must_equal_the_opening_date():
+    ok = {"kind": "execute", "dry_run": False, "complete": True}
+    d = date(2025, 12, 31)
+    assert opening.parse_import_receipt({**ok, "history_cutoff": "2025-12-31"}) == d
+    assert opening.parse_import_receipt({**ok, "history_cutoff": {"history_cutoff": "2025-12-31"}}) == d
+    for bad, code in (
+        ({**ok, "dry_run": True, "history_cutoff": "2025-12-31"}, "invalid_import_receipt"),
+        ({**ok, "complete": False, "history_cutoff": "2025-12-31"}, "import_receipt_incomplete"),
+        ({**ok}, "import_receipt_history_cutoff_missing"),
+        ({**ok, "history_cutoff": "2025-13-01"}, "import_receipt_history_cutoff_invalid"),
+        ([], "invalid_import_receipt"),
+    ):
+        assert refusal(opening.parse_import_receipt, bad) == code
+    opening.require_as_of_matches_cutoff(d, d)
+    assert refusal(opening.require_as_of_matches_cutoff, d, date(2025, 12, 30)) == (
+        "opening_as_of_differs_from_history_cutoff"
+    )
 
 
 def test_ias8_is_empty_before_the_flip():

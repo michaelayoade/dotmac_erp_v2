@@ -27,7 +27,7 @@ and every gated control tie holds. The profile is a code constant; no setting ca
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -431,16 +431,50 @@ def counts(db: Session, tenant: UUID) -> dict[str, Any]:
     }
 
 
-# Section-4 gate checks that need owners not on main yet. A non-empty list REFUSES the gate
-# (``profile_checks_unbuilt``), so the gate can never pass with an unbuilt check.
-# Each owner PR removes its own entry when it wires its check.
-PROFILE_CHECKS_PENDING: Final = (
-    "completeness_per_module_currency",  # needs the per-module legacy = landed + held census (B-13/B-14/#72)
-    "holding_ties",  # B-14 (e2_0030 holdings)
-    "prepayment_tie_r1",  # billing a13 (R1)
-    "setup_keyed_accounts_and_periods",  # B-10-lite keyed accounts
-    "writer_role_m1",  # #72
-)
+def _post_flip_tools_unused(db: Session, tenant: UUID) -> list[str]:
+    """Rule 0.2: B-1 reviews (#67), B-2 void/post decisions (#69) and IAS 8 opening journals are post-flip Finance
+    tools. Any record of their use before the flip means a journal the legacy never posted is in the v2 ledger (it
+    would count as v2-native in the bridge), so the gate refuses."""
+    from erp_v2.held_drafts.models import OUTCOME_QUEUED, HeldDraftDecision
+    from erp_v2.legacy_ap.models import AdmissionReview
+
+    used = (
+        db.scalar(sa.select(sa.func.count()).select_from(AdmissionReview).where(AdmissionReview.tenant_id == tenant))
+        or db.scalar(
+            sa.select(sa.func.count())
+            .select_from(HeldDraftDecision)
+            .where(HeldDraftDecision.tenant_id == tenant, HeldDraftDecision.outcome != OUTCOME_QUEUED)
+        )
+        or db.scalar(
+            sa.select(sa.func.count())
+            .select_from(m.OpeningJournal)
+            .where(m.OpeningJournal.tenant_id == tenant, m.OpeningJournal.kind == m.KIND_IAS8)
+        )
+    )
+    return ["post_flip_tool_used_before_flip"] if used else []
+
+
+# The section-4 checks of profile ``as_is_v1`` (AS-IS-MIGRATION-REPLAN, sections 4.1-4.5): name -> ``check(db, tenant)``
+# returning its refusal reasons, or None while the owner that wires it is not on main. EVERY None refuses the gate
+# (``profile_checks_unbuilt``), so the gate can never pass with an unbuilt check. An owner PR replaces its None with the
+# function; deleting a name fails the pinned test in tests/test_migration_ledger_pg.py (the set is pinned to the spec).
+# The exact ties of the signed bridge, the ledger comparison and the signature are checked inline in ``gate``.
+AS_IS_V1_CHECKS: Final[dict[str, Callable[[Session, UUID], list[str]] | None]] = {
+    "completeness_per_module_currency": None,  # 4.1: legacy = landed + held per module x currency (B-13/B-14/#72)
+    "control_ties_per_currency": None,  # 4.2: every control tie per currency (the inline ties net all currencies)
+    "prepayment_tie_r1": None,  # 4.2: prepayment == R1 available_credit + prepaid_funding (billing a13)
+    "holding_ties": None,  # 4.3: holding account == open register items; migration_holding posted once (B-14)
+    "setup_keyed_accounts": None,  # 4.5: every keyed account exists, active and postable (B-10-lite)
+    "setup_control_and_tax_codes_exist_once": None,  # 4.5
+    "setup_vat_deferral_pair": None,  # 4.5: the VAT codes have the deferral pair set
+    "setup_periods": None,  # 4.5: FY2025 holds the opening and is LOCKED; FY2026 and the cutover month OPEN
+    "setup_writer_role_m1": None,  # 4.5: the writer role passes the M1 checks (#72)
+    "post_flip_tools_unused": _post_flip_tools_unused,  # rule 0.2 (built)
+}
+
+
+def profile_checks_pending() -> list[str]:
+    return sorted(name for name, check in AS_IS_V1_CHECKS.items() if check is None)
 
 
 def gate(db: Session, tenant: UUID) -> dict[str, Any]:
@@ -456,8 +490,12 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
     version = sha = None
     reasons: list[str] = []
     reports: dict[str, Any] = {}
-    if PROFILE_CHECKS_PENDING:
+    pending = profile_checks_pending()
+    if pending:
         reasons.append("profile_checks_unbuilt")
+    for check in AS_IS_V1_CHECKS.values():
+        if check is not None:
+            reasons.extend(check(db, tenant))
     if row is None:
         reasons.append("no_bridge_version")
     else:
@@ -486,7 +524,7 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
         "passed": not reasons,
         "profile": ledger_check.GATE_PROFILE,
         "reasons": reasons,
-        "profile_checks_pending": list(PROFILE_CHECKS_PENDING),
+        "profile_checks_pending": pending,
         "reports": {
             "open_count": c["open"],
             "resolved_count": c["resolved"],

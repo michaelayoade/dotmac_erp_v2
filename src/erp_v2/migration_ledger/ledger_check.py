@@ -137,8 +137,8 @@ def _sub_1410(db: Session, tenant: UUID) -> Decimal:
 
 _SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410}
 # NOT in ``_SUBLEDGERS`` because no owner subledger exists in v2 yet, so the gate REFUSES with a named reason (never
-# skips): 1400 (ruling D-B9-1 pending), 2045 (expenses a2 not pinned), 2110 (the a6 WHT table is not pinned; GL(2110)
-# must then equal the WHT ledger plus named exceptions).
+# skips): 1400 (billing a13 R1 not pinned), 2045 (expenses a2 not pinned). 2110 is report-only (``report_state``).
+# These ties net ALL currencies together; the per-currency tie is the pending check ``control_ties_per_currency``.
 
 
 def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:

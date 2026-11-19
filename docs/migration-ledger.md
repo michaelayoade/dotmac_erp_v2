@@ -18,6 +18,9 @@ exclusively before any read, and carry shas, counts and tie-outs.
 
 ## Opening (`python -m erp_v2.migration_ledger.opening_cli gen-tb|plan|apply`; IAS 8 is a post-flip tool)
 
+* plan, apply and `gen-tb` take `--import-receipt` (the applied, complete B-13 importer execute receipt): its
+  `history_cutoff` must equal the opening date (`opening_as_of_differs_from_history_cutoff`, refused before any database
+  access) and its sha is in the plan sha. Until #74 lands, tests use a fixture in its shape.
 * `gen-tb` WRITES the opening TB recomputed from the legacy snapshot (`legacy_ledger.recompute`, P&L rolled into 3100).
   plan/apply REFUSE a declared TB that differs from it (`opening_tb_differs_from_legacy`); the recomputed TB's canonical
   sha is part of the plan sha.
@@ -93,8 +96,13 @@ REPORTS (never gate reasons, in the `reports` block of the gate output): open wo
 (`classes_missing`; `classes.CLASSES` is the E01-E34 inventory plus E35, E36a, E36b, E37, E38), the 2030 balance
 (`REPORT_ZERO_CODES`) and the 2110 balance (`REPORT_WHT_CODES`). `profile_checks_pending` lists section-4 checks that
 need owners not on main (per-module completeness, holding ties, prepayment tie against R1, keyed-account/period setup,
-writer role): a non-empty list REFUSES the gate (`profile_checks_unbuilt`); each owner PR removes its own entry when
-it wires its check. The lists are code constants in `ledger_roles`
+writer role): every check is an entry of `register.AS_IS_V1_CHECKS` (name -> function, or None while unbuilt; the name set is
+pinned to spec section 4 by a test). Each None REFUSES the gate (`profile_checks_unbuilt`); an owner PR replaces its None
+with the check. The pending list is: per-module completeness, `control_ties_per_currency` (the inline ties net all
+currencies), prepayment tie, holding ties, keyed accounts, control/tax codes exist once, VAT deferral pair, periods,
+writer role. Built: `post_flip_tools_unused` (the gate refuses `post_flip_tool_used_before_flip` if any B-1 review, any
+non-queued B-2 decision or any IAS 8 opening journal exists). Pending probe P-7: the opening posts functional currency
+only, so foreign-currency control positions at D need confirming before B-14. The lists are code constants in `ledger_roles`
 and recorded in each bridge body; the ledger and register state at signature is stored with the signature.
 `sign` takes `approval_reference` = `dotmac-debt-register v<N>` (format-checked only).
 

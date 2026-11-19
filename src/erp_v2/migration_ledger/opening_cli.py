@@ -9,8 +9,12 @@
     ERP_MIGRATION_LEDGER_APPLY=1 python -m erp_v2.migration_ledger.opening_cli apply ... --plan-receipt P.json \
         --approved-plan-sha256 <plan_sha256 in P.json> --receipt A.json --operator-ref <who> --apply
 
-    python -m erp_v2.migration_ledger.opening_cli gen-tb --tenant-id <uuid> --as-of YYYY-MM-DD --receipt TB.json \
-        --operator-ref <who>
+    python -m erp_v2.migration_ledger.opening_cli gen-tb --tenant-id <uuid> --as-of YYYY-MM-DD \
+        --import-receipt IMPORT.json --receipt TB.json --operator-ref <who>
+
+``--import-receipt`` (plan, apply, gen-tb) is the applied, complete importer execute receipt (B-13): its
+``history_cutoff`` must equal the opening date (``opening_as_of_differs_from_history_cutoff``), and its sha is part of
+the plan sha.
 
 Flip-gate profile ``as_is_v1``: ``gen-tb`` WRITES the opening TB recomputed from the legacy snapshot (0600, exclusive);
 plan/apply REFUSE a declared TB that differs from the recomputed one, refuse a TB that does not sum to zero, and refuse
@@ -37,6 +41,7 @@ from erp_v2.migration_ledger import legacy_subledger, opening
 from erp_v2.migration_ledger.common import (
     ZERO,
     canonical_sha,
+    day,
     fmt,
     keys_exactly,
     refuse,
@@ -113,12 +118,14 @@ def _recompute_tb(eng, legacy_eng, tenant, as_of) -> dict[str, Any]:
 
 
 def _gen_tb(args) -> dict[str, Any]:
-    from datetime import date
-
-    if not args.tenant_id or not args.as_of:
+    if not args.tenant_id or not args.as_of or not args.import_receipt:
         refuse("gen_tb_args_required")
     tenant = uuid_text(args.tenant_id, "invalid_tenant_id")
-    as_of = date.fromisoformat(args.as_of)
+    as_of = day(args.as_of, "invalid_as_of")
+    receipt_data, _sha = cli.read_bound(args.import_receipt)
+    opening.require_as_of_matches_cutoff(
+        as_of, opening.parse_import_receipt(strict_json(receipt_data, "invalid_import_receipt"))
+    )
     eng = cli.engine()
     legacy_eng = cli.legacy_engine()
     cli.install_registries()
@@ -135,7 +142,7 @@ def _gen_tb(args) -> dict[str, Any]:
 def _run(args) -> dict[str, Any]:
     if args.mode == "gen-tb":
         return _gen_tb(args)
-    if not (args.spec and args.tb and args.ias8):
+    if not (args.spec and args.tb and args.ias8 and args.import_receipt):
         refuse("plan_inputs_required")
     applying = args.mode == "apply"
     operator = cli.operator(args.operator_ref)
@@ -150,6 +157,10 @@ def _run(args) -> dict[str, Any]:
     if sum(given["tb"].values(), ZERO) != 0:
         out["refusal"] = "opening_tb_not_zero_sum"  # refused before any database access
         return out
+    receipt_data, import_sha = cli.read_bound(args.import_receipt)
+    opening.require_as_of_matches_cutoff(
+        given["as_of"], opening.parse_import_receipt(strict_json(receipt_data, "invalid_import_receipt"))
+    )  # refused before any database access, i.e. before the irreversible opening post
     eng = cli.engine()  # the DSNs leave the environment BEFORE the assembly is imported
     legacy_eng = cli.legacy_engine()
     cli.install_registries()
@@ -162,7 +173,7 @@ def _run(args) -> dict[str, Any]:
         inputs = opening.OpeningInputs(
             given["as_of"], given["tb"], given["tb_sha"], sub,
             canonical_sha({k: fmt(v) for k, v in sorted(sub.items())}), given["ias8"], given["ias8_sha"],
-            opening.tb_canonical_sha(generated),
+            opening.tb_canonical_sha(generated), import_sha,
         )  # fmt: skip
         opening.require_no_ias8_before_flip(inputs)
         proof = opening.opening_proof(inputs)
@@ -225,8 +236,8 @@ def _run(args) -> dict[str, Any]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m erp_v2.migration_ledger.opening_cli")
     parser.add_argument("mode", choices=("plan", "apply", "gen-tb"))
-    for name in ("spec", "tb", "ias8"):
-        parser.add_argument(f"--{name}", type=Path)
+    for name in ("spec", "tb", "ias8", "import_receipt"):
+        parser.add_argument(f"--{name.replace('_', '-')}", type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--tenant-id")
     parser.add_argument("--as-of")

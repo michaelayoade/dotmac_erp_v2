@@ -123,7 +123,7 @@ def opening_inputs(*, two_thousand_sub="-399.00", ias8=True):
     as_of, parsed = opening.parse_tb(tb, SHA)
     sub = {"2000": Decimal(two_thousand_sub), "2040": Decimal("-100"), "1410": Decimal("50"), "1400": Decimal("300")}
     items = (opening.Ias8Item("IAS8-001", "2000", Decimal("1.00"), SHA, "AP overstated at 2025 close"),) if ias8 else ()
-    return opening.OpeningInputs(as_of, parsed, "c" * 64, sub, "d" * 64, items, "e" * 64)
+    return opening.OpeningInputs(as_of, parsed, "c" * 64, sub, "d" * 64, items, "e" * 64, "a" * 64, "b" * 64)
 
 
 def apply_inputs(env, *, dual=False):
@@ -219,6 +219,8 @@ def test_the_opening_refuses_unproven_inputs_before_any_write(engine):
         "d" * 64,
         unbalanced.ias8,
         "e" * 64,
+        "a" * 64,
+        "b" * 64,
     )
     with Session(engine) as db:
         with pytest.raises(LedgerRefused) as caught:
@@ -231,7 +233,15 @@ def test_a_second_trial_balance_is_refused_once_an_opening_exists(engine):
     post_opening(engine, env)
     other = opening_inputs()
     other = opening.OpeningInputs(
-        other.as_of, other.tb, "9" * 64, other.subledger, other.subledger_sha256, other.ias8, other.ias8_sha256
+        other.as_of,
+        other.tb,
+        "9" * 64,
+        other.subledger,
+        other.subledger_sha256,
+        other.ias8,
+        other.ias8_sha256,
+        other.recomputed_tb_sha256,
+        other.import_receipt_sha256,
     )
     with Session(engine) as db:
         with pytest.raises(LedgerRefused) as caught:
@@ -535,14 +545,16 @@ def gate(engine, env):
 
 @pytest.fixture
 def owners_available(monkeypatch):
-    """The owner subledgers not built in v2 yet (1400, 2045, 2110) stand in as zero; the gate REFUSES without them."""
+    """The owner subledgers not built in v2 yet (1400, 2045) stand in as zero; the gate REFUSES without them."""
     from erp_v2.migration_ledger import ledger_check
 
     zero = lambda db, tenant: Decimal(0)  # noqa: E731
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "1400", zero)
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "2045", zero)
-    monkeypatch.setitem(ledger_check._SUBLEDGERS, "2110", zero)
-    monkeypatch.setattr(register, "PROFILE_CHECKS_PENDING", ())  # tests of the other reasons; see the unbuilt test
+    # tests of the other reasons: the unbuilt checks (None) become no-ops; the built ones stay (see the unbuilt tests)
+    monkeypatch.setattr(
+        register, "AS_IS_V1_CHECKS", {k: v or (lambda db, tenant: []) for k, v in register.AS_IS_V1_CHECKS.items()}
+    )
 
 
 def cover_all(engine, env, *, except_classes=()):
@@ -688,33 +700,64 @@ def test_manual_add_takes_only_a_class_from_the_closed_list_and_is_a_report_item
     assert g["passed"] and g["reasons"] == [] and g["reports"]["open_by_class"] == {"E26": 1}
 
 
-def test_the_gate_refuses_while_any_profile_check_is_unbuilt(engine, owners_available, monkeypatch):
+SPEC_SECTION_4_CHECKS = {
+    "completeness_per_module_currency",
+    "control_ties_per_currency",
+    "prepayment_tie_r1",
+    "holding_ties",
+    "setup_keyed_accounts",
+    "setup_control_and_tax_codes_exist_once",
+    "setup_vat_deferral_pair",
+    "setup_periods",
+    "setup_writer_role_m1",
+    "post_flip_tools_unused",
+}
+
+
+def test_the_profile_check_names_are_pinned_to_spec_section_4():
+    # removing a name (or adding one) is a visible change to this pinned set, never a silent tuple edit
+    assert set(register.AS_IS_V1_CHECKS) == SPEC_SECTION_4_CHECKS
+    assert callable(register.AS_IS_V1_CHECKS["post_flip_tools_unused"])
+    assert register.profile_checks_pending() == sorted(SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"})
+
+
+def test_the_gate_refuses_profile_checks_unbuilt_for_every_none(engine, owners_available, monkeypatch):
     env = world(engine)
     seed_clean(engine, env)
     cover_all(engine, env)
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     sign(engine, env, version, sha)
-    assert gate(engine, env)["passed"]
-    monkeypatch.setattr(register, "PROFILE_CHECKS_PENDING", ("holding_ties", "writer_role_m1"))
+    assert gate(engine, env)["passed"]  # the fixture wired every None to a no-op
+    checks = {**register.AS_IS_V1_CHECKS, "holding_ties": None, "setup_periods": None}
+    monkeypatch.setattr(register, "AS_IS_V1_CHECKS", checks)
     g = gate(engine, env)
     assert not g["passed"] and g["reasons"] == ["profile_checks_unbuilt"]
-    assert g["profile_checks_pending"] == ["holding_ties", "writer_role_m1"]
-    assert register.PROFILE_CHECKS_PENDING == ("holding_ties", "writer_role_m1")
+    assert g["profile_checks_pending"] == ["holding_ties", "setup_periods"]
     monkeypatch.undo()
-    assert register.PROFILE_CHECKS_PENDING  # the shipped list is non-empty: the real gate refuses today
+    # the shipped mapping refuses: every owner check is still None
+    assert register.profile_checks_pending() and all(
+        register.AS_IS_V1_CHECKS[k] is None for k in SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"}
+    )
 
 
-def test_the_bridge_body_records_the_gate_profile_and_the_gate_lists_unbuilt_profile_checks(engine, owners_available):
+def test_the_gate_refuses_when_a_post_flip_tool_was_used_before_the_flip(engine, owners_available):
+    env = world(engine)
+    with Session(engine) as db:
+        assert register._post_flip_tools_unused(db, env.tenant_id) == []
+    post_opening(engine, env)  # the opening input carries an IAS 8 item: a post-flip tool used before the flip
+    with Session(engine) as db:
+        assert register._post_flip_tools_unused(db, env.tenant_id) == ["post_flip_tool_used_before_flip"]
+    assert "post_flip_tool_used_before_flip" in gate(engine, env)["reasons"]
+
+
+def test_the_bridge_body_records_the_gate_profile(engine, owners_available):
     env = world(engine)
     seed_clean(engine, env)
     cover_all(engine, env)
-    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     with Session(engine) as db:
         body = bridge.verified_body(bridge.latest(db, env.tenant_id))
     assert body["gate_profile"] == "as_is_v1"  # recorded in the bridge body: Michael's signature covers it
-    sign(engine, env, version, sha)
-    g = gate(engine, env)
-    assert g["passed"] and g["profile_checks_pending"] == []  # (the fixture empties the shipped list)
 
 
 def test_the_gate_refuses_when_the_ledger_moved_since_signature(engine, owners_available):
@@ -1263,6 +1306,16 @@ def seed_cli_legacy(engine, env):
     )
 
 
+def import_receipt_file(tmp_path, cutoff="2025-12-31", **over):
+    """A FIXTURE importer execute receipt in the shape #74 (B-13, history cutoff) emits: ``history_cutoff`` section
+    with the ISO date. Replace by a real receipt once #74 lands."""
+    body = {"kind": "execute", "dry_run": False, "complete": True, "history_cutoff": {"history_cutoff": cutoff}}
+    body.update(over)
+    path = tmp_path / "import-receipt.json"
+    write(path, body)
+    return path
+
+
 def cli_files(tmp_path, env, ias_items):
     tb_path, tb_sha = tb_file_for(tmp_path)
     ias_path = tmp_path / "ia.json"
@@ -1271,7 +1324,8 @@ def cli_files(tmp_path, env, ias_items):
     write(spec, {"version": 1, "tenant_id": str(env.tenant_id), "tb_sha256": tb_sha, "ias8_sha256": ias_sha,
                  "evidence_ref": "FIN-OPENING-1", "requester_party_id": str(env.parties["requester"]),
                  "approver_party_id": str(env.parties["approver"])})  # fmt: skip
-    return ["--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path)]
+    return ["--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path),
+            "--import-receipt", str(import_receipt_file(tmp_path))]  # fmt: skip
 
 
 def item_row(item_id, code, amount):
@@ -1364,6 +1418,7 @@ def test_opening_cli_refuses_ias8_items_and_a_declared_tb_that_differs_from_the_
     monkeypatch.setenv("LEGACY_DATABASE_URL", url)
     receipt2 = other / "r.json"
     code = opening_main(["plan", "--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path),
+                         "--import-receipt", str(import_receipt_file(other)),
                          "--receipt", str(receipt2), "--operator-ref", "operator-a"])  # fmt: skip
     assert code == 2 and json.loads(receipt2.read_text())["refusal"] == "opening_tb_differs_from_legacy"
     assert count_journals(engine, env) == 0
@@ -1375,11 +1430,54 @@ def test_opening_cli_gen_tb_writes_the_recomputed_tb_in_the_parse_schema(engine,
     monkeypatch.setenv("MIGRATION_DATABASE_URL", engine.url.render_as_string(hide_password=False))
     monkeypatch.setenv("LEGACY_DATABASE_URL", engine.url.render_as_string(hide_password=False))
     out = tmp_path / "tb.json"
+    rcpt = str(import_receipt_file(tmp_path))
     assert opening_main(["gen-tb", "--tenant-id", str(env.tenant_id), "--as-of", "2025-12-31", "--receipt", str(out),
-                         "--operator-ref", "operator-a"]) == 0  # fmt: skip
+                         "--import-receipt", rcpt, "--operator-ref", "operator-a"]) == 0  # fmt: skip
     assert (os.stat(out).st_mode & 0o777) == 0o600
     as_of, tb = opening.parse_tb(json.loads(out.read_text()), "0" * 64)
     assert as_of == date(2025, 12, 31) and tb == {c: Decimal(n) for c, n in tb_rows().items()}
+
+
+def test_opening_requires_the_import_receipt_and_its_cutoff_equal_to_the_opening_date(
+    engine, monkeypatch, tmp_path, legacy_schema
+):
+    env = world(engine)
+    seed_cli_legacy(engine, env)
+    url = engine.url.render_as_string(hide_password=False)
+
+    def plan(directory, receipt_over=None, cutoff="2025-12-31"):
+        directory.mkdir()
+        base = cli_files(directory, env, [])
+        if receipt_over is not None or cutoff != "2025-12-31":
+            import_receipt_file(directory, cutoff, **(receipt_over or {}))  # overwrites the default fixture
+        monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
+        monkeypatch.setenv("LEGACY_DATABASE_URL", url)
+        out = directory / "r.json"
+        code = opening_main(["plan", *base, "--receipt", str(out), "--operator-ref", "operator-a"])
+        return code, json.loads(out.read_text())
+
+    code, ok = plan(tmp_path / "ok")
+    assert code == 0 and ok["ready"]
+    code, out = plan(tmp_path / "differs", cutoff="2025-12-30")
+    assert code == 2 and out["refusal"] == "opening_as_of_differs_from_history_cutoff"
+    for name, over, refusal in (
+        ("dry", {"dry_run": True}, "invalid_import_receipt"),
+        ("kind", {"kind": "plan"}, "invalid_import_receipt"),
+        ("incomplete", {"complete": False}, "import_receipt_incomplete"),
+        ("nocutoff", {"history_cutoff": None}, "import_receipt_history_cutoff_missing"),
+    ):
+        code, out = plan(tmp_path / name, receipt_over=over)
+        assert code == 2 and out["refusal"] == refusal, name
+    # the plan sha binds the receipt sha: another (equally valid) receipt gives another plan sha
+    d = tmp_path / "other"
+    code, again = plan(d, receipt_over={"extra": "x"})
+    assert code == 0 and again["plan_sha256"] != ok["plan_sha256"]
+    # a bad --as-of is a named refusal, not a traceback
+    out = tmp_path / "tb.json"
+    code = opening_main(["gen-tb", "--tenant-id", str(env.tenant_id), "--as-of", "2025-13-45", "--receipt", str(out),
+                         "--import-receipt", str(import_receipt_file(tmp_path)), "--operator-ref", "o"])  # fmt: skip
+    assert code == 2 and json.loads(out.read_text())["refusal"] == "invalid_as_of"
+    assert count_journals(engine, env) == 0
 
 
 def test_opening_cli_refuses_an_untied_tb_before_touching_the_database(engine, monkeypatch, tmp_path):
@@ -1399,6 +1497,7 @@ def test_opening_cli_refuses_an_untied_tb_before_touching_the_database(engine, m
     monkeypatch.delenv("LEGACY_DATABASE_URL", raising=False)
     receipt = tmp_path / "r.json"
     code = opening_main(["plan", "--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path),
+                         "--import-receipt", str(import_receipt_file(tmp_path)),
                          "--receipt", str(receipt), "--operator-ref", "operator-a"])  # fmt: skip
     out = json.loads(receipt.read_text())
     assert code == 3 and out["refusal"] == "opening_tb_not_zero_sum" and not out["ready"]
