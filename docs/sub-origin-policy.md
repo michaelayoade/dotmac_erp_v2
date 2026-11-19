@@ -30,3 +30,11 @@ Billing go through `billing_opening` (the COMMAND-IMPORT pairing).
 The receipt also reports `sub_origin.customers_referenced_by_native`:
 sorted keys of Sub-tagged customers referenced by ERP-native invoices or
 payments. These customers are not imported (M11).
+
+## AR opening: F1 reversed for Billing (v1677, rev 2)
+
+For the Billing opening (`importer/billing_opening.py`, `ar_census.py`, `ar_opening_cli.py`) the Sub-origin
+exclusion and the Splynx-era block are REVERSED: ERP and Sub are independent, every open 1400 item (native,
+Sub-origin, Splynx) is admitted, and origin is provenance in the evidence digest, never an identity or a rule.
+The `customer_payment` and `customer_accounts` / `customer_profiles` rows above are the importer's other pairings
+and are unchanged here; the AR opening mints its own customers and billing accounts (`ar_opening_cli mint`).

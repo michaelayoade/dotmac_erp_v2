@@ -81,3 +81,12 @@ revocation and target readers remain unwired. The default preview still
 reports `verifier_unavailable` and `importable=False`; adoption alone
 does not qualify rehearsal or activate imports. The 2026-10-12 Billing
 freeze and no repair/backfill rule remain in force.
+
+## AR opening admission (rev 2): billing a12, one complete manifest
+
+Pin `dotmac-billing==0.1.0a12` (head `bi_0017_open_documents_index`). a12 binds ONE window to ONE complete
+`OpeningManifestV2`; every command carries the whole manifest and its `partition` (customer x currency) only
+selects. `ar_opening_cli` runs census -> mint -> plan -> apply (provision as app_admin, import every partition as
+the restricted NOLOGIN `erp_billing_opening_writer` created by `e2_0029`, seal). A partition with any
+non-carryable row is excluded whole (E35); there is no hold path; the opening posts no GL (`opening_gl_carried`
+is the ERP mapper's rule for V4/V5 facts, a separate flip dependency).

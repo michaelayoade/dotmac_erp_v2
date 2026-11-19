@@ -116,7 +116,11 @@ def two_partition_manifest():
             invoice("inv-3", total="40.00"),
             invoice("inv-closed", total="30.00"),
         ],
-        allocations=[alloc("pay-1", "inv-1", "400.00"), alloc("pay-closed", "inv-closed", "30.00"), alloc("pay-2", "inv-3", "10.00")],
+        allocations=[
+            alloc("pay-1", "inv-1", "400.00"),
+            alloc("pay-closed", "inv-closed", "30.00"),
+            alloc("pay-2", "inv-3", "10.00"),
+        ],
         payments=[payment("pay-1", "450.00"), payment("pay-2", "10.00"), payment("pay-closed", "30.00")],
     )
     t2 = translate_partition(

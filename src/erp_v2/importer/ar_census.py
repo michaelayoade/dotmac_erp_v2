@@ -321,8 +321,12 @@ def build_census(
                     open_residual_minor=sum(
                         r for k, r in translation.residual_minor_by_invoice.items() if k not in closed_inv
                     ),
-                    invoice_keys=tuple(sorted(str(i["invoice_id"]) for i in invs if str(i["invoice_id"]) not in closed_inv)),
-                    payment_keys=tuple(sorted(str(p["payment_id"]) for p in pays if str(p["payment_id"]) not in ignored)),
+                    invoice_keys=tuple(
+                        sorted(str(i["invoice_id"]) for i in invs if str(i["invoice_id"]) not in closed_inv)
+                    ),
+                    payment_keys=tuple(
+                        sorted(str(p["payment_id"]) for p in pays if str(p["payment_id"]) not in ignored)
+                    ),
                 )
             )
         for inv in invs:
@@ -346,12 +350,25 @@ def build_census(
                 row = CensusRow("payment", key, CLOSED, "fully_allocated_to_history", origin, part, gross, 0)
             elif translation.carryable:
                 row = CensusRow(
-                    "payment", key, CARRY_LOT, "translated", origin, part, gross, translation.payment_residual_minor.get(key)
+                    "payment",
+                    key,
+                    CARRY_LOT,
+                    "translated",
+                    origin,
+                    part,
+                    gross,
+                    translation.payment_residual_minor.get(key),
                 )
             else:
                 reasons = sorted(set(by_key.get(key, [])) or {"partition_excluded"})
                 row = CensusRow(
-                    "payment", key, EXCLUDED_PARTITION, ",".join(reasons), origin, part, gross,
+                    "payment",
+                    key,
+                    EXCLUDED_PARTITION,
+                    ",".join(reasons),
+                    origin,
+                    part,
+                    gross,
                     translation.payment_residual_minor.get(key),
                 )
             put(row)
@@ -365,8 +382,16 @@ def build_census(
                 "snapshot_sha256": snapshot_sha256,
                 "cutoff": cutoff.isoformat(),
                 "rows": [
-                    [r.kind, r.key, r.bucket, r.reason, r.origin, list(r.partition) if r.partition else None,
-                     r.gross_minor, r.residual_minor]
+                    [
+                        r.kind,
+                        r.key,
+                        r.bucket,
+                        r.reason,
+                        r.origin,
+                        list(r.partition) if r.partition else None,
+                        r.gross_minor,
+                        r.residual_minor,
+                    ]
                     for r in rows
                 ],
                 "excluded": [[list(e.partition), [list(b) for b in e.blockers]] for e in excluded_t],
@@ -455,14 +480,14 @@ def load_legacy_rows(source, cutoff: datetime) -> dict[str, list[dict[str, objec
     payments = [dict(r) for r in source.execute(sa.text(PAYMENT_SQL), params).mappings()]
     posted_payments = {str(p["payment_id"]) for p in payments if p["posted"]}
     allocations = [
-        dict(r) for r in source.execute(sa.text(ALLOCATION_SQL), params).mappings() if str(r["payment_id"]) in posted_payments
+        dict(r)
+        for r in source.execute(sa.text(ALLOCATION_SQL), params).mappings()
+        if str(r["payment_id"]) in posted_payments
     ]
     return {"invoices": invoices, "payments": payments, "allocations": allocations}
 
 
 __all__ = [
-    "normalise_rows",
-    "partition_rows",
     "BUCKETS",
     "CARRY_ITEM",
     "CARRY_LOT",
@@ -475,5 +500,7 @@ __all__ = [
     "ExcludedPartition",
     "build_census",
     "load_legacy_rows",
+    "normalise_rows",
+    "partition_rows",
     "prove_partition",
 ]

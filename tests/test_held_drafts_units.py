@@ -487,8 +487,12 @@ def test_migration_revision_and_chain():
 
     assert migration.revision == "e2_0027_held_draft_decisions"
     assert migration.down_revision == "e2_0026_admission_reviews"
-    assert "e2_0027_held_draft_decisions" in EXPECTED_HEADS
-    assert "e2_0026_admission_reviews" not in EXPECTED_HEADS  # the chain is linear: one e2 head
+    from erp_v2.migrations.versions import e2_0029_ar_opening_admissions as successor
+
+    assert successor.down_revision == "e2_0027_held_draft_decisions"  # AR opening chains after this one
+    assert "e2_0029_ar_opening_admissions" in EXPECTED_HEADS
+    assert "e2_0027_held_draft_decisions" not in EXPECTED_HEADS  # the chain is linear: one e2 head
+    assert "e2_0026_admission_reviews" not in EXPECTED_HEADS
 
 
 def test_no_estate_address_literals_in_the_package():

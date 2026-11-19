@@ -172,7 +172,7 @@ class ArAssembly:
 class RefusingHoldApprovals:
     """Holds are never used (rev 2 section 9, R4): the approval port ALWAYS refuses."""
 
-    def hold_approval(self, db, *, scope, request_id, subject_type, subject_id, content_digest):  # noqa: ANN001, ARG002
+    def hold_approval(self, db, *, scope, request_id, subject_type, subject_id, content_digest):
         return None
 
 
@@ -258,7 +258,7 @@ class ErpImportVerifier:
             migration_authority_proof_ref=_ref("debt-register", self.migration_authority_ref),
         )
 
-    def verify_import_reversal_v2(self, request):  # noqa: ANN001, ARG002
+    def verify_import_reversal_v2(self, request):
         return None  # an opening import is never reversed through this assembly
 
 

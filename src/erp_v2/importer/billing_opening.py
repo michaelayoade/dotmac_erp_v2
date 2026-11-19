@@ -350,7 +350,8 @@ def translate_partition(
                 )
             )
         customer = customer_snapshot_cache[str(invoice["customer_key"])]
-        assert customer is not None
+        if customer is None:  # cannot happen: a missing snapshot blocked the partition above
+            raise OpeningTranslationError(f"invoice {key}: customer snapshot vanished")
         subtotal = Decimal(str(invoice.get("subtotal", grand)))
         tax_total = Decimal(str(invoice.get("tax_amount", 0)))
         original = OpeningOriginalDocumentV1(
@@ -490,9 +491,7 @@ def translate_partition(
     # Rebuild (documents - payments), receivable-positive: item totals less what was discharged by payments,
     # less the unallocated cash held as lots (net of credit), as the E4 equation expects.
     item_totals = sum(totals[k] for k in item_ids)
-    discharged_to_items = sum(
-        d.amount_minor for item in items for d in item.historical_discharges
-    )
+    discharged_to_items = sum(d.amount_minor for item in items for d in item.historical_discharges)
     result.rebuild_minor = item_totals - discharged_to_items - lots_residual
     result.stored_balance_minor = stored_total
     result.items = tuple(items)
@@ -584,9 +583,7 @@ def build_complete_manifest(
         capture=capture,
         population=population,
         dispositions=tuple(dispositions),
-        counts=OpeningPopulationCountsV1(
-            population=len(population), eligible=len(population), excluded=0, blocking=0
-        ),
+        counts=OpeningPopulationCountsV1(population=len(population), eligible=len(population), excluded=0, blocking=0),
         controls=tuple(controls),
         cash_lots=tuple(cash_lots),
         receivables=tuple(receivables),

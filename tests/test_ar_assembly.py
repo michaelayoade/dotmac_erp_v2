@@ -62,7 +62,12 @@ def _request(asm, partition, *, command=None):
 def test_authority_satisfies_billings_port_and_holds_always_refuse() -> None:
     authority = _authority()
     assert isinstance(authority, OpeningLaneAssemblyAuthorityV1)
-    assert authority.hold_approvals().hold_approval(None, scope=None, request_id=uuid4(), subject_type="x", subject_id="y", content_digest="z") is None
+    assert (
+        authority.hold_approvals().hold_approval(
+            None, scope=None, request_id=uuid4(), subject_type="x", subject_id="y", content_digest="z"
+        )
+        is None
+    )
 
 
 def test_genuine_command_passes_and_proof_refs_are_the_shas() -> None:
@@ -118,7 +123,9 @@ def test_swapped_partition_and_foreign_target_are_refused() -> None:
     command = _request(asm, first).command
     swapped = replace(command, partition=second)
     assert (
-        _authority(asm).import_verifier().verify_import_v2(
+        _authority(asm)
+        .import_verifier()
+        .verify_import_v2(
             OpeningImportVerificationRequestV2(
                 swapped, opening_account_command_digest_v2(swapped), opening_manifest_fingerprint_v2(swapped.manifest)
             )
@@ -128,7 +135,9 @@ def test_swapped_partition_and_foreign_target_are_refused() -> None:
     stranger = replace(first, account_id=uuid4())
     foreign = replace(command, partition=stranger, target=replace(command.target, account_id=stranger.account_id))
     assert (
-        _authority(asm).import_verifier().verify_import_v2(
+        _authority(asm)
+        .import_verifier()
+        .verify_import_v2(
             OpeningImportVerificationRequestV2(
                 foreign, opening_account_command_digest_v2(foreign), opening_manifest_fingerprint_v2(foreign.manifest)
             )
@@ -146,7 +155,9 @@ def test_a_different_manifest_a_wrong_authority_ref_and_a_stale_digest_are_refus
     other_partition = next(p for p in other.partitions() if p.source_account_key == partition.source_account_key)
     assert verifier.verify_import_v2(_request(other, other_partition)) is None
     # a command bound to some other migration authority
-    command = asm.command(partition, target=_target(partition), migration_authority_ref="dotmac-debt-register v2", occurred_at=NOW)
+    command = asm.command(
+        partition, target=_target(partition), migration_authority_ref="dotmac-debt-register v2", occurred_at=NOW
+    )
     assert verifier.verify_import_v2(_request(asm, partition, command=command)) is None
     # a digest that does not match the command
     request = _request(asm, partition)
@@ -172,7 +183,10 @@ def test_new_snapshot_row_the_census_does_not_know_is_refused() -> None:
     asm = assembly()
     grown = replace(
         asm,
-        invoices=[*asm.invoices, {**invoice("late-add", total="9.00", posted=True), "invoice_date": datetime(2025, 5, 1, tzinfo=UTC)}],
+        invoices=[
+            *asm.invoices,
+            {**invoice("late-add", total="9.00", posted=True), "invoice_date": datetime(2025, 5, 1, tzinfo=UTC)},
+        ],
         _cache={},
     )
     with pytest.raises(OpeningTranslationError, match="ERP != census"):
@@ -200,7 +214,9 @@ def test_provision_verifier_passes_and_refuses_a_wrong_principal_oid_name_or_man
     verifier = _authority(asm, oid=4242).provision_verifier()
 
     def verify(window):
-        return verifier.verify_provision(OpeningWindowProvisionVerificationRequestV1(ProvisionOpeningWindowV1(window), "d" * 64))
+        return verifier.verify_provision(
+            OpeningWindowProvisionVerificationRequestV1(ProvisionOpeningWindowV1(window), "d" * 64)
+        )
 
     ok = verify(_window(asm))
     assert ok is not None and ok.complete_population_proof_ref == f"census-sha256:{asm.census.sha256}"
@@ -241,8 +257,14 @@ def _seal(asm, *, accounts=None, held=(), watermark=FENCE, ref=REF):
 
 
 def _verify_seal(asm, command):
-    return _authority(asm).seal_verifier().verify_seal(
-        OpeningWindowSealVerificationRequestV1(command, "c" * 64, opening_admission_population_digest(command.admissions))
+    return (
+        _authority(asm)
+        .seal_verifier()
+        .verify_seal(
+            OpeningWindowSealVerificationRequestV1(
+                command, "c" * 64, opening_admission_population_digest(command.admissions)
+            )
+        )
     )
 
 

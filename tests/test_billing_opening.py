@@ -218,7 +218,10 @@ def test_measures_and_controls_are_consistent_with_the_items_and_lots() -> None:
 
 def test_manifest_refuses_a_blocked_partition_and_a_duplicate() -> None:
     blocked = translate_partition(
-        context=context("c"), invoices=[invoice("cn", total="-1.00", invoice_type="CREDIT_NOTE")], allocations=[], payments=[]
+        context=context("c"),
+        invoices=[invoice("cn", total="-1.00", invoice_type="CREDIT_NOTE")],
+        allocations=[],
+        payments=[],
     )
     with pytest.raises(OpeningTranslationError, match="only carryable"):
         build_complete_manifest(tenant_id=TENANT, capture=capture(), translations=(blocked,))

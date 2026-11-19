@@ -61,7 +61,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "cl_0001_collections",  # collections 0.1.0a1
     "cu_0001_customer_accounts",  # customers 0.1.0a1
     "do_0001_documents",  # documents 0.1.0a1
-    "e2_0027_held_draft_decisions",  # assembly e2 head, held draft decisions (after e2_0026 admission reviews on main)
+    "e2_0029_ar_opening_admissions",  # assembly e2 head: AR opening admissions + writer role (after e2_0027)
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1
     "ex_0001_expenses",  # expenses 0.1.0a1
     "fi_0002_selectable_planes",  # files 0.1.0a7
@@ -88,6 +88,7 @@ _ABSORBED_HEADS: tuple[str, ...] = (
     "0030_credential_tenant_key",
     "pe_0001_people_directory",
     "bk_0001_banking",  # e2_0013 depends on banking tables
+    "bi_0017_open_documents_index",  # e2_0029 depends on the billing opening tables (grants to the writer role)
 )
 EXPECTED_STAMPED_HEADS: tuple[str, ...] = tuple(h for h in EXPECTED_HEADS if h not in _ABSORBED_HEADS)
 
