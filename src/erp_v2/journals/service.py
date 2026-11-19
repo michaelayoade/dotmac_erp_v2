@@ -1280,7 +1280,11 @@ def soft_close_period(
     try:
         _actor(db, tenant_id, actor)
         with db.begin_nested():
-            _period(db, tenant_id, period_id)
+            row = _period(db, tenant_id, period_id)
+            from erp_v2.billing_gl.checks import facts_incomplete
+
+            if facts_incomplete(db, tenant_id, row.start_date, row.end_date):
+                raise JournalRefused("billing_facts_incomplete", "billing accounting facts are not fully mapped")
             pending = pending_manual_journals(db, tenant_id, period_id)
             if pending:
                 raise JournalRefused("pending_manual_journals", f"{pending} manual journal(s) are still unresolved")
@@ -1318,7 +1322,11 @@ def lock_period(db: Session, *, tenant_id: UUID, period_id: UUID, actor: UUID, n
     try:
         _actor(db, tenant_id, actor)
         with db.begin_nested():
-            _period(db, tenant_id, period_id)
+            row = _period(db, tenant_id, period_id)
+            from erp_v2.billing_gl.checks import facts_incomplete
+
+            if facts_incomplete(db, tenant_id, row.start_date, row.end_date):
+                raise JournalRefused("billing_facts_incomplete", "billing accounting facts are not fully mapped")
             period = accounting.lock_period(
                 db,
                 scope=_scope(tenant_id),

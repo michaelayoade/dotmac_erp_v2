@@ -86,6 +86,11 @@ POLICIES: Final = MappingProxyType(
         # is refused by the ERP workflow, so none are posted).
         ("payables", "supplier_payment"): RefPolicy(),
         ("payables", "supplier_payment_reversal"): RefPolicy(),
+        # B-15 live billing -> GL mapper: one journal per billing accounting fact (document_id = fact id, version =
+        # fact version, fingerprint = fact digest). Lines are system-built from the fact's lane effects: Dr/Cr the
+        # 1400 receivable, the prepayment liability (or the prepaid-funding account) and the settlement source's
+        # cash account, all Account UUIDs resolved from the tenant, never typed. W4/B15.6.
+        ("billing", "accounting_fact"): RefPolicy(),
         ("payroll", "payroll_run"): RefPolicy(frozenset({"2040"})),
         ("payroll", "payroll_liability_settlement"): RefPolicy(frozenset({"2040"})),
         # payroll a5: bank-returned salary. Dr the ORIGINAL bank cash GL (Account UUID) / Cr 2040.
