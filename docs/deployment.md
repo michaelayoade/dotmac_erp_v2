@@ -341,6 +341,12 @@ this does not authorize adjusting balances or switching traffic.
   head in this section moves to it. Before the first statutory remittance Finance proposes and approves one
   instruction per authority. No new permission, role profile bump or environment variable.
 
+- Reviewed admission (B-1; `docs/reviewed-admission.md`) adds the head `e2_0026_admission_reviews` (after
+  `e2_0023_staff_loan_entries` until the coordinator re-chains it behind e2_0024/e2_0025): one table
+  `erp_admission_reviews` (RLS forced, runtime SELECT only, append-only trigger). Written only by
+  `python -m erp_v2.legacy_ap.review_cli`. No new permission, role profile bump or environment variable
+  (apply uses the existing `ERP_IMPORT_APPROVED=1` and `ERP_IMPORT_APPLY_OK=1`).
+
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
 depends on `bk_0001_banking`; its stamped head is absorbed by that lineage.

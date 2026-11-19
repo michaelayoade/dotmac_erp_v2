@@ -48,6 +48,7 @@ from erp_v2.importer.payables_history import (
     SOURCE_JOURNAL_REFERENCE,
     SOURCE_LEDGER,
     HistoricalPayablesVerifier,
+    WaiverGate,
     _at_scale,
     _day,
     _equal,
@@ -106,6 +107,10 @@ def _one_sided(row: dict, suffix: str) -> bool:
     )
 
 
+def _two_places_waivable(gate: WaiverGate, value: Decimal) -> None:
+    gate.require(value.is_finite() and _at_scale(value, 2), "source_amount_scale", "source_amount_scale")
+
+
 def _two_places(value: object, reason: str) -> Decimal:
     _require(isinstance(value, Decimal) and value.is_finite() and _at_scale(value, 2), reason)
     return value
@@ -134,9 +139,11 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
         _require(command.evidence_fingerprint == evidence.fingerprint(), "command_fingerprint")
         return evidence
 
-    def _evidence(self, tenant: UUID, invoice_id: UUID, dest: sa.Connection) -> HistoricalSettledInvoiceEvidence:
+    def _evidence(
+        self, tenant: UUID, invoice_id: UUID, dest: sa.Connection, gate: WaiverGate
+    ) -> HistoricalSettledInvoiceEvidence:
         src = self.source
-        header, common = self._parts(tenant, invoice_id, dest, settled=True)
+        header, common = self._parts(tenant, invoice_id, dest, gate, settled=True)
         # Goods-receipt and purchase-order links are refused by the shared proof (destination and source
         # lines). Item and inventory links change the accounting too (inventory valuation) and settled
         # admission produces no consequence, so they are refused as in B1b.
@@ -192,7 +199,9 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
                 )
             )
         applied_total = _sum([item.applied_amount for item in settlements])
-        paid = _two_places(header["amount_paid"], "source_amount_scale")
+        _require(isinstance(header["amount_paid"], Decimal) and header["amount_paid"] > 0, "source_amount_scale")
+        _two_places_waivable(gate, header["amount_paid"])
+        paid = header["amount_paid"]
         total = common["total_amount"]
         _require(applied_total == paid, "allocation_sum_mismatch")
         _require(applied_total <= total, "allocation_exceeds_total")

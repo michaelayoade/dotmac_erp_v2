@@ -34,6 +34,9 @@ from erp_v2.importer.payables_history import (
     SOURCE_HEADER,
     SOURCE_INVOICE_LINE,
     HistoricalEvidenceError,
+    ReviewFacts,
+    WaiverGate,
+    _allocations_without_control_effect,
     _amount,
     _at_scale,
     _database,
@@ -50,6 +53,7 @@ from erp_v2.importer.payables_history import (
     _require,
     _tenant,
     invoice_tax,
+    load_review,
     require_line_tax_account,
 )
 from erp_v2.importer.payables_reconciliation import _reflect, _sum
@@ -60,6 +64,8 @@ SOURCE_OWNER = "legacy-erp"
 FACTS_DOMAIN = "erp.payables.recognition-facts.v1"
 NOT_POSTED_STATUS = "APPROVED"
 NOT_POSTED_POSTING_STATUS = "NOT_POSTED"
+# B1b honours a Finance waiver and the IAS 8 posting decision (D-M5); any other decision refuses the invoice.
+RECOGNITION_DECISIONS = frozenset({"admit_residual", "admit_with_waivers", "ias8_post"})
 
 
 def _hex_in(column, values) -> sa.ColumnElement:
@@ -101,6 +107,7 @@ class ApprovedInvoiceVerifier:
     manifest: SnapshotManifest
     evidence_reference: str
     source_owner: str = SOURCE_OWNER
+    transforms: tuple[tuple[str, str], ...] = ()
 
     def command(
         self, evidence: ApprovedInvoiceRecognitionEvidence, *, recognized_by: str, approval_reference: str
@@ -145,12 +152,31 @@ class ApprovedInvoiceVerifier:
         with destination.no_autoflush:
             connection = destination.connection()
             _require(_database(connection) == manifest.destination_database, "destination_database")
+            gate = WaiverGate(
+                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=RECOGNITION_DECISIONS),
+                dict(self.transforms),
+            )
             try:
-                return self._evidence(tenant, invoice_id, connection)
+                result = self._evidence(tenant, invoice_id, connection, gate)
             except KeyError as exc:
                 raise HistoricalEvidenceError(f"missing_required_fact:{exc.args[0]}") from exc
+            gate.finish()
+            return result
 
-    def _evidence(self, tenant: UUID, invoice_id: UUID, dest: sa.Connection) -> ApprovedInvoiceRecognitionEvidence:
+    def review(self, *, scope, invoice_id: UUID, destination: Session) -> ReviewFacts | None:
+        """The Finance decision for this invoice (None if none), read in the destination under the same manifest."""
+        return load_review(
+            destination.connection(),
+            scope.tenant_id,
+            invoice_id,
+            self.manifest.snapshot_sha256,
+            allowed=RECOGNITION_DECISIONS,
+        )
+
+    def _evidence(
+        self, tenant: UUID, invoice_id: UUID, dest: sa.Connection, gate: WaiverGate
+    ) -> ApprovedInvoiceRecognitionEvidence:
+        _require(gate.review is None or gate.review.legacy_journal_id is None, "review_journal_unexpected")
         src = self.source
         header = _one(
             _read(src, "supplier_invoice", key="invoice_id", value=invoice_id), "source_invoice_missing_or_duplicate"
@@ -168,11 +194,18 @@ class ApprovedInvoiceVerifier:
         )
         _require(header["is_prepayment"] is False and header["prepayment_applied"] == 0, "source_prepayment")
         _require(header["stamp_duty_amount"] == 0, "unsupported_stamp_duty")
-        _require(not _read(src, "payment_allocation", key="invoice_id", value=invoice_id), "source_allocations")
+        if "source_allocations" in gate.waived and _read(src, "payment_allocation", key="invoice_id", value=invoice_id):
+            _allocations_without_control_effect(src, invoice_id, header["ap_control_account_id"])
+        gate.require(
+            not _read(src, "payment_allocation", key="invoice_id", value=invoice_id),
+            "source_allocations",
+            "source_allocations",
+        )
         for field in ("subtotal", "tax_amount", "total_amount"):
             amount = header[field]
             # Exact remainder, not quantization: source storage must never round.
-            _require(isinstance(amount, Decimal) and amount >= 0 and _at_scale(amount, 2), "source_amount_scale")
+            _require(isinstance(amount, Decimal) and amount >= 0, "source_amount_scale")
+            gate.require(_at_scale(amount, 2), "source_amount_scale", "source_amount_scale")
         _require(
             header["total_amount"] > 0 and _sum([header["subtotal"], header["tax_amount"]]) == header["total_amount"],
             "source_total",
@@ -265,10 +298,11 @@ class ApprovedInvoiceVerifier:
             derived = require_line_tax_account(outcome, original["line_id"], imported)
             # A folded taxed line is a WHT line keyed as additive tax; it must never be posted as cost.
             _require(derived.klass != "B2", "folded_tax_line_requires_review")
-        _require(
+        gate.require(
             _sum([row["line_amount"] for row in lines]) == header["subtotal"]
             and _sum([row["tax_amount"] for row in lines]) == header["tax_amount"],
             "invoice_line_totals",
+            "line_totals",
         )
         facts = _fingerprint(
             FACTS_DOMAIN,
@@ -288,6 +322,7 @@ class ApprovedInvoiceVerifier:
                     ],
                     codes=tax_evidence,
                 ),
+                **gate.facts(),
             ),
         )
         return ApprovedInvoiceRecognitionEvidence(
