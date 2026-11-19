@@ -16,7 +16,9 @@ currency) only selects. A partition is one legacy customer x currency:
 Honesty rules kept: exact minor units (rounding is a blocker); `unknown_unverified` collection evidence (B9-1c:
 face value, no collection proof); required provenance columns (a missing column refuses the translation).
 
-a12 refuses the whole manifest on any non-carryable row, and holds are operational only. AS-IS rework (replan section 2.3, amended by the billing owner's a13 answers). Billing a13 answers P-1 = NO: a
+a12 refuses the whole manifest on any non-carryable row, and holds are operational only.
+
+AS-IS rework (replan section 2.3, amended by the billing owner's a13 answers). Billing a13 answers P-1 = NO: a
 customer x currency partition is the smallest holdable unit (`manifest_noncarryable_row`,
 opening_variance_validation.py:127-132; no variance reason accepts source kind credit_note,
 opening_variance_contracts.py:107-157; a `customer_credit` variance is refused for a customer with cash lots,
@@ -148,7 +150,7 @@ class OpeningTranslation:
     items: tuple[OpeningReceivableItemV1, ...] = ()
     cash_lots: tuple[OpeningCashLotV1, ...] = ()
     blockers: list[OpeningBlocker] = field(default_factory=list)
-    # Unapplied credit notes kept out of the manifest (P-1 = NO: no row is held inside billing); the partition is carried.
+    # Unapplied credit notes kept out of the manifest (P-1 = NO: billing holds no row); the partition is carried.
     unapplied_credit_notes: list[OpeningUnappliedCreditNote] = field(default_factory=list)
     dispositions: tuple[OpeningDispositionV1, ...] = ()
     variances: tuple[OpeningVarianceV1, ...] = ()

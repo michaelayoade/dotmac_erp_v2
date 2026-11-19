@@ -146,16 +146,14 @@ def upgrade() -> None:
             r pg_catalog.pg_roles%ROWTYPE;
         BEGIN
             IF server_major < 15 THEN
-                RAISE EXCEPTION 'erp_billing_opening_writer requires PostgreSQL 15 or newer'
-                    ' (SET and INHERIT membership options)';
+                RAISE EXCEPTION 'erp_billing_opening_writer requires PostgreSQL 15 or newer';
             END IF;
             SELECT * INTO r FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}';
             IF NOT FOUND THEN
                 CREATE ROLE {WRITER_ROLE} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
             ELSIF r.rolcanlogin OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb
                   OR r.rolreplication THEN
-                RAISE EXCEPTION 'existing role {WRITER_ROLE} carries login, superuser, bypassrls, createrole, '
-                    'createdb or replication: refusing to adopt it';
+                RAISE EXCEPTION 'existing role {WRITER_ROLE} has a forbidden attribute: refusing to adopt it';
             END IF;
             -- never a member (even transitively) of the serving or admin roles, and none of them a member of it
             IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}') THEN
