@@ -8,9 +8,9 @@
 <h2>Propose bank details</h2>
 <form method="post" action="/finance/payee-bank-details" autocomplete="off">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <p><label>Payee type <select name="payee_kind" required><option value="supplier">Supplier</option><option value="employee">Employee</option></select></label></p>
+  <p><label>Payee type <select name="payee_kind" required><option value="supplier">Supplier</option><option value="employee">Employee</option><option value="statutory">Statutory (tax office or pension administrator)</option></select></label></p>
   {% for name, label, maxlength in [
-    ('payee_ref', 'Payee reference (supplier reference or employee id; the name is taken from the system)', 255),
+    ('payee_ref', 'Payee reference (supplier reference, employee id, or for Statutory the payroll destination such as dest:PENSION_ER or dest:PAYE; the name is taken from the system)', 255),
     ('bank_code', 'Bank code', 6), ('bank_name', 'Bank name', 120), ('account_number', 'Account number (10 digits)', 10),
     ('account_name', 'Account name', 200), ('evidence_ref', 'Evidence reference (signed letter, form, call-back record)', 240)
   ] %}
