@@ -307,7 +307,9 @@ def test_missing_tax_code_or_account_row_refuses_the_map():
 
 def test_supplier_invoice_lines_pairing_declares_the_lookup():
     pairing = next(p for p in ALL_WAVE_PAIRINGS if p.destination == "mod_payables.supplier_invoice_lines")
-    assert pairing.lookups["tax_account_ref"] == ("supplier_line_tax_accounts", "id", "tax_account_ref")
+    # B-3: the line spec reads the transform map, whose tax refs are this classification's (plus ruled transforms).
+    assert pairing.lookups["tax_account_ref"] == ("supplier_line_transforms", "id", "tax_account_ref")
+    assert pairing.lookups["posting_account_ref"] == ("supplier_line_transforms", "id", "posting_account_ref")
     assert "supplier_line_tax_accounts" in MAP_BUILDERS
 
 

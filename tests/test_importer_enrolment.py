@@ -43,7 +43,9 @@ def test_every_declared_map_has_a_builder() -> None:
     ):
         declared.update(pairing.fk_rewrites.values())
         declared.update(map_name for map_name, _k, _f in pairing.lookups.values())
-    assert declared == set(MAP_BUILDERS), declared ^ set(MAP_BUILDERS)
+    # supplier_line_tax_accounts is the classification-only view (receipt class counts, verifier-shared rule); the
+    # supplier specs read the B-3 transform maps, which carry its refs.
+    assert declared | {"supplier_line_tax_accounts"} == set(MAP_BUILDERS), declared ^ set(MAP_BUILDERS)
 
 
 def test_source_built_maps_and_conflict() -> None:

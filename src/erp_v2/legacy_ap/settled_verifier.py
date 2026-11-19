@@ -62,9 +62,10 @@ from erp_v2.importer.payables_history import (
     _read,
     _require,
     _tenant,
+    rederive_transform,
 )
 from erp_v2.importer.payables_reconciliation import _sum
-from erp_v2.legacy_ap.recognition_verifier import _items, _linked_rows
+from erp_v2.legacy_ap.recognition_verifier import _linked_rows, item_link_explained
 
 ALLOCATION_FIELDS = [
     "allocation_id",
@@ -148,7 +149,10 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
         # lines). Item and inventory links change the accounting too (inventory valuation) and settled
         # admission produces no consequence, so they are refused as in B1b.
         lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
-        _require(_items(src, invoice_id) == 0, "source_item_link")
+        _require(
+            item_link_explained(src, invoice_id, rederive_transform(self, tenant, invoice_id, header)),
+            "source_item_link",
+        )
         _require(
             _linked_rows(
                 src,
