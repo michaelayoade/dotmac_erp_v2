@@ -32,6 +32,8 @@ from erp_v2.migration_ledger.rounding_verify import ROUNDING_KIND
 GATE_PROFILE: Final = "as_is_v1"  # recorded in the bridge body, so Michael's signature covers it
 LEGACY_OWNER: Final = "legacy-erp"
 OPENING_OWNERS: Final = ("erp.opening", "erp.ias8")
+STRADDLE_OWNER: Final = "erp.migration"  # B-14 kind ``migration_straddle``: explained by T-STRADDLE items, not native
+STRADDLE_KIND: Final = "migration_straddle"
 MANUAL_OWNER: Final = "erp.manual"
 _OPEN_OBLIGATION = ("OPEN", "PARTIALLY_SETTLED")
 _OPEN_LIABILITY = ("outstanding", "partially_settled")
@@ -62,7 +64,11 @@ def v2_posted(db: Session, tenant: UUID) -> tuple[dict[tuple[str, str], Decimal]
     for code, day, owner, kind, net in _lines(db, tenant):
         period = OPENING_PERIOD if owner in OPENING_OWNERS else day.strftime("%Y-%m")
         total[(code, period)] += Decimal(net)
-        if owner not in (LEGACY_OWNER, *OPENING_OWNERS) and not (owner == MANUAL_OWNER and kind == ROUNDING_KIND):
+        if (
+            owner not in (LEGACY_OWNER, *OPENING_OWNERS)
+            and not (owner == MANUAL_OWNER and kind == ROUNDING_KIND)
+            and not (owner == STRADDLE_OWNER and kind == STRADDLE_KIND)
+        ):
             native[(code, period)] += Decimal(net)
     return dict(total), dict(native)
 

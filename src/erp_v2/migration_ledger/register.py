@@ -469,6 +469,8 @@ AS_IS_V1_CHECKS: Final[dict[str, Callable[[Session, UUID], list[str]] | None]] =
     "setup_vat_deferral_pair": None,  # 4.5: the VAT codes have the deferral pair set
     "setup_periods": None,  # 4.5: FY2025 holds the opening and is LOCKED; FY2026 and the cutover month OPEN
     "setup_writer_role_m1": None,  # 4.5: the writer role passes the M1 checks (#72)
+    "straddle_reproduced": None,  # STRADDLE-SPEC (W8): every E39 journal has its migration_straddle journals (B-14)
+    "e15_subkobo_posted": None,  # B13 review N1: every E15 (sub-kobo) key has its 2-dp line on the rounding account
     "post_flip_tools_unused": _post_flip_tools_unused,  # rule 0.2 (built)
 }
 

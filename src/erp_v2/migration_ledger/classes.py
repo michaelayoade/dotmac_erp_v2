@@ -22,7 +22,7 @@ INVENTORY_CLASSES: Final = (
 )  # fmt: skip
 # As-is additions (plan section 1): E35 held AR rows/partitions, E36a AR customer gaps / unattributed journals,
 # E36b billing variances, E37 D-level control differences (info; the flip holding covers them), E38 report items
-# (2110 / 2030 / 1455 statutory review).
-AS_IS_CLASSES: Final = ("E35", "E36a", "E36b", "E37", "E38")
+# (2110 / 2030 / 1455 statutory review), E39 ``journal_straddles_cutoff`` (STRADDLE-SPEC, W8).
+AS_IS_CLASSES: Final = ("E35", "E36a", "E36b", "E37", "E38", "E39")
 CLASSES: Final = (*INVENTORY_CLASSES, *AS_IS_CLASSES)
 NA_REASON_MAX: Final = 500

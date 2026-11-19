@@ -100,7 +100,10 @@ writer role): every check is an entry of `register.AS_IS_V1_CHECKS` (name -> fun
 pinned to spec section 4 by a test). Each None REFUSES the gate (`profile_checks_unbuilt`); an owner PR replaces its None
 with the check. The pending list is: per-module completeness, `control_ties_per_currency` (the inline ties net all
 currencies), prepayment tie, holding ties, keyed accounts, control/tax codes exist once, VAT deferral pair, periods,
-writer role. Built: `post_flip_tools_unused` (the gate refuses `post_flip_tool_used_before_flip` if any B-1 review, any
+writer role, `straddle_reproduced` (STRADDLE-SPEC W8: every E39 `journal_straddles_cutoff` journal has its B-14
+`migration_straddle` journals; B-14 wires it) and `e15_subkobo_posted` (B-13 review N1: every E15 sub-kobo key has its
+2-dp line on the rounding account; the posting itself is not built, see the PR). `migration_straddle` journals (owner
+`erp.migration`) are excluded from the bridge's native side. Built: `post_flip_tools_unused` (the gate refuses `post_flip_tool_used_before_flip` if any B-1 review, any
 non-queued B-2 decision or any IAS 8 opening journal exists). Pending probe P-7: the opening posts functional currency
 only, so foreign-currency control positions at D need confirming before B-14. The lists are code constants in `ledger_roles`
 and recorded in each bridge body; the ledger and register state at signature is stored with the signature.

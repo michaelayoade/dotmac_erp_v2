@@ -454,8 +454,8 @@ def test_the_class_list_is_the_plan_inventory_ids_and_carries_the_plan_sha():
     )
 
     assert PLAN_SHA256 == "a28adf06752c43cd69481830c1b0e8d02a36f94a3bbe3c2ce35443d46b28de54"  # AS-IS-MIGRATION-REPLAN
-    assert AS_IS_CLASSES == ("E35", "E36a", "E36b", "E37", "E38")
-    assert CLASSES == (*INVENTORY_CLASSES, *AS_IS_CLASSES) and len(CLASSES) == len(set(CLASSES)) == 51
+    assert AS_IS_CLASSES == ("E35", "E36a", "E36b", "E37", "E38", "E39")
+    assert CLASSES == (*INVENTORY_CLASSES, *AS_IS_CLASSES) and len(CLASSES) == len(set(CLASSES)) == 52
     assert (
         len(INVENTORY_CLASSES) == 46
         and INVENTORY_PLAN_SHA256 == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"

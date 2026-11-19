@@ -710,6 +710,8 @@ SPEC_SECTION_4_CHECKS = {
     "setup_vat_deferral_pair",
     "setup_periods",
     "setup_writer_role_m1",
+    "straddle_reproduced",
+    "e15_subkobo_posted",
     "post_flip_tools_unused",
 }
 
@@ -748,6 +750,82 @@ def test_the_gate_refuses_when_a_post_flip_tool_was_used_before_the_flip(engine,
     with Session(engine) as db:
         assert register._post_flip_tools_unused(db, env.tenant_id) == ["post_flip_tool_used_before_flip"]
     assert "post_flip_tool_used_before_flip" in gate(engine, env)["reasons"]
+
+
+def _held_decision(env, outcome):
+    from erp_v2.held_drafts.models import HeldDraftDecision
+
+    return HeldDraftDecision(
+        tenant_id=env.tenant_id, journal_id=uuid4(), rule_id="R", outcome=outcome, reason_code="already_posted_duplicate",
+        amount=Decimal(1), evidence={"key_sha256": "a" * 64}, evidence_sha256="d" * 64, rules_sha256="e" * 64, plan_sha256="f" * 64,
+        plan_receipt_sha256="1" * 64, manual_journal_id=None, dual_control=False, planned_by="a", applied_by="b",
+    )  # fmt: skip
+
+
+def test_post_flip_tool_guard_counts_held_draft_voids_and_posts_but_not_queued(engine):
+    env = world(engine)
+    with Session(engine) as db:
+        db.add(_held_decision(env, "queued"))  # a queued decision posts nothing: only a register item
+        db.commit()
+        assert register._post_flip_tools_unused(db, env.tenant_id) == []
+        db.add(_held_decision(env, "voided"))
+        db.commit()
+        assert register._post_flip_tools_unused(db, env.tenant_id) == ["post_flip_tool_used_before_flip"]
+
+
+def test_post_flip_tool_guard_counts_an_admission_review(engine):
+    from datetime import UTC, datetime
+
+    from erp_v2.legacy_ap.models import AdmissionReview
+
+    env = world(engine)
+    with Session(engine) as db:
+        assert register._post_flip_tools_unused(db, env.tenant_id) == []
+        db.add(
+            AdmissionReview(
+                tenant_id=env.tenant_id, legacy_invoice_id=uuid4(), decision="admit_residual", waived_checks=[],
+                evidence_sha="a" * 64, decision_file_sha="b" * 64, snapshot_sha256="c" * 64, decided_by="f",
+                decided_at=datetime.now(UTC), operator_ref="o", dual_control=False,
+            )
+        )  # fmt: skip
+        db.commit()
+        assert register._post_flip_tools_unused(db, env.tenant_id) == ["post_flip_tool_used_before_flip"]
+
+
+def test_migration_straddle_journals_are_not_v2_native_in_the_bridge_comparison(engine):
+    """STRADDLE-SPEC (W8): the B-14 reproduction journals (erp.migration / migration_straddle) are planned, not native."""
+    from dotmac_accounting.contracts import CreateJournal, JournalKind, JournalLineInput, SourceIdentity
+
+    env = world(engine)
+
+    def post(owner, kind):
+        with Session(engine) as db:
+            scope = TenantScope(env.tenant_id)
+            j = accounting.create_journal(
+                db, scope=scope,
+                command=CreateJournal(
+                    number=f"S-{uuid4().hex[:12]}", kind=JournalKind.STANDARD, entry_date=date(2026, 1, 15),
+                    posting_date=date(2026, 1, 15), currency_code="USD", exchange_rate=Decimal(1), description="s",
+                    reference="s",
+                    source=SourceIdentity(owner=owner, document_kind=kind, document_id=f"d-{uuid4().hex}",
+                        version="1", fingerprint="f" * 64),
+                    lines=(JournalLineInput(env.accounts["5000"], Decimal(2), Decimal(0), None),
+                           JournalLineInput(env.accounts["1000"], Decimal(0), Decimal(2), None)),
+                ),
+                idempotency_key=f"t:{uuid4()}", idempotency_expires_at=None, recorded_at=NOW,
+            )  # fmt: skip
+            accounting.post_journal(
+                db, scope=scope, journal_id=j.id, approval_reference="t", posted_by="t",
+                idempotency_key=f"p:{uuid4()}", idempotency_expires_at=None, posted_at=NOW,
+            )  # fmt: skip
+            db.commit()
+
+    post("erp.migration", "migration_straddle")
+    post("erp.migration", "something_else")
+    with Session(engine) as db:
+        total, native = ledger_check.v2_posted(db, env.tenant_id)
+    assert total[("5000", "2026-01")] == Decimal(4)
+    assert native[("5000", "2026-01")] == Decimal(2)  # only the other kind counts as native
 
 
 def test_the_bridge_body_records_the_gate_profile(engine, owners_available):
