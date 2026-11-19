@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long legacy-schema SQL fixtures)
 """B-9 on real PostgreSQL: opening and IAS 8 journals, signed-bridge immutability, the flip gate and the governed
 rounding-residue correction. Real migrations, the real accounting commands and the real B2 maker-checker path.
 
@@ -120,15 +121,9 @@ def opening_inputs(*, two_thousand_sub="-399.00", ias8=True):
     ]
     tb = {"version": 1, "as_of": "2025-12-31", "rows": rows}
     as_of, parsed = opening.parse_tb(tb, SHA)
-    sub = {
-        "version": 1,
-        "openings": {
-            c: {"net": n, "source_receipt_sha256": SHA}
-            for c, n in (("2000", two_thousand_sub), ("2040", "-100.00"), ("1410", "50.00"), ("1400", "300.00"))
-        },
-    }
+    sub = {"2000": Decimal(two_thousand_sub), "2040": Decimal("-100"), "1410": Decimal("50"), "1400": Decimal("300")}
     items = (opening.Ias8Item("IAS8-001", "2000", Decimal("1.00"), SHA, "AP overstated at 2025 close"),) if ias8 else ()
-    return opening.OpeningInputs(as_of, parsed, "c" * 64, opening.parse_subledger(sub), "d" * 64, items, "e" * 64)
+    return opening.OpeningInputs(as_of, parsed, "c" * 64, sub, "d" * 64, items, "e" * 64)
 
 
 def apply_inputs(env, *, dual=False):
@@ -1191,87 +1186,88 @@ def write(path, body):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_opening_cli_plan_then_apply_with_private_receipts(engine, monkeypatch, tmp_path):
-    env = world(engine)
-    inputs = opening_inputs()
-    tb = {
-        "version": 1,
-        "as_of": "2025-12-31",
-        "rows": [
-            {
-                "account_code": c,
-                "debit": n if not n.startswith("-") else "0",
-                "credit": n[1:] if n.startswith("-") else "0",
-            }
-            for c, n in tb_rows().items()
-        ],
-    }
-    sub = {
-        "version": 1,
-        "openings": {
-            c: {"net": n, "source_receipt_sha256": SHA}
-            for c, n in (("2000", "-399.00"), ("2040", "-100.00"), ("1410", "50.00"), ("1400", "300.00"))
-        },
-    }
-    ias = {
-        "version": 1,
-        "items": [
-            {
-                "item_id": "IAS8-001",
-                "account_code": "2000",
-                "amount": "1.00",
-                "evidence_sha256": SHA,
-                "description": "AP overstated",
-            }
-        ],
-    }
-    files = {"tb": tmp_path / "tb.json", "subledger": tmp_path / "sl.json", "ias8": tmp_path / "ia.json"}
-    shas = {k: write(files[k], v) for k, v in (("tb", tb), ("subledger", sub), ("ias8", ias))}
-    spec = tmp_path / "spec.json"
-    write(
-        spec,
+def tb_file_for(tmp_path, rows=None):
+    rows = rows or [
         {
-            "version": 1,
-            "tenant_id": str(env.tenant_id),
-            "tb_sha256": shas["tb"],
-            "subledger_sha256": shas["subledger"],
-            "ias8_sha256": shas["ias8"],
-            "evidence_ref": "FIN-OPENING-1",
-            "requester_party_id": str(env.parties["requester"]),
-            "approver_party_id": str(env.parties["approver"]),
-        },
-    )
-    monkeypatch.setenv("MIGRATION_DATABASE_URL", engine.url.render_as_string(hide_password=False))
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    base = [
-        "--spec",
-        str(spec),
-        "--tb",
-        str(files["tb"]),
-        "--subledger",
-        str(files["subledger"]),
-        "--ias8",
-        str(files["ias8"]),
+            "account_code": c,
+            "debit": n if not n.startswith("-") else "0",
+            "credit": n[1:] if n.startswith("-") else "0",
+        }
+        for c, n in tb_rows().items()
     ]
+    path = tmp_path / "tb.json"
+    return path, write(path, {"version": 1, "as_of": "2025-12-31", "rows": rows})
 
+
+def seed_cli_legacy(engine):
+    """Legacy documents behind the subledger the CLI RECOMPUTES: 2000 -399, 1400 300, 2040 -100, 1410 0."""
+    inv = uuid4()
+    legacy_exec(
+        engine,
+        "INSERT INTO ap.supplier_invoice (invoice_id, journal_entry_id, functional_currency_amount) VALUES (:i, :j, 399)",
+        i=inv,
+        j=posted_journal(engine, date(2025, 6, 1)),
+    )
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.invoice (invoice_id, journal_entry_id, functional_currency_amount) VALUES (:i, :j, 300)",
+        i=uuid4(),
+        j=posted_journal(engine, date(2025, 6, 1)),
+    )
+    legacy_exec(
+        engine,
+        "INSERT INTO expense.expense_claim VALUES (:c, :j, 100)",
+        c=uuid4(),
+        j=posted_journal(engine, date(2025, 6, 1)),
+    )
+
+
+def cli_files(tmp_path, env, ias_items):
+    tb_path, tb_sha = tb_file_for(tmp_path)
+    ias_path = tmp_path / "ia.json"
+    ias_sha = write(ias_path, {"version": 1, "items": ias_items})
+    spec = tmp_path / "spec.json"
+    write(spec, {"version": 1, "tenant_id": str(env.tenant_id), "tb_sha256": tb_sha, "ias8_sha256": ias_sha,
+                 "evidence_ref": "FIN-OPENING-1", "requester_party_id": str(env.parties["requester"]),
+                 "approver_party_id": str(env.parties["approver"])})  # fmt: skip
+    return ["--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path)]
+
+
+def item_row(item_id, code, amount):
+    return {
+        "item_id": item_id,
+        "account_code": code,
+        "amount": amount,
+        "evidence_sha256": SHA,
+        "description": "restate",
+    }
+
+
+def test_opening_cli_recomputes_the_subledger_and_applies_with_private_receipts(
+    engine, monkeypatch, tmp_path, legacy_schema
+):
+    env = world(engine)
+    seed_cli_legacy(engine)
+    # TB: 2000 -400 vs sub -399 -> +1; 1410 +50 vs sub 0 -> -50; each difference covered EXACTLY by an itemised item
+    base = cli_files(tmp_path, env, [item_row("IAS8-001", "2000", "1.00"), item_row("IAS8-002", "1410", "-50.00")])
+    url = engine.url.render_as_string(hide_password=False)
+
+    def dsn():  # the CLI pops both DSNs from the environment
+        monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
+        monkeypatch.setenv("LEGACY_DATABASE_URL", url)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    dsn()
     plan_receipt = tmp_path / "plan.json"
     assert opening_main(["plan", *base, "--receipt", str(plan_receipt), "--operator-ref", "operator-a"]) == 0
     plan = json.loads(plan_receipt.read_text())
     assert (os.stat(plan_receipt).st_mode & 0o777) == 0o600 and plan["ready"] and plan["proof"]["ok"]
+    assert plan["proof"]["control_accounts"]["2000"]["subledger_net"] == "-399.000000"  # recomputed, not declared
+    assert plan["proof"]["control_accounts"]["1400"]["subledger_net"] == "300.000000"
     assert str(env.tenant_id) not in plan_receipt.read_text() and "postgresql" not in plan_receipt.read_text()
     assert count_journals(engine, env) == 0  # plan wrote nothing
-    apply_args = [
-        "apply",
-        *base,
-        "--plan-receipt",
-        str(plan_receipt),
-        "--approved-plan-sha256",
-        plan["plan_sha256"],
-        "--operator-ref",
-        "operator-b",
-        "--apply",
-    ]
-    dsn = lambda: monkeypatch.setenv("MIGRATION_DATABASE_URL", engine.url.render_as_string(hide_password=False))  # noqa: E731  (the CLI pops it)
+    apply_args = ["apply", *base, "--plan-receipt", str(plan_receipt), "--approved-plan-sha256", plan["plan_sha256"],
+                  "--operator-ref", "operator-b", "--apply"]  # fmt: skip
     # no environment switch: refused before any write, and the receipt path is not even consumed
     assert opening_main([*apply_args, "--receipt", str(tmp_path / "a0.json")]) == 2 and count_journals(engine, env) == 0
     monkeypatch.setenv("ERP_MIGRATION_LEDGER_APPLY", "1")
@@ -1281,95 +1277,56 @@ def test_opening_cli_plan_then_apply_with_private_receipts(engine, monkeypatch, 
     dsn()
     assert opening_main([*apply_args, "--receipt", str(receipt)]) == 0, receipt.read_text()
     applied = json.loads(receipt.read_text())
-    assert applied["applied"] == {"opening": 1, "ias8": 1, "replayed": 0} and count_journals(engine, env) == 2
-    # a bound plan cannot be reused with other bytes
+    assert applied["applied"] == {"opening": 1, "ias8": 2, "replayed": 0} and count_journals(engine, env) == 3
+    # the posted ledger now ties to the recomputed subledger on every control account
+    assert [ledger_net(engine, env, c) for c in ("2000", "2040", "1410", "1400")] == [-399, -100, 0, 300]
+    # a bound plan cannot be reused with another approved sha
     dsn()
-    assert (
-        opening_main(
-            [
-                "apply",
-                *base[:-1],
-                str(files["ias8"]),
-                "--plan-receipt",
-                str(plan_receipt),
-                "--approved-plan-sha256",
-                "0" * 64,
-                "--operator-ref",
-                "operator-b",
-                "--apply",
-                "--receipt",
-                str(tmp_path / "a3.json"),
-            ]
-        )
-        == 2
-    )
-    del inputs
+    bad = ["apply", *base, "--plan-receipt", str(plan_receipt), "--approved-plan-sha256", "0" * 64,
+           "--operator-ref", "operator-b", "--apply", "--receipt", str(tmp_path / "a3.json")]  # fmt: skip
+    assert opening_main(bad) == 2
 
 
-def test_opening_cli_refuses_an_untied_control_before_touching_the_database(engine, monkeypatch, tmp_path):
+def test_opening_cli_refuses_a_difference_not_covered_exactly_by_itemised_ias8(
+    engine, monkeypatch, tmp_path, legacy_schema
+):
     env = world(engine)
-    tb = {
-        "version": 1,
-        "as_of": "2025-12-31",
-        "rows": [
-            {"account_code": "1000", "debit": "1.00", "credit": "0"},
-            {"account_code": "3100", "debit": "0", "credit": "1.00"},
-        ],
-    }
-    sub = {
-        "version": 1,
-        "openings": {c: {"net": "0", "source_receipt_sha256": SHA} for c in ("2000", "2040", "1410", "1400")},
-    }
-    ias = {"version": 1, "items": []}
-    paths = {k: tmp_path / f"{k}.json" for k in ("tb", "sl", "ia", "spec")}
-    shas = {k: write(paths[k], v) for k, v in (("tb", tb), ("sl", sub), ("ia", ias))}
-    write(
-        paths["spec"],
-        {
-            "version": 1,
-            "tenant_id": str(env.tenant_id),
-            "tb_sha256": shas["tb"],
-            "subledger_sha256": shas["sl"],
-            "ias8_sha256": shas["ia"],
-            "evidence_ref": "E",
-            "requester_party_id": str(env.parties["requester"]),
-            "approver_party_id": str(env.parties["approver"]),
-        },
-    )
-    tb["rows"][0]["debit"] = "2.00"  # the TB no longer sums to zero
+    seed_cli_legacy(engine)
+    url = engine.url.render_as_string(hide_password=False)
+    for name, items in (
+        ("none", []),  # the GL - subledger differences are not itemised at all
+        ("short", [item_row("I1", "2000", "0.99"), item_row("I2", "1410", "-50.00")]),  # 0.01 not covered
+    ):
+        sub_dir = tmp_path / name
+        sub_dir.mkdir()
+        base = cli_files(sub_dir, env, items)
+        monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
+        monkeypatch.setenv("LEGACY_DATABASE_URL", url)
+        receipt = sub_dir / "r.json"
+        assert opening_main(["plan", *base, "--receipt", str(receipt), "--operator-ref", "operator-a"]) == 3
+        out = json.loads(receipt.read_text())
+        assert out["refusal"] == "opening_control_not_subledger" and not out["ready"]
+    assert count_journals(engine, env) == 0
+
+
+def test_opening_cli_refuses_an_untied_tb_before_touching_the_database(engine, monkeypatch, tmp_path):
+    env = world(engine)
+    rows = [
+        {"account_code": "1000", "debit": "2.00", "credit": "0"},
+        {"account_code": "3100", "debit": "0", "credit": "1.00"},
+    ]
+    tb_path, tb_sha = tb_file_for(tmp_path, rows)
+    ias_path = tmp_path / "ia.json"
+    ias_sha = write(ias_path, {"version": 1, "items": []})
+    spec = tmp_path / "spec.json"
+    write(spec, {"version": 1, "tenant_id": str(env.tenant_id), "tb_sha256": tb_sha, "ias8_sha256": ias_sha,
+                 "evidence_ref": "E", "requester_party_id": str(env.parties["requester"]),
+                 "approver_party_id": str(env.parties["approver"])})  # fmt: skip
     monkeypatch.delenv("MIGRATION_DATABASE_URL", raising=False)  # no database at all: the refusal comes first
+    monkeypatch.delenv("LEGACY_DATABASE_URL", raising=False)
     receipt = tmp_path / "r.json"
-    shas["tb"] = write(paths["tb"], tb)
-    write(
-        paths["spec"],
-        {
-            "version": 1,
-            "tenant_id": str(env.tenant_id),
-            "tb_sha256": shas["tb"],
-            "subledger_sha256": shas["sl"],
-            "ias8_sha256": shas["ia"],
-            "evidence_ref": "E",
-            "requester_party_id": str(env.parties["requester"]),
-            "approver_party_id": str(env.parties["approver"]),
-        },
-    )
-    code = opening_main(
-        [
-            "plan",
-            "--spec",
-            str(paths["spec"]),
-            "--tb",
-            str(paths["tb"]),
-            "--subledger",
-            str(paths["sl"]),
-            "--ias8",
-            str(paths["ia"]),
-            "--receipt",
-            str(receipt),
-            "--operator-ref",
-            "operator-a",
-        ]
-    )
+    code = opening_main(["plan", "--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path),
+                         "--receipt", str(receipt), "--operator-ref", "operator-a"])  # fmt: skip
     out = json.loads(receipt.read_text())
     assert code == 3 and out["refusal"] == "opening_tb_not_zero_sum" and not out["ready"]
 
@@ -1546,31 +1503,55 @@ def test_b2_outcomes_load_from_the_decisions_table_and_e17_is_derived(engine):
 
 @pytest.fixture
 def legacy_schema(engine):
+    ddl = [
+        "CREATE SCHEMA IF NOT EXISTS gl",
+        "CREATE SCHEMA IF NOT EXISTS ap",
+        "CREATE SCHEMA IF NOT EXISTS ar",
+        "CREATE SCHEMA IF NOT EXISTS expense",
+        "CREATE SCHEMA IF NOT EXISTS payroll",
+        "CREATE TABLE gl.journal_entry (journal_entry_id uuid PRIMARY KEY, status text NOT NULL DEFAULT 'POSTED', "
+        "posting_date date, reversal_journal_id uuid)",
+        "CREATE TABLE gl.posted_ledger_line (account_id uuid, debit_amount numeric, credit_amount numeric, "
+        "posting_date date, journal_entry_id uuid, source_document_type text, source_document_id text)",
+        "CREATE TABLE ap.supplier_invoice (invoice_id uuid PRIMARY KEY, journal_entry_id uuid, "
+        "ap_control_account_id uuid, functional_currency_amount numeric, exchange_rate numeric DEFAULT 1)",
+        "CREATE TABLE ap.supplier_payment (payment_id uuid PRIMARY KEY, journal_entry_id uuid)",
+        "CREATE TABLE ap.payment_allocation (invoice_id uuid, payment_id uuid, allocation_date date, "
+        "allocated_amount numeric, discount_taken numeric DEFAULT 0)",
+        "CREATE TABLE ar.invoice (invoice_id uuid PRIMARY KEY, journal_entry_id uuid, "
+        "functional_currency_amount numeric, exchange_rate numeric DEFAULT 1)",
+        "CREATE TABLE ar.customer_payment (payment_id uuid PRIMARY KEY, journal_entry_id uuid, gross_amount numeric, "
+        "exchange_rate numeric DEFAULT 1)",
+        "CREATE TABLE ar.payment_allocation (invoice_id uuid, payment_id uuid, allocation_date date, "
+        "allocated_amount numeric, discount_taken numeric DEFAULT 0, write_off_amount numeric DEFAULT 0)",
+        "CREATE TABLE expense.expense_claim (claim_id uuid PRIMARY KEY, journal_entry_id uuid, net_payable_amount numeric)",
+        "CREATE TABLE payroll.salary_slip (slip_id uuid PRIMARY KEY, journal_entry_id uuid)",
+        "CREATE TABLE payroll.employee_loan (loan_id uuid PRIMARY KEY, disbursement_date date)",
+    ]
     with engine.begin() as c:
-        c.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS gl")
-        c.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS ap")
-        c.exec_driver_sql("CREATE TABLE gl.journal_entry (journal_entry_id uuid PRIMARY KEY, posting_date date)")
-        c.exec_driver_sql(
-            "CREATE TABLE gl.posted_ledger_line (account_id uuid, debit_amount numeric, credit_amount numeric, "
-            "posting_date date, journal_entry_id uuid)"
-        )
-        c.exec_driver_sql(
-            "CREATE TABLE ap.supplier_invoice "
-            "(invoice_id uuid PRIMARY KEY, journal_entry_id uuid, ap_control_account_id uuid)"
-        )
+        for statement in ddl:
+            c.exec_driver_sql(statement)
     yield
     with engine.begin() as c:
-        c.exec_driver_sql("DROP SCHEMA gl CASCADE")
-        c.exec_driver_sql("DROP SCHEMA ap CASCADE")
+        for schema in ("gl", "ap", "ar", "expense", "payroll"):
+            c.exec_driver_sql(f"DROP SCHEMA {schema} CASCADE")
 
 
-def legacy_post(engine, jid, day, lines):
+def legacy_post(engine, jid, day, lines, *, status="POSTED", reversal=None, doc=(None, None)):
     with engine.begin() as c:
-        c.execute(sa.text("INSERT INTO gl.journal_entry VALUES (:j, :d)"), {"j": jid, "d": day})
+        c.execute(
+            sa.text(
+                "INSERT INTO gl.journal_entry (journal_entry_id, status, posting_date, reversal_journal_id) VALUES (:j, :s, :d, :r)"
+            ),
+            {"j": jid, "s": status, "d": day, "r": reversal},
+        )
         for account, debit, credit in lines:
             c.execute(
-                sa.text("INSERT INTO gl.posted_ledger_line VALUES (:a, :d, :c, :p, :j)"),
-                {"a": account, "d": Decimal(debit), "c": Decimal(credit), "p": day, "j": jid},
+                sa.text(
+                    "INSERT INTO gl.posted_ledger_line (account_id, debit_amount, credit_amount, posting_date, journal_entry_id, "
+                    "source_document_type, source_document_id) VALUES (:a, :d, :c, :p, :j, :t, :i)"
+                ),
+                {"a": account, "d": Decimal(debit), "c": Decimal(credit), "p": day, "j": jid, "t": doc[0], "i": doc[1]},
             )
 
 
@@ -1585,11 +1566,13 @@ def test_the_legacy_side_is_recomputed_from_the_snapshot_by_account_id_and_perio
     with engine.connect() as legacy, Session(engine) as db:
         net, universe = legacy_ledger.recompute(legacy, db, env.tenant_id, opening_as_of=date(2025, 12, 31))
     assert net == {
-        ("5000", "OPENING"): Decimal("7"), ("1000", "OPENING"): Decimal("-7"),
+        ("3100", "OPENING"): Decimal("7"), ("1000", "OPENING"): Decimal("-7"),  # 5000 (expense) rolled into 3100
         ("5000", "2026-01"): Decimal("3.5"), ("2000", "2026-01"): Decimal("-3.5"),
         ("5000", "2026-02"): Decimal("1"), ("2000", "2026-02"): Decimal("-1"),
     }  # fmt: skip
     assert universe == {str(j2), str(j3)}  # the FY2026 journal ids; the opening-year journal is not a bridge ref
+    # 12.3d: no income or expense account carries anything in OPENING
+    assert not [k for k in net if k[1] == "OPENING" and k[0] == "5000"]
     legacy_post(engine, uuid4(), date(2026, 3, 1), [(uuid4(), "1", "0")])  # an account the destination chart lacks
     with engine.connect() as legacy, Session(engine) as db:
         assert (
@@ -1614,7 +1597,9 @@ def test_the_68_adapter_takes_period_and_account_from_the_snapshot(engine, legac
             (wrong, j, env.accounts["1000"]),
         ):
             c.execute(
-                sa.text("INSERT INTO ap.supplier_invoice VALUES (:i, :j, :a)"),
+                sa.text(
+                    "INSERT INTO ap.supplier_invoice (invoice_id, journal_entry_id, ap_control_account_id) VALUES (:i, :j, :a)"
+                ),
                 {"i": invoice, "j": journal, "a": control},
             )
     line = lambda inv, legacy_t, v2_t: {  # noqa: E731
@@ -1680,3 +1665,175 @@ def test_the_68_adapter_takes_period_and_account_from_the_snapshot(engine, legac
         import_sha=bridge.canonical_sha(itemised),
     )
     assert body["rounding_residue_by_period"] == {"2026-01": "-0.005000"}
+
+
+# --- the opening-date legacy subledger (12.3b recipes) --------------------------------------------------------------
+
+D_OPEN = date(2025, 12, 31)
+
+
+def legacy_exec(engine, sql, **params):
+    with engine.begin() as c:
+        c.execute(sa.text(sql), params)
+
+
+def posted_journal(engine, day, *, status="POSTED", reversal=None):
+    jid = uuid4()
+    legacy_exec(
+        engine,
+        "INSERT INTO gl.journal_entry (journal_entry_id, status, posting_date, reversal_journal_id) VALUES (:j, :s, :d, :r)",
+        j=jid, s=status, d=day, r=reversal,
+    )  # fmt: skip
+    return jid
+
+
+def seed_payables(engine):
+    def invoice(amount, *, day=date(2025, 6, 1), status="POSTED", reversal=None, rate=1):
+        inv = uuid4()
+        j = posted_journal(engine, day, status=status, reversal=reversal)
+        legacy_exec(
+            engine,
+            "INSERT INTO ap.supplier_invoice (invoice_id, journal_entry_id, functional_currency_amount, exchange_rate) VALUES (:i, :j, :a, :r)",
+            i=inv,
+            j=j,
+            a=Decimal(amount),
+            r=Decimal(rate),
+        )
+        return inv
+
+    def pay(inv, allocated, day, *, discount=0, journal_status="POSTED"):
+        p = uuid4()
+        j = posted_journal(engine, date(2025, 7, 1), status=journal_status)
+        legacy_exec(engine, "INSERT INTO ap.supplier_payment VALUES (:p, :j)", p=p, j=j)
+        legacy_exec(
+            engine,
+            "INSERT INTO ap.payment_allocation (invoice_id, payment_id, allocation_date, allocated_amount, discount_taken) VALUES (:i, :p, :d, :a, :x)",
+            i=inv,
+            p=p,
+            d=day,
+            a=Decimal(allocated),
+            x=Decimal(discount),
+        )
+
+    inv1 = invoice("100")
+    pay(inv1, "40", date(2025, 7, 1))  # allocated by D: residual 60
+    inv2 = invoice("50")
+    pay(inv2, "50", date(2026, 1, 5))  # allocated AFTER D: still 50 open at D
+    invoice("-10")  # a credit note, stored negative: never negated
+    reversing = posted_journal(engine, date(2025, 8, 1))
+    invoice("70", reversal=reversing)  # reversed by D: excluded
+    invoice("30", day=date(2026, 1, 2))  # posted after D: excluded
+    invoice("20", status="DRAFT")  # never posted: excluded
+    after = posted_journal(engine, date(2026, 2, 1))
+    invoice("25", status="REVERSED", reversal=after)  # reversed only AFTER D: open at D
+    inv8 = invoice("15")
+    pay(inv8, "5", date(2025, 7, 1), journal_status="DRAFT")  # the payment was never posted: ignored
+    inv9 = invoice("200", rate=2)
+    pay(inv9, "10", date(2025, 7, 1), discount="5")  # (10 + 5) x rate 2 = 30 functional
+    return Decimal("-310")  # -(60 + 50 - 10 + 25 + 15 + 170)
+
+
+def seed_receivables(engine):
+    a = uuid4()
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.invoice (invoice_id, journal_entry_id, functional_currency_amount) VALUES (:i, :j, 500)",
+        i=a,
+        j=posted_journal(engine, date(2025, 3, 1)),
+    )
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.invoice (invoice_id, journal_entry_id, functional_currency_amount) VALUES (:i, :j, -40)",
+        i=uuid4(),
+        j=posted_journal(engine, date(2025, 3, 2)),
+    )
+    p = uuid4()
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.customer_payment (payment_id, journal_entry_id, gross_amount) VALUES (:p, :j, 200)",
+        p=p,
+        j=posted_journal(engine, date(2025, 4, 1)),
+    )
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.payment_allocation (invoice_id, payment_id, allocation_date, allocated_amount, discount_taken, write_off_amount) VALUES (:i, :p, :d, 100, 10, 5)",
+        i=a,
+        p=p,
+        d=date(2025, 5, 1),
+    )
+    # items 500 - 40 - (100 + 10 + 5) = 345; unallocated cash -(200 - 100) = -100
+    return Decimal("245")
+
+
+def seed_claims(engine, family_account):
+    c1, c2, c3 = uuid4(), uuid4(), uuid4()
+    for claim, amount, day in ((c1, 80, date(2025, 5, 1)), (c2, 50, date(2025, 5, 2)), (c3, 40, date(2026, 1, 3))):
+        legacy_exec(
+            engine,
+            "INSERT INTO expense.expense_claim VALUES (:c, :j, :a)",
+            c=claim,
+            j=posted_journal(engine, day),
+            a=Decimal(amount),
+        )
+    for amount, day in ((30, date(2025, 11, 1)), (99, date(2026, 2, 1))):  # the 2026 reimbursement is after D
+        legacy_post(engine, uuid4(), day, [(family_account, str(amount), "0")], doc=("EXPENSE_REIMBURSEMENT", str(c1)))
+    return Decimal("-100")  # -(80 + 50 - 30)
+
+
+def test_the_legacy_subledger_recipes_at_the_opening_date(engine, legacy_schema):
+    from erp_v2.migration_ledger import legacy_subledger
+
+    env = world(engine)
+    ap, ar = seed_payables(engine), seed_receivables(engine)
+    claims = seed_claims(engine, env.accounts["2040"])
+    with engine.connect() as legacy:
+        out = legacy_subledger.recompute(legacy, D_OPEN, [str(env.accounts["2040"])])
+    assert out == {"2000": ap, "1400": ar, "2040": claims, "1410": Decimal(0)}
+    # a missing recipe is refused rather than ignored: payroll net pay or a staff loan at D
+    legacy_exec(engine, "INSERT INTO payroll.employee_loan VALUES (:l, :d)", l=uuid4(), d=date(2025, 5, 1))
+    with engine.connect() as legacy:
+        assert refusal_code(legacy_subledger.recompute, legacy, D_OPEN, []) == "legacy_subledger_recipe_missing"
+
+
+def test_the_pnl_rolls_up_into_3100_in_the_opening_period(engine, legacy_schema):
+    from erp_v2.migration_ledger import legacy_ledger
+
+    env = world(engine)
+    legacy_post(
+        engine, uuid4(), date(2025, 6, 1), [(env.accounts["1000"], "100", "0"), (env.accounts["4000"], "0", "100")]
+    )
+    legacy_post(
+        engine, uuid4(), date(2025, 6, 2), [(env.accounts["5000"], "30", "0"), (env.accounts["1000"], "0", "30")]
+    )
+    with engine.connect() as legacy, Session(engine) as db:
+        net, _ = legacy_ledger.recompute(legacy, db, env.tenant_id, opening_as_of=D_OPEN)
+    # 4000 (revenue) -100 and 5000 (expense) +30 carry 0 and roll into 3100 as -70; the balance-sheet side is untouched
+    assert ("5000", "OPENING") not in net and ("4000", "OPENING") not in net
+    assert net[("3100", "OPENING")] == Decimal("-70") and net[("1000", "OPENING")] == Decimal("70")
+    assert sum(v for (a, p), v in net.items() if p == "OPENING") == 0
+
+
+def test_g9_pins_for_the_opening_date_subledgers():
+    """The recipes against the real g9 snapshot (9fc8fb1e); skipped when no snapshot is present."""
+    url = os.environ.get("ERP_G9_LEGACY_URL")
+    if not url:
+        pytest.skip("no g9 legacy snapshot present (set ERP_G9_LEGACY_URL to a read-only copy)")
+    from erp_v2.migration_ledger import legacy_subledger
+
+    eng = sa.create_engine(url)
+    try:
+        with eng.connect() as legacy, legacy.begin():
+            legacy.execute(sa.text("SET TRANSACTION READ ONLY"))
+            family = [
+                r[0]
+                for r in legacy.execute(
+                    sa.text("SELECT account_id::text FROM gl.account WHERE account_code IN ('2040', '2030', '2110')")
+                )
+            ]
+            out = legacy_subledger.recompute(legacy, date(2025, 12, 31), family)
+    finally:
+        eng.dispose()
+    assert out == {
+        "2000": Decimal("-66479663.78"), "1400": Decimal("729671283.82"),
+        "2040": Decimal("-409280.00"), "1410": Decimal("0.00"),
+    }  # fmt: skip

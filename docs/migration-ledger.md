@@ -13,8 +13,7 @@ exclusively before any read, and carry shas, counts and tie-outs.
 
 ## Opening and IAS 8 (`python -m erp_v2.migration_ledger.opening_cli plan|apply`)
 
-* Inputs, each bound by sha in the spec: the reviewed TB at the FY2025 close (`as_of`, one row per account),
-  the declared subledger openings for 2000, 2040, 1410 and 1400 (each with its source receipt sha), and the
+* Inputs, each bound by sha in the spec: the reviewed TB at the FY2025 close (`as_of`, one row per account) and the
   itemised IAS 8 items (`item_id`, restated account, signed movement, evidence sha, description).
 * ONE system-built opening journal, owner `erp.opening`, one line per account (the spec says "one opening journal
   per account"; a single-account journal cannot balance, so this is one journal with one line per account).
@@ -26,6 +25,14 @@ exclusively before any read, and carry shas, counts and tie-outs.
   lock it afterwards. A second, different TB is refused; a repeat is a replay. Provenance is `erp_opening_journals`.
 * Both journals are posted through accounting a2 (create + post) under their own source owners, not through the B2
   manual-journal path, so the manual control guard is not the door; the control equality above is.
+
+* The subledger openings for 2000, 1400, 2040 and 1410 are RECOMPUTED from the legacy snapshot at the opening date
+  (`legacy_subledger.py`, `LEGACY_DATABASE_URL`, read-only; recipes in MIGRATION-REVIEWED-CONVERSION 12.3b-addendum:
+  "posted by D" journals, allocations dated on or before D, claims net of reimbursements; payroll net pay and staff loans
+  are 0 and refused if the snapshot says otherwise). Each GL - subledger difference must be covered EXACTLY by itemised
+  IAS 8 items, else the CLI refuses. The g9 figures are pinned by a test that skips without a snapshot.
+* OPENING P&L roll-up (12.3d): income and expense accounts carry 0 in the bridge's OPENING legacy side and their
+  cumulative net to the opening date is rolled into 3100.
 
 ## Bridge (`python -m erp_v2.migration_ledger.bridge_report build|sign|rounding`)
 
@@ -96,7 +103,8 @@ is 0 AND the latest bridge version is signed.
 
 ## Not covered (by design or follow-up)
 
-* The legacy side of the bridge and the subledger openings are DECLARED inputs with sha provenance; the tool does not
-  read the legacy ledger or the subledgers itself.
-* The v2 side of FY2026 months (carry and transform) is taken from the items, not recomputed from the v2 ledger.
+* The v2 side of the 2000/2040/1410 gate ties uses the owner tables; 1400, 2045 and 2110 refuse (no owner yet).
+* `expense.cash_advance` at the opening date is not queried (the recipe says 0; its column names were not confirmed).
+* The recipes were written to the architect's column names and tested on synthetic snapshots; only the g9 pin test (skipped
+  without a snapshot) proves them on real data.
 * Receipts of other builds (B-1 plan receipts, settled admission) enter through the admission-review rows only.

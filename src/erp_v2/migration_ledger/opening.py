@@ -8,7 +8,8 @@
 Sign convention everywhere: net = debit - credit (an asset is positive, a liability negative).
 
 The CLI refuses unless the trial balance sums to zero AND every control account (2000, 2040, 1410, 1400) equals its
-declared subledger opening once the itemised IAS 8 movements are applied:
+recomputed subledger opening (from the legacy snapshot at the opening date, never a declared file) once the
+itemised IAS 8 movements are applied:
 
     tb_net[code] + sum(ias8 movement on code) == subledger_net[code]
 
@@ -67,7 +68,7 @@ class OpeningInputs:
     as_of: date
     tb: dict[str, Decimal]  # account code -> net
     tb_sha256: str
-    subledger: dict[str, Decimal]  # control code -> net (declared subledger opening)
+    subledger: dict[str, Decimal]  # control code -> net (recomputed from the legacy snapshot, legacy_subledger.py)
     subledger_sha256: str
     ias8: tuple[Ias8Item, ...]
     ias8_sha256: str
@@ -93,20 +94,6 @@ def parse_tb(raw: object, raw_sha: str) -> tuple[date, dict[str, Decimal]]:
             refuse("tb_duplicate_account")
         rows[code] = debit - credit
     return as_of, rows
-
-
-def parse_subledger(raw: object) -> dict[str, Decimal]:
-    """{"version":1,"openings":{"<control code>":{"net":"..","source_receipt_sha256":".."}}}: all four controls."""
-    body = keys_exactly(raw, {"version", "openings"}, "invalid_subledger_schema")
-    openings = body["openings"]
-    if body["version"] != 1 or not isinstance(openings, dict) or set(openings) != CONTROL_CODES:
-        refuse("invalid_subledger_schema", "every control account needs a declared subledger opening")
-    out: dict[str, Decimal] = {}
-    for code, entry in openings.items():
-        item = keys_exactly(entry, {"net", "source_receipt_sha256"}, "invalid_subledger_schema")
-        sha_text(item["source_receipt_sha256"], "invalid_subledger_schema")
-        out[code] = money(item["net"], "invalid_subledger_schema")
-    return out
 
 
 def parse_ias8(raw: object) -> tuple[Ias8Item, ...]:
@@ -147,6 +134,8 @@ def parse_ias8(raw: object) -> tuple[Ias8Item, ...]:
 
 def opening_proof(inputs: OpeningInputs) -> dict[str, Any]:
     """The refusal conditions as data. ``ok`` only when Σ = 0 and every control account ties."""
+    if set(inputs.subledger) != CONTROL_CODES:
+        refuse("subledger_incomplete", "every control account needs a recomputed subledger opening")
     total = sum(inputs.tb.values(), ZERO)
     ias8_by_account: dict[str, Decimal] = {}
     for item in inputs.ias8:

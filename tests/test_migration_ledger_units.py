@@ -1,6 +1,5 @@
 """B-9 migration ledger, pure parts: opening proof, bridge partition, register adapters, migration shape."""
 
-import json
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -40,18 +39,12 @@ GOOD_TB = [
     ("2040", "0", "100.00"),
     ("3100", "0", "350.00"),
 ]
-SUBLEDGER = {
-    "version": 1,
-    "openings": {
-        code: {"net": net, "source_receipt_sha256": SHA}
-        for code, net in (("2000", "-400.00"), ("2040", "-100.00"), ("1410", "50.00"), ("1400", "300.00"))
-    },
-}
+SUBLEDGER = {"2000": D("-400.00"), "2040": D("-100.00"), "1410": D("50.00"), "1400": D("300.00")}  # recomputed
 
 
 def inputs(tb_rows=GOOD_TB, sub=SUBLEDGER, ias8=()):
     as_of, tb = opening.parse_tb(tb_file(tb_rows), SHA)
-    return opening.OpeningInputs(as_of, tb, SHA, opening.parse_subledger(sub), SHA, tuple(ias8), SHA)
+    return opening.OpeningInputs(as_of, tb, SHA, dict(sub), SHA, tuple(ias8), SHA)
 
 
 def ias8_item(item_id, code, amount):
@@ -77,8 +70,7 @@ def test_a_sub_kobo_imbalance_is_refused_too():
 
 
 def test_opening_refuses_when_a_control_account_differs_from_its_subledger():
-    sub = json.loads(json.dumps(SUBLEDGER))
-    sub["openings"]["2000"]["net"] = "-399.00"  # the subledger holds 1.00 less than the TB
+    sub = {**SUBLEDGER, "2000": D("-399.00")}  # the subledger holds 1.00 less than the TB
     proof = opening.opening_proof(inputs(sub=sub))
     assert not proof["ok"] and proof["zero_sum"]
     assert proof["control_accounts"]["2000"]["difference"] == "-1.000000"
@@ -86,18 +78,16 @@ def test_opening_refuses_when_a_control_account_differs_from_its_subledger():
 
 
 def test_an_itemised_ias8_movement_closes_the_control_gap_and_only_exactly():
-    sub = json.loads(json.dumps(SUBLEDGER))
-    sub["openings"]["2000"]["net"] = "-399.00"
+    sub = {**SUBLEDGER, "2000": D("-399.00")}
     # the IAS 8 journal moves 2000 by +1.00 net (a debit), so TB -400 + 1 = -399 = the subledger
     assert opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "1.00")]))["ok"]
     assert not opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "0.99")]))["ok"]
     assert not opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "-1.00")]))["ok"]
 
 
-def test_every_control_account_must_have_a_declared_subledger_opening():
-    sub = json.loads(json.dumps(SUBLEDGER))
-    del sub["openings"]["1400"]
-    assert refusal(opening.parse_subledger, sub) == "invalid_subledger_schema"
+def test_every_control_account_must_have_a_recomputed_subledger_opening():
+    sub = {k: v for k, v in SUBLEDGER.items() if k != "1400"}
+    assert refusal(opening.opening_proof, inputs(sub=sub)) == "subledger_incomplete"
 
 
 def test_a_missing_control_account_in_the_tb_counts_as_zero_and_must_tie():
