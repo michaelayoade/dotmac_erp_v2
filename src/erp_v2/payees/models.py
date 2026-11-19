@@ -27,6 +27,7 @@ from erp_v2.hr.models import _tenant_fk
 class PayeeKind(str, enum.Enum):
     SUPPLIER = "supplier"
     EMPLOYEE = "employee"
+    STATUTORY = "statutory"  # payee_ref = payroll external beneficiary ref (e.g. dest:PENSION_ER)
 
 
 class InstructionStatus(str, enum.Enum):

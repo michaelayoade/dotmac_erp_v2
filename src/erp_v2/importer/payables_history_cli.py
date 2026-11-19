@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+from collections import Counter
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -26,6 +27,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from erp_v2.importer.identity_cli import _manifest, _safe_engine, _sha
+from erp_v2.importer.payables_history import admission_notes
 
 # The only owner release whose admission contract this command is qualified for.
 REQUIRED_PAYABLES_VERSION = "0.1.0a5"
@@ -136,7 +138,7 @@ def _command_json(command) -> dict:
 
 
 def _plan(verifier, scope, invoice_ids, session, bindings: dict, referenced: frozenset[str] = frozenset()) -> dict:
-    commands, refusals = [], []
+    commands, refusals, notes = [], [], []
     for invoice_id in invoice_ids:
         if str(invoice_id) in referenced:
             # Re-entered as a NEW ERP invoice with this legacy reference: never also admitted.
@@ -145,6 +147,11 @@ def _plan(verifier, scope, invoice_ids, session, bindings: dict, referenced: fro
         try:
             evidence = verifier.evidence(scope=scope, invoice_id=invoice_id, destination=session)
             commands.append(_command_json(verifier.command(evidence)))
+            note = admission_notes(
+                verifier.source, invoice_id, verifier.review(scope=scope, invoice_id=invoice_id, destination=session)
+            )
+            if note:
+                notes.append(note)
         except ValueError as exc:
             reason = getattr(exc, "reason", None)
             # Only deliberately named evidence failures enter private receipts.
@@ -160,6 +167,12 @@ def _plan(verifier, scope, invoice_ids, session, bindings: dict, referenced: fro
         counts=dict(requested=len(invoice_ids), eligible=len(commands), refused=len(refusals)),
         commands=commands,
         refusals=refusals,
+        # Finance-reviewed admissions: counts only. ``requires_correcting_journal`` admissions (waived A3 treatment)
+        # cannot be closed by B-9 without the correcting journal.
+        reviewed_admissions=dict(
+            waived=dict(sorted(Counter(name for n in notes for name in n["waived_checks"]).items())),
+            requires_correcting_journal=sum(1 for n in notes if n["requires_correcting_journal"]),
+        ),
     )
 
 
@@ -187,6 +200,36 @@ def _apply(session, scope, verifier, plan: dict, reviewed: dict, admit, *, comma
             idempotency_expires_at=None,
             admitted_at=datetime.now(UTC),
         )
+        _audit_reviewed(session, scope, verifier, UUID(raw["invoice_id"]), raw["evidence_fingerprint"])
+
+
+def _audit_reviewed(session, scope, verifier, invoice_id: UUID, evidence_fingerprint: str) -> None:
+    """One audit event per admission that honoured a Finance decision (as in settled admission and B1b): the
+    decision, the waived check name, the legacy header status and whether a correcting journal is still owed."""
+    if verifier is None or session is None:
+        return
+    from dotmac_kernel.audit import write_audit_event
+
+    from erp_v2.legacy_ap.audit import AUDIT_UNPAID_ADMITTED, SOURCE_APPLICATION
+
+    notes = admission_notes(
+        verifier.source, invoice_id, verifier.review(scope=scope, invoice_id=invoice_id, destination=session)
+    )
+    if not notes:
+        return
+    write_audit_event(
+        session,
+        tenant_id=scope.tenant_id,
+        actor_type="service",
+        actor_id="erp_v2.importer.payables_history_cli",
+        actor_label="erp_v2.importer.payables_history_cli",
+        source_application=SOURCE_APPLICATION,
+        action=AUDIT_UNPAID_ADMITTED,
+        entity_type="supplier_invoice",
+        entity_id=str(invoice_id),
+        is_success=True,
+        details={**notes, "evidence_fingerprint": evidence_fingerprint},
+    )
 
 
 def _dependencies():
@@ -290,6 +333,9 @@ def _run(args) -> dict:
         "DATABASE_URL" not in os.environ and "PLATFORM_DATABASE_URL" not in os.environ,
         "serving_database_materials_forbidden",
     )
+    from erp_v2.legacy_ap.recognize_cli import _install_audit_actions
+
+    _install_audit_actions()  # the reviewed-admission audit vocabulary (no effect on admissions without a decision)
     # Read each binding once. The held reviewed-plan bytes are both hashed and
     # parsed; no second path read can substitute another approved cohort.
     manifest_bytes, cohort_bytes = args.manifest.read_bytes(), args.cohort.read_bytes()

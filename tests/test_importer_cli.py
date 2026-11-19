@@ -29,7 +29,7 @@ def test_census_receipt(tmp_path) -> None:
     assert main(["census", "--receipt", str(receipt)]) == 0
     data = json.loads(receipt.read_text())
     assert data["legacy_tables_named"] == 426
-    assert "e2_0023_staff_loan_entries" in data["destination_heads"]
+    assert "e2_0026_admission_reviews" in data["destination_heads"]
     assert data["pairings_total"] > 100
 
 

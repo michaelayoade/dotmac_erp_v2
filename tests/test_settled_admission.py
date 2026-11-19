@@ -63,8 +63,14 @@ def test_private_plan_file_holds_the_detail_and_the_receipt_does_not():
 class FakeVerifier:
     """Stands in for SettledInvoiceVerifier: evidence per invoice, no database."""
 
+    source = None
+
     def __init__(self, settlements):
         self.settlements = settlements
+
+    @staticmethod
+    def review(**_):
+        return None  # no Finance decision on file
 
     @staticmethod
     def command(evidence):
