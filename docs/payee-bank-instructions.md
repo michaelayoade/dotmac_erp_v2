@@ -144,3 +144,16 @@ to `('supplier','employee','statutory')` (additive; downgrade refuses while a st
 - B5: a statutory batch needs an approved instruction for its destination at approve and record
   (`statutory_payee_instruction_required`). Setup: Finance proposes and approves one instruction per authority used
   before the first statutory remittance.
+
+## Bulk proposals (B-11, `python -m erp_v2.payees.bulk_cli`)
+
+Operator plan/apply of a sha-bound, mode-0600 Finance file against a sha-bound, Finance-confirmed bank reference
+(see the module docstring for the file formats and refusals). Each row is one B8 `propose`.
+
+- `--approve` approves only onboarding rows (payees with no approved instruction yet) and only with the tenant
+  dual-control policy OFF; it requires `--operator-ref` and `--expect new=N,replace=N,change=N` (`expect_required`).
+  Rows that change an approved instruction are proposed and approved per row in the UI with a call-back reference.
+- **Name-only corrections:** a change of only the account name (same bank and account) is a change like any other:
+  once approved it SUPERSEDES the approved instruction. Any B5 payout batch or B3 payment file already approved for
+  that payee then refuses with `payee_instruction_changed`. Finance should make name corrections outside payment
+  runs (when no batch or file for the payee is approved and unpaid).
