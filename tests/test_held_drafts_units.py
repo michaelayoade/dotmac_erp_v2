@@ -85,12 +85,13 @@ def test_bank_fee_with_more_posted_than_statement_voids_the_excess_and_raises_an
     ev = evidence(drafts, s=1, p=4)
     decisions = rules.decide(drafts, ev)
     assert {(d.outcome, d.reason_code) for d in decisions} == {(OUTCOME_VOIDED, "duplicate_of_posted_fee_excess")}
-    findings = rules.e17_findings(decisions)
+    findings = rules.e17_findings(decisions, ev.posted_fees)
     assert len(findings) == 1  # one finding per key, however many drafts sit on it
     assert findings[0]["finding"] == "E17" and findings[0]["excess_posted_fee_journals"] == 3
     assert findings[0]["posted_fee_journals"] == 4 and findings[0]["statement_lines"] == 1
     assert findings[0]["drafts_voided"] == 2
     assert findings[0]["posted_journal_ids_sha256"] == rules.ids_sha256(ev.posted_fees[KEY])
+    assert findings[0]["posted_journal_ids"] == sorted(str(i) for i in ev.posted_fees[KEY])  # Finance can act on them
 
 
 def test_no_finding_when_posted_does_not_exceed_the_statement():
@@ -215,6 +216,20 @@ def test_an_exact_mirror_of_a_posted_twin_on_a_live_document_voids_as_unapproved
         d.evidence["document_status"] == status and d.evidence["twin_journal_id"] and d.evidence["document_id"] == "D-1"
     )
     assert d.evidence["mirror_proof"]["mirror_sha256"] and d.evidence["mirror_proof"]["accounts"] == 2
+
+
+def test_a_cleared_customer_payment_is_live_but_a_cleared_invoice_is_not():
+    payment = ar(1, kind="CUSTOMER_PAYMENT")
+    d = rules.decide([payment], mirror_ev(payment, "CLEARED", kind="CUSTOMER_PAYMENT"))[0]
+    assert (d.outcome, d.reason_code) == (OUTCOME_VOIDED, "unapproved_reversal_of_live_document")
+    invoice = ar(2)
+    d = rules.decide([invoice], mirror_ev(invoice, "CLEARED"))[0]
+    assert (d.outcome, d.reason_code) == (OUTCOME_QUEUED, "reversal_document_not_live")
+
+
+def test_the_rules_text_says_p_includes_the_posts_this_tool_made():
+    assert "INCLUDING" in rules.RULES_DEFINITION["rules"][rules.RULE_BANK_FEE]["P"]
+    assert "excluding" not in rules.RULES_DEFINITION["rules"][rules.RULE_BANK_FEE]["P"]
 
 
 @pytest.mark.parametrize("status", ["CANCELLED", "VOID", "DRAFT", None])

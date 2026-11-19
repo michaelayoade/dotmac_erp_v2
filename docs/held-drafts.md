@@ -14,7 +14,7 @@ receipt as `excluded_legacy_status_not_held`).
 |---|---|---|
 | `R-BANK-FEE` | legacy BANKING / BANK_FEE with exactly one line on a bank cash GL. Key = (bank cash GL, posting date, signed amount). S = bank statement lines on the key, P = POSTED BANK_FEE journals on the key (including any this tool already posted), D = drafts on the key. | S = 0: queue `no_statement_evidence`. P > S: void every draft `duplicate_of_posted_fee_excess` and raise an **E17 finding** for the key. Otherwise `postable = min(D, max(0, S - P))`: the first `postable` drafts (by number, id) post through the B2 legacy-held path; the rest are voided `duplicate_of_posted_fee`. Not a single bank line: queue `not_single_bank_line`. A key on a shared or re-pointed cash GL queues `bank_gl_unresolved` (the refusal semantics of `recon_service.resolve_gl_account`). |
 | `R-AR-TWIN` | legacy AR / INVOICE or CUSTOMER_PAYMENT with a document id | A POSTED twin (same legacy module, type, document id, POSTED in v2) with equal per-account (debit, credit) functional totals: void `already_posted_duplicate`. Different totals: queue `twin_amount_differs`. No twin: `twin_missing`. No document id: `no_document_reference`. |
-| `R-AR-UNAPPROVED-REVERSAL` | an AR draft that is the EXACT sign mirror of a POSTED twin (same accounts, debit and credit swapped) | Legacy document PAID, POSTED or PARTIALLY_PAID: void `unapproved_reversal_of_live_document`, evidence = twin id, document id and status, mirror proof (account count, totals, digest). Document not live or not found: queue `reversal_document_not_live`. Not an exact mirror: queue (`twin_amount_differs`). The equal-amount rule is tried first. |
+| `R-AR-UNAPPROVED-REVERSAL` | an AR draft that is the EXACT sign mirror of a POSTED twin (same accounts, debit and credit swapped) | Legacy document PAID, POSTED or PARTIALLY_PAID (a CUSTOMER_PAYMENT also CLEARED): void `unapproved_reversal_of_live_document`, evidence = twin id, document id and status, mirror proof (account count, totals, digest). Document not live or not found: queue `reversal_document_not_live`. Not an exact mirror: queue (`twin_amount_differs`). The equal-amount rule is tried first. |
 | `R-QUEUE` | everything else (BANK_RECONCILIATION, EXPENSE, PAYROLL, AP, no legacy record, a draft already in the B2 workflow) | queue (`no_published_rule`, `no_legacy_record`, `legacy_record_mismatch`, `workflow_in_progress`) |
 
 The document status is read from the legacy `ar.invoice (invoice_id, status)` and
@@ -22,7 +22,7 @@ The document status is read from the legacy `ar.invoice (invoice_id, status)` an
 confirmed against the g9 snapshot before a real plan.
 
 **E17 finding.** For every key where P > S the plan and receipt carry `e17_findings`: key digest, statement lines S,
-posted fee journals P, `excess_posted_fee_journals` = P - S, a digest of the ids of all P posted journals, and the
+posted fee journals P, `excess_posted_fee_journals` = P - S, a digest and the list of the ids of all P posted journals (so Finance can act on them), and the
 number of drafts voided. The excess journals cannot be told apart from the matched ones, so Finance reviews the set.
 
 **Evidence ids.** Per-draft evidence stores counts plus sha256 digests of the sorted statement-line and posted

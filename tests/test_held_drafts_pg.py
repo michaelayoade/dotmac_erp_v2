@@ -661,6 +661,7 @@ def test_posted_exceeding_statement_voids_the_excess_and_the_plan_carries_the_e1
     assert finding["finding"] == "E17" and finding["excess_posted_fee_journals"] == 2
     assert finding["posted_fee_journals"] == 3 and finding["statement_lines"] == 1 and finding["drafts_voided"] == 2
     assert finding["posted_journal_ids_sha256"] == rules.ids_sha256([p.id for p in posted])
+    assert finding["posted_journal_ids"] == sorted(str(p.id) for p in posted)
     plan_and_apply(engine, env)
     assert {decisions(engine, env)[d.id].reason_code for d in drafts} == {"duplicate_of_posted_fee_excess"}
 

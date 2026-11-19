@@ -76,6 +76,7 @@ class Plan:
     population_amount: Decimal
     out_of_scope_before_fy: int
     excluded_legacy_status: int = 0
+    findings: tuple[dict[str, Any], ...] = ()
 
     @property
     def sha256(self) -> str:
@@ -417,6 +418,7 @@ def build_plan(db: Session, legacy: sa.Connection, scope: Scope) -> Plan:
         population_amount,
         int(before or 0),
         excluded,
+        tuple(rules.e17_findings(decisions, evidence.posted_fees)),
     )
 
 

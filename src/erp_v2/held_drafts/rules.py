@@ -62,6 +62,11 @@ Q_NO_STATEMENT: Final = "no_statement_evidence"
 Q_BANK_GL_UNRESOLVED: Final = "bank_gl_unresolved"
 Q_REVERSAL_NOT_LIVE: Final = "reversal_document_not_live"
 LIVE_DOCUMENT_STATUSES: Final = ("PAID", "POSTED", "PARTIALLY_PAID")
+# A cleared customer payment is a live document too (invoices have no CLEARED status).
+LIVE_STATUSES_BY_TYPE: Final = {
+    "INVOICE": LIVE_DOCUMENT_STATUSES,
+    "CUSTOMER_PAYMENT": (*LIVE_DOCUMENT_STATUSES, "CLEARED"),
+}
 HELD_LEGACY_STATUSES: Final = ("DRAFT", "SUBMITTED", "APPROVED")
 Q_NO_DOCUMENT: Final = "no_document_reference"
 Q_NO_TWIN: Final = "twin_missing"
@@ -77,7 +82,7 @@ RULES_DEFINITION: Final = {
             "key": ["bank_cash_gl", "posting_date", "signed_functional_amount"],
             "postable": "min(drafts, max(0, S - P))",
             "S": "bank statement lines on the key (all bank accounts on that cash GL)",
-            "P": "POSTED BANK_FEE journals on the key (excluding journals posted by this tool)",
+            "P": "POSTED BANK_FEE journals on the key (INCLUDING journals this tool already posted)",
             "order": ["number", "id"],
             "void": VOID_DUPLICATE_OF_POSTED_FEE,
             "excess": "P > S (S >= 1): void every draft as duplicate_of_posted_fee_excess + E17 finding",
@@ -94,7 +99,7 @@ RULES_DEFINITION: Final = {
         RULE_AR_REVERSAL: {
             "match": "AR draft that is the exact sign mirror of a POSTED twin; legacy document status live",
             "mirror": "same accounts, debit and credit swapped, per-account functional totals",
-            "live": list(LIVE_DOCUMENT_STATUSES),
+            "live": {k: list(v) for k, v in LIVE_STATUSES_BY_TYPE.items()},
             "void": VOID_UNAPPROVED_REVERSAL,
             "queue": [Q_REVERSAL_NOT_LIVE],
         },
@@ -301,7 +306,7 @@ def decide(drafts: list[Draft], evidence: Evidence) -> list[Decision]:
                 "mirror_proof": proof,
                 **base,
             }
-            if status not in LIVE_DOCUMENT_STATUSES:
+            if status not in LIVE_STATUSES_BY_TYPE.get(legacy.doc_type or "", ()):
                 decisions[draft.journal_id] = _queue(draft, RULE_AR_REVERSAL, Q_REVERSAL_NOT_LIVE, **reversal)
                 continue
             decisions[draft.journal_id] = Decision(
@@ -369,12 +374,19 @@ def decide(drafts: list[Draft], evidence: Evidence) -> list[Decision]:
     return [decisions[d.journal_id] for d in sorted(drafts, key=lambda d: (d.number, str(d.journal_id)))]
 
 
-def e17_findings(decisions: list[Decision]) -> list[dict[str, object]]:
+def e17_findings(
+    decisions: list[Decision], posted_fees: dict[tuple[UUID, date, Decimal], list[UUID]] | None = None
+) -> list[dict[str, object]]:
     """One finding per key where POSTED fee journals exceed statement lines (derived from the decisions' evidence).
 
     ``excess_posted_fee_journals`` is P - S; ``posted_journal_ids_sha256`` digests all P posted journals on the key
-    (the excess ones cannot be told apart from the matched ones, so Finance reviews the set).
+    (the excess ones cannot be told apart from the matched ones, so Finance reviews the set), and
+    ``posted_journal_ids`` lists those journal ids so Finance can act on them.
     """
+    ids_by_key = {
+        sha256_json([str(gl), day.isoformat(), str(net)]): sorted(str(i) for i in ids)
+        for (gl, day, net), ids in (posted_fees or {}).items()
+    }
     found: dict[str, dict[str, object]] = {}
     for d in decisions:
         if d.reason_code != VOID_DUPLICATE_OF_POSTED_FEE_EXCESS:
@@ -389,6 +401,7 @@ def e17_findings(decisions: list[Decision]) -> list[dict[str, object]]:
                 "posted_fee_journals": d.evidence["posted_fee_journals"],
                 "excess_posted_fee_journals": d.evidence["excess_posted_fee_journals"],
                 "posted_journal_ids_sha256": d.evidence["posted_journal_ids_sha256"],
+                "posted_journal_ids": ids_by_key.get(key, []),
                 "drafts_voided": 0,
             },
         )

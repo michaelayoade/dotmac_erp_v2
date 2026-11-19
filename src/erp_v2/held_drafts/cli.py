@@ -147,7 +147,7 @@ def _summary(plan, proof: dict[str, Any]) -> dict[str, Any]:
         "scope_sha256": plan.scope_sha256,
         "held_total": proof["held_total"],
         "excluded_legacy_status_not_held": plan.excluded_legacy_status,
-        "e17_findings": rules.e17_findings(list(plan.decisions)),
+        "e17_findings": list(plan.findings),
         "pending": len(plan.pending),
         "pre_fiscal_year_drafts_out_of_scope": plan.out_of_scope_before_fy,
         "outcomes": proof["counts"],
