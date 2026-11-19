@@ -837,6 +837,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             transform_binding={
                 "snapshot_sha256": manifest.snapshot_sha256,
                 "candidate_revision": manifest.candidate_revision,
+                **({"history_cutoff": history_cutoff.isoformat()} if history_cutoff is not None else {}),
             },
         )
         if needs_transforms:

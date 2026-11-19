@@ -23,6 +23,7 @@ from dotmac_payables import HistoricalUnpaidInvoiceCommand, HistoricalUnpaidInvo
 from sqlalchemy.orm import Session
 
 from erp_v2.importer import admission_waivers, tax_accounts
+from erp_v2.importer.cutoff_evidence import journal_proof
 from erp_v2.importer.payables_reconciliation import _money, _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
 from erp_v2.legacy_ap.transform_manifest import InvoiceTransform, TransformManifest
@@ -784,6 +785,15 @@ def _pair(source: list[dict], target: list[dict], source_id: str, prefix: str):
     return [(sm[key], tm[key]) for key in sorted(sm)]
 
 
+def _pairs(source: list[dict], target: list[dict], source_id: str, prefix: str, excluded: bool):
+    """``_pair``, or (B-13) every source row against None for a cutoff-excluded journal that must be absent in v2."""
+    if excluded:
+        _require(bool(source), prefix + "_missing")
+        _require(not target, prefix + "_present_after_cutoff")
+        return [(row, None) for row in source]
+    return _pair(source, target, source_id, prefix)
+
+
 def _tenant(rows: list[dict], tenant: UUID, prefix: str, column: str = "tenant_id") -> None:
     _require(all(column in row and _equal(row[column], tenant) for row in rows), prefix + "_tenant")
 
@@ -802,6 +812,11 @@ class HistoricalPayablesVerifier:
     # The declared fallback expense account (``import.fallback_expense_account``), bound in the plan: the verifier
     # re-derives every transform with it and requires manifest == re-derived == destination.
     fallback_expense_account: str | None = None
+
+    @property
+    def history_cutoff(self) -> date | None:
+        """The importer's receipt cutoff (B-13), from the hash-bound transform manifest binding; None when absent."""
+        return self.transform_manifest.history_cutoff if self.transform_manifest is not None else None
 
     def invoice_transform(self, invoice_id: UUID) -> InvoiceTransform | None:
         """The manifest's entry, UNVERIFIED (used only to open the gate); ``rederive_transform`` verifies it."""
@@ -1175,54 +1190,63 @@ class HistoricalPayablesVerifier:
             journal["currency_code"] == header["currency_code"] and journal["exchange_rate"] == 1,
             "unsupported_currency",
         )
-        target = _one(
-            _read(dest, "journal_entries", schema="mod_accounting", key="id", value=journal_id),
-            "destination_journal_missing",
-        )
-        _tenant([target], tenant, "destination_journal")
-        mapping = {
-            key: key
-            for key in (
-                "status",
-                "currency_code",
-                "exchange_rate",
-                "entry_date",
-                "posting_date",
-                "fiscal_period_id",
-                "description",
-                "reference",
-                "total_debit",
-                "total_credit",
-                "total_debit_functional",
-                "total_credit_functional",
-                "posted_at",
-                "created_at",
+        ledger = _read(self.source, "posted_ledger_line", key="journal_entry_id", value=journal_id)
+        proof = journal_proof(journal, ledger, self.history_cutoff, _require)
+        excluded = proof is not None
+        destination_rows = _read(dest, "journal_entries", schema="mod_accounting", key="id", value=journal_id)
+        if excluded:
+            # B-13: the journal is in the opening TB, not in v2. Proven on the snapshot above, asserted absent here.
+            _require(not destination_rows, "cutoff_journal_present_in_destination")
+            target = None
+        else:
+            target = _one(destination_rows, "destination_journal_missing")
+            _tenant([target], tenant, "destination_journal")
+        if target is not None:
+            mapping = {
+                key: key
+                for key in (
+                    "status",
+                    "currency_code",
+                    "exchange_rate",
+                    "entry_date",
+                    "posting_date",
+                    "fiscal_period_id",
+                    "description",
+                    "reference",
+                    "total_debit",
+                    "total_credit",
+                    "total_debit_functional",
+                    "total_credit_functional",
+                    "posted_at",
+                    "created_at",
+                )
+            }
+            mapping.update(
+                number="journal_number",
+                kind="journal_type",
+                posted_by="posted_by_user_id",
+                reverses_journal_id="reversed_journal_id",
+                reversal_journal_id="reversal_journal_id",
+                source_document_kind="source_document_type",
             )
-        }
-        mapping.update(
-            number="journal_number",
-            kind="journal_type",
-            posted_by="posted_by_user_id",
-            reverses_journal_id="reversed_journal_id",
-            reversal_journal_id="reversal_journal_id",
-            source_document_kind="source_document_type",
-        )
-        _match(journal, target, mapping, "journal")
-        # waves36 deliberately uses the legacy journal row as destination document
-        # identity, retaining the AP invoice link in source provenance.
-        _require(
-            target["source_document_id"] == f"{SOURCE_JOURNAL_REFERENCE}{journal['journal_entry_id']}",
-            "journal_source_document_id",
-        )
-        expected_posting_stamp = (
-            f"{SOURCE_JOURNAL_REFERENCE}{target['id']}@"
-            f"{_day(journal['posting_date'], 'source_journal_posting_date').isoformat()}"
-        )
-        _require(target["approval_reference"] == expected_posting_stamp, "journal_posting_stamp")
-        self._provenance(target, "journal")
+            _match(journal, target, mapping, "journal")
+            # waves36 deliberately uses the legacy journal row as destination document
+            # identity, retaining the AP invoice link in source provenance.
+            _require(
+                target["source_document_id"] == f"{SOURCE_JOURNAL_REFERENCE}{journal['journal_entry_id']}",
+                "journal_source_document_id",
+            )
+            expected_posting_stamp = (
+                f"{SOURCE_JOURNAL_REFERENCE}{target['id']}@"
+                f"{_day(journal['posting_date'], 'source_journal_posting_date').isoformat()}"
+            )
+            _require(target["approval_reference"] == expected_posting_stamp, "journal_posting_stamp")
+            self._provenance(target, "journal")
         originals = _read(self.source, "journal_entry_line", key="journal_entry_id", value=journal_id)
         imported = _read(dest, "journal_lines", schema="mod_accounting", key="journal_id", value=journal_id)
         _tenant(imported, tenant, "journal_line")
+        if excluded:
+            _require(not imported, "cutoff_journal_line_present_in_destination")
         line_map = {key: key for key in ("line_number", "account_id", "description", "created_at")}
         line_map.update(
             journal_id="journal_entry_id",
@@ -1232,7 +1256,7 @@ class HistoricalPayablesVerifier:
             credit_functional="credit_amount_functional",
         )
         dimensions = []
-        for original, landed in _pair(originals, imported, "line_id", "journal_line"):
+        for original, landed in _pairs(originals, imported, "line_id", "journal_line", excluded):
             _require(
                 all(
                     isinstance(original[field], Decimal) and original[field] >= 0
@@ -1249,7 +1273,8 @@ class HistoricalPayablesVerifier:
                 ),
                 "source_journal_line_amounts",
             )
-            _match(original, landed, line_map, "journal_line")
+            if landed is not None:
+                _match(original, landed, line_map, "journal_line")
             _require(
                 original["currency_code"] in (None, header["currency_code"])
                 and original["exchange_rate"] in (None, Decimal(1)),
@@ -1260,7 +1285,8 @@ class HistoricalPayablesVerifier:
                 and original["credit_amount"] == original["credit_amount_functional"],
                 "unsupported_currency",
             )
-            dimensions.append(self._dimensions(tenant, original, landed["id"], dest, ledger=False))
+            if landed is not None:
+                dimensions.append(self._dimensions(tenant, original, landed["id"], dest, ledger=False))
         for side in ("debit", "credit"):
             total = _sum([row[side + "_amount"] for row in originals])
             _require(
@@ -1274,10 +1300,11 @@ class HistoricalPayablesVerifier:
             and _sum([row["credit_amount"] for row in control]) == header["total_amount"],
             "source_ap_control_credit",
         )
-        ledger = _read(self.source, "posted_ledger_line", key="journal_entry_id", value=journal_id)
         posted = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=journal_id)
         _tenant(ledger, tenant, "source_ledger", "organization_id")
         _tenant(posted, tenant, "ledger")
+        if excluded:
+            _require(not posted, "cutoff_journal_ledger_present_in_destination")
         _require(len(ledger) == len(originals), "source_ledger_line_count")
         by_line = {_id(row["line_id"]): row for row in originals}
         _require(len({_id(row["journal_line_id"]) for row in ledger}) == len(ledger), "source_ledger_line_duplicate")
@@ -1302,10 +1329,11 @@ class HistoricalPayablesVerifier:
             source_document_id="source_document_id",
             posted_by="posted_by_user_id",
         )
-        for original, landed in _pair(ledger, posted, "ledger_line_id", "ledger"):
-            _match(original, landed, ledger_map, "ledger")
-            self._provenance(landed, "ledger")
-            _require(landed["journal_number"] == journal["journal_number"], "ledger_journal_number")
+        for original, landed in _pairs(ledger, posted, "ledger_line_id", "ledger", excluded):
+            if landed is not None:
+                _match(original, landed, ledger_map, "ledger")
+                self._provenance(landed, "ledger")
+                _require(landed["journal_number"] == journal["journal_number"], "ledger_journal_number")
             gate.require(
                 original["source_module"] == "AP"
                 and original["source_document_type"] == "SUPPLIER_INVOICE"
@@ -1316,8 +1344,10 @@ class HistoricalPayablesVerifier:
             _require(
                 original["original_currency_code"] in (None, header["currency_code"])
                 and original["exchange_rate"] in (None, Decimal(1))
-                and landed["currency_code"] == header["currency_code"]
-                and landed["exchange_rate"] == 1,
+                and (
+                    landed is None
+                    or (landed["currency_code"] == header["currency_code"] and landed["exchange_rate"] == 1)
+                ),
                 "unsupported_currency",
             )
             line = by_line.get(_id(original["journal_line_id"]))
@@ -1327,20 +1357,22 @@ class HistoricalPayablesVerifier:
                 value = original[side + "_amount"] if value is None else value
                 _require(
                     value == original[side + "_amount"] == line[side + "_amount"]
-                    and landed["original_" + side] == value,
+                    and (landed is None or landed["original_" + side] == value),
                     "ledger_original_" + side,
                 )
-            dimensions.append(self._dimensions(tenant, original, landed["id"], dest, ledger=True))
+            if landed is not None:
+                dimensions.append(self._dimensions(tenant, original, landed["id"], dest, ledger=True))
         return _fingerprint(
             "erp.payables.historical-accounting.v1",
             dict(
                 source_journal=_project(journal, SOURCE_JOURNAL),
-                destination_journal=_project(target, DESTINATION_JOURNAL),
+                destination_journal=None if target is None else _project(target, DESTINATION_JOURNAL),
                 source_lines=_project_rows(originals, SOURCE_JOURNAL_LINE, "line_id"),
                 destination_lines=_project_rows(imported, DESTINATION_JOURNAL_LINE, "id"),
                 source_ledger=_project_rows(ledger, SOURCE_LEDGER, "ledger_line_id"),
                 destination_ledger=_project_rows(posted, DESTINATION_LEDGER, "id"),
                 dimensions=dimensions,
+                **({"history_cutoff_proof": proof} if proof is not None else {}),
             ),
         )
 
@@ -1367,10 +1399,16 @@ class HistoricalPayablesVerifier:
                 and journal["status"] == "POSTED",
                 "deferral_journal_source",
             )
-            target = _one(
-                _read(dest, "journal_entries", schema="mod_accounting", key="id", value=journal_id),
-                "destination_deferral_journal_missing",
-            )
+            ledger = _read(self.source, "posted_ledger_line", key="journal_entry_id", value=journal_id)
+            posted = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=journal_id)
+            destination_rows = _read(dest, "journal_entries", schema="mod_accounting", key="id", value=journal_id)
+            if journal_proof(journal, ledger, self.history_cutoff, _require) is not None:
+                # B-13: the deferral journal is in the opening TB (proven on the snapshot), absent from v2.
+                _require(not destination_rows, "cutoff_deferral_journal_present_in_destination")
+                _require(not posted, "cutoff_deferral_ledger_present_in_destination")
+                _require(len(ledger) > 0, "deferral_journal_ledger")
+                continue
+            target = _one(destination_rows, "destination_deferral_journal_missing")
             _tenant([target], tenant, "destination_deferral_journal")
             _require(target["status"] == "POSTED", "destination_deferral_journal_status")
             _match(
@@ -1385,8 +1423,6 @@ class HistoricalPayablesVerifier:
                 "deferral_journal_source_document_id",
             )
             self._provenance(target, "deferral_journal")
-            ledger = _read(self.source, "posted_ledger_line", key="journal_entry_id", value=journal_id)
-            posted = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=journal_id)
             _tenant(posted, tenant, "deferral_ledger")
             _require(
                 sorted((_id(r["account_id"]), r["debit_amount"], r["credit_amount"]) for r in ledger)

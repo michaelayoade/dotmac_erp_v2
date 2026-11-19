@@ -1093,3 +1093,59 @@ def test_deferral_journal_ledger_that_differs_in_the_destination_refuses(db):
     db[1].commit()
     with pytest.raises(HistoricalEvidenceError, match="deferral_journal_ledger"):
         evidence(db)
+
+
+# --- B-13: a journal the history cutoff did not import is proven on the snapshot and asserted absent in v2 ----------
+
+
+def _cutoff(monkeypatch, day):
+    monkeypatch.setattr(HistoricalPayablesVerifier, "history_cutoff", property(lambda self: day))
+
+
+def _empty_destination_journals(db):
+    for name in ("journal_entries", "journal_lines", "posted_ledger_lines"):
+        db[1].execute(db[4][False, name].delete())
+    db[1].commit()
+
+
+def test_a_cutoff_excluded_invoice_journal_is_proven_on_the_snapshot_and_asserted_absent_in_v2(db, monkeypatch):
+    with pytest.raises(HistoricalEvidenceError, match="destination_journal_missing"):  # no cutoff: still required
+        _empty_destination_journals(db)
+        evidence(db)
+    _cutoff(monkeypatch, date(2025, 12, 31))  # the fixture journal and its ledger lines are dated 2025-01-02
+    item = evidence(db)
+    assert item.total_amount == Decimal("100")
+    scope = SimpleNamespace(tenant_id=UUID(T))
+    assert db[3].verify(scope=scope, command=db[3].command(item), destination=db[2]) == item
+    # the proof enters the fingerprint: the same invoice with the journal imported is NOT the same evidence
+    assert item.fingerprint().startswith("cv1:")
+
+
+def test_a_cutoff_excluded_journal_that_is_present_in_v2_refuses(db, monkeypatch):
+    _cutoff(monkeypatch, date(2025, 12, 31))
+    with pytest.raises(HistoricalEvidenceError, match="cutoff_journal_present_in_destination"):
+        evidence(db)
+
+
+def test_a_cutoff_before_the_journal_date_takes_the_ordinary_path(db, monkeypatch):
+    _cutoff(monkeypatch, date(2024, 12, 31))
+    assert evidence(db).total_amount == Decimal("100")
+    _empty_destination_journals(db)
+    with pytest.raises(HistoricalEvidenceError, match="destination_journal_missing"):
+        evidence(db)
+
+
+def test_a_cutoff_excluded_journal_whose_ledger_is_on_the_other_side_or_undated_refuses(db, monkeypatch):
+    _cutoff(monkeypatch, date(2025, 12, 31))
+    _empty_destination_journals(db)
+    ledger = db[4][True, "posted_ledger_line"]
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(ledger.update().values(posting_date="2026-01-01"))
+    db[0].commit()
+    with pytest.raises(HistoricalEvidenceError, match="journal_straddles_history_cutoff"):
+        evidence(db)
+    db[0].exec_driver_sql("PRAGMA query_only=0")
+    db[0].execute(ledger.update().values(posting_date=None))
+    db[0].commit()
+    with pytest.raises(HistoricalEvidenceError, match="journal_ledger_line_undated"):
+        evidence(db)

@@ -1120,3 +1120,15 @@ def test_taxed_settled_invoice_whose_destination_tax_account_differs_is_refused(
     scene.build()
     plan = scene.run([iid], apply=False)
     assert plan["refusals_by_reason"] == {"legacy_evidence:invoice_line_tax_account": 1}
+
+
+def test_b13_a_cutoff_excluded_journal_that_is_present_in_the_destination_is_refused(engine, setup, monkeypatch):
+    """The scene's journals are dated 2026-01-10 and imported; with a receipt cutoff on or after that date the
+    verifier must see them as cutoff-excluded, so their presence in v2 is a named refusal (never silently accepted)."""
+    from datetime import date
+
+    from erp_v2.importer.payables_history import HistoricalPayablesVerifier
+
+    monkeypatch.setattr(HistoricalPayablesVerifier, "history_cutoff", property(lambda self: date(2026, 1, 10)))
+    _env, scene, iid = one(engine, setup)
+    refused(scene, [iid], "legacy_evidence:cutoff_journal_present_in_destination")
