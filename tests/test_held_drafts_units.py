@@ -488,7 +488,7 @@ def test_migration_revision_and_chain():
     assert migration.revision == "e2_0027_held_draft_decisions"
     assert migration.down_revision == "e2_0026_admission_reviews"
     assert "e2_0027_held_draft_decisions" not in EXPECTED_HEADS  # B-9 (e2_0028) chains after it: one e2 head
-    assert "e2_0028_migration_ledger" in EXPECTED_HEADS
+    assert "e2_0030_migration_holdings" in EXPECTED_HEADS  # B-14 is the e2 head; e2_0028/e2_0029 chain before it
     assert "e2_0026_admission_reviews" not in EXPECTED_HEADS
 
 
