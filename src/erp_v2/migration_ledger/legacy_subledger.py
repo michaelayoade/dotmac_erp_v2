@@ -10,12 +10,10 @@ REVERSED, ``posting_date <= D``. The CURRENT document status is never used: a do
 at D.
 
 * 2000: -sum over invoices posted by D of (``functional_currency_amount`` - allocations dated <= D whose payment is
-  posted by D; allocation = (``allocated_amount`` + ``discount_taken``) x the invoice ``exchange_rate``). The credit
-  note
-  row is stored negative, so it is never negated.
+  posted by D; allocation = (``allocated_amount`` + ``discount_taken``) x the invoice rate: 1 for a functional-currency
+  invoice, else its ``exchange_rate``). The credit note row is stored negative, so it is never negated.
 * 1400: sum of item residuals (``ar.invoice``, allocations also include ``write_off_amount``) plus the unallocated
-  cash of
-  payments posted by D (``gross_amount`` x ``exchange_rate`` less allocations dated <= D to invoices posted by D,
+  cash of payments posted by D (``functional_currency_amount`` less allocations dated <= D to invoices posted by D,
   negated).
 * 2040: payroll net pay is 0 at D (refused if any salary slip was posted by D: the recipe would be missing); expense
   claims posted by D: ``net_payable_amount`` less the reimbursement postings dated <= D on the claim family
@@ -45,20 +43,40 @@ def _posted_by(alias: str) -> str:
     )
 
 
+# The invoice rate in functional terms. A functional-currency invoice is at 1 whatever its stored rate (legacy left the
+# rate NULL on tens of thousands of NGN rows, and NULL x amount would silently drop them from the sums).
+RATE: Final = "(CASE WHEN i.currency_code = :functional THEN 1 ELSE i.exchange_rate END)"
+
+
 def _scalar(conn: sa.Connection, sql: str, **params) -> Decimal:
-    return Decimal(conn.execute(sa.text(sql), params).scalar() or 0)
+    return Decimal(conn.execute(sa.text(sql.replace("{RATE}", RATE)), params).scalar() or 0)
 
 
-def sub_2000(conn: sa.Connection, d: date) -> Decimal:
+def require_rates(conn: sa.Connection, d: date, functional: str) -> None:
+    """Refuse (``legacy_rate_missing``) if any non-functional-currency invoice posted by D has a NULL rate."""
+    for table in ("ap.supplier_invoice", "ar.invoice"):
+        missing = conn.execute(
+            sa.text(
+                f"SELECT count(*) FROM {table} i JOIN gl.journal_entry j ON j.journal_entry_id = i.journal_entry_id "
+                f"WHERE i.currency_code <> :functional AND i.exchange_rate IS NULL AND {_posted_by('j')}"
+            ),
+            {"functional": functional, "d": d},
+        ).scalar()
+        if missing:
+            refuse("legacy_rate_missing", f"{table}: a foreign-currency invoice has no exchange rate")
+
+
+def sub_2000(conn: sa.Connection, d: date, functional: str) -> Decimal:
     invoices = _scalar(
         conn,
         "SELECT coalesce(sum(i.functional_currency_amount), 0) FROM ap.supplier_invoice i "
         f"JOIN gl.journal_entry j ON j.journal_entry_id = i.journal_entry_id WHERE {_posted_by('j')}",
         d=d,
+        functional=functional,
     )
     allocations = _scalar(
         conn,
-        "SELECT coalesce(sum((a.allocated_amount + a.discount_taken) * i.exchange_rate), 0) "
+        "SELECT coalesce(sum((a.allocated_amount + a.discount_taken) * {RATE}), 0) "
         "FROM ap.payment_allocation a "
         "JOIN ap.supplier_invoice i ON i.invoice_id = a.invoice_id "
         "JOIN gl.journal_entry ij ON ij.journal_entry_id = i.journal_entry_id "
@@ -66,20 +84,22 @@ def sub_2000(conn: sa.Connection, d: date) -> Decimal:
         "JOIN gl.journal_entry pj ON pj.journal_entry_id = p.journal_entry_id "
         f"WHERE a.allocation_date <= :d AND {_posted_by('ij')} AND {_posted_by('pj')}",
         d=d,
+        functional=functional,
     )
     return -(invoices - allocations)
 
 
-def sub_1400(conn: sa.Connection, d: date) -> Decimal:
+def sub_1400(conn: sa.Connection, d: date, functional: str) -> Decimal:
     items = _scalar(
         conn,
         "SELECT coalesce(sum(i.functional_currency_amount), 0) FROM ar.invoice i "
         f"JOIN gl.journal_entry j ON j.journal_entry_id = i.journal_entry_id WHERE {_posted_by('j')}",
         d=d,
+        functional=functional,
     )
     item_allocations = _scalar(
         conn,
-        "SELECT coalesce(sum((a.allocated_amount + a.discount_taken + a.write_off_amount) * i.exchange_rate), 0) "
+        "SELECT coalesce(sum((a.allocated_amount + a.discount_taken + a.write_off_amount) * {RATE}), 0) "
         "FROM ar.payment_allocation a "
         "JOIN ar.invoice i ON i.invoice_id = a.invoice_id "
         "JOIN gl.journal_entry ij ON ij.journal_entry_id = i.journal_entry_id "
@@ -87,22 +107,25 @@ def sub_1400(conn: sa.Connection, d: date) -> Decimal:
         "JOIN gl.journal_entry pj ON pj.journal_entry_id = p.journal_entry_id "
         f"WHERE a.allocation_date <= :d AND {_posted_by('ij')} AND {_posted_by('pj')}",
         d=d,
+        functional=functional,
     )
     cash = _scalar(
         conn,
-        "SELECT coalesce(sum(p.gross_amount * p.exchange_rate), 0) FROM ar.customer_payment p "
+        "SELECT coalesce(sum(p.functional_currency_amount), 0) FROM ar.customer_payment p "
         f"JOIN gl.journal_entry j ON j.journal_entry_id = p.journal_entry_id WHERE {_posted_by('j')}",
         d=d,
+        functional=functional,
     )
     cash_allocated = _scalar(
         conn,
-        "SELECT coalesce(sum(a.allocated_amount * i.exchange_rate), 0) FROM ar.payment_allocation a "
+        "SELECT coalesce(sum(a.allocated_amount * {RATE}), 0) FROM ar.payment_allocation a "
         "JOIN ar.invoice i ON i.invoice_id = a.invoice_id "
         "JOIN gl.journal_entry ij ON ij.journal_entry_id = i.journal_entry_id "
         "JOIN ar.customer_payment p ON p.payment_id = a.payment_id "
         "JOIN gl.journal_entry pj ON pj.journal_entry_id = p.journal_entry_id "
         f"WHERE a.allocation_date <= :d AND {_posted_by('ij')} AND {_posted_by('pj')}",
         d=d,
+        functional=functional,
     )
     return (items - item_allocations) - (cash - cash_allocated)
 
@@ -145,11 +168,12 @@ def sub_1410(conn: sa.Connection, d: date) -> Decimal:
     return ZERO
 
 
-def recompute(conn: sa.Connection, d: date, family_account_ids: list[str]) -> dict[str, Decimal]:
-    """Sub(2000, 1400, 2040, 1410) at D from the snapshot."""
+def recompute(conn: sa.Connection, d: date, family_account_ids: list[str], functional: str) -> dict[str, Decimal]:
+    """Sub(2000, 1400, 2040, 1410) at D from the snapshot; ``functional`` is the tenant's functional currency."""
+    require_rates(conn, d, functional)
     return {
-        "2000": sub_2000(conn, d),
-        "1400": sub_1400(conn, d),
+        "2000": sub_2000(conn, d, functional),
+        "1400": sub_1400(conn, d, functional),
         "2040": sub_2040(conn, d, family_account_ids),
         "1410": sub_1410(conn, d),
     }

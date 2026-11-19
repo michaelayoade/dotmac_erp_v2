@@ -78,7 +78,10 @@ def _recompute_subledger(eng, legacy_eng, tenant, as_of) -> dict[str, Any]:
     """Sub(2000, 1400, 2040, 1410) at the opening date from the legacy snapshot (read only)."""
     from dotmac_accounting.models import Account
 
+    from erp_v2.journals.policy import functional_currency
+
     with Session(eng) as db:
+        functional = functional_currency(db, tenant)
         family = [
             str(i)
             for i in db.scalars(
@@ -90,7 +93,7 @@ def _recompute_subledger(eng, legacy_eng, tenant, as_of) -> dict[str, Any]:
     with legacy_eng.connect() as legacy, legacy.begin():
         legacy.execute(sa.text("SET TRANSACTION READ ONLY"))
         legacy.execute(sa.text("SET LOCAL row_security = off"))
-        return legacy_subledger.recompute(legacy, as_of, family)
+        return legacy_subledger.recompute(legacy, as_of, family, functional)
 
 
 def _run(args) -> dict[str, Any]:

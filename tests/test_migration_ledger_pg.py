@@ -1514,14 +1514,15 @@ def legacy_schema(engine):
         "CREATE TABLE gl.posted_ledger_line (account_id uuid, debit_amount numeric, credit_amount numeric, "
         "posting_date date, journal_entry_id uuid, source_document_type text, source_document_id text)",
         "CREATE TABLE ap.supplier_invoice (invoice_id uuid PRIMARY KEY, journal_entry_id uuid, "
-        "ap_control_account_id uuid, functional_currency_amount numeric, exchange_rate numeric DEFAULT 1)",
+        "ap_control_account_id uuid, functional_currency_amount numeric, currency_code text NOT NULL DEFAULT 'USD', "
+        "exchange_rate numeric)",
         "CREATE TABLE ap.supplier_payment (payment_id uuid PRIMARY KEY, journal_entry_id uuid)",
         "CREATE TABLE ap.payment_allocation (invoice_id uuid, payment_id uuid, allocation_date date, "
         "allocated_amount numeric, discount_taken numeric DEFAULT 0)",
         "CREATE TABLE ar.invoice (invoice_id uuid PRIMARY KEY, journal_entry_id uuid, "
-        "functional_currency_amount numeric, exchange_rate numeric DEFAULT 1)",
+        "functional_currency_amount numeric, currency_code text NOT NULL DEFAULT 'USD', exchange_rate numeric)",
         "CREATE TABLE ar.customer_payment (payment_id uuid PRIMARY KEY, journal_entry_id uuid, gross_amount numeric, "
-        "exchange_rate numeric DEFAULT 1)",
+        "functional_currency_amount numeric, exchange_rate numeric)",
         "CREATE TABLE ar.payment_allocation (invoice_id uuid, payment_id uuid, allocation_date date, "
         "allocated_amount numeric, discount_taken numeric DEFAULT 0, write_off_amount numeric DEFAULT 0)",
         "CREATE TABLE expense.expense_claim (claim_id uuid PRIMARY KEY, journal_entry_id uuid, net_payable_amount numeric)",
@@ -1688,16 +1689,18 @@ def posted_journal(engine, day, *, status="POSTED", reversal=None):
 
 
 def seed_payables(engine):
-    def invoice(amount, *, day=date(2025, 6, 1), status="POSTED", reversal=None, rate=1):
+    def invoice(amount, *, day=date(2025, 6, 1), status="POSTED", reversal=None, rate=None):
         inv = uuid4()
         j = posted_journal(engine, day, status=status, reversal=reversal)
         legacy_exec(
             engine,
-            "INSERT INTO ap.supplier_invoice (invoice_id, journal_entry_id, functional_currency_amount, exchange_rate) VALUES (:i, :j, :a, :r)",
+            "INSERT INTO ap.supplier_invoice (invoice_id, journal_entry_id, functional_currency_amount, currency_code, "
+            "exchange_rate) VALUES (:i, :j, :a, :c, :r)",
             i=inv,
             j=j,
             a=Decimal(amount),
-            r=Decimal(rate),
+            c="EUR" if rate else "USD",
+            r=None if rate is None else Decimal(rate),
         )
         return inv
 
@@ -1750,7 +1753,7 @@ def seed_receivables(engine):
     p = uuid4()
     legacy_exec(
         engine,
-        "INSERT INTO ar.customer_payment (payment_id, journal_entry_id, gross_amount) VALUES (:p, :j, 200)",
+        "INSERT INTO ar.customer_payment (payment_id, journal_entry_id, gross_amount, functional_currency_amount) VALUES (:p, :j, 200, 200)",
         p=p,
         j=posted_journal(engine, date(2025, 4, 1)),
     )
@@ -1787,12 +1790,12 @@ def test_the_legacy_subledger_recipes_at_the_opening_date(engine, legacy_schema)
     ap, ar = seed_payables(engine), seed_receivables(engine)
     claims = seed_claims(engine, env.accounts["2040"])
     with engine.connect() as legacy:
-        out = legacy_subledger.recompute(legacy, D_OPEN, [str(env.accounts["2040"])])
+        out = legacy_subledger.recompute(legacy, D_OPEN, [str(env.accounts["2040"])], "USD")
     assert out == {"2000": ap, "1400": ar, "2040": claims, "1410": Decimal(0)}
     # a missing recipe is refused rather than ignored: payroll net pay or a staff loan at D
     legacy_exec(engine, "INSERT INTO payroll.employee_loan VALUES (:l, :d)", l=uuid4(), d=date(2025, 5, 1))
     with engine.connect() as legacy:
-        assert refusal_code(legacy_subledger.recompute, legacy, D_OPEN, []) == "legacy_subledger_recipe_missing"
+        assert refusal_code(legacy_subledger.recompute, legacy, D_OPEN, [], "USD") == "legacy_subledger_recipe_missing"
 
 
 def test_the_pnl_rolls_up_into_3100_in_the_opening_period(engine, legacy_schema):
@@ -1830,10 +1833,49 @@ def test_g9_pins_for_the_opening_date_subledgers():
                     sa.text("SELECT account_id::text FROM gl.account WHERE account_code IN ('2040', '2030', '2110')")
                 )
             ]
-            out = legacy_subledger.recompute(legacy, date(2025, 12, 31), family)
+            out = legacy_subledger.recompute(legacy, date(2025, 12, 31), family, "NGN")
     finally:
         eng.dispose()
     assert out == {
         "2000": Decimal("-66479663.78"), "1400": Decimal("729671283.82"),
         "2040": Decimal("-409280.00"), "1410": Decimal("0.00"),
     }  # fmt: skip
+
+
+def test_a_functional_currency_row_with_a_null_rate_counts_at_face_and_a_foreign_one_refuses(engine, legacy_schema):
+    """Legacy left the rate NULL on tens of thousands of NGN rows; NULL x amount must not drop them from the sums."""
+    from erp_v2.migration_ledger import legacy_subledger
+
+    env = world(engine)
+    inv, pay = uuid4(), uuid4()
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.invoice (invoice_id, journal_entry_id, functional_currency_amount, currency_code, exchange_rate) VALUES (:i, :j, 1000, 'NGN', NULL)",
+        i=inv,
+        j=posted_journal(engine, date(2025, 3, 1)),
+    )
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.customer_payment (payment_id, journal_entry_id, gross_amount, functional_currency_amount, exchange_rate) VALUES (:p, :j, 400, 400, NULL)",
+        p=pay,
+        j=posted_journal(engine, date(2025, 4, 1)),
+    )
+    legacy_exec(
+        engine,
+        "INSERT INTO ar.payment_allocation (invoice_id, payment_id, allocation_date, allocated_amount, discount_taken, write_off_amount) VALUES (:i, :p, :d, 150, 0, 0)",
+        i=inv,
+        p=pay,
+        d=date(2025, 5, 1),
+    )
+    with engine.connect() as legacy:
+        # items 1000 - allocation 150 (rate 1, NULL stored) = 850; cash 400 - 150 = 250 unallocated: 850 - 250 = 600
+        assert legacy_subledger.recompute(legacy, D_OPEN, [], "NGN")["1400"] == Decimal("600")
+    legacy_exec(
+        engine,
+        "INSERT INTO ap.supplier_invoice (invoice_id, journal_entry_id, functional_currency_amount, currency_code, exchange_rate) VALUES (:i, :j, 10, 'EUR', NULL)",
+        i=uuid4(),
+        j=posted_journal(engine, date(2025, 3, 1)),
+    )
+    with engine.connect() as legacy:
+        assert refusal_code(legacy_subledger.recompute, legacy, D_OPEN, [], "NGN") == "legacy_rate_missing"
+    del env
