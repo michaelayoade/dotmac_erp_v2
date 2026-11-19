@@ -93,7 +93,8 @@ REPORTS (never gate reasons, in the `reports` block of the gate output): open wo
 (`classes_missing`; `classes.CLASSES` is the E01-E34 inventory plus E35, E36a, E36b, E37, E38), the 2030 balance
 (`REPORT_ZERO_CODES`) and the 2110 balance (`REPORT_WHT_CODES`). `profile_checks_pending` lists section-4 checks that
 need owners not on main (per-module completeness, holding ties, prepayment tie against R1, keyed-account/period setup,
-writer role): they are not implemented here and are not silently skipped. The lists are code constants in `ledger_roles`
+writer role): a non-empty list REFUSES the gate (`profile_checks_unbuilt`); each owner PR removes its own entry when
+it wires its check. The lists are code constants in `ledger_roles`
 and recorded in each bridge body; the ledger and register state at signature is stored with the signature.
 `sign` takes `approval_reference` = `dotmac-debt-register v<N>` (format-checked only).
 

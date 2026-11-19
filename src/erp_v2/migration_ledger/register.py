@@ -431,8 +431,9 @@ def counts(db: Session, tenant: UUID) -> dict[str, Any]:
     }
 
 
-# Section-4 gate checks that need owners not on main yet. They are not silently skipped: the gate output lists them,
-# and the control ties that depend on them (1400, 2045) already refuse by name until the owners are pinned.
+# Section-4 gate checks that need owners not on main yet. A non-empty list REFUSES the gate
+# (``profile_checks_unbuilt``), so the gate can never pass with an unbuilt check.
+# Each owner PR removes its own entry when it wires its check.
 PROFILE_CHECKS_PENDING: Final = (
     "completeness_per_module_currency",  # needs the per-module legacy = landed + held census (B-13/B-14/#72)
     "holding_ties",  # B-14 (e2_0030 holdings)
@@ -455,6 +456,8 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
     version = sha = None
     reasons: list[str] = []
     reports: dict[str, Any] = {}
+    if PROFILE_CHECKS_PENDING:
+        reasons.append("profile_checks_unbuilt")
     if row is None:
         reasons.append("no_bridge_version")
     else:

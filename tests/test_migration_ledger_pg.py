@@ -542,6 +542,7 @@ def owners_available(monkeypatch):
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "1400", zero)
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "2045", zero)
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "2110", zero)
+    monkeypatch.setattr(register, "PROFILE_CHECKS_PENDING", ())  # tests of the other reasons; see the unbuilt test
 
 
 def cover_all(engine, env, *, except_classes=()):
@@ -687,6 +688,22 @@ def test_manual_add_takes_only_a_class_from_the_closed_list_and_is_a_report_item
     assert g["passed"] and g["reasons"] == [] and g["reports"]["open_by_class"] == {"E26": 1}
 
 
+def test_the_gate_refuses_while_any_profile_check_is_unbuilt(engine, owners_available, monkeypatch):
+    env = world(engine)
+    seed_clean(engine, env)
+    cover_all(engine, env)
+    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    sign(engine, env, version, sha)
+    assert gate(engine, env)["passed"]
+    monkeypatch.setattr(register, "PROFILE_CHECKS_PENDING", ("holding_ties", "writer_role_m1"))
+    g = gate(engine, env)
+    assert not g["passed"] and g["reasons"] == ["profile_checks_unbuilt"]
+    assert g["profile_checks_pending"] == ["holding_ties", "writer_role_m1"]
+    assert register.PROFILE_CHECKS_PENDING == ("holding_ties", "writer_role_m1")
+    monkeypatch.undo()
+    assert register.PROFILE_CHECKS_PENDING  # the shipped list is non-empty: the real gate refuses today
+
+
 def test_the_bridge_body_records_the_gate_profile_and_the_gate_lists_unbuilt_profile_checks(engine, owners_available):
     env = world(engine)
     seed_clean(engine, env)
@@ -697,7 +714,7 @@ def test_the_bridge_body_records_the_gate_profile_and_the_gate_lists_unbuilt_pro
     assert body["gate_profile"] == "as_is_v1"  # recorded in the bridge body: Michael's signature covers it
     sign(engine, env, version, sha)
     g = gate(engine, env)
-    assert g["passed"] and {"holding_ties", "completeness_per_module_currency"} <= set(g["profile_checks_pending"])
+    assert g["passed"] and g["profile_checks_pending"] == []  # (the fixture empties the shipped list)
 
 
 def test_the_gate_refuses_when_the_ledger_moved_since_signature(engine, owners_available):
