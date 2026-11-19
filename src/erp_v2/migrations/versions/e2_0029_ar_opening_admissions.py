@@ -7,11 +7,15 @@ Two things, both additive:
 2. NOLOGIN role `erp_billing_opening_writer` (SECURITY WIDENING, architect review before the pin PR). a12 binds a
    window to ONE restricted principal and refuses ordinary roles; the operator CLI `SET ROLE`s into it for import
    and seal. Its grants are exactly the closure billing names in the docstrings of bi_0009 / bi_0013 / bi_0014:
-   REVIEW-R5: projects-60 has not yet confirmed this list; it is the minimal set derived from those docstrings.
-   It is never a member of app_user / platform_api / app_admin, owns nothing, and has no LOGIN. The migration
-   role is granted membership so it can `SET ROLE` into it.
+   Billing R5 list (billing-step5 BILLING-R1-R4-R5): INSERT only the 20 tables below; no hold or authority-switch
+   tables because the ERP uses no holds and passes no authority switch to the seal.
+   It is never a member of app_user / platform_api / app_admin, owns nothing, and has no LOGIN. NO membership is
+   granted by this migration (not to the migrator, not to anyone): the operator's `SET ROLE` membership is a Michael
+   root step for the window's lifetime only (`WITH SET TRUE, INHERIT FALSE`), revoked after the seal.
+   An existing role with login / superuser / bypassrls / createrole / createdb / replication, or any membership, is
+   refused. PostgreSQL below 15 is refused.
 
-Revision chain: e2_0027 (current main head) -> this (e2_0028, B-9, is reserved; the coordinator re-chains).
+Revision chain: e2_0028_migration_ledger (B-9) -> this. e2_0030 is reserved for B-14 holdings.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from alembic import op
 from erp_v2.importer.ar_opening_models import TABLE, WRITER_ROLE
 
 revision = "e2_0029_ar_opening_admissions"
-down_revision = "e2_0027_held_draft_decisions"
+down_revision = "e2_0028_migration_ledger"
 branch_labels = None
 depends_on = ("bi_0017_open_documents_index",)
 
@@ -133,13 +137,43 @@ def upgrade() -> None:
         f"FOR EACH ROW EXECUTE FUNCTION public.{TABLE}_guard()"
     )
     op.execute(f"GRANT SELECT ON public.{TABLE} TO app_user")
-    # The restricted opening principal. Idempotent: an existing role is verified, never altered or widened.
+    # The restricted opening principal (billing R5). An existing role is verified, never altered or widened.
     op.execute(
         f"""
         DO $$
+        DECLARE
+            server_major integer := current_setting('server_version_num')::integer / 10000;
+            r pg_catalog.pg_roles%ROWTYPE;
         BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}') THEN
+            IF server_major < 15 THEN
+                RAISE EXCEPTION 'erp_billing_opening_writer requires PostgreSQL 15 or newer'
+                    ' (SET and INHERIT membership options)';
+            END IF;
+            SELECT * INTO r FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}';
+            IF NOT FOUND THEN
                 CREATE ROLE {WRITER_ROLE} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+            ELSIF r.rolcanlogin OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb
+                  OR r.rolreplication THEN
+                RAISE EXCEPTION 'existing role {WRITER_ROLE} carries login, superuser, bypassrls, createrole, '
+                    'createdb or replication: refusing to adopt it';
+            END IF;
+            -- never a member (even transitively) of the serving or admin roles, and none of them a member of it
+            IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}') THEN
+                IF EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_roles g
+                    WHERE g.rolname IN ('app_user', 'platform_api', 'app_admin')
+                      AND (pg_catalog.pg_has_role('{WRITER_ROLE}', g.oid, 'MEMBER')
+                           OR pg_catalog.pg_has_role(g.oid, '{WRITER_ROLE}', 'MEMBER'))
+                ) THEN
+                    RAISE EXCEPTION '{WRITER_ROLE} is linked to app_user, platform_api or app_admin: refusing';
+                END IF;
+                -- membership of ANY role (e.g. one granted to the pipeline migrator) is a widening: refuse
+                IF EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_auth_members m
+                    WHERE m.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}')
+                ) THEN
+                    RAISE EXCEPTION '{WRITER_ROLE} is a member of another role: refusing to adopt it';
+                END IF;
             END IF;
         END
         $$
@@ -147,24 +181,10 @@ def upgrade() -> None:
     )
     for line in _grant_lines():
         op.execute(line)
-    # The migration role (the CLI's session) must be able to SET ROLE into the writer for import and seal.
-    # A role created earlier by a DIFFERENT migration role (shared test clusters) cannot be re-granted here; then the
-    # operator's session simply cannot SET ROLE into it and the CLI fails closed (nothing is widened silently).
-    op.execute(
-        f"""
-        DO $$
-        BEGIN
-            IF NOT pg_catalog.pg_has_role(current_user, '{WRITER_ROLE}', 'SET') THEN
-                BEGIN
-                    EXECUTE 'GRANT {WRITER_ROLE} TO ' || quote_ident(current_user);
-                EXCEPTION WHEN insufficient_privilege THEN
-                    RAISE NOTICE 'migration role cannot be granted {WRITER_ROLE}: grant membership out of band';
-                END;
-            END IF;
-        END
-        $$
-        """
-    )
+    # NO membership is granted here, to the migration role or anyone else. A standing, inheriting membership of the
+    # pipeline migrator would be a permanent widening against R5. The operator's membership is a Michael root step,
+    # for the window's lifetime only: GRANT erp_billing_opening_writer TO <operator> WITH SET TRUE, INHERIT FALSE;
+    # revoked after the seal together with the writer's INSERT grants (runbook F9).
 
 
 def downgrade() -> None:

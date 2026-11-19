@@ -13,6 +13,7 @@ from erp_v2.importer.ar_census import (
     CLOSED,
     EXCLUDED_PARTITION,
     NOT_RECEIVABLE,
+    UNAPPLIED_CREDIT_NOTE,
     CensusError,
     build_census,
     prove_partition,
@@ -54,7 +55,7 @@ def test_every_row_lands_in_exactly_one_bucket_with_all_buckets_exercised() -> N
         _inv("sub-1", posted=False, status="SUBMITTED"),
         _inv("void-1", posted=False, status="VOID"),
         _inv("late-1", invoice_date=datetime(2026, 2, 1, tzinfo=UTC)),
-        _inv("bad-1", customer="cust-2", total="50.00"),
+        _inv("bad-1", customer="cust-2", total="50.005"),
         _inv("cn-1", customer="cust-2", total="-20.00", invoice_type="CREDIT_NOTE"),
     ]
     payments = [_pay("p-lot", "100.00"), _pay("p-hist", "30.00"), _pay("p-draft", "5.00", posted=False)]
@@ -71,14 +72,32 @@ def test_every_row_lands_in_exactly_one_bucket_with_all_buckets_exercised() -> N
     assert _bucket(census, "invoice", "late-1").bucket == NOT_RECEIVABLE  # issued after the cutoff
     assert _bucket(census, "invoice", "void-1").bucket == CLOSED
     assert _bucket(census, "payment", "p-draft").bucket == CLOSED
-    # cust-2 holds an unapplied credit note: the WHOLE partition is excluded, the open invoice with it
-    assert _bucket(census, "invoice", "cn-1").bucket == EXCLUDED_PARTITION
+    # cust-2: bad-1 is inexact (a dependency blocker for the partition); the unapplied credit note rides along
     assert _bucket(census, "invoice", "bad-1").bucket == EXCLUDED_PARTITION
+    assert _bucket(census, "invoice", "cn-1").bucket == EXCLUDED_PARTITION
     (excluded,) = census.excluded
     assert excluded.partition == ("cust-2", "NGN")
-    assert ("cn-1", "credit_transfer_unsupported") in excluded.blockers
-    assert excluded.open_residual_minor == 5000 - 2000
     assert census.carry_partitions == (("cust-1", "NGN"),)
+
+
+def test_unapplied_credit_note_does_not_exclude_its_partition_and_is_listed_for_the_work_queue() -> None:
+    invoices = [
+        _inv("open-1", total="100.00"),
+        _inv("cn-1", total="-20.00", invoice_type="CREDIT_NOTE"),
+        _inv("cn-only", customer="cust-9", total="-5.00", invoice_type="CREDIT_NOTE"),
+        _inv("cn-zero", total="0.00", invoice_type="CREDIT_NOTE"),
+    ]
+    census = _census(invoices)
+    assert _bucket(census, "invoice", "cn-1").bucket == UNAPPLIED_CREDIT_NOTE
+    assert _bucket(census, "invoice", "cn-only").bucket == UNAPPLIED_CREDIT_NOTE
+    assert _bucket(census, "invoice", "cn-zero").bucket == CLOSED  # residual 0: history
+    assert census.carry_partitions == (("cust-1", "NGN"),) and census.excluded == ()
+    assert census.credit_note_only_partitions == (("cust-9", "NGN"),)  # nothing to carry: no account minted
+    receipt = census.receipt()
+    assert [(n["key"], n["document_number"], n["gross_minor"]) for n in receipt["unapplied_credit_notes"]] == [
+        ("cn-1", "CN-1", -2000),
+        ("cn-only", "CN-ONLY", -500),
+    ]
 
 
 def test_totals_by_origin_tie_to_the_source_and_origin_is_provenance() -> None:

@@ -16,10 +16,25 @@ currency) only selects. A partition is one legacy customer x currency:
 Honesty rules kept: exact minor units (rounding is a blocker); `unknown_unverified` collection evidence (B9-1c:
 face value, no collection proof); required provenance columns (a missing column refuses the translation).
 
-a12 refuses the whole manifest on any non-carryable row, and holds are operational only, so a partition with ANY
-blocker is excluded WHOLE (never a single row: that would orphan the discharges and lots that depend on it).
-`translate_partition` reports blockers; `build_complete_manifest` only accepts carryable translations; the census
-(`ar_census`) routes the excluded partitions to E35.
+a12 refuses the whole manifest on any non-carryable row, and holds are operational only. AS-IS rework (replan section 2.3, amended by the billing owner's a13 answers). Billing a13 answers P-1 = NO: a
+customer x currency partition is the smallest holdable unit (`manifest_noncarryable_row`,
+opening_variance_validation.py:127-132; no variance reason accepts source kind credit_note,
+opening_variance_contracts.py:107-157; a `customer_credit` variance is refused for a customer with cash lots,
+opening_variance_validation.py:149-157). So a row is NEVER credit_notes inside billing. Two levels:
+
+- an UNAPPLIED CREDIT NOTE (credit note or negative total, nonzero residual, no allocation links, nothing depends
+  on it) is simply NOT PART of the billing manifest. It never enters the population, so it cannot make the manifest
+  non-carryable; its partition is carried as legacy recorded it. The note becomes a migration work-queue item
+  (`ar_unapplied_credit_note`: party, document number, amount) that Finance applies or issues after the flip with
+  normal billing commands, and part of the itemised per-party GL-minus-subledger difference on 1400 that the B-14
+  holding reclass moves to the AR holding account. A credit note whose residual is 0 is just closed history;
+- every other blocker stays WHOLE-PARTITION (E35 `partition:`, GL to holding): `payment_allocation_outside_population`,
+  `payment_overallocated`, `invoice_residual_nonpositive`, `amount_not_exact`, currency, a missing customer
+  snapshot, and a credit note that HAS allocation links (excluding only it would orphan the discharges and lots
+  that depend on it).
+`translate_partition` reports blockers and unapplied credit notes; `build_complete_manifest` only accepts carryable
+translations;
+the census (`ar_census`) routes unapplied credit notes and excluded partitions to the register.
 
 Identity kinds are `invoice` and `payment`: a12's variance ledger only resolves a variance whose source kind is in
 its closed itemised set and equals the population identity, so `ar_invoice` / `ar_customer_payment` (revision 2
@@ -107,6 +122,13 @@ class OpeningBlocker:
 
 
 @dataclass(frozen=True)
+class OpeningUnappliedCreditNote:
+    kind: str  # invoice
+    source_key: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class OpeningTranslationContext:
     partition: OpeningPartitionV1
     seller: PartyDocumentSnapshotV1
@@ -126,6 +148,8 @@ class OpeningTranslation:
     items: tuple[OpeningReceivableItemV1, ...] = ()
     cash_lots: tuple[OpeningCashLotV1, ...] = ()
     blockers: list[OpeningBlocker] = field(default_factory=list)
+    # Unapplied credit notes kept out of the manifest (P-1 = NO: no row is held inside billing); the partition is carried.
+    unapplied_credit_notes: list[OpeningUnappliedCreditNote] = field(default_factory=list)
     dispositions: tuple[OpeningDispositionV1, ...] = ()
     variances: tuple[OpeningVarianceV1, ...] = ()
     stored_balance_minor: int = 0
@@ -220,6 +244,7 @@ def translate_partition(
     _require_fields("payment", payments, "payment_id", PAYMENT_REQUIRED_FIELDS)
     result = OpeningTranslation(partition=partition)
     blockers = result.blockers
+    credit_notes = result.unapplied_credit_notes
 
     invoice_by_id = {str(i["invoice_id"]): i for i in invoices}
     payment_by_id = {str(p["payment_id"]): p for p in payments}
@@ -241,19 +266,27 @@ def translate_partition(
             continue
         total_minor = _minor(Decimal(str(invoice["total_amount"])), precision)
         alloc_minors = [_minor(Decimal(str(a["amount_allocated"])), precision) for a in allocs_by_invoice.get(key, [])]
+        linked = bool(allocs_by_invoice.get(key))
         if total_minor is None or any(m is None for m in alloc_minors):
             blockers.append(OpeningBlocker(key, INEXACT_REASON))
             continue
         residual = total_minor - sum(m for m in alloc_minors if m is not None)
         totals[key] = total_minor
         residuals[key] = residual
-        if residual > 0 and str(invoice.get("invoice_type", "")).upper() == "CREDIT_NOTE":
+        if residual != 0 and str(invoice.get("invoice_type", "")).upper() == "CREDIT_NOTE" and not linked:
+            credit_notes.append(
+                OpeningUnappliedCreditNote(INVOICE_KIND, key, UNAPPLIED_CREDIT_REASON)
+            )  # unapplied credit note: out of the manifest
+        elif residual > 0 and str(invoice.get("invoice_type", "")).upper() == "CREDIT_NOTE":
             blockers.append(OpeningBlocker(key, UNAPPLIED_CREDIT_REASON))
         elif residual > 0:
             item_ids.append(key)
         elif residual < 0:
             is_credit = total_minor < 0 or str(invoice.get("invoice_type", "")).upper() == "CREDIT_NOTE"
-            blockers.append(OpeningBlocker(key, UNAPPLIED_CREDIT_REASON if is_credit else OVERALLOCATED_REASON))
+            if is_credit and not linked:
+                credit_notes.append(OpeningUnappliedCreditNote(INVOICE_KIND, key, UNAPPLIED_CREDIT_REASON))
+            else:
+                blockers.append(OpeningBlocker(key, UNAPPLIED_CREDIT_REASON if is_credit else OVERALLOCATED_REASON))
         else:
             closed.append(key)
     result.closed_invoices = tuple(closed)
@@ -312,8 +345,10 @@ def translate_partition(
 
     if blockers:
         # Whole-partition exclusion: no items, lots, dispositions or variances are produced.
+        result.unapplied_credit_notes = []
         result.census = {"invoices": len(invoices), "payments": len(payments), "carryable": False}
         return result
+    result.unapplied_credit_notes = sorted(credit_notes, key=lambda h: (h.kind, h.source_key))
 
     items: list[OpeningReceivableItemV1] = []
     dispositions: list[OpeningDispositionV1] = []
@@ -438,6 +473,7 @@ def translate_partition(
                 )
             )
     if blockers:
+        result.unapplied_credit_notes = []  # the whole partition is excluded; its rows are E35 partition members
         result.census = {"invoices": len(invoices), "payments": len(payments), "carryable": False}
         return result
 
@@ -489,7 +525,7 @@ def translate_partition(
 
     lots_residual = sum(lot.residual_minor for lot in cash_lots)
     # Rebuild (documents - payments), receivable-positive: item totals less what was discharged by payments,
-    # less the unallocated cash held as lots (net of credit), as the E4 equation expects.
+    # less the unallocated cash credit_notes as lots (net of credit), as the E4 equation expects.
     item_totals = sum(totals[k] for k in item_ids)
     discharged_to_items = sum(d.amount_minor for item in items for d in item.historical_discharges)
     result.rebuild_minor = item_totals - discharged_to_items - lots_residual
@@ -506,6 +542,7 @@ def translate_partition(
         "lots": len(cash_lots),
         "closed_invoices": len(closed),
         "ignored_payments": len(ignored),
+        "unapplied_credit_notes": len(credit_notes),
         "carryable": True,
     }
     return result
@@ -730,6 +767,7 @@ __all__ = [
     "OpeningTranslation",
     "OpeningTranslationContext",
     "OpeningTranslationError",
+    "OpeningUnappliedCreditNote",
     "build_complete_manifest",
     "build_import_command",
     "build_manifest",

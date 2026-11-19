@@ -97,15 +97,37 @@ def test_closed_invoice_is_history_not_an_item() -> None:
     assert "inv-closed" not in {i.source_invoice_key for i in t1.items}
 
 
-def test_unapplied_credit_note_excludes_the_whole_partition() -> None:
+def test_unapplied_credit_note_is_kept_out_of_the_manifest_and_the_partition_is_carried() -> None:
     t = translate_partition(
         context=context("c"),
         invoices=[invoice("inv-1"), invoice("cn-1", total="-25.00", invoice_type="CREDIT_NOTE")],
         allocations=[],
         payments=[payment("p-1", "10.00")],
     )
-    assert not t.carryable and t.items == () and t.cash_lots == ()  # nothing partial leaks out
+    assert t.carryable and not t.blockers
+    assert [(n.source_key, n.reason) for n in t.unapplied_credit_notes] == [("cn-1", "credit_transfer_unsupported")]
+    assert [i.source_invoice_key for i in t.items] == ["inv-1"] and [
+        lot.source_identity.key for lot in t.cash_lots
+    ] == ["p-1"]
+    assert "cn-1" not in {d.identity.key for d in t.dispositions}  # never in the billing population
+
+
+def test_credit_note_with_allocation_links_still_excludes_the_whole_partition() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1"), invoice("cn-1", total="50.00", invoice_type="CREDIT_NOTE")],
+        allocations=[alloc("p-1", "cn-1", "20.00")],
+        payments=[payment("p-1", "20.00")],
+    )
+    assert not t.carryable and t.items == () and t.unapplied_credit_notes == []
     assert _reasons(t) == {("cn-1", "credit_transfer_unsupported")}
+
+
+def test_standalone_inexact_row_is_a_partition_blocker_not_a_dropped_row() -> None:
+    t = translate_partition(
+        context=context("c"), invoices=[invoice("inv-1"), invoice("bad", total="10.005")], allocations=[], payments=[]
+    )
+    assert not t.carryable and _reasons(t) == {("bad", "amount_not_exact")}
 
 
 def test_over_allocated_invoice_is_a_named_blocker() -> None:
@@ -219,7 +241,7 @@ def test_measures_and_controls_are_consistent_with_the_items_and_lots() -> None:
 def test_manifest_refuses_a_blocked_partition_and_a_duplicate() -> None:
     blocked = translate_partition(
         context=context("c"),
-        invoices=[invoice("cn", total="-1.00", invoice_type="CREDIT_NOTE")],
+        invoices=[invoice("bad", total="1.001")],
         allocations=[],
         payments=[],
     )

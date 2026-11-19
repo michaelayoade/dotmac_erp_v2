@@ -4,7 +4,10 @@ Pure over already-read legacy rows (the read-only loader is `load_legacy_rows`).
 `ar.customer_payment` lands in exactly ONE bucket:
 
 - `CARRY_ITEM` / `CARRY_LOT`: in a carryable customer x currency partition (a receivable item / a cash lot);
-- `EXCLUDED_PARTITION(reason)`: its partition has a non-carryable row, so the WHOLE partition is excluded (E35);
+- `UNAPPLIED_CREDIT_NOTE(reason)`: an unapplied credit note (no allocation links, nothing depends on it). It is NOT part
+  of the billing manifest (billing a13 cannot hold a row inside a partition: P-1 = NO) and does not stop its
+  partition from being carried; it is a work-queue item (`ar_unapplied_credit_note`) and part of the 1400 holding;
+- `EXCLUDED_PARTITION(reason)`: its partition has a DEPENDENCY blocker, so the WHOLE partition is excluded (E35);
 - `NOT_RECEIVABLE`: DRAFT or SUBMITTED, or issued after the capture cutoff (no GL, Finance re-issues or voids);
 - `CLOSED`: residual 0 (history, no item), or not posted at the cutoff and not a draft.
 
@@ -40,9 +43,10 @@ from erp_v2.importer.billing_opening import (
 CARRY_ITEM = "CARRY_ITEM"
 CARRY_LOT = "CARRY_LOT"
 EXCLUDED_PARTITION = "EXCLUDED_PARTITION"
+UNAPPLIED_CREDIT_NOTE = "UNAPPLIED_CREDIT_NOTE"
 NOT_RECEIVABLE = "NOT_RECEIVABLE"
 CLOSED = "CLOSED"
-BUCKETS = (CARRY_ITEM, CARRY_LOT, EXCLUDED_PARTITION, NOT_RECEIVABLE, CLOSED)
+BUCKETS = (CARRY_ITEM, CARRY_LOT, EXCLUDED_PARTITION, UNAPPLIED_CREDIT_NOTE, NOT_RECEIVABLE, CLOSED)
 UNPOSTED_STATUSES = frozenset({"DRAFT", "SUBMITTED"})
 _SHA = re.compile(r"[0-9a-f]{64}")
 
@@ -63,6 +67,7 @@ class CensusRow:
     partition: PartitionKey | None
     gross_minor: int | None
     residual_minor: int | None
+    document_number: str | None = None  # only set for unapplied credit notes (work-queue item detail)
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,16 @@ class ExcludedPartition:
 
 
 @dataclass(frozen=True)
+class CensusVariance:
+    """A stored-balance difference carried into the manifest (billing records it at import or seal): an E36b item."""
+
+    partition: PartitionKey
+    source_key: str
+    reason: str
+    amount_minor: int
+
+
+@dataclass(frozen=True)
 class ArCensus:
     snapshot_sha256: str
     cutoff: str
@@ -82,6 +97,10 @@ class ArCensus:
     carry_partitions: tuple[PartitionKey, ...]
     excluded: tuple[ExcludedPartition, ...]
     sha256: str
+    variances: tuple[CensusVariance, ...] = ()
+    credit_note_only_partitions: tuple[
+        PartitionKey, ...
+    ] = ()  # only unapplied credit notes: nothing to carry, no account minted
 
     def totals(self) -> dict[str, dict[str, dict[str, int]]]:
         """origin -> bucket -> {count, gross_minor, residual_minor} (inexact amounts counted as 0, listed apart)."""
@@ -111,6 +130,38 @@ class ArCensus:
             "buckets": self.counts(),
             "totals_by_origin": self.totals(),
             "carry_partitions": len(self.carry_partitions),
+            "credit_note_only_partitions": [list(p) for p in self.credit_note_only_partitions],
+            "unapplied_credit_notes": [
+                {
+                    "kind": r.kind,
+                    "key": r.key,
+                    "reason": r.reason,
+                    "document_number": r.document_number,
+                    "partition": list(r.partition) if r.partition else None,
+                    "gross_minor": r.gross_minor,
+                }
+                for r in self.rows
+                if r.bucket == UNAPPLIED_CREDIT_NOTE
+            ],
+            "unposted_documents": [
+                {
+                    "kind": r.kind,
+                    "key": r.key,
+                    "status": r.reason.removeprefix("unposted_").upper(),
+                    "gross_minor": r.gross_minor,
+                }
+                for r in self.rows
+                if r.bucket == NOT_RECEIVABLE and r.reason.startswith("unposted_")
+            ],
+            "variances": [
+                {
+                    "partition": list(v.partition),
+                    "source_key": v.source_key,
+                    "reason": v.reason,
+                    "amount_minor": v.amount_minor,
+                }
+                for v in self.variances
+            ],
             "excluded_partitions": [
                 {
                     "partition": list(e.partition),
@@ -297,6 +348,8 @@ def build_census(
 
     partitions = sorted(set(in_play_invoices) | set(in_play_payments))
     carry: list[PartitionKey] = []
+    credit_note_only: list[PartitionKey] = []
+    variances: list[CensusVariance] = []
     excluded: list[ExcludedPartition] = []
     for part in partitions:
         invs, pays, part_allocs = partition_rows(part, invoices, payments, allocations, cutoff)
@@ -308,8 +361,15 @@ def build_census(
         )
         closed_inv = set(translation.closed_invoices)
         ignored = set(translation.ignored_payments)
-        if translation.carryable:
+        credit_by_key = {h.source_key: h.reason for h in translation.unapplied_credit_notes}
+        if translation.carryable and credit_by_key and not translation.items and not translation.cash_lots:
+            credit_note_only.append(part)  # only unapplied credit notes: nothing to carry
+        elif translation.carryable:
             carry.append(part)
+        if translation.carryable:
+            variances.extend(
+                CensusVariance(part, v.source.key, v.reason_code, v.amount_minor) for v in translation.variances
+            )
         else:
             by_key: dict[str, list[str]] = defaultdict(list)
             for blocker in translation.blockers:
@@ -334,7 +394,19 @@ def build_census(
             origin = origin_of(inv)
             gross = translation.gross_minor_by_key.get(key, _minor(inv["total_amount"], precision))
             residual = translation.residual_minor_by_invoice.get(key)
-            if key in closed_inv:
+            if key in credit_by_key:
+                row = CensusRow(
+                    "invoice",
+                    key,
+                    UNAPPLIED_CREDIT_NOTE,
+                    credit_by_key[key],
+                    origin,
+                    part,
+                    gross,
+                    residual,
+                    str(inv.get("invoice_number") or ""),
+                )
+            elif key in closed_inv:
                 row = CensusRow("invoice", key, CLOSED, "residual_zero", origin, part, gross, 0)
             elif translation.carryable:
                 row = CensusRow("invoice", key, CARRY_ITEM, "translated", origin, part, gross, residual)
@@ -391,14 +463,29 @@ def build_census(
                         list(r.partition) if r.partition else None,
                         r.gross_minor,
                         r.residual_minor,
+                        r.document_number,
                     ]
                     for r in rows
                 ],
                 "excluded": [[list(e.partition), [list(b) for b in e.blockers]] for e in excluded_t],
+                "credit_note_only": [list(p) for p in sorted(credit_note_only)],
+                "variances": [
+                    [list(v.partition), v.source_key, v.reason, v.amount_minor]
+                    for v in sorted(variances, key=lambda v: (v.partition, v.source_key))
+                ],
             }
         )
     ).hexdigest()
-    census = ArCensus(snapshot_sha256, cutoff.isoformat(), rows, carry_t, excluded_t, digest)
+    census = ArCensus(
+        snapshot_sha256,
+        cutoff.isoformat(),
+        rows,
+        carry_t,
+        excluded_t,
+        digest,
+        tuple(sorted(variances, key=lambda v: (v.partition, v.source_key))),
+        tuple(sorted(credit_note_only)),
+    )
     prove_partition(census, invoice_ids=seen_invoices, payment_ids=seen_payments, invoices=invoices, payments=payments)
     return census
 
@@ -494,9 +581,11 @@ __all__ = [
     "CLOSED",
     "EXCLUDED_PARTITION",
     "NOT_RECEIVABLE",
+    "UNAPPLIED_CREDIT_NOTE",
     "ArCensus",
     "CensusError",
     "CensusRow",
+    "CensusVariance",
     "ExcludedPartition",
     "build_census",
     "load_legacy_rows",
