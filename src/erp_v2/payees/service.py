@@ -106,6 +106,8 @@ def resolve_payee(db: Session, tenant_id: UUID, payee_kind: str, payee_ref: str)
     Employee: ``mod_people.employees`` by canonical dashed UUID (code plus person name).
     Supplier: the payables supplier reference set (``supplier_invoices.supplier_ref`` with the
     latest name snapshot); v2 has no separate supplier master. Never free text.
+    Statutory: the payroll external beneficiary ref (``dest:...``) of a component, structure rule or
+    liability of the tenant; the label is the component name (never caller text).
     """
 
     if payee_kind == PayeeKind.EMPLOYEE.value:
@@ -135,7 +137,43 @@ def resolve_payee(db: Session, tenant_id: UUID, payee_kind: str, payee_ref: str)
             .order_by(SupplierInvoice.created_at.desc())
             .limit(1)
         )
+    if payee_kind == PayeeKind.STATUTORY.value:
+        return _resolve_statutory(db, tenant_id, payee_ref)
     return None
+
+
+def _resolve_statutory(db: Session, tenant_id: UUID, payee_ref: str) -> str | None:
+    from dotmac_payroll.models import PayComponent, PayrollLiability, PayStructureRule
+
+    if not payee_ref or payee_ref != payee_ref.strip():
+        return None
+    name = db.scalar(
+        select(PayComponent.name)
+        .where(PayComponent.tenant_id == tenant_id, PayComponent.liability_destination_ref == payee_ref)
+        .order_by(PayComponent.status, PayComponent.component_code)
+        .limit(1)
+    )
+    if name is None:
+        name = db.scalar(
+            select(PayStructureRule.component_name)
+            .where(PayStructureRule.tenant_id == tenant_id, PayStructureRule.liability_destination_ref == payee_ref)
+            .order_by(PayStructureRule.component_code)
+            .limit(1)
+        )
+    if name is None:
+        name = db.scalar(
+            select(PayComponent.name)
+            .join(PayrollLiability, PayrollLiability.component_id == PayComponent.id)
+            .where(
+                PayrollLiability.tenant_id == tenant_id,
+                PayrollLiability.beneficiary_type == "external",
+                PayrollLiability.beneficiary_ref == payee_ref,
+                PayComponent.tenant_id == tenant_id,
+            )
+            .order_by(PayComponent.component_code)
+            .limit(1)
+        )
+    return name
 
 
 def mask_account(account_number: str) -> str:
@@ -266,11 +304,11 @@ def propose(
     try:
         kind = PayeeKind(payee_kind)
     except ValueError as exc:
-        raise PayeeBankError("invalid_input", "payee_kind must be supplier or employee") from exc
+        raise PayeeBankError("invalid_input", "payee_kind must be supplier, employee or statutory") from exc
     ref = _text(payee_ref, "payee_ref", limit=255)
     system_name = resolve_payee(db, tenant_id, kind.value, ref or "")
     if system_name is None:
-        raise PayeeBankError("unknown_payee", "payee is not a known supplier or employee in this tenant")
+        raise PayeeBankError("unknown_payee", "payee is not a known supplier, employee or statutory authority")
     label = system_name[:200]
     code = _text(bank_code, "bank_code", limit=10)
     if not _BANK_CODE.match(code or ""):
@@ -363,7 +401,7 @@ def approve(
     if row.dual_control and row.proposed_by_party_id == approver_party_id:
         raise PayeeBankError("same_person", "the proposer cannot approve their own proposal")
     if resolve_payee(db, tenant_id, row.payee_kind, row.payee_ref) is None:
-        raise PayeeBankError("unknown_payee", "payee is not a known supplier or employee in this tenant")
+        raise PayeeBankError("unknown_payee", "payee is not a known supplier, employee or statutory authority")
     decision_note = _text(note, "note", limit=500, required=False)
     missing = missing_for_approval(row)
     if missing:

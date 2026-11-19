@@ -64,6 +64,9 @@ BATCH_UPDATE_COLUMNS: Final = (
     "recall_reference",
     "updated_at",
 )
+# e2_0024: the approved payee instruction id each line was approved against (set once at approve; a trigger
+# makes it write-once). Record refuses (``payee_instruction_changed``) if the current approved instruction differs.
+LINE_INSTRUCTION_COLUMN: Final = "payee_instruction_id"
 LINE_UPDATE_COLUMNS: Final = ("active", "settlement_id", "journal_id", "journal_number", "consequence_fingerprint")
 
 # e2_0021 (payroll a5): a RECORDED net-pay line whose bank credit came back. The return columns are
@@ -200,6 +203,7 @@ class PayrollPayoutLine(Base):
     beneficiary_ref: Mapped[str] = mapped_column(String(240), nullable=False)
     liability_account_ref: Mapped[str] = mapped_column(String(240), nullable=False)
     amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    payee_instruction_id: Mapped[UUID | None] = mapped_column(Uuid())
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     settlement_id: Mapped[UUID | None] = mapped_column(Uuid())
     journal_id: Mapped[UUID | None] = mapped_column(Uuid())

@@ -337,10 +337,14 @@ this does not authorize adjusting balances or switching traffic.
   by `python -m erp_v2.governance.cli`.
 
 - Held drafts (B-2; `docs/held-drafts.md`) adds the head `e2_0027_held_draft_decisions` (chained after
-  `e2_0023_staff_loan_entries` on main; the coordinator re-chains it after `e2_0026` at merge): one table
+  `e2_0024_statutory_payees` on main; the coordinator re-chains it after `e2_0026` at merge): one table
   `erp_held_draft_decisions` (RLS forced, runtime SELECT only, a trigger refuses UPDATE and DELETE; the downgrade
   refuses while rows exist). Written only by `python -m erp_v2.held_drafts.cli`. No new permission, role profile
   bump or environment variable for the serving runtime.
+- Statutory payees (PR-4b; `docs/payee-bank-instructions.md`) adds the head `e2_0024_statutory_payees` (after
+  `e2_0023_staff_loan_entries`): one CHECK on `payee_bank_instructions` widened to allow kind `statutory`. The e2
+  head in this section moves to it. Before the first statutory remittance Finance proposes and approves one
+  instruction per authority. No new permission, role profile bump or environment variable.
 
 Compose adds `127.0.0.1` to the explicitly declared trusted hosts so the
 container liveness probe passes host filtering. The e2 banking revision
