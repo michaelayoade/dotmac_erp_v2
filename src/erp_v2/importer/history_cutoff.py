@@ -32,9 +32,12 @@ refuses before touching either database.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterable
-from datetime import date
-from typing import Final
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, Final
 
 import sqlalchemy as sa
 
@@ -179,50 +182,220 @@ def keys_sha256(keys: Iterable[str]) -> str:
     return digest.hexdigest()
 
 
-STRADDLE_SQL: Final = (  # constant identifiers only; the cutoff is a bound parameter
-    "SELECT count(*) FROM ("  # noqa: S608
-    "SELECT l.journal_entry_id FROM posted_ledger_line l "
+STRADDLE_IDS_SQL: Final = (  # constant identifiers only; the cutoff is a bound parameter
+    "SELECT l.journal_entry_id FROM posted_ledger_line l "  # noqa: S608
     f"LEFT JOIN {_PARENT_TABLE} j ON j.{_PARENT_KEY} = l.journal_entry_id "
     "GROUP BY l.journal_entry_id, j.journal_entry_id, COALESCE(j.posting_date, j.entry_date) "
-    "HAVING bool_or(l.posting_date <= :history_cutoff) <> bool_and(l.posting_date <= :history_cutoff) "
-    "OR (j.journal_entry_id IS NOT NULL AND bool_and(COALESCE(l.posting_date <= :history_cutoff, FALSE)) "
-    "<> COALESCE(COALESCE(j.posting_date, j.entry_date) <= :history_cutoff, FALSE))"
-    ") s"
+    "HAVING max(CASE WHEN l.posting_date <= :history_cutoff THEN 1 ELSE 0 END) "
+    "<> min(CASE WHEN l.posting_date <= :history_cutoff THEN 1 ELSE 0 END) "
+    "OR (j.journal_entry_id IS NOT NULL "
+    "AND min(CASE WHEN l.posting_date <= :history_cutoff THEN 1 ELSE 0 END) "
+    "<> CASE WHEN COALESCE(j.posting_date, j.entry_date) <= :history_cutoff THEN 1 ELSE 0 END)"
+)
+STRADDLE_SQL: Final = f"SELECT count(*) FROM ({STRADDLE_IDS_SQL}) s"  # noqa: S608
+REASON_STRADDLE: Final = "journal_straddles_cutoff"  # register class E39
+CLASS_STRADDLE: Final = "E39"
+
+
+def straddle_predicate(kind: str, source_table: str, key_column: str, journal_column: str | None) -> str:
+    """SQL boolean, true for a row of a straddling journal (STRADDLE_SPEC). The journal, its lines and its ledger
+    lines are excluded TOGETHER as a unit: landing it double counts its pre-cutoff lines (already in the opening),
+    skipping part of it drops lines, and a partial landing cannot post."""
+
+    column = key_column if kind == KIND_JOURNAL else journal_column
+    if not column:
+        raise ValueError("a straddle exclusion needs the journal column")
+    return f"{source_table}.{column} IN ({STRADDLE_IDS_SQL})"
+
+
+def not_landed_predicate(kind: str, source_table: str, key_column: str, journal_column: str | None) -> str:
+    """Rows the importer does NOT land for any cutoff reason: pre-cutoff, straddling, or unbalanced-unit."""
+
+    return (
+        f"({exclusion_predicate(kind, source_table, journal_column)} "
+        f"OR {straddle_predicate(kind, source_table, key_column, journal_column)} "
+        f"OR {unit_refusal_predicate(kind, source_table, key_column, journal_column)})"
+    )
+
+
+@dataclass(frozen=True)
+class Straddler:
+    """One legacy journal that crosses the cutoff, classified from its posted ledger lines.
+
+    ``kind`` S1: its ledger lines fall on both sides of the cutoff. S2: all its lines fall on one side, but the journal
+    date is on the other. ``pre_net`` is already inside the opening TB (the recompute includes every line);
+    ``post_net`` (per day, per account) is what the legacy ledger holds after the cutoff; ``s_j`` = sum of ``pre_net``.
+    """
+
+    journal: str
+    kind: str
+    status: str | None
+    journal_date: str | None
+    source_module: str | None
+    source_document_type: str | None
+    source_document_id: str | None
+    currency: str | None
+    lines: tuple[dict[str, Any], ...]
+    pre_net: dict[str, str]
+    post_net: dict[str, dict[str, str]]
+    s_j: str
+    evidence_sha256: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "class": CLASS_STRADDLE,
+            "reason": REASON_STRADDLE,
+            "journal": self.journal,
+            "type": self.kind,
+            "legacy_status": self.status,
+            "journal_date": self.journal_date,
+            "source_module": self.source_module,
+            "source_document_type": self.source_document_type,
+            "source_document_id": self.source_document_id,
+            "currency": self.currency,
+            "pre_net": self.pre_net,
+            "post_net": self.post_net,
+            "s_j": self.s_j,
+            "evidence_sha256": self.evidence_sha256,
+            "lines": list(self.lines),
+        }
+
+
+_CLASSIFY_SQL: Final = (
+    "SELECT l.journal_entry_id, l.ledger_line_id, l.journal_line_id, l.account_id, l.account_code, l.posting_date, "  # noqa: S608
+    "l.debit_amount, l.credit_amount, l.original_currency_code, j.status, j.posting_date AS jpd, j.entry_date AS jed, "
+    "j.source_module, j.source_document_type, j.source_document_id, j.currency_code "
+    f"FROM posted_ledger_line l LEFT JOIN {_PARENT_TABLE} j ON j.{_PARENT_KEY} = l.journal_entry_id "
+    f"WHERE l.journal_entry_id IN ({STRADDLE_IDS_SQL}) ORDER BY l.journal_entry_id, l.ledger_line_id"
 )
 
 
-def straddling_journals(source: sa.Connection, cutoff: date) -> int:
-    """Journals whose ledger lines are not all on one side of the cutoff, or disagree with the journal date.
+def _day(value: object) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
 
-    Raises ``HistoryCutoffRefused`` when the census cannot be read: an unreadable source is never an empty one.
-    """
+
+def _iso(value: object) -> str | None:
+    day = _day(value)
+    return None if day is None else day.isoformat()
+
+
+def classify_straddlers(source: sa.Connection, cutoff: date) -> tuple[Straddler, ...]:
+    """Every straddling journal with its type, nets and ledger lines. Raises ``HistoryCutoffRefused`` when the census
+    cannot be read (an unreadable source is never an empty one) or when the classifier and the exclusion predicate
+    disagree about which journals straddle."""
 
     try:
         with source.begin_nested():
-            return int(source.execute(bind(STRADDLE_SQL, cutoff)).scalar_one())
+            rows = source.execute(bind(_CLASSIFY_SQL, cutoff)).mappings().all()
+            expected = int(source.execute(bind(STRADDLE_SQL, cutoff)).scalar_one())
     except sa.exc.SQLAlchemyError as exc:
         raise HistoryCutoffRefused(REFUSAL_UNREADABLE) from exc
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["journal_entry_id"]), []).append(row)
+    if len(grouped) != expected:
+        raise HistoryCutoffRefused(REFUSAL_STRADDLE, "the classifier and the exclusion disagree")
+    out: list[Straddler] = []
+    zero = Decimal(0)
+    for journal, lines in sorted(grouped.items()):
+        first = lines[0]
+        jday = _day(first["jpd"]) or _day(first["jed"])
+        pre_flags = [(_day(r["posting_date"]) or date.max) <= cutoff for r in lines]
+        kind = "S1" if any(pre_flags) and not all(pre_flags) else "S2"
+        pre: dict[str, Decimal] = {}
+        post: dict[str, dict[str, Decimal]] = {}
+        payload = []
+        for r, is_pre in zip(lines, pre_flags, strict=True):
+            net = Decimal(r["debit_amount"]) - Decimal(r["credit_amount"])
+            account = str(r["account_id"])
+            if is_pre:
+                pre[account] = pre.get(account, zero) + net
+            else:
+                day = _iso(r["posting_date"]) or ""
+                post.setdefault(day, {})
+                post[day][account] = post[day].get(account, zero) + net
+            payload.append(
+                {
+                    "ledger_line_id": str(r["ledger_line_id"]),
+                    "journal_line_id": None if r["journal_line_id"] is None else str(r["journal_line_id"]),
+                    "account_id": account,
+                    "account_code": r["account_code"],
+                    "posting_date": _iso(r["posting_date"]),
+                    "debit": format(Decimal(r["debit_amount"]), "f"),
+                    "credit": format(Decimal(r["credit_amount"]), "f"),
+                    "original_currency": r["original_currency_code"],
+                }
+            )
+        evidence = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        out.append(
+            Straddler(
+                journal=journal,
+                kind=kind,
+                status=first["status"],
+                journal_date=None if jday is None else jday.isoformat(),
+                source_module=first["source_module"],
+                source_document_type=first["source_document_type"],
+                source_document_id=None if first["source_document_id"] is None else str(first["source_document_id"]),
+                currency=first["currency_code"],
+                lines=tuple(payload),
+                pre_net={a: format(v, "f") for a, v in sorted(pre.items())},
+                post_net={d: {a: format(v, "f") for a, v in sorted(m.items())} for d, m in sorted(post.items())},
+                s_j=format(sum(pre.values(), zero), "f"),
+                evidence_sha256=evidence,
+            )
+        )
+    return tuple(out)
+
+
+def write_private_json(path: Any, body: dict[str, Any]) -> str:
+    """Mode-600 JSON file (owner only); returns its sha256. Raises OSError."""
+
+    import os
+
+    data = (json.dumps(body, indent=1, sort_keys=True) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return hashlib.sha256(data).hexdigest()
 
 
 __all__ = [
+    "CLASS_STRADDLE",
     "KINDS",
     "KIND_JOURNAL",
     "KIND_JOURNAL_LINE",
     "KIND_LEDGER_LINE",
     "MISSING_COLUMN",
+    "REASON_STRADDLE",
     "REASON_UNBALANCED_UNIT",
     "REFUSAL_INVALID",
     "REFUSAL_REQUIRED",
     "REFUSAL_STRADDLE",
+    "STRADDLE_SQL",
     "UNBALANCED_AMOUNTS_SQL",
     "HistoryCutoffRefused",
+    "Straddler",
     "bind",
     "c_collated",
+    "classify_straddlers",
     "exclusion_predicate",
     "keys_sha256",
+    "not_landed_predicate",
     "parse_cutoff",
     "required_source_columns",
-    "straddling_journals",
+    "straddle_predicate",
     "undated_predicate",
     "unit_refusal_predicate",
+    "write_private_json",
 ]

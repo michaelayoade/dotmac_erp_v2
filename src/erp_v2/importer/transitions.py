@@ -49,7 +49,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from erp_v2.importer.executor import RowException
-from erp_v2.importer.history_cutoff import REFUSAL_REQUIRED, HistoryCutoffRefused, bind, exclusion_predicate
+from erp_v2.importer.history_cutoff import REFUSAL_REQUIRED, HistoryCutoffRefused, bind, not_landed_predicate
 from erp_v2.importer.spec import TransformSpec
 
 _BATCH = 500
@@ -389,7 +389,9 @@ def _run_family(
         if history_cutoff is None:
             raise HistoryCutoffRefused(REFUSAL_REQUIRED, spec.destination_table)
         # Pre-cutoff journals were never landed: walking them would name rows that do not exist.
-        cutoff_where = f" WHERE NOT ({exclusion_predicate(spec.history_cutoff, spec.source_table, None)})"
+        cutoff_where = " WHERE NOT " + not_landed_predicate(
+            spec.history_cutoff, spec.source_table, id_source, spec.column_map.get("journal_id")
+        )
     select_sql = (
         bind(f"SELECT {id_source}, status FROM {spec.source_table}{cutoff_where}", history_cutoff)  # noqa: S608
         if cutoff_where and history_cutoff is not None

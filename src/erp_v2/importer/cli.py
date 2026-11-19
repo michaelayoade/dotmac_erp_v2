@@ -32,11 +32,14 @@ import sqlalchemy as sa
 from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBLIC_SECTOR_PAIRINGS
 from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
 from erp_v2.importer.history_cutoff import (
+    CLASS_STRADDLE,
+    REASON_STRADDLE,
     REFUSAL_STRADDLE,
     HistoryCutoffRefused,
-    exclusion_predicate,
+    classify_straddlers,
+    not_landed_predicate,
     parse_cutoff,
-    straddling_journals,
+    write_private_json,
 )
 from erp_v2.importer.history_cutoff import bind as history_cutoff_bind
 from erp_v2.importer.minting import MintContext, MintResult
@@ -715,11 +718,16 @@ def _legacy_void_journal_count(engine: sa.Engine, schemas, specs, history_cutoff
         with engine.connect() as conn:
             _set_search_path(conn, schemas)
             if spec.history_cutoff is not None and history_cutoff is not None:
+                skipped = not_landed_predicate(
+                    spec.history_cutoff,
+                    spec.source_table,
+                    spec.column_map.get("id", ""),
+                    spec.column_map.get("journal_id"),
+                )
                 return int(
                     conn.execute(
                         history_cutoff_bind(
-                            f"SELECT count(*) FROM {spec.source_table} WHERE status = 'VOID' "  # noqa: S608
-                            f"AND NOT ({exclusion_predicate(spec.history_cutoff, spec.source_table, None)})",
+                            f"SELECT count(*) FROM {spec.source_table} WHERE status = 'VOID' AND NOT {skipped}",  # noqa: S608
                             history_cutoff,
                         )
                     ).scalar_one()
@@ -741,7 +749,8 @@ def _history_cutoff(args: argparse.Namespace, executable, source_engine: sa.Engi
     """Resolve and verify the B-13 cutoff BEFORE any write.
 
     Required whenever an executable spec declares one (the cutover profile always includes the journal pairings):
-    a missing or invalid flag, or a source with journals straddling the cutoff, refuses the whole run.
+    a missing or invalid flag refuses the whole run. Journals straddling the cutoff are classified and excluded as
+    units (E39), with a mode-600 side file.
     Returns (cutoff date or None, receipt section).
     """
 
@@ -760,20 +769,52 @@ def _history_cutoff(args: argparse.Namespace, executable, source_engine: sa.Engi
         cutoff = parse_cutoff(raw)
     except HistoryCutoffRefused as exc:
         raise CliRefusal(f"{exc.code}: {HISTORY_CUTOFF_HINT}; nothing written") from exc
-    straddling = 0
-    # Whenever ANY cutoff pairing runs (a lines-only or ledger-only batch can split a journal just as well).
+    # STRADDLE_SPEC (W8): a journal crossing the cutoff is classified (S1/S2) and excluded as a UNIT (journal, lines,
+    # ledger lines) with class E39, not refused. Whenever ANY cutoff pairing runs. The mode-600 side file is written
+    # BEFORE any database write; the run refuses if it cannot be written or if the classifier and the exclusion
+    # predicate disagree.
     try:
         with source_engine.connect() as conn:
             _set_search_path(conn, schemas)
-            straddling = straddling_journals(conn, cutoff)
+            straddlers = classify_straddlers(conn, cutoff)
     except HistoryCutoffRefused as exc:
-        raise CliRefusal(f"{exc.code}: the straddle census could not be read; nothing written") from exc
-    if straddling:
-        raise CliRefusal(
-            f"{REFUSAL_STRADDLE}: {straddling} legacy journals have ledger lines on both sides of {cutoff} (or a "
-            "date that disagrees with them); a journal cannot land half of itself; nothing written"
-        )
-    return cutoff, {"history_cutoff": cutoff.isoformat(), "applies_to": sorted(needing), "straddling_journals": 0}
+        raise CliRefusal(f"{exc.code}: the straddle census failed ({exc}); nothing written") from exc
+    straddle_section: dict[str, object] = {
+        "class": CLASS_STRADDLE,
+        "reason": REASON_STRADDLE,
+        "count": len(straddlers),
+        "s1": sum(1 for j in straddlers if j.kind == "S1"),
+        "s2": sum(1 for j in straddlers if j.kind == "S2"),
+        "sum_s_j": format(sum((_Decimal(j.s_j) for j in straddlers), _Decimal(0)), "f"),
+        "side_file": None,
+        "side_file_sha256": None,
+    }
+    receipt = getattr(args, "receipt", None)
+    if straddlers or receipt:
+        if not receipt:
+            raise CliRefusal(f"{REFUSAL_STRADDLE}: no receipt path to write the straddler side file; nothing written")
+        path = Path(receipt).with_name(Path(receipt).name + ".straddlers.json")
+        try:
+            straddle_section["side_file_sha256"] = write_private_json(
+                path,
+                {
+                    "history_cutoff": cutoff.isoformat(),
+                    "class": CLASS_STRADDLE,
+                    "reason": REASON_STRADDLE,
+                    "journals": [j.as_dict() for j in straddlers],
+                },
+            )
+        except OSError as exc:
+            raise CliRefusal(
+                f"{REFUSAL_STRADDLE}: the straddler side file could not be written ({type(exc).__name__}); "
+                "nothing written"
+            ) from exc
+        straddle_section["side_file"] = path.name
+    return cutoff, {
+        "history_cutoff": cutoff.isoformat(),
+        "applies_to": sorted(needing),
+        "straddlers": straddle_section,
+    }
 
 
 def _history_cutoff_side_file(reports, receipt_path: Path) -> str | None:
@@ -919,7 +960,12 @@ def cmd_execute(args: argparse.Namespace) -> int:
             dest_conn.rollback()
     transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
     transforms_section, transforms_incomplete = _transforms_receipt(enrolment, Path(args.receipt))
-    cutoff_side_sha = _history_cutoff_side_file(result.reports, Path(args.receipt))
+    # Written after the apply commit: a failure here must not lose the receipt; it marks the run incomplete instead.
+    cutoff_side_error: str | None = None
+    try:
+        cutoff_side_sha = _history_cutoff_side_file(result.reports, Path(args.receipt))
+    except OSError as exc:
+        cutoff_side_sha, cutoff_side_error = None, type(exc).__name__
     sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports, Path(args.receipt))
     complete = (
         result.complete
@@ -931,6 +977,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         and not transition_exceptions
         and not sub_origin["incomplete"]
         and not transforms_incomplete
+        and cutoff_side_error is None
         and not resolution.get("refusal_sources_incomplete")
     )
     payload: dict[str, object] = {
@@ -956,6 +1003,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         "history_cutoff_census": {
             **cutoff_section,
             "side_file_sha256": cutoff_side_sha,
+            "side_file_error": cutoff_side_error,
             "censuses": [
                 {
                     "destination_table": r.destination_table,
@@ -965,6 +1013,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
                     "excluded_by_legacy_status": dict(sorted(r.history_cutoff_excluded_by_status.items())),
                     "undated_refused": r.history_cutoff_undated,
                     "unbalanced_unit_refused_rows": r.history_cutoff_unit_refused,
+                    "straddle_excluded_rows": r.history_cutoff_straddle_excluded,
                     "unbalanced_unit_refused_journals": [
                         {"journal": j, "debit": d, "credit": c} for j, d, c in r.history_cutoff_unit_refused_journals
                     ],

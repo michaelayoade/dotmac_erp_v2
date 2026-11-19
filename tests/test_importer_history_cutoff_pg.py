@@ -49,7 +49,7 @@ LEGACY_DDL = (
     "journal_number text, journal_type text, status text, entry_date date, posting_date date, description text, "
     "currency_code text, exchange_rate numeric, total_debit numeric, total_credit numeric, total_debit_functional numeric, "
     "total_credit_functional numeric, source_document_type text, source_document_id text, posted_by_user_id text, "
-    "posted_at timestamptz, reversed_journal_id uuid, reversal_journal_id uuid, created_by_user_id uuid, reference text)",
+    "posted_at timestamptz, reversed_journal_id uuid, reversal_journal_id uuid, created_by_user_id uuid, reference text, source_module text)",
     "CREATE TABLE gl.journal_entry_line (line_id uuid PRIMARY KEY, journal_entry_id uuid, organization_id uuid, "
     "line_number int, account_id uuid, description text, debit_amount numeric, credit_amount numeric, "
     "debit_amount_functional numeric, credit_amount_functional numeric)",
@@ -79,7 +79,7 @@ def post_legacy(engine, env, jid, day, lines, *, number, status="POSTED", ledger
         c.execute(
             sa.text(
                 "INSERT INTO gl.journal_entry VALUES (:j, :o, :p, :n, 'STANDARD', :s, :d, :d, :n, 'NGN', 1, :t, :t, :t, :t, "
-                "'JOURNAL', :j, 'legacy-user', :at, :rv, NULL, NULL, NULL)"
+                "'JOURNAL', :j, 'legacy-user', :at, :rv, NULL, NULL, NULL, 'GL')"
             ),
             {
                 "j": jid,
@@ -343,24 +343,81 @@ def test_without_the_cutoff_the_same_import_double_counts_the_closed_years_so_th
     assert v2_net_by_code(engine, env, through=date(2030, 1, 1)) == {}  # refused before any write
 
 
-def test_a_journal_straddling_the_cutoff_is_refused_before_any_write(engine, legacy):
-    env = world(engine)
-    jid = uuid4()
-    post_legacy(engine, env, jid, NEXT_DAY, [("1000", "10", "0"), ("2000", "0", "10")], number="JE-straddle")
-    with engine.begin() as c:  # one ledger line of the journal moves to the closed year
+def seed_straddlers(engine, env):
+    """S1: a journal dated in the closed year with one ledger line on each side. S2: dated in the closed year, ALL its
+    ledger lines after the cutoff (the 39 real ones)."""
+    s1, s2 = uuid4(), uuid4()
+    post_legacy(engine, env, s1, CUTOFF, [("1000", "10", "0"), ("2000", "0", "10")], number="JE-S1")
+    post_legacy(engine, env, s2, date(2025, 12, 20), [("1400", "5", "0"), ("2000", "0", "5")], number="JE-S2")
+    with engine.begin() as c:
         c.execute(
             sa.text(
-                "UPDATE gl.posted_ledger_line SET posting_date = :d WHERE ctid = (SELECT ctid FROM gl.posted_ledger_line WHERE journal_entry_id = :j LIMIT 1)"
+                "UPDATE gl.posted_ledger_line SET posting_date = :d WHERE journal_entry_id = :j AND debit_amount = 0"
             ),
-            {"d": CUTOFF, "j": jid},
+            {"d": date(2026, 3, 13), "j": s1},
         )
+        c.execute(
+            sa.text("UPDATE gl.posted_ledger_line SET posting_date = :d WHERE journal_entry_id = :j"),
+            {"d": date(2026, 3, 13), "j": s2},
+        )
+    return s1, s2
+
+
+def test_straddling_journals_are_classified_and_excluded_as_units_with_a_private_side_file(engine, legacy, tmp_path):
+    env = world(engine)
+    ids = seed_legacy(engine, env)
+    s1, s2 = seed_straddlers(engine, env)
+    specs = journal_specs(engine)
+    receipt_path = tmp_path / "receipt.json"
+    args = type("A", (), {"history_cutoff": "2025-12-31", "receipt": str(receipt_path)})()
+    cutoff, section = cli._history_cutoff(args, specs, engine, ["gl"])
+    straddlers = section["straddlers"]
+    assert (straddlers["class"], straddlers["count"], straddlers["s1"], straddlers["s2"]) == ("E39", 2, 1, 1)
+    assert straddlers["sum_s_j"] == "10"  # S1's pre-cutoff debit of 10 is in the opening; S2 has no pre-cutoff line
+    side = tmp_path / "receipt.json.straddlers.json"
+    assert (side.stat().st_mode & 0o777) == 0o600
+    import hashlib
+    import json
+
+    assert hashlib.sha256(side.read_bytes()).hexdigest() == straddlers["side_file_sha256"]
+    body = {j["journal"]: j for j in json.loads(side.read_text())["journals"]}
+    assert body[str(s1)]["type"] == "S1" and body[str(s2)]["type"] == "S2"
+    assert body[str(s1)]["legacy_status"] == "POSTED" and body[str(s1)]["source_module"] == "GL"
+    assert len(body[str(s1)]["lines"]) == 2 and body[str(s1)]["post_net"].keys() == {"2026-03-13"}
+    assert body[str(s2)]["s_j"] == "0" and body[str(s2)]["evidence_sha256"]
+
+    # the run completes: neither straddler lands (journal, lines, ledger lines), and nothing is an exception
+    receipt, transitions = run_importer(engine, env, specs, cutoff)
+    assert receipt.complete and all(not t.exceptions for t in transitions)
+    with Session(engine) as db:
+        landed = {str(j) for j in db.scalars(sa.select(JournalEntry.id).where(JournalEntry.tenant_id == env.tenant_id))}
+    assert str(s1) not in landed and str(s2) not in landed and str(ids["j5"]) in landed
+    census = {r.destination_table: r for r in receipt.reports}
+    assert census["mod_accounting.journal_entries"].history_cutoff_straddle_excluded == 2
+    assert census["mod_accounting.journal_lines"].history_cutoff_straddle_excluded == 4
+    assert census["mod_accounting.posted_ledger_lines"].history_cutoff_straddle_excluded == 4
+    # a straddler is not also counted as a plain pre-cutoff exclusion
+    assert census["mod_accounting.journal_entries"].history_cutoff_excluded == 6
+
+
+def test_the_straddle_side_file_failing_to_write_refuses_before_any_write(engine, legacy, tmp_path):
+    env = world(engine)
+    seed_straddlers(engine, env)
+    args = type("A", (), {"history_cutoff": "2025-12-31", "receipt": str(tmp_path / "no-such-dir" / "r.json")})()
+    with pytest.raises(cli.CliRefusal, match="nothing written"):
+        cli._history_cutoff(args, journal_specs(engine), engine, ["gl"])
+
+
+def test_the_classifier_agrees_with_the_exclusion_predicate_and_handles_a_lines_only_batch(engine, legacy, tmp_path):
+    env = world(engine)
+    seed_straddlers(engine, env)
     with engine.connect() as source:
         source.exec_driver_sql("SET search_path TO gl, public")
-        assert history_cutoff.straddling_journals(source, CUTOFF) == 1
-    specs = journal_specs(engine)
-    with pytest.raises(cli.CliRefusal) as exc:
-        cli._history_cutoff(type("A", (), {"history_cutoff": "2025-12-31"})(), specs, engine, ["gl"])
-    assert str(exc.value).startswith(history_cutoff.REFUSAL_STRADDLE) and "nothing written" in str(exc.value)
+        assert len(history_cutoff.classify_straddlers(source, CUTOFF)) == 2
+    lines_only = tuple(s for s in journal_specs(engine) if s.destination_table == "mod_accounting.journal_lines")
+    args = type("A", (), {"history_cutoff": "2025-12-31", "receipt": str(tmp_path / "r.json")})()
+    _cutoff, section = cli._history_cutoff(args, lines_only, engine, ["gl"])
+    assert section["straddlers"]["count"] == 2
 
 
 def test_p5_a_sub_kobo_unbalanced_journal_is_refused_as_a_unit_e15_and_the_run_stays_complete(engine, legacy, tmp_path):
@@ -401,18 +458,31 @@ def test_recompute_refuses_a_null_dated_legacy_ledger_line_instead_of_omitting_i
             legacy_ledger.recompute(legacy_conn, db, env.tenant_id, opening_as_of=CUTOFF)
 
 
-def test_the_straddle_census_runs_for_a_lines_only_batch_too(engine, legacy):
+def test_a_reversal_of_an_e15_or_e39_journal_lands_with_the_link_empty_and_is_not_an_exception(engine, legacy):
     env = world(engine)
-    jid = uuid4()
-    post_legacy(engine, env, jid, NEXT_DAY, [("1000", "10", "0"), ("2000", "0", "10")], number="JE-straddle2")
-    with engine.begin() as c:
-        c.execute(
-            sa.text(
-                "UPDATE gl.posted_ledger_line SET posting_date = :d WHERE ctid = (SELECT min(ctid) FROM gl.posted_ledger_line)"
-            ),
-            {"d": CUTOFF},
+    s1, _s2 = seed_straddlers(engine, env)
+    unbalanced = uuid4()
+    post_legacy(engine, env, unbalanced, NEXT_DAY, [("1000", "7.000001", "0"), ("2000", "0", "7")], number="JE-UNB")
+    reversals = {}
+    for name, target in (("r_e39", s1), ("r_e15", unbalanced)):
+        reversals[name] = uuid4()
+        post_legacy(
+            engine,
+            env,
+            reversals[name],
+            date(2026, 4, 1),
+            [("2000", "4", "0"), ("1000", "0", "4")],
+            number=f"JE-{name}",
+            reverses=target,
         )
-    lines_only = tuple(s for s in journal_specs(engine) if s.destination_table == "mod_accounting.journal_lines")
-    with pytest.raises(cli.CliRefusal) as exc:
-        cli._history_cutoff(type("A", (), {"history_cutoff": "2025-12-31"})(), lines_only, engine, ["gl"])
-    assert str(exc.value).startswith(history_cutoff.REFUSAL_STRADDLE)
+    receipt, transitions = run_importer(engine, env, journal_specs(engine), CUTOFF)
+    assert receipt.complete and all(not t.exceptions for t in transitions)
+    journals = {r.destination_table: r for r in receipt.reports}["mod_accounting.journal_entries"]
+    assert sorted(journals.history_cutoff_reversal_targets) == sorted(
+        [(str(reversals["r_e39"]), str(s1)), (str(reversals["r_e15"]), str(unbalanced))]
+    )
+    with Session(engine) as db:
+        links = list(
+            db.scalars(sa.select(JournalEntry.reverses_journal_id).where(JournalEntry.tenant_id == env.tenant_id))
+        )
+    assert links == [None, None]

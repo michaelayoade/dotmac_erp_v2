@@ -36,6 +36,7 @@ from erp_v2.importer.history_cutoff import (
     c_collated,
     exclusion_predicate,
     keys_sha256,
+    straddle_predicate,
     undated_predicate,
     unit_refusal_predicate,
 )
@@ -261,6 +262,8 @@ class TransformReport:
     history_cutoff_reversal_targets: list[tuple[str, str]] = field(default_factory=list)
     # P-5: rows of unbalanced journals refused as a unit (E15); journal pairing lists (key, debit, credit).
     history_cutoff_unit_refused: int = 0
+    # STRADDLE_SPEC: rows of journals crossing the cutoff, excluded as a unit (E39); the CLI side file lists them.
+    history_cutoff_straddle_excluded: int = 0
     history_cutoff_unit_refused_journals: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
@@ -443,10 +446,19 @@ def execute_transform(
         conditions.append(f"{spec.source_table}.{SUB_ORIGIN_COLUMN} IS NULL")
     cutoff_exclusion: str | None = None
     if spec.history_cutoff is not None:
-        cutoff_exclusion = exclusion_predicate(
-            spec.history_cutoff, spec.source_table, spec.column_map.get("journal_id")
+        straddle = straddle_predicate(
+            spec.history_cutoff,
+            spec.source_table,
+            spec.column_map.get("id", ""),
+            spec.column_map.get("journal_id"),
+        )
+        # A straddling journal is excluded as a UNIT for its own reason (E39), never counted as a plain pre-cutoff row.
+        cutoff_exclusion = (
+            f"({exclusion_predicate(spec.history_cutoff, spec.source_table, spec.column_map.get('journal_id'))}"
+            f" AND NOT ({straddle}))"
         )
         conditions.append(f"NOT ({cutoff_exclusion})")
+        conditions.append(f"NOT ({straddle})")
         unit_refusal = unit_refusal_predicate(
             spec.history_cutoff,
             spec.source_table,
@@ -536,22 +548,39 @@ def execute_transform(
             source_connection.execute(
                 bind(
                     f"SELECT count(*) FROM {spec.source_table} "  # noqa: S608
-                    f"WHERE NOT ({cutoff_exclusion}) AND {unit_refusal}",
+                    f"WHERE NOT ({cutoff_exclusion}) AND NOT ({straddle}) AND {unit_refusal}",
                     history_cutoff,
                 )
             ).scalar()
             or 0
         )
+        report.history_cutoff_straddle_excluded = (
+            source_connection.execute(
+                bind(f"SELECT count(*) FROM {spec.source_table} WHERE {straddle}", history_cutoff)  # noqa: S608
+            ).scalar()
+            or 0
+        )
+        if is_journal and report.history_cutoff_straddle_excluded:
+            # A reversal whose target is a straddler (E39) joins the excluded set too (it lands with the link empty).
+            excluded_journal_keys.update(
+                str(r[0])
+                for r in source_connection.execute(
+                    bind(f"SELECT {key_expr} FROM {spec.source_table} WHERE {straddle}", history_cutoff)  # noqa: S608
+                )
+            )
         if is_journal and report.history_cutoff_unit_refused:
             for jid, debit, credit in source_connection.execute(
                 bind(
                     f"SELECT {key_expr}, a.d, a.c FROM {spec.source_table} "  # noqa: S608
-                    f"JOIN ({UNBALANCED_AMOUNTS_SQL}) a ON a.k = {key_expr} WHERE NOT ({cutoff_exclusion})",
+                    f"JOIN ({UNBALANCED_AMOUNTS_SQL}) a ON a.k = {key_expr} "
+                    f"WHERE NOT ({cutoff_exclusion}) AND NOT ({straddle})",
                     history_cutoff,
                 )
             ):
                 report.history_cutoff_unit_refused_journals.append((str(jid), format(debit, "f"), format(credit, "f")))
             report.history_cutoff_unit_refused_journals.sort()
+            # ... and so does one whose target is an unbalanced-unit (E15) journal.
+            excluded_journal_keys.update(j for j, _d, _c in report.history_cutoff_unit_refused_journals)
         undated = undated_predicate(spec.history_cutoff or "", spec.source_table, spec.column_map.get("journal_id"))
         if undated is not None:
             for row in source_connection.execute(

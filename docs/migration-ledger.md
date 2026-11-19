@@ -146,8 +146,19 @@ path (B-9r). If such a journal were dated on or before the cutoff, the opening w
   info register rows, not counted against completeness) and `undated_*`.
 * Undated rows (no `posting_date`/`entry_date`) are named row refusals `history_cutoff_undated`;
   `legacy_ledger.recompute` refuses a NULL-dated ledger line instead of omitting it.
-* The straddle census runs whenever any cutoff pairing runs; a straddling journal refuses the run (no treatment yet).
+* Straddlers (STRADDLE-SPEC, W8): a journal crossing the cutoff is classified from its posted ledger lines (S1: lines on
+  both sides; S2: lines on one side, journal date on the other) and excluded as a UNIT (journal, lines, ledger lines) with
+  class E39 `journal_straddles_cutoff`, whenever any cutoff pairing runs. It is not a row exception, so F2 completes, and
+  it is not counted as a plain pre-cutoff exclusion. The mode-600 side file `<receipt>.straddlers.json` (sha256 in
+  `history_cutoff_census.straddlers`) lists, per journal: type, legacy status, journal date, source module/document,
+  currency, `pre_net` (already in the opening), `post_net` per day and account, `s_j`, the ledger lines and an evidence
+  sha256. The run refuses before any write if the side file cannot be written or if the classifier and the exclusion
+  predicate disagree. The reproduction journals (T-B) are B-14; the opening/bridge/gate share is B-9r (the observed straddlers all have
+  S_j = 0, so no opening suspense row is needed).
 * AP verifiers: a journal the cutoff excluded is proven on the snapshot (same predicate, the receipt cutoff carried in the
-  transform manifest binding as `history_cutoff`, all ledger lines on or before it) and asserted ABSENT in v2.
+  transform manifest binding as `history_cutoff`, all ledger lines on or before it), asserted ABSENT in v2, and a POSTED
+  `erp.opening` journal dated exactly the cutoff must exist in v2 (one read, every path).
+* A reversal whose target is a cutoff-excluded, E15 or E39 journal lands with the link empty (target kept as evidence).
+* A failed post-commit write of the side file is caught: the receipt is still written and the run is marked incomplete.
 * A transform manifest with no `import.unposted_wht` in its binding is a pre-B-13 manifest: `remove` is the only legal
   default (the binding is under the manifest sha256).
