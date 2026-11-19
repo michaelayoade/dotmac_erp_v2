@@ -491,6 +491,7 @@ def rederive_transform(
         ),
         tm.fallback_account,
         accounts,
+        tm.unposted_wht,
     )
     _require(derived.lands, "transform_invoice_not_landable")
     expected = InvoiceTransform.from_outcome(derived)

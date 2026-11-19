@@ -108,3 +108,30 @@ is 0 AND the latest bridge version is signed.
 * The recipes were written to the architect's column names and tested on synthetic snapshots; only the g9 pin test (skipped
   without a snapshot) proves them on real data.
 * Receipts of other builds (B-1 plan receipts, settled admission) enter through the admission-review rows only.
+
+## History cutoff (B-13) and the importer
+
+`python -m erp_v2.importer execute ... --history-cutoff 2025-12-31` is required whenever the journal pairings run (the
+cutover profile always includes them; the CLI refuses before touching either database without it, and the executor
+raises without it). The journal, journal-line and posted-ledger-line pairings do not read legacy rows dated on or before
+the cutoff: closed years arrive only through the opening journal above (its TB is the cumulative legacy balance to the
+cutoff, so copying the same lines too would count them twice). Journals are dated by `COALESCE(posting_date,
+entry_date)`, journal lines follow their parent journal, posted ledger lines use their own `posting_date` (the column
+the opening TB is computed from). An undated row is not provably closed, so it lands and is counted. A journal whose
+ledger lines straddle the cutoff refuses the run. The receipt's `history_cutoff` section is the census:
+`legacy = landed + excluded + refused` per pairing, with a sha256 over the excluded legacy keys (the legacy journal ids
+for the journal pairing). No destination document table references the journal tables (pinned by a test), so a
+pre-cutoff document keeps its legacy journal id as evidence in the retained snapshot and is neither excluded nor
+rewritten. PG test: `tests/test_importer_history_cutoff_pg.py` (v2 holds no legacy-owner line on or before the cutoff;
+opening + post-cutoff journals = the legacy TB at cutoff + 1 day).
+
+### P-5: the 3 sub-kobo journals (finding only; no importer change)
+
+Read from code, then pinned by `test_p5_a_sub_kobo_unbalanced_journal_copies_its_ledger_lines...` (PG). The destination money columns are `NUMERIC(20,6)`, so the 0.000001 imbalance is stored as legacy
+recorded it. The importer inserts journals as DRAFT, then their journal lines and posted ledger lines (row-level
+checks only: one side per line); only the DRAFT to POSTED transition runs the balanced-evidence trigger
+(`ledger_debit <> ledger_credit` refuses it). So the ledger lines of the 3 journals DO copy, at their legacy amounts;
+the journals stay DRAFT and surface as named `status` exceptions from the transitions step (receipt `complete` is
+false). The plan's fallback (H-GL on the rounding account) is conditional on the ledger NOT copying, so it is not
+implemented. The open point is the DRAFT journals carrying posted ledger lines (they count in the v2 ledger, the bridge
+sees no gap, the transition exceptions remain), to be ruled on with the architect.

@@ -20,7 +20,15 @@ from pathlib import Path
 from typing import Any, Final
 
 from erp_v2.importer.tax_accounts import canonical
-from erp_v2.importer.transforms import T_ITEM_NONSTOCK, T_ROUND_2DP, InvoiceOutcome, canonical_digest
+from erp_v2.importer.transforms import (
+    PARAM_UNPOSTED_WHT,
+    T_ITEM_NONSTOCK,
+    T_ROUND_2DP,
+    UNPOSTED_WHT_MODES,
+    UNPOSTED_WHT_REMOVE,
+    InvoiceOutcome,
+    canonical_digest,
+)
 
 HEADER_FIELDS: Final = ("subtotal", "tax_amount", "total_amount")
 LINE_FIELDS: Final = ("posting_account_ref", "tax_account_ref", "line_amount", "tax_amount")
@@ -100,6 +108,9 @@ class TransformManifest:
     sha256: str  # canonical_digest over the WHOLE itemised body, the same value as the import receipt's itemised_sha256
     snapshot_sha256: str = ""  # the snapshot the importer ran against (binding)
     fallback_account: str = ""  # the declared fallback expense account the importer used
+    # ``import.unposted_wht`` the importer ran with (recorded in the binding). A manifest that predates B-13 records
+    # none and was built by the old rule, which removed the WHT.
+    unposted_wht: str = UNPOSTED_WHT_REMOVE
 
     def for_invoice(self, invoice_id: object) -> InvoiceTransform | None:
         return self.invoices.get(canonical(invoice_id) or "")
@@ -134,7 +145,10 @@ class TransformManifest:
                 )
         except (KeyError, TypeError, ArithmeticError, ValueError) as exc:
             raise TransformManifestError("transform_manifest_malformed") from exc
-        return cls(invoices, canonical_digest(data), snapshot, fallback)
+        mode = binding.get(PARAM_UNPOSTED_WHT, UNPOSTED_WHT_REMOVE) if isinstance(binding, Mapping) else None
+        if mode not in UNPOSTED_WHT_MODES:
+            raise TransformManifestError("transform_manifest_binding_missing")
+        return cls(invoices, canonical_digest(data), snapshot, fallback, mode)
 
     @classmethod
     def load(cls, path: Path, expected_sha256: str | None) -> TransformManifest:

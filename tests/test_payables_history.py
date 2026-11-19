@@ -1,6 +1,7 @@
 """Read-only evidence near misses, using historical column names and real SQL."""
 
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID
@@ -423,13 +424,18 @@ def test_resolved_journal_producer_references_verify_and_reject_public_namespace
     assert not resolution["missing"] and not resolution["ambiguous"]
     (spec,), generated = build_specs(resolved, columns, {destination.fullname: destination})
     assert not generated and spec.executable
+    cutoff = date(2000, 1, 1)  # B-13: the journal pairing requires a history cutoff; this fixture is dated after it
     report = execute_transform(
-        source, target, spec, run_constants={"source_owner": "legacy-erp", "source_version": "candidate"}
+        source,
+        target,
+        spec,
+        run_constants={"source_owner": "legacy-erp", "source_version": "candidate"},
+        history_cutoff=cutoff,
     )
     assert report.complete and report.read == report.written == 1
     draft = target.execute(sa.select(destination)).mappings().one()
     assert draft["status"] == "DRAFT" and draft["approval_reference"] is None
-    (outcome,) = run_transitions(source, target, (spec,))
+    (outcome,) = run_transitions(source, target, (spec,), history_cutoff=cutoff)
     assert not outcome.exceptions and outcome.transitioned == {"POSTED": 1}
     assert outcome.stamped_approval_refs == 1
     produced = target.execute(sa.select(destination)).mappings().one()

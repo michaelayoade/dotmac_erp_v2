@@ -21,11 +21,20 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
 import sqlalchemy as sa
 
+from erp_v2.importer.history_cutoff import (
+    REFUSAL_REQUIRED,
+    HistoryCutoffRefused,
+    bind,
+    exclusion_predicate,
+    keys_sha256,
+    undated_predicate,
+)
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.sub_origin import (
     SUB_CUSTOMER_REFERENCE_REASON,
@@ -231,6 +240,14 @@ class TransformReport:
     sub_origin_excluded: int = 0
     sub_origin_excluded_keys: tuple[str, ...] = ()  # full, sorted
     sub_customer_ref_rows: tuple[str, ...] = ()  # keys refused: reference a Sub-tagged customer
+    # B-13 history cutoff census (None unless the spec declares one): rows provably dated on or before the cutoff
+    # are not read; they are counted, with a sha256 over their sorted source keys (the legacy journal ids for the
+    # journal pairing), and undated rows (not provably pre-cutoff, so they land) are counted too.
+    history_cutoff: str | None = None
+    history_cutoff_source: int | None = None
+    history_cutoff_excluded: int = 0
+    history_cutoff_excluded_sha256: str | None = None
+    history_cutoff_undated: int = 0
 
     @property
     def refused(self) -> int:
@@ -332,8 +349,15 @@ def execute_transform(
     run_constants: dict[str, Any] | None = None,
     dry_run: bool = False,
     limit: int | None = None,
+    history_cutoff: date | None = None,
 ) -> TransformReport:
-    """Execute one table transform. Raises if the spec is not executable."""
+    """Execute one table transform. Raises if the spec is not executable.
+
+    A spec that declares a history cutoff (B-13) raises ``HistoryCutoffRefused`` without one: closed years must
+    never be copied by omission of a flag."""
+
+    if spec.history_cutoff is not None and history_cutoff is None:
+        raise HistoryCutoffRefused(REFUSAL_REQUIRED, spec.destination_table)
 
     if spec.source_row_refusal is not None:
         refusal = spec.source_row_refusal
@@ -400,7 +424,16 @@ def execute_transform(
     report = TransformReport(source_table=spec.source_table, destination_table=spec.destination_table)
     source_columns = list(dict.fromkeys(spec.column_map.values()))
     exclude_sub = spec.sub_origin is SubOriginPolicy.EXCLUDE
-    where_sub = f" WHERE {spec.source_table}.{SUB_ORIGIN_COLUMN} IS NULL" if exclude_sub else ""
+    conditions: list[str] = []
+    if exclude_sub:
+        conditions.append(f"{spec.source_table}.{SUB_ORIGIN_COLUMN} IS NULL")
+    cutoff_exclusion: str | None = None
+    if spec.history_cutoff is not None:
+        cutoff_exclusion = exclusion_predicate(
+            spec.history_cutoff, spec.source_table, spec.column_map.get("journal_id")
+        )
+        conditions.append(f"NOT ({cutoff_exclusion})")
+    where_sub = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     ref = spec.sub_customer_ref
     select_columns = list(source_columns)
     if ref is not None and ref.column not in select_columns:
@@ -411,8 +444,9 @@ def execute_transform(
         order_sql = " ORDER BY " + ", ".join(
             f"{column} DESC" if descending else f"{column} ASC" for column, descending in spec.source_order
         )
-    select_sql = sa.text(
-        f"SELECT {', '.join(select_columns)} FROM {spec.source_table}{where_sub}{order_sql}"  # noqa: S608
+    select_text = f"SELECT {', '.join(select_columns)} FROM {spec.source_table}{where_sub}{order_sql}"  # noqa: S608
+    select_sql = (
+        bind(select_text, history_cutoff) if cutoff_exclusion is not None and history_cutoff else sa.text(select_text)
     )
     dest_columns = [
         c
@@ -435,6 +469,38 @@ def execute_transform(
     # feeding the destination `id`, else the first mapped column.
     guards = _fk_guards(destination_connection, spec, dest_columns) if not dry_run else ()
     key_source = spec.column_map.get("id", source_columns[0])
+    if cutoff_exclusion is not None and history_cutoff is not None:
+        # Excluded rows are never silent: counted, with a digest of their keys (legacy journal ids for the journal
+        # pairing), so legacy = landed + excluded-by-cutoff + refused is provable, and the closed years are known to
+        # arrive only through the opening.
+        report.history_cutoff = history_cutoff.isoformat()
+        report.history_cutoff_source = (
+            source_connection.execute(sa.text(f"SELECT count(*) FROM {spec.source_table}")).scalar() or 0  # noqa: S608
+        )
+        excluded = source_connection.execute(
+            bind(
+                f"SELECT {spec.source_table}.{key_source} FROM {spec.source_table} "  # noqa: S608
+                f"WHERE {cutoff_exclusion} ORDER BY CAST({spec.source_table}.{key_source} AS TEXT)",
+                history_cutoff,
+            ),
+            execution_options={"stream_results": True, "yield_per": 5000},
+        )
+        count = 0
+
+        def _counted_keys():
+            nonlocal count
+            for row in excluded:
+                count += 1
+                yield str(row[0])
+
+        report.history_cutoff_excluded_sha256 = keys_sha256(_counted_keys())
+        report.history_cutoff_excluded = count
+        undated = undated_predicate(spec.history_cutoff or "", spec.source_table)
+        if undated is not None:
+            report.history_cutoff_undated = (
+                source_connection.execute(sa.text(f"SELECT count(*) FROM {spec.source_table} WHERE {undated}")).scalar()  # noqa: S608
+                or 0
+            )
     if exclude_sub:
         # Excluded rows are never silent: counted, with sorted keys, so
         # the census (source = imported + excluded + refused) reconciles.
