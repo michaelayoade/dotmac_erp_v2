@@ -331,7 +331,6 @@ def cmd_billing_plan(args: argparse.Namespace) -> int:
         "open_ar_minor": result.open_ar_minor,
         "cash_lots": len(result.cash_lots),
         "blockers": [{"source_key": b.source_key, "reason": b.reason} for b in result.blockers],
-        "sub_origin_exclusions": result.exclusions.as_dict(),
         "census": result.census,
         "dispositions": [
             {"key": d.identity.key, "disposition": d.disposition, "residual_minor": d.residual_minor}
@@ -367,7 +366,8 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
     if len(manifest.tenant_extent) != 1:
         raise CliRefusal("billing-preflight requires a single-tenant snapshot extent")
     tenant_id = _uuid.UUID(str(manifest.tenant_extent[0]))
-    if not result.items and result.blockers:
+    if not result.carryable or (not result.items and not result.cash_lots):
+        # Rev 2: a partition with any blocker is excluded WHOLE (E35); an empty one has nothing to import.
         _write_receipt(
             Path(args.receipt),
             {
@@ -375,27 +375,10 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
                 "manifest": manifest.as_dict(),
                 "importable": False,
                 "translation_blockers": [{"source_key": b.source_key, "reason": b.reason} for b in result.blockers],
-                "sub_origin_exclusions": result.exclusions.as_dict(),
                 "census": result.census,
             },
         )
-        return 3
-    if not result.items and not result.cash_lots and not result.blockers:
-        # Wholly Sub-origin (or empty) partition: a clean, explicit no-op.
-        _write_receipt(
-            Path(args.receipt),
-            {
-                "kind": "billing-preflight",
-                "manifest": manifest.as_dict(),
-                "nothing_to_import": "sub_origin"
-                if any(result.exclusions.counts()[k] for k in ("invoices", "credit_notes", "payments"))
-                else "empty",
-                "importable": False,
-                "sub_origin_exclusions": result.exclusions.as_dict(),
-                "census": result.census,
-            },
-        )
-        return 0
+        return 3 if result.blockers else 0
     economic_cutoff = _datetime.fromisoformat(str(args.economic_cutoff))
     recorded_cutoff = _datetime.fromisoformat(str(args.recorded_cutoff))
     capture = OpeningCaptureV1(
@@ -446,7 +429,6 @@ def cmd_billing_preflight(args: argparse.Namespace) -> int:
         "translation_blockers": [
             {"source_key": b.source_key, "reason": b.reason} for b in preflight.translation_blockers
         ],
-        "sub_origin_exclusions": result.exclusions.as_dict(),
         "census": result.census,
     }
     _write_receipt(Path(args.receipt), payload)
