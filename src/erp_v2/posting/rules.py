@@ -101,6 +101,9 @@ POLICIES: Final = MappingProxyType(
         ("erp.migration", "holding_release"): RefPolicy(),
         ("erp.migration", "holding_writeoff"): RefPolicy(),
         ("erp.migration", "ar_opening_credit"): RefPolicy(),
+        # B-14 straddle reproduction (W8): a legacy journal dated across the history cutoff, re-posted balanced at its
+        # legacy accounts and days; refuses control accounts, so no control door is used.
+        ("erp.migration", "migration_straddle"): RefPolicy(),
     }
 )
 

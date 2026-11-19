@@ -295,9 +295,45 @@ def test_the_posting_rules_carry_exactly_the_four_reviewed_entries():
     assert mine == {("erp.migration", kind) for kind in POSTING_KINDS}
 
 
-def test_unapplied_credit_notes_are_recognised_by_the_legacy_key_prefix():
-    body = census_body(held=[{"reason": "whatever", "legacy_key": "ar_unapplied_credit_note:cn7", "amount_minor": -500,
+def test_credit_notes_key_on_the_reason_and_a_disagreeing_prefix_refuses():
+    body = census_body(held=[{"reason": "ar_unapplied_credit_note", "legacy_key": "cn7", "amount_minor": -500,
                               "customer": "C2", "currency": "NGN"}])  # fmt: skip
     att = attr.census_attribution(attr.parse_census(body, SHA), code="1400", currency="NGN", functional="NGN")
     (e,) = att.explained[Party("customer", "C2")]
-    assert (e.class_code, e.reason) == ("E35", "ar_unapplied_credit_note")
+    assert (e.class_code, e.reason, e.source_key) == ("E35", "ar_unapplied_credit_note", "ar_unapplied_credit_note:cn7")
+    clash = census_body(held=[{"reason": "row_after_cutoff", "legacy_key": "ar_unapplied_credit_note:cn7",
+                               "amount_minor": -500, "customer": "C2", "currency": "NGN"}])  # fmt: skip
+    with pytest.raises(HoldingRefused) as err:
+        attr.census_attribution(attr.parse_census(clash, SHA), code="1400", currency="NGN", functional="NGN")
+    assert err.value.code == "census_reason_mismatch"
+
+
+def test_every_census_reason_maps_to_its_register_key():
+    assert attr.census_register_key("partition_held:x", "partition:C1:NGN") == "partition:C1:NGN"
+    assert attr.census_register_key("ar_unapplied_credit_note", "cn1") == "ar_unapplied_credit_note:cn1"
+    assert attr.census_register_key("row_after_cutoff", "r1") == "row:r1"
+
+
+def test_items_link_back_to_their_source_exception():
+    a = party("A")
+    att = attribution(gl={a: D("-60")}, explained={a: (Explained("E02", "r", "inv-1", D("-60")),)})
+    (item,) = items_for(att, {a: D(0)})
+    assert item.detail()["origin"] == {"class": "E02", "legacy_key": "inv-1"}
+
+
+def test_the_real_72_census_output_is_consumed_by_the_b14_adapter():
+    """F5: feed #72's real ``build_attribution`` output (not a hand-written fixture) through parse_census."""
+    from test_ar_attribution import _attr
+
+    _census, receipt = _attr()
+    census = attr.parse_census(receipt, SHA, SHA)
+    att = attr.census_attribution(census, code="1400", currency="NGN", functional="NGN")
+    reasons = {(e.class_code, e.reason) for es in att.explained.values() for e in es}
+    assert ("E35", "ar_unapplied_credit_note") in reasons
+    assert any(r.startswith("partition_held:") for _c, r in reasons)
+    # the receipt's own invariant carries through: parties' GL + unattributed == the legacy 1400 net
+    assert census.gl_total_minor("NGN", "NGN") == receipt["legacy_1400_minor_by_currency"]["NGN"]
+    # every held row names its source register key under the #72 key scheme
+    for es in att.explained.values():
+        for e in es:
+            assert e.source_key.startswith(("partition:", "ar_unapplied_credit_note:", "row:"))

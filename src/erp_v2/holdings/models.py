@@ -23,6 +23,7 @@ from erp_v2.hr.models import _tenant_fk
 from erp_v2.migration_ledger.models import EXCEPTIONS_TABLE
 
 HOLDINGS_TABLE: Final = "erp_migration_holdings"
+ACCOUNTS_TABLE: Final = "erp_migration_holding_accounts"
 MONEY = Numeric(20, 6)
 
 KIND_RECLASS: Final = "reclass"
@@ -40,13 +41,16 @@ KIND_HOLDING_POST: Final = "migration_holding"
 KIND_RELEASE_POST: Final = "holding_release"
 KIND_WRITEOFF_POST: Final = "holding_writeoff"
 KIND_T1_POST: Final = "ar_opening_credit"
-POSTING_KINDS: Final = (KIND_HOLDING_POST, KIND_RELEASE_POST, KIND_WRITEOFF_POST, KIND_T1_POST)
+KIND_STRADDLE_POST: Final = "migration_straddle"
+POSTING_KINDS: Final = (KIND_HOLDING_POST, KIND_RELEASE_POST, KIND_WRITEOFF_POST, KIND_T1_POST, KIND_STRADDLE_POST)
 
 # uuid5 namespaces (constants; never random) for the once-only document identities.
 HOLDING_NS: Final = UUID("5b0d1f0e-3f0a-5c7e-9b6a-0b14c0de0001")
 T1_NS: Final = UUID("5b0d1f0e-3f0a-5c7e-9b6a-0b14c0de0002")
 REL_NS: Final = UUID("5b0d1f0e-3f0a-5c7e-9b6a-0b14c0de0003")
 WRITEOFF_NS: Final = UUID("5b0d1f0e-3f0a-5c7e-9b6a-0b14c0de0004")
+STRADDLE_NS: Final = UUID("5b0d1f0e-3f0a-5c7e-9b6a-0b14c0de0005")
+STRADDLE_SOURCE: Final = "migration_straddle"  # the register source of the E39 review items
 
 SOURCE_KIND: Final = "migration_holdings"  # the register source for the items
 
@@ -61,6 +65,10 @@ def t1_document_id(window_id: str, currency: str) -> str:
 
 def release_document_id(exception_id: UUID | str, n: int) -> str:
     return str(uuid5(REL_NS, f"{exception_id}:{n}"))
+
+
+def straddle_document_id(legacy_journal_id: str, day: str) -> str:
+    return str(uuid5(STRADDLE_NS, f"{legacy_journal_id}:{day}"))
 
 
 def writeoff_document_id(exception_id: UUID | str) -> str:
@@ -87,4 +95,19 @@ class Holding(Base):
     planned_by: Mapped[str] = mapped_column(String(120), nullable=False)
     applied_by: Mapped[str] = mapped_column(String(120), nullable=False)
     dual_control: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class HoldingAccount(Base):
+    """The holding accounts a flip run resolved (L6), persisted even when a code had X = 0, so the manual-journal guard
+    covers every configured holding account. Append-only."""
+
+    __tablename__ = ACCOUNTS_TABLE
+    __table_args__ = (UniqueConstraint("tenant_id", "control_code", name=f"uq_{ACCOUNTS_TABLE}_code"),)
+
+    id: Mapped[UUID] = uuid_pk()
+    tenant_id: Mapped[UUID] = _tenant_fk()
+    control_code: Mapped[str] = mapped_column(String(30), nullable=False)
+    holding_account_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
+    plan_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

@@ -204,6 +204,11 @@ def release_once(
 ) -> dict[str, Any]:
     """One attempt, inside a transaction the caller opened at REPEATABLE READ and will commit or roll back."""
     operator = text(operator, "operator_ref_required")
+    # F4: no preview/approve split exists for a release yet, so a single-operator release is refused while the D-9
+    # policy is ON (default OFF: no runtime change).
+    dual = governance.dual_control(db, tenant)
+    if dual:
+        refuse("release_dual_control_unbuilt", "the release has no two-person split yet")
     item = lock_item(db, tenant, key)
     code = item.reclass.control_code
     adapter = adapters.get(code) or refuse("release_owner_unavailable")
@@ -229,6 +234,7 @@ def release_once(
         ),
     )
     doc = release_document_id(item.exception.id, n)
+    command_sha = canonical_sha(dict(command))  # L2: the owner command is part of the identity and the receipt
     fingerprint = canonical_sha(
         {
             "exception": str(item.exception.id),
@@ -236,6 +242,7 @@ def release_once(
             "delta": fmt(delta),
             "control": str(control.id),
             "holding": str(holding),
+            "owner_command_sha256": command_sha,
         }
     )
     consequence = posting.build(
@@ -269,7 +276,7 @@ def release_once(
             owner_receipt_sha256=receipt.sha256,
             planned_by=operator,
             applied_by=operator,
-            dual_control=False,
+            dual_control=dual,
         )
     )
     db.flush()
@@ -281,7 +288,7 @@ def release_once(
             outcome="admitted", evidence_sha256=receipt.sha256,
         )  # fmt: skip
     return {"ready": True, "kind": KIND_RELEASE, "exception_state": "resolved" if remaining == 0 else "open",
-            "remaining": fmt(remaining), "journal_id": str(result.journal_id), "owner_receipt_sha256": receipt.sha256}  # fmt: skip
+            "remaining": fmt(remaining), "journal_id": str(result.journal_id), "owner_receipt_sha256": receipt.sha256, "owner_command_sha256": command_sha}  # fmt: skip
 
 
 def _postcondition(db: Session, tenant: UUID, adapter: HoldingOwnerAdapter, code: str, control: cfg.AccountRef) -> None:

@@ -71,6 +71,26 @@ runtime SELECT only. Downgrade refuses while any row exists.
 `journals/service._control_guard` refuses any manual-journal or held-draft line on a holding account
 (`holding_account_requires_holding_command`), so a bare journal cannot break the holding tie.
 
+## Review hardening (architect review of 6b4adec)
+
+* F1: T1 and the holding plan anchor the census to the `erp_ar_opening_admissions` rows (census digest = the receipt's own
+  `census_sha256`, one manifest fingerprint, admitted partitions == census parties carrying items or cash lots); T1 also
+  compares `BillingReader.window_manifest_fingerprint` (refuses `manifest_fingerprint_unavailable` until the a13 reader).
+* F2: `window_already_applied` once any `migration_holding` identity of the window is posted from another plan.
+* F3: apply re-reads the owner subledgers inside its transaction. F4: a release refuses `release_dual_control_unbuilt` while D-9 is ON.
+* F6: every explained (held) row must match an OPEN register exception, with an equal amount where the source records one.
+* L3/L4/L6: TRUNCATE refused; a `migration_holdings` item cannot be resolved with an outstanding amount; resolved holding accounts are
+  persisted (`erp_migration_holding_accounts`) and guarded even with no rows. L5: verify checks the prepayment account has not moved.
+
+## Straddle reproduction (W8, simplified)
+
+`holding straddle plan|apply|verify` reproduces each legacy journal dated across the history cutoff as one balanced
+`migration_straddle` journal per ledger-line day, at the legacy account, amount and date (identity uuid5 over journal and day).
+It refuses any control or holding account line, non-zero net (total or per day), a line on or before the cutoff, a non-functional
+currency, an inactive account or a day whose period is not OPEN. It never touches suspense. Each journal gets one OPEN `E39`
+register item (source `migration_straddle`), a review item only. Input is the B-13 side file named in `receipts.straddle`
+(format in `holdings/straddle.py`).
+
 ## Not in this change
 
 The gate wiring (`holdings.ties.holding_tie` and the `verify` receipt as gate items 2/3, class rows), the control-code
