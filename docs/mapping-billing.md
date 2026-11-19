@@ -126,3 +126,28 @@ exactly the R5 list (20 INSERT tables, 9 SELECT-only, `UPDATE(generation)` on `o
 migrator. The operator's `SET ROLE` membership is a Michael root step for the window only
 (`GRANT erp_billing_opening_writer TO <operator> WITH SET TRUE, INHERIT FALSE`), revoked after the seal with the
 writer's INSERT grants (runbook F9).
+
+Review af472276 hardening (architect findings):
+
+- PostgreSQL 16 or newer is required (`WITH SET TRUE, INHERIT FALSE` and `REVOKE ... OPTION FOR` are PG16). Any membership
+  row on the writer with SET or INHERIT, held by any role, is refused by the migration and again by `apply` (only the
+  session operator may hold SET, never INHERIT). An ADMIN-only row is allowed: a non-superuser CREATEROLE migrator gets
+  one automatically on PG16; if `createrole_self_grant` also gave the creator SET or INHERIT on a role the migration
+  just created, those two options are revoked. A superuser migrator gets no row. An adopted role has every privilege
+  stripped and exactly the R5 set re-granted, and the exact set is asserted from the ACLs; owned objects and default
+  privileges are refused (`erp_v2.importer.ar_opening_role`).
+- The two-person policy (`dual_control`) is bound into the plan sha: a policy flip after approval changes the sha and
+  `apply` refuses it (`approved_plan_sha_mismatch`).
+- The GL attribution reads the legacy snapshot at the census cutoff D with the census's posting-date and status
+  semantics, and REFUSES any 1400 line after D (`ar_gl_after_cutoff`). A non-functional currency on any partition or
+  journal owner is refused (`ar_attribution_fx_unsupported`) until P-4/P-7; unowned journals are never forced to the
+  functional currency. A census without `gl_attribution` cannot be loaded into the register.
+- Nothing legacy recorded is dropped silently. A document with no posted journal (any non-void, non-reversed status,
+  invoices and payments) is an H-DOC work item with its status. A document posted by D but dated after it is an E35
+  `row:` item with its GL-signed amount held (`row_after_cutoff`). CLOSED is only for residual 0, void or reversed.
+- A refused partition is held whole: one `partition_held:<blockers>` item equal to the party's entire legacy GL.
+- The apply receipt carries the window's manifest fingerprint read back after the seal, T1 per currency and the
+  per-account cash-lot split; an aborted apply keeps what was admitted (`partial_receipt`).
+- Runbook: an aborted apply followed by a re-plan yields a new window id (the id derives from the plan sha), so the
+  existing window is refused (`existing_window_differs`). The only way forward is a restore of the pre-F6 database and a
+  fresh run; do not try to edit or reuse the half-provisioned window.

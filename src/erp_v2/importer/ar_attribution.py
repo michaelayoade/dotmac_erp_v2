@@ -27,8 +27,8 @@ from decimal import Decimal
 from erp_v2.importer.ar_census import (
     CARRY_ITEM,
     CARRY_LOT,
-    EXCLUDED_PARTITION,
     NOT_RECEIVABLE,
+    POSTED_AFTER_CUTOFF,
     UNAPPLIED_CREDIT_NOTE,
     ArCensus,
     CensusError,
@@ -66,6 +66,21 @@ def build_attribution(
 ) -> dict[str, object]:
     """`gl_lines`: (journal id, net debit - credit as Decimal-like) per legacy 1400 line or journal (summed here)."""
 
+    # Fail closed on FX (replan T5; B14.4 holding_fx_unsupported): ledger lines are functional-currency amounts, so a
+    # non-functional partition or journal owner cannot be compared with its transaction-currency carried amounts, and
+    # an unowned journal must never be forced to the functional currency. Lifted only by an explicit P-4/P-7 ruling.
+    foreign = {
+        ccy
+        for ccy in (
+            *(p[1] for p in census.carry_partitions),
+            *(e.partition[1] for e in census.excluded),
+            *(r.partition[1] for r in census.rows if r.partition),
+            *(k for owners in journal_owners.values() for _c, k in owners),
+        )
+        if ccy != functional_currency
+    }
+    if foreign:
+        raise CensusError("ar_attribution_fx_unsupported")
     per_journal: dict[str, int] = defaultdict(int)
     for journal, net in gl_lines:
         per_journal[str(journal)] += _minor(net, str(journal))
@@ -78,7 +93,9 @@ def build_attribution(
         if len(owners) == 1:
             gl[owners[0]] += amount
         elif not owners:
-            unattributed[functional_currency].append({"gljournal_id": journal, "amount_minor": amount})
+            unattributed[functional_currency].append(
+                {"gljournal_id": journal, "amount_minor": amount, "currency": functional_currency}
+            )
         else:
             shared.append(
                 {
@@ -88,7 +105,9 @@ def build_attribution(
                     "currency": functional_currency,
                 }
             )
-            unattributed[functional_currency].append({"gljournal_id": journal, "amount_minor": amount, "shared": True})
+            unattributed[functional_currency].append(
+                {"gljournal_id": journal, "amount_minor": amount, "shared": True, "currency": functional_currency}
+            )
 
     carried: dict[PartyKey, int] = defaultdict(int)
     lots: dict[PartyKey, int] = defaultdict(int)
@@ -105,20 +124,44 @@ def build_attribution(
             held[party].append(
                 {
                     "reason": "ar_unapplied_credit_note",
+                    "customer": party[0],
+                    "currency": party[1],
                     "legacy_key": row.key,
                     "amount_minor": _held_amount(row, invoice_types),
                 }
             )
-        elif row.bucket == EXCLUDED_PARTITION and (row.residual_minor or 0) != 0:
+        elif row.bucket == NOT_RECEIVABLE and row.reason == POSTED_AFTER_CUTOFF:
             held[party].append(
                 {
-                    "reason": f"partition_held:{row.reason}",
+                    "reason": "row_after_cutoff",
+                    "customer": party[0],
+                    "currency": party[1],
                     "legacy_key": row.key,
                     "amount_minor": _held_amount(row, invoice_types),
                 }
             )
+    for excluded in census.excluded:
+        # A refused partition is held WHOLE: one item equal to the party's entire legacy GL, so none of it falls out
+        # as an unexplained custgap (rows without a residual, such as inexact or outside-population payments, included).
+        reasons = ",".join(sorted({reason for _key, reason in excluded.blockers})) or "partition_excluded"
+        held[excluded.partition].append(
+            {
+                "reason": f"partition_held:{reasons}",
+                "customer": excluded.partition[0],
+                "currency": excluded.partition[1],
+                "legacy_key": f"partition:{excluded.partition[0]}:{excluded.partition[1]}",
+                "amount_minor": gl.get(excluded.partition, 0),
+            }
+        )
     unposted = [
-        {"reason": "doc_unposted", "legacy_key": r.key, "amount_minor": 0, "gross_minor": r.gross_minor}
+        {
+            "reason": "doc_unposted",
+            "customer": r.partition[0] if r.partition else None,
+            "currency": r.partition[1] if r.partition else None,
+            "legacy_key": r.key,
+            "amount_minor": 0,
+            "gross_minor": r.gross_minor,
+        }
         for r in census.rows
         if r.bucket == NOT_RECEIVABLE and r.reason.startswith("unposted_")
     ]
@@ -158,36 +201,48 @@ def build_attribution(
 # --- read-only loader (the caller sets the READ ONLY transaction posture) ----------------------------------------
 
 OWNER_SQL = """
-SELECT i.journal_entry_id::text AS journal_id, i.customer_id::text AS customer_key, i.currency_code
-FROM ar.invoice i WHERE i.journal_entry_id IS NOT NULL
-UNION ALL
-SELECT j.reversal_journal_id::text, i.customer_id::text, i.currency_code
-FROM ar.invoice i JOIN gl.journal_entry j ON j.journal_entry_id = i.journal_entry_id
-WHERE j.reversal_journal_id IS NOT NULL
-UNION ALL
-SELECT p.journal_entry_id::text, p.customer_id::text, p.currency_code
-FROM ar.customer_payment p WHERE p.journal_entry_id IS NOT NULL
-UNION ALL
-SELECT j.reversal_journal_id::text, p.customer_id::text, p.currency_code
-FROM ar.customer_payment p JOIN gl.journal_entry j ON j.journal_entry_id = p.journal_entry_id
-WHERE j.reversal_journal_id IS NOT NULL
+SELECT o.journal_id, o.customer_key, o.currency_code FROM (
+  SELECT i.journal_entry_id AS jid, i.journal_entry_id::text AS journal_id, i.customer_id::text AS customer_key,
+         i.currency_code FROM ar.invoice i WHERE i.journal_entry_id IS NOT NULL
+  UNION ALL
+  SELECT j.reversal_journal_id, j.reversal_journal_id::text, i.customer_id::text, i.currency_code
+    FROM ar.invoice i JOIN gl.journal_entry j ON j.journal_entry_id = i.journal_entry_id
+   WHERE j.reversal_journal_id IS NOT NULL
+  UNION ALL
+  SELECT p.journal_entry_id, p.journal_entry_id::text, p.customer_id::text, p.currency_code
+    FROM ar.customer_payment p WHERE p.journal_entry_id IS NOT NULL
+  UNION ALL
+  SELECT j.reversal_journal_id, j.reversal_journal_id::text, p.customer_id::text, p.currency_code
+    FROM ar.customer_payment p JOIN gl.journal_entry j ON j.journal_entry_id = p.journal_entry_id
+   WHERE j.reversal_journal_id IS NOT NULL
+) o JOIN gl.journal_entry g ON g.journal_entry_id = o.jid
+WHERE g.status IN ('POSTED', 'REVERSED') AND g.posting_date <= :cutoff
 """
 GL_SQL = """
-SELECT journal_entry_id::text AS journal_id, sum(debit_amount - credit_amount) AS net
-FROM gl.posted_ledger_line WHERE account_id::text = ANY(:accounts) GROUP BY 1
+SELECT l.journal_entry_id::text AS journal_id, sum(l.debit_amount - l.credit_amount) AS net
+FROM gl.posted_ledger_line l
+WHERE l.account_id::text = ANY(:accounts) AND l.posting_date <= :cutoff GROUP BY 1
+"""
+GL_AFTER_SQL = """
+SELECT count(*) FROM gl.posted_ledger_line l WHERE l.account_id::text = ANY(:accounts) AND l.posting_date > :cutoff
 """
 
 
-def load_gl_rows(source, ar_account_ids: Iterable[str]):
-    """(gl lines, journal owners) from the legacy snapshot; `ar_account_ids` = the account coded 1400 (same ids)."""
+def load_gl_rows(source, ar_account_ids: Iterable[str], cutoff):
+    """(gl lines, journal owners) from the legacy snapshot AT THE CENSUS CUTOFF D (same posting-date and status
+    semantics as the census loader). 1400 activity after D is refused (`ar_gl_after_cutoff`): the census does not
+    cover it, so it would be mis-itemised as a custgap while the ledger tie still passed."""
 
     import sqlalchemy as sa
 
     accounts = sorted({str(a) for a in ar_account_ids})
     if not accounts:
         raise CensusError("ar_control_account_missing")
-    lines = [(r["journal_id"], r["net"]) for r in source.execute(sa.text(GL_SQL), {"accounts": accounts}).mappings()]
+    params = {"accounts": accounts, "cutoff": cutoff.date() if hasattr(cutoff, "date") else cutoff}
+    if source.scalar(sa.text(GL_AFTER_SQL), params):
+        raise CensusError("ar_gl_after_cutoff")
+    lines = [(r["journal_id"], r["net"]) for r in source.execute(sa.text(GL_SQL), params).mappings()]
     owners: dict[str, set[PartyKey]] = defaultdict(set)
-    for r in source.execute(sa.text(OWNER_SQL)).mappings():
+    for r in source.execute(sa.text(OWNER_SQL), {"cutoff": params["cutoff"]}).mappings():
         owners[r["journal_id"]].add((str(r["customer_key"]), str(r["currency_code"])))
     return lines, owners

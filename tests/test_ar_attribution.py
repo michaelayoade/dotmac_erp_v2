@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -79,8 +80,8 @@ def test_the_b14_invariant_sum_gl_plus_unattributed_equals_the_legacy_1400_net_p
     assert a["shared_ar_journal"] == [
         {"gljournal_id": "j-shared", "amount_minor": 300, "partitions": [list(C1), list(C4)], "currency": "NGN"}
     ]
-    assert {"gljournal_id": "j-shared", "amount_minor": 300, "shared": True} in a["unattributed"]
-    assert {"gljournal_id": "j-manual", "amount_minor": 700} in a["unattributed"]
+    assert {"gljournal_id": "j-shared", "amount_minor": 300, "shared": True, "currency": "NGN"} in a["unattributed"]
+    assert {"gljournal_id": "j-manual", "amount_minor": 700, "currency": "NGN"} in a["unattributed"]
 
 
 def test_per_party_fields_and_the_distinct_held_reasons():
@@ -94,9 +95,9 @@ def test_per_party_fields_and_the_distinct_held_reasons():
     assert parties[C2]["carried_minor"] == 0 and parties[C2]["cash_lot_minor"] == 0  # whole partition held
     held = {(h["reason"], h["legacy_key"]): h["amount_minor"] for h in a["held"]}
     assert held[("ar_unapplied_credit_note", "cn-1")] == -2000  # distinct reason, GL-signed (negative total)
-    assert held[("partition_held:partition_excluded", "ok-2")] == 5000
-    # the inexact row has no exact residual, so its GL (10.00) is the unexplained remainder: an E36a custgap
-    assert parties[C2]["gl_minor"] == 6000 and parties[C2]["custgap_minor"] == 1000
+    # an excluded partition is held WHOLE: one item equal to the party's entire GL, so nothing falls out as custgap
+    assert held[("partition_held:amount_not_exact", "partition:cust-2:NGN")] == 6000
+    assert parties[C2]["gl_minor"] == 6000 and parties[C2]["custgap_minor"] == 0
     assert held[("doc_unposted", "draft-1")] == 0  # no GL
     assert census.carry_partitions == (C1, C4)
 
@@ -124,3 +125,74 @@ def test_lines_of_one_journal_are_summed_and_a_reversal_journal_follows_its_owne
     )["gl_attribution"]
     assert [p["gl_minor"] for p in a["parties"] if p["customer"] == "cust-1"] == [0]
     assert a["unattributed"] == []
+
+
+def test_non_functional_currency_is_refused_and_unowned_journals_are_never_forced_to_the_functional_currency():
+    census, types = _census()
+    for owners in ({"j-fx": [("cust-1", "USD")]},):
+        with pytest.raises(CensusError, match="ar_attribution_fx_unsupported"):
+            build_attribution(
+                census,
+                gl_lines=[("j-fx", Decimal("1.00"))],
+                journal_owners=owners,
+                invoice_types=types,
+                functional_currency="NGN",
+            )
+    usd = build_census(
+        snapshot_sha256="d" * 64,
+        cutoff=CUTOFF,
+        invoices=[invoice("u-1", currency_code="USD", posted=True)],
+        payments=[],
+        allocations=[],
+        customer_snapshot=lambda _k: SNAPSHOT,
+        seller=SNAPSHOT,
+    )
+    with pytest.raises(CensusError, match="ar_attribution_fx_unsupported"):
+        build_attribution(usd, gl_lines=[], journal_owners={}, invoice_types={}, functional_currency="NGN")
+
+
+def test_posted_after_cutoff_rows_are_held_at_their_gl_signed_amount():
+    invoices = [
+        invoice("inv-1", total="100.00", posted=True),
+        invoice("late-1", total="40.00", posted=True, invoice_date=datetime(2026, 2, 1, tzinfo=UTC)),
+        invoice(
+            "late-cn",
+            total="25.00",
+            invoice_type="CREDIT_NOTE",
+            posted=True,
+            invoice_date=datetime(2026, 2, 1, tzinfo=UTC),
+        ),
+    ]
+    census = build_census(
+        snapshot_sha256="d" * 64,
+        cutoff=CUTOFF,
+        invoices=invoices,
+        payments=[],
+        allocations=[],
+        customer_snapshot=lambda _k: SNAPSHOT,
+        seller=SNAPSHOT,
+    )
+    types = {i["invoice_id"]: i["invoice_type"] for i in invoices}
+    a = build_attribution(
+        census,
+        gl_lines=[("j1", Decimal("100.00")), ("j2", Decimal("40.00")), ("j3", Decimal("-25.00"))],
+        journal_owners={"j1": [C1], "j2": [C1], "j3": [C1]},
+        invoice_types=types,
+        functional_currency="NGN",
+    )["gl_attribution"]
+    held = {h["legacy_key"]: (h["reason"], h["amount_minor"]) for h in a["held"]}
+    assert held == {"late-1": ("row_after_cutoff", 4000), "late-cn": ("row_after_cutoff", -2500)}
+    (party,) = a["parties"]
+    assert party["gl_minor"] == 11500 and party["custgap_minor"] == 0  # 100 carried + 40 - 25 explained
+
+
+def test_every_held_entry_carries_its_customer_and_currency():
+    _, a = _attr()
+    assert a["held"], "the fixture must produce held items of every reason"
+    reasons = {h["reason"].split(":")[0] for h in a["held"]}
+    assert {"ar_unapplied_credit_note", "partition_held", "doc_unposted"} <= reasons
+    for h in a["held"]:
+        assert h["customer"] and h["currency"] == "NGN", h  # B-14 refuses census_held_party_unknown otherwise
+        assert {"reason", "legacy_key", "amount_minor"} <= set(h)
+    by_key = {h["legacy_key"]: h["customer"] for h in a["held"]}
+    assert by_key["cn-1"] == "cust-1" and by_key["partition:cust-2:NGN"] == "cust-2" and by_key["draft-1"] == "cust-3"

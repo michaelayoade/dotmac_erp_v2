@@ -91,3 +91,4 @@ def test_plan_sha_binds_the_manifest_and_every_command_digest() -> None:
     assert a != cli.plan_sha256("f" * 64, {"1": "a" * 64, "2": "c" * 64})
     variance = [{"partition": "c", "source_key": "i", "basis": "stored_balance", "amount_minor": 5}]
     assert cli.plan_sha256("f" * 64, {"1": "a" * 64}, variance) != cli.plan_sha256("f" * 64, {"1": "a" * 64}, [])
+    assert cli.plan_sha256("f" * 64, {}, [], "on") != cli.plan_sha256("f" * 64, {}, [], "off")  # dual_control is bound
