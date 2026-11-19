@@ -5,6 +5,10 @@
     python -m erp_v2.migration_ledger.exceptions_register resolve --spec S.json --class E16a --key <legacy key> \
         --outcome <posted|admitted|voided|written_off|no_action> --evidence-sha256 <sha> --receipt R.json \
         --operator-ref <who> --apply
+    python -m erp_v2.migration_ledger.exceptions_register add --spec S.json --class E26 --key <legacy key> \
+        --evidence-sha256 <sha> --receipt R.json --operator-ref <who> --apply
+    python -m erp_v2.migration_ledger.exceptions_register declare-na --spec S.json --class E27 --reason <text> \
+        --evidence-sha256 <sha> --receipt R.json --operator-ref <who> --apply
     python -m erp_v2.migration_ledger.exceptions_register gate --spec S.json --receipt R.json --operator-ref <who>
 
 ``S.json`` is ``{"version": 1, "tenant_id": "<uuid>", "receipts": [{"kind": "held_drafts"|"import_itemised",
@@ -54,11 +58,11 @@ def gather(db: Session, tenant, spec) -> tuple[list[register.Fact], set[str], st
             Path(text(e["path"], "invalid_spec_schema", 1024)), sha_text(e["sha256"], "invalid_spec_schema")
         )
         body = strict_json(data, "invalid_receipt_json")
-        facts += (
-            register.from_held_drafts(body) if e["kind"] == register.SRC_HELD else register.from_import_itemised(body)
-        )
+        facts += register.from_import_itemised(body)
         sources.add(e["kind"])
         shas.append(sha)
+    facts += register.from_held_decisions(db, tenant)  # B-2 outcomes: the immutable table, never a receipt file
+    sources.add(register.SRC_HELD)
     if spec["include_admission_reviews"]:
         facts += register.from_admission_reviews(db, tenant)
         sources.add(register.SRC_REVIEWS)
@@ -102,6 +106,32 @@ def _run(args) -> dict[str, Any]:
                     db.rollback()
                 return out
             cli.require_apply(args.apply)
+            if args.mode in ("add", "declare-na"):
+                if args.mode == "add":
+                    row = register.add_item(
+                        db,
+                        tenant,
+                        class_code=args.class_code,
+                        legacy_key=args.key or "",
+                        evidence_sha256=args.evidence_sha256 or "",
+                        operator=operator,
+                    )
+                else:
+                    row = register.declare_na(
+                        db,
+                        tenant,
+                        class_code=args.class_code,
+                        reason=args.reason or "",
+                        evidence_sha256=args.evidence_sha256 or "",
+                        operator=operator,
+                    )
+                db.commit()
+                return {
+                    "mode": args.mode,
+                    "class": row.class_code,
+                    "state": row.state,
+                    "register": register.counts(db, tenant),
+                }
             row = register.resolve(
                 db,
                 tenant,
@@ -123,7 +153,7 @@ def _run(args) -> dict[str, Any]:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m erp_v2.migration_ledger.exceptions_register")
-    parser.add_argument("mode", choices=("load", "resolve", "gate"))
+    parser.add_argument("mode", choices=("load", "resolve", "gate", "add", "declare-na"))
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--operator-ref", required=True)
@@ -131,15 +161,20 @@ def main(argv=None) -> int:
     parser.add_argument("--key")
     parser.add_argument("--outcome")
     parser.add_argument("--evidence-sha256")
+    parser.add_argument("--reason", help="declare-na: why the class does not apply (<= 500 characters)")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
+    if args.mode == "add" and not (args.class_code and args.key and args.evidence_sha256):
+        parser.error("add needs --class, --key and --evidence-sha256")
+    if args.mode == "declare-na" and not (args.class_code and args.reason and args.evidence_sha256):
+        parser.error("declare-na needs --class, --reason and --evidence-sha256")
     if args.mode == "resolve" and not (args.class_code and args.key and args.outcome and args.evidence_sha256):
         parser.error("resolve needs --class, --key, --outcome and --evidence-sha256")
     return cli.run(
         args.receipt,
         lambda: _run(args),
         "exceptions register",
-        pre=(lambda: cli.require_apply(args.apply)) if args.mode == "resolve" else None,
+        pre=(lambda: cli.require_apply(args.apply)) if args.mode in ("resolve", "add", "declare-na") else None,
     )
 
 

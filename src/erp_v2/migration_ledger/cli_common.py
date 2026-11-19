@@ -35,6 +35,19 @@ def engine():
     return eng
 
 
+def legacy_engine():
+    """The read-only legacy snapshot connection (``LEGACY_DATABASE_URL``), popped from the environment like the DSN."""
+    import sqlalchemy as sa
+
+    url = os.environ.pop("LEGACY_DATABASE_URL", "")
+    if not url:
+        refuse("operator_legacy_materials_required")
+    eng = sa.create_engine(url, echo=False, hide_parameters=True)
+    if eng.dialect.name != "postgresql":
+        refuse("postgresql_required")
+    return eng
+
+
 def install_registries() -> None:
     from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
 

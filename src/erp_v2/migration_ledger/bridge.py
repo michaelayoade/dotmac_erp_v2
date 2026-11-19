@@ -66,6 +66,7 @@ class Item:
     legacy: Decimal
     v2: Decimal
     evidence_sha256: str
+    source_invoice_id: str | None = None
 
     def as_dict(self) -> dict[str, str | None]:
         return {
@@ -79,6 +80,7 @@ class Item:
             "legacy_amount": fmt(self.legacy),
             "v2_amount": fmt(self.v2),
             "evidence_sha256": self.evidence_sha256,
+            "source_invoice_id": self.source_invoice_id,
         }
 
 
@@ -102,7 +104,7 @@ def parse_inputs(raw: object, raw_sha: str) -> Inputs:
     """The bridge input file (version 1), every amount a string in net (debit - credit) terms."""
     body = keys_exactly(
         raw,
-        {"version", "snapshot_sha256", "rounding_account_code", "universe_refs", "legacy", "items"},
+        {"version", "snapshot_sha256", "rounding_account_code", "items"},
         "invalid_bridge_inputs_schema",
     )
     if body["version"] != 1 or not isinstance(body["items"], list) or len(body["items"]) > MAX_ITEMS:
@@ -110,18 +112,6 @@ def parse_inputs(raw: object, raw_sha: str) -> Inputs:
     rounding = body["rounding_account_code"]
     if rounding is not None:
         rounding = text(rounding, "invalid_rounding_account", 30)
-    if not isinstance(body["universe_refs"], list) or not isinstance(body["legacy"], list):
-        refuse("invalid_bridge_inputs_schema")
-    refs = [text(r, "invalid_universe_ref", 255) for r in body["universe_refs"]]
-    if len(set(refs)) != len(refs):
-        refuse("universe_duplicate_ref")
-    legacy: dict[tuple[str, str], Decimal] = {}
-    for row in body["legacy"]:
-        entry = keys_exactly(row, {"account", "period", "net"}, "invalid_legacy_row")
-        key = (text(entry["account"], "invalid_legacy_row", 30), _period(entry["period"], "invalid_legacy_row"))
-        if key in legacy:
-            refuse("legacy_duplicate_row")
-        legacy[key] = money(entry["net"], "invalid_legacy_row")
     seen: set[str] = set()
     items: list[Item] = []
     keys = {
@@ -135,6 +125,7 @@ def parse_inputs(raw: object, raw_sha: str) -> Inputs:
         "legacy_amount",
         "v2_amount",
         "evidence_sha256",
+        "source_invoice_id",
     }
     for row in body["items"]:
         e = keys_exactly(row, keys, "invalid_bridge_item")
@@ -177,16 +168,26 @@ def parse_inputs(raw: object, raw_sha: str) -> Inputs:
                 legacy_amount,
                 v2_amount,
                 sha_text(e["evidence_sha256"], "invalid_bridge_item"),
+                None if e["source_invoice_id"] is None else text(e["source_invoice_id"], "invalid_bridge_item", 255),
             )
         )
+    # the legacy side and the universe are NEVER in the file: ``with_snapshot`` fills them from the legacy ledger
     return Inputs(
         sha_text(body["snapshot_sha256"], "invalid_snapshot_sha"),
         rounding,
-        frozenset(refs),
-        legacy,
+        frozenset(),
+        {},
         tuple(sorted(items, key=lambda i: i.item_id)),
         raw_sha,
     )
+
+
+def with_snapshot(inputs: Inputs, legacy: dict[tuple[str, str], Decimal], universe: frozenset[str]) -> Inputs:
+    """Attach the RECOMPUTED legacy net (per account code x period) and the universe of legacy journal ids. The item
+    file only classifies refs; its sums must tie exactly to this, else the partition gap shows it."""
+    from dataclasses import replace
+
+    return replace(inputs, legacy=dict(legacy), universe=universe)
 
 
 def partition_proof(inputs: Inputs) -> dict[str, Any]:
@@ -253,7 +254,7 @@ def verify_rounding_items(inputs: Inputs, import_itemised: dict[str, Any] | None
     per_period: dict[str, list[Decimal]] = defaultdict(list)
     for item in items:
         line = lines.get(item.evidence_sha256)
-        if line is None or item.evidence_sha256 in used or line.get("invoice_id") != item.ref:
+        if line is None or item.evidence_sha256 in used or line.get("invoice_id") != item.source_invoice_id:
             refuse("rounding_item_forged", "no matching #68 header bridge line")
         used.add(item.evidence_sha256)
         try:
@@ -269,6 +270,12 @@ def verify_rounding_items(inputs: Inputs, import_itemised: dict[str, Any] | None
     for deltas in per_period.values():
         if abs(sum(deltas, ZERO)) > CENT * len(deltas):
             refuse("rounding_residue_oversize")
+
+
+def control_lists() -> dict[str, list[str]]:
+    from erp_v2.migration_ledger import ledger_check
+
+    return ledger_check.control_lists()
 
 
 def compute(
@@ -365,6 +372,7 @@ def compute(
             "ias8_sha256": ias8_sha,
             "import_itemised_sha256": import_sha,
         },
+        "control_lists": control_lists(),
         "rounding_account_code": inputs.rounding_account_code,
         "rounding_residue_by_period": {p: fmt(v) for p, v in residue.items()},
         "rows": rows,
@@ -415,7 +423,11 @@ def ledger_inputs(
     rows = list(db.scalars(sa.select(m.OpeningJournal).where(m.OpeningJournal.tenant_id == tenant)))
     op = next((r for r in rows if r.kind == m.KIND_OPENING), None)
     opening_net = opening.ledger_net_by_account(db, tenant, op.journal_id) if op else None
-    ias8 = [(r.account_code, r.amount) for r in rows if r.kind == m.KIND_IAS8 and r.account_code]
+    ias8: list[tuple[str, Decimal]] = []
+    for r in rows:
+        if r.kind == m.KIND_IAS8 and r.account_code:
+            ias8.append((r.account_code, r.amount))
+            ias8.append(("3100", -r.amount))  # each IAS 8 journal's other leg: retained earnings
     ias8_shas = sorted({r.source_sha256 for r in rows if r.kind == m.KIND_IAS8})
     return (
         opening_net,
@@ -449,12 +461,20 @@ def store_version(db: Session, tenant: UUID, body: dict[str, Any], *, created_by
 
 
 def sign_version(
-    db: Session, tenant: UUID, *, version: int, expect_sha: str, signed_by: str
+    db: Session, tenant: UUID, *, version: int, expect_sha: str, signed_by: str, approval_reference: str
 ) -> tuple[m.BridgeVersion, bool]:
-    """Michael signs one version: it must be the latest, bound by sha, ready, and every planned rounding journal
-    posted. A repeat by the same signer replays; a signed version never changes."""
-    from erp_v2.migration_ledger import rounding_verify
+    """Michael signs one version. It must be the latest, bound by sha, ready, with every planned rounding journal
+    posted and the recomputed v2 ledger equal to the bridge (difference 0, no tolerance).
 
+    ``approval_reference`` is ``dotmac-debt-register v<N>`` (format-checked only: the register line at that version
+    must quote this version number and sha, which a separate reader check confirms). The ledger and register state at
+    signature is recorded and is what the flip gate compares against (``ledger_moved_since_signature``)."""
+    import re
+
+    from erp_v2.migration_ledger import ledger_check, register, rounding_verify
+
+    if not isinstance(approval_reference, str) or not re.fullmatch(r"dotmac-debt-register v[0-9]+", approval_reference):
+        refuse("invalid_approval_reference")
     row = latest(db, tenant)
     if row is None or row.version != version:
         refuse("bridge_version_not_latest")
@@ -462,7 +482,7 @@ def sign_version(
         refuse("bridge_sha_mismatch")
     body = verified_body(row)
     if row.signed_at is not None:
-        if row.signed_by == signed_by:
+        if row.signed_by == signed_by and row.approval_reference == approval_reference:
             return row, False
         refuse("bridge_already_signed")
     if not row.ready or not body["ready"]:
@@ -470,7 +490,11 @@ def sign_version(
     pending = rounding_verify.pending_periods(db, tenant, body)
     if pending:
         refuse("rounding_journal_pending", f"{len(pending)} period(s)")
+    if ledger_check.difference_rows(db, tenant, body):
+        refuse("v2_ledger_differs_from_bridge")
+    row.signed_state = {**ledger_check.ledger_state(db, tenant), "register": register.signature_summary(db, tenant)}
     row.signed_by = signed_by
+    row.approval_reference = approval_reference
     row.signed_at = datetime.now(UTC)
     db.flush()
     return row, True

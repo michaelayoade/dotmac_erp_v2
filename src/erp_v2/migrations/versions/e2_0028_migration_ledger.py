@@ -117,6 +117,8 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("signed_by", sa.String(120), nullable=True),
         sa.Column("signed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("approval_reference", sa.String(80), nullable=True),
+        sa.Column("signed_state", sa.dialects.postgresql.JSONB(), nullable=True),
         sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("tenant_id", "version", name=f"uq_{BRIDGE_TABLE}_version"),
         sa.UniqueConstraint("tenant_id", "sha256", name=f"uq_{BRIDGE_TABLE}_sha"),
@@ -125,8 +127,9 @@ def upgrade() -> None:
         sa.CheckConstraint(_SHA.format(col="itemised_sha256"), name=f"ck_{BRIDGE_TABLE}_itemised_sha"),
         sa.CheckConstraint("jsonb_typeof(body) = 'object'", name=f"ck_{BRIDGE_TABLE}_body"),
         sa.CheckConstraint(
-            "(signed_by IS NULL AND signed_at IS NULL) OR "
-            "(signed_by IS NOT NULL AND length(btrim(signed_by)) > 0 AND signed_at IS NOT NULL AND ready)",
+            "(signed_by IS NULL AND signed_at IS NULL AND approval_reference IS NULL AND signed_state IS NULL) OR "
+            "(signed_by IS NOT NULL AND length(btrim(signed_by)) > 0 AND signed_at IS NOT NULL AND ready "
+            "AND approval_reference ~ '^dotmac-debt-register v[0-9]+$' AND jsonb_typeof(signed_state) = 'object')",
             name=f"ck_{BRIDGE_TABLE}_signature",
         ),
     )

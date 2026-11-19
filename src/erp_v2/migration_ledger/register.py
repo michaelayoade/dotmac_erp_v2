@@ -6,8 +6,8 @@ Tier F journal) or confirmed no-action, each with evidence.
 
 Sources (each adapter is a pure function from a receipt or rows to ``Fact``s):
 
-* ``held_drafts``: the B-2 APPLY receipt (``bridge_lines`` and ``e17_findings``). A queued draft is open (E16a); a
-  voided or posted draft is resolved; every E17 finding is open until Finance resolves it. A PLAN receipt is refused.
+* ``held_drafts``: the immutable ``erp_held_draft_decisions`` rows (no receipt adapter). A queued draft is open
+  (E16a); a voided or posted draft is resolved; E17 findings derive from the ``duplicate_of_posted_fee_excess`` rows.
 * ``import_itemised``: the importer transform itemised file (#68: ``queue`` list); every queued invoice is open.
 * ``admission_reviews`` (database rows of B-1 decisions): a decision that waived a ``requires_correcting_journal``
   check (E08) or whose action is not executed here (void, supplier credit, reopen, ias8_post) is open; a plain
@@ -41,7 +41,8 @@ SRC_HELD: Final = "held_drafts"
 SRC_IMPORT: Final = "import_itemised"
 SRC_REVIEWS: Final = "admission_reviews"
 SRC_MANUAL: Final = "manual"
-RECEIPT_KINDS: Final = (SRC_HELD, SRC_IMPORT)
+SRC_NA: Final = "not_applicable"
+RECEIPT_KINDS: Final = (SRC_IMPORT,)  # B-2 outcomes load from the database, never from a receipt file
 
 # class by importer queue reason (#68 Q_* constants); an unknown reason is refused, never guessed.
 IMPORT_CLASS: Final = {
@@ -78,44 +79,52 @@ class Fact:
 # --- adapters --------------------------------------------------------------------------------------------------
 
 
-def from_held_drafts(receipt: Any) -> list[Fact]:
-    if not isinstance(receipt, dict) or receipt.get("mode") != "apply":
-        refuse("receipt_not_applied", "only a B-2 apply receipt is loaded")
-    lines, findings = receipt.get("bridge_lines"), receipt.get("e17_findings")
-    if not isinstance(lines, list) or not isinstance(findings, list):
-        refuse("invalid_held_drafts_receipt")
+def from_held_decisions(db: Session, tenant: UUID) -> list[Fact]:
+    """B-2 outcomes from the immutable ``erp_held_draft_decisions`` table (never from receipt files).
+
+    A queued draft is open (E16a); a voided or posted draft is resolved (E16). E17 findings are derived from the
+    decision rows whose reason is ``duplicate_of_posted_fee_excess``: one open finding per key.
+    """
+    from erp_v2.held_drafts.models import (
+        OUTCOME_POSTED,
+        OUTCOME_QUEUED,
+        OUTCOME_VOIDED,
+        VOID_DUPLICATE_OF_POSTED_FEE_EXCESS,
+        HeldDraftDecision,
+    )
+
     facts: list[Fact] = []
-    for line in lines:
-        if not isinstance(line, dict):
-            refuse("invalid_held_drafts_receipt")
-        outcome, jid = line.get("outcome"), line.get("journal_id")
-        evidence = sha_text(line.get("evidence_sha256"), "invalid_held_drafts_receipt")
+    e17: dict[str, dict[str, Any]] = {}
+    for row in db.scalars(sa.select(HeldDraftDecision).where(HeldDraftDecision.tenant_id == tenant)):
         detail = {
-            "rule_id": line.get("rule_id"),
-            "reason_code": line.get("reason_code"),
-            "amount": line.get("amount"),
-            "outcome": outcome,
+            "rule_id": row.rule_id,
+            "reason_code": row.reason_code,
+            "amount": str(row.amount),
+            "outcome": row.outcome,
         }
-        if outcome == "queued":
-            facts.append(Fact("E16a", f"held_draft:{jid}", SRC_HELD, None, evidence, detail))
-        elif outcome in ("voided", "posted"):
-            facts.append(Fact("E16", f"held_draft:{jid}", SRC_HELD, outcome, evidence, detail))
+        key = f"held_draft:{row.journal_id}"
+        if row.outcome == OUTCOME_QUEUED:
+            facts.append(Fact("E16a", key, SRC_HELD, None, row.evidence_sha256, detail))
+        elif row.outcome in (OUTCOME_VOIDED, OUTCOME_POSTED):
+            facts.append(Fact("E16", key, SRC_HELD, row.outcome, row.evidence_sha256, detail))
         else:
-            refuse("invalid_held_drafts_receipt")
-    for finding in findings:
-        if not isinstance(finding, dict) or finding.get("finding") != "E17":
-            refuse("invalid_held_drafts_receipt")
-        key = sha_text(finding.get("key_sha256"), "invalid_held_drafts_receipt")
-        detail = {
-            k: finding.get(k)
-            for k in (
-                "statement_lines",
-                "posted_fee_journals",
-                "excess_posted_fee_journals",
-                "posted_journal_ids_sha256",
+            refuse("invalid_held_draft_decision")
+        if row.reason_code == VOID_DUPLICATE_OF_POSTED_FEE_EXCESS:
+            ev = row.evidence or {}
+            k = str(ev.get("key_sha256", ""))
+            entry = e17.setdefault(
+                k,
+                {
+                    "statement_lines": ev.get("statement_lines"),
+                    "posted_fee_journals": ev.get("posted_fee_journals"),
+                    "excess_posted_fee_journals": ev.get("excess_posted_fee_journals"),
+                    "posted_journal_ids_sha256": ev.get("posted_journal_ids_sha256"),
+                    "drafts_voided": 0,
+                },
             )
-        }
-        facts.append(Fact("E17", f"e17:{key}", SRC_HELD, None, finding.get("posted_journal_ids_sha256"), detail))
+            entry["drafts_voided"] += 1
+    for k, detail in sorted(e17.items()):
+        facts.append(Fact("E17", f"e17:{k}", SRC_HELD, None, detail.get("posted_journal_ids_sha256"), detail))
     return facts
 
 
@@ -275,6 +284,134 @@ def resolve(
     return row
 
 
+def _class_row(db: Session, tenant: UUID, code: str, key: str):
+    return db.scalar(
+        sa.select(m.MigrationException).where(
+            m.MigrationException.tenant_id == tenant,
+            m.MigrationException.class_code == code,
+            m.MigrationException.legacy_key == key,
+        )
+    )
+
+
+def add_item(
+    db: Session, tenant: UUID, *, class_code: str, legacy_key: str, evidence_sha256: str, operator: str
+) -> m.MigrationException:
+    """Governed manual add of a Finance item: the class is from the closed list; the item starts OPEN."""
+    from erp_v2.migration_ledger.classes import CLASSES
+
+    if class_code not in CLASSES:
+        refuse("unknown_exception_class")
+    key = text(legacy_key, "legacy_key_required", 255)
+    if key.startswith("class:"):
+        refuse("legacy_key_reserved")
+    sha_text(evidence_sha256, "evidence_sha_required")
+    existing = _class_row(db, tenant, class_code, key)
+    if existing is not None:
+        refuse("exception_exists")
+    now = datetime.now(UTC)
+    detail = {"added_by": text(operator, "operator_ref_required")}
+    row = m.MigrationException(
+        tenant_id=tenant,
+        class_code=class_code,
+        legacy_key=key,
+        source_kind=SRC_MANUAL,
+        state=m.STATE_OPEN,
+        evidence_sha256=evidence_sha256,
+        fingerprint=canonical_sha({"c": class_code, "k": key, "d": detail}),
+        source_receipt_sha256=evidence_sha256,
+        detail=detail,
+        loaded_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def declare_na(
+    db: Session, tenant: UUID, *, class_code: str, reason: str, evidence_sha256: str, operator: str
+) -> m.MigrationException:
+    """Declare an inventory class not applicable: a RESOLVED ``not_applicable`` row (``class:<code>``) with a
+    reason, the
+    declarer and the plan sha, in the same table under the same immutability triggers."""
+    from erp_v2.migration_ledger.classes import CLASSES, NA_REASON_MAX, PLAN_SHA256
+
+    if class_code not in CLASSES:
+        refuse("unknown_exception_class")
+    sha_text(evidence_sha256, "evidence_sha_required")
+    why = text(reason, "reason_required", NA_REASON_MAX)
+    key = f"class:{class_code}"
+    existing = _class_row(db, tenant, class_code, key)
+    if existing is not None:
+        if existing.evidence_sha256 == evidence_sha256 and existing.detail.get("reason") == why:
+            return existing
+        refuse("not_applicable_already_declared")
+    now = datetime.now(UTC)
+    detail = {
+        "reason": why,
+        "declared_by": text(operator, "operator_ref_required"),
+        "declared_at": now.isoformat(),
+        "plan_sha256": PLAN_SHA256,
+    }
+    row = m.MigrationException(
+        tenant_id=tenant,
+        class_code=class_code,
+        legacy_key=key,
+        source_kind=SRC_NA,
+        state=m.STATE_RESOLVED,
+        terminal_outcome="not_applicable",
+        evidence_sha256=evidence_sha256,
+        fingerprint=canonical_sha({"c": class_code, "k": key, "d": {"reason": why}}),
+        source_receipt_sha256=evidence_sha256,
+        detail=detail,
+        loaded_at=now,
+        resolved_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def coverage(db: Session, tenant: UUID) -> dict[str, Any]:
+    """Every class in the closed list needs at least one row (a fact, a manual item or a not-applicable declaration)."""
+    from erp_v2.migration_ledger.classes import CLASSES
+
+    have = set(
+        db.scalars(
+            sa.select(m.MigrationException.class_code).where(m.MigrationException.tenant_id == tenant).distinct()
+        )
+    )
+    missing = [c for c in CLASSES if c not in have]
+    na = sorted(
+        db.scalars(
+            sa.select(m.MigrationException.class_code).where(
+                m.MigrationException.tenant_id == tenant, m.MigrationException.terminal_outcome == "not_applicable"
+            )
+        )
+    )
+    return {"missing": missing, "not_applicable": na, "complete": not missing}
+
+
+def signature_summary(db: Session, tenant: UUID) -> dict[str, Any]:
+    """Register counts by class and the not-applicable list, recorded at signature."""
+    rows = db.execute(
+        sa.select(m.MigrationException.class_code, m.MigrationException.state, sa.func.count())
+        .where(m.MigrationException.tenant_id == tenant)
+        .group_by(m.MigrationException.class_code, m.MigrationException.state)
+    )
+    by: dict[str, dict[str, int]] = {}
+    for cls, state, n in rows:
+        by.setdefault(cls, {})[state] = n
+    cov = coverage(db, tenant)
+    return {
+        "by_class": dict(sorted(by.items())),
+        "not_applicable": cov["not_applicable"],
+        "missing_classes": cov["missing"],
+    }
+
+
 def counts(db: Session, tenant: UUID) -> dict[str, Any]:
     rows = db.execute(
         sa.select(m.MigrationException.state, m.MigrationException.class_code, sa.func.count())
@@ -292,31 +429,49 @@ def counts(db: Session, tenant: UUID) -> dict[str, Any]:
 
 
 def gate(db: Session, tenant: UUID) -> dict[str, Any]:
-    """The flip gate: open count 0 AND the latest bridge version signed (its body re-hashed)."""
+    """The flip gate: open count 0, every class covered, the latest bridge signed (body re-hashed), the recomputed v2
+    ledger equal to the bridge and unmoved since signature, and every control account tied (or named-unavailable,
+    which refuses)."""
+    from erp_v2.migration_ledger import ledger_check
+
     c = counts(db, tenant)
+    cov = coverage(db, tenant)
     row = bridge.latest(db, tenant)
     signed = False
     version = sha = None
-    if row is not None:
-        version, sha = row.version, row.sha256
-        try:
-            bridge.verified_body(row)
-            signed = row.signed_at is not None and row.ready
-        except LedgerRefused:
-            signed = False
-    reasons = []
+    reasons: list[str] = []
     if c["open"] != 0:
         reasons.append("open_exceptions")
+    if not cov["complete"]:
+        reasons.append("class_coverage_incomplete")
     if row is None:
         reasons.append("no_bridge_version")
-    elif not signed:
-        reasons.append("latest_bridge_not_signed")
+    else:
+        version, sha = row.version, row.sha256
+        try:
+            body = bridge.verified_body(row)
+            signed = row.signed_at is not None and row.ready
+        except LedgerRefused:
+            body, signed = None, False
+        if not signed:
+            reasons.append("latest_bridge_not_signed")
+        else:
+            if ledger_check.difference_rows(db, tenant, body):
+                reasons.append("v2_ledger_differs_from_bridge")
+            state = ledger_check.ledger_state(db, tenant)
+            was = row.signed_state or {}
+            if state["v2_posted_sha256"] != was.get("v2_posted_sha256") or state["controls"] != was.get("controls"):
+                reasons.append("ledger_moved_since_signature")
+            if body.get("control_lists") != state["control_lists"]:
+                reasons.append("control_lists_changed_since_signature")
+            reasons.extend(v["reason"] for v in state["controls"].values() if not v["ok"])
     return {
         "passed": not reasons,
         "reasons": reasons,
         "open_count": c["open"],
         "resolved_count": c["resolved"],
         "open_by_class": c["open_by_class"],
+        "classes_missing": cov["missing"],
         "latest_bridge_version": version,
         "latest_bridge_sha256": sha,
         "latest_bridge_signed": signed,

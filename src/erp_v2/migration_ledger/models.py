@@ -31,7 +31,7 @@ MONEY = Numeric(20, 6)
 STATE_OPEN: Final = "open"
 STATE_RESOLVED: Final = "resolved"
 # "Resolved" never means parked: posted, admitted, voided with a reason, written off, or confirmed no-action.
-TERMINAL_OUTCOMES: Final = ("posted", "admitted", "voided", "written_off", "no_action")
+TERMINAL_OUTCOMES: Final = ("posted", "admitted", "voided", "written_off", "no_action", "not_applicable")
 KIND_OPENING: Final = "opening"
 KIND_IAS8: Final = "ias8"
 OPENING_KINDS: Final = (KIND_OPENING, KIND_IAS8)
@@ -78,6 +78,9 @@ class BridgeVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     signed_by: Mapped[str | None] = mapped_column(String(120))
     signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approval_reference: Mapped[str | None] = mapped_column(String(80))
+    # the ledger and register state at the moment of signature (what the signature covers; the gate compares it)
+    signed_state: Mapped[dict | None] = mapped_column(_JSON)
 
 
 class OpeningJournal(Base):

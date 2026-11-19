@@ -48,6 +48,31 @@ posted opening journal's ledger net and its IAS 8 column the posted IAS 8 journa
 * Adapter for #68: its itemised `bridge_lines` carry no period or account for header lines; the feeder maps header
   lines to account 2000 in net terms (credit negative) and adds the invoice period.
 
+## Recompute, not self-attestation (architect addendum, MIGRATION-REVIEWED-CONVERSION s12)
+
+* The legacy side is recomputed from `gl.posted_ledger_line` through `LEGACY_DATABASE_URL` (read-only): `account_id`,
+  functional `debit_amount` / `credit_amount`, `posting_date` (period `YYYY-MM`), `journal_entry_id` (the universe of
+  FY2026 refs). Keyed by account id, shown by the current v2 code. The item file only CLASSIFIES refs; its sums must tie
+  exactly to the recomputed totals or the partition gap shows.
+* The v2 side is the whole destination ledger (`ledger_check.v2_posted`). Per account x period the difference
+  `recomputed v2 - (planned v2 + v2-native postings)` must be 0: `sign` refuses `v2_ledger_differs_from_bridge`, and so
+  does the gate. A header T-ROUND-2DP line changes the subledger only (GL delta 0).
+* `bridge_inputs.py` is the #68 adapter: period from the invoice journal's posting date, account by id (must be 2000),
+  invoices never legacy-posted are excluded from the residue. Rounding items must fingerprint-match a header line of the
+  #68 itemised file bound to the receipt `itemised_sha256` and the snapshot; |delta| < 0.01; |period residue| <=
+  0.01 x invoices; the bridge must be `ready` to anchor a correction.
+
+## Gate (`register.gate`)
+
+Passes only when: open exceptions = 0; every class in `classes.CLASSES` (the plan inventory ids, plan sha pinned) has a
+row (a fact, a manual add, or a `declare-na`); the latest bridge is signed and its body re-hashes; the recomputed v2
+ledger equals the bridge and has not moved since signature (`ledger_moved_since_signature`); and every control account
+is tied: GL vs the live owner subledger for 2000 (payables obligations less approved credit notes), 2040 (payroll
+liabilities) and 1410 (staff-loan book position); 2030 net = 0. 1400, 2045 and 2110 have no owner subledger yet and
+REFUSE with `control_subledger_unavailable:<code>` (1400 pending ruling D-B9-1). The lists are code constants in
+`ledger_roles` and recorded in each bridge body; the ledger and register state at signature is stored with the signature.
+`sign` takes `approval_reference` = `dotmac-debt-register v<N>` (format-checked only).
+
 ## Rounding residue (`bridge_report rounding`; `journals.service.prepare_rounding_correction`)
 
 Per period, residue = Σ T-ROUND-2DP header deltas (v2 - legacy net, all on 2000). One system-built journal per

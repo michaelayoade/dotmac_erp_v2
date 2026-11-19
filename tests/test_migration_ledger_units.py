@@ -141,6 +141,7 @@ def item(item_id, bucket, ref, account, period, legacy, v2, *, rule=None, scope=
         "legacy_amount": legacy,
         "v2_amount": v2,
         "evidence_sha256": SHA,
+        "source_invoice_id": ref if rule == "T-ROUND-2DP" and scope == "header" else None,
     }
 
 
@@ -154,11 +155,11 @@ def bridge_inputs(items, legacy, refs=None, rounding="6900"):
         "version": 1,
         "snapshot_sha256": SHA,
         "rounding_account_code": rounding,
-        "universe_refs": sorted(refs if refs is not None else {i["ref"] for i in items}),
-        "legacy": [{"account": a, "period": p, "net": n} for (a, p), n in legacy.items()],
         "items": items,
     }
-    return bridge.parse_inputs(raw, SHA)
+    universe = frozenset(refs if refs is not None else {i["ref"] for i in items})
+    # the legacy side and the universe are recomputed from the snapshot, never read from the file
+    return bridge.with_snapshot(bridge.parse_inputs(raw, SHA), {k: D(v) for k, v in legacy.items()}, universe)
 
 
 def compute(inp, **kw):
@@ -268,38 +269,36 @@ def bind_keep(items, itemised):
 
 def test_a_forged_rounding_item_is_refused():
     inp = bridge_inputs(ROUND_ITEMS, ROUND_LEGACY)
-    # same #68 file, but an item whose amount (or fingerprint, or ref) the file does not back
     itemised, sha = dict(LAST["itemised"]), LAST["sha"]
-    items = [{**i, "evidence_sha256": "e" * 64} if i["item_id"] == "r1" else i for i in ROUND_ITEMS]
-    raw = {
-        "version": 1,
-        "snapshot_sha256": SHA,
-        "rounding_account_code": "6900",
-        "universe_refs": ["A", "B", "C"],
-        "legacy": [{"account": a, "period": p, "net": n} for (a, p), n in ROUND_LEGACY.items()],
-        "items": items,
-    }
-    assert (
-        refusal(compute, bridge.parse_inputs(raw, SHA), import_itemised=itemised, import_sha=sha)
-        == "rounding_item_forged"
-    )
-    # an amount altered after binding is also a forgery
-    items = [{**i, "v2_amount": "-100.009"} if i["item_id"] == "r1" else i for i in ROUND_ITEMS]
-    raw["items"] = bind_keep(items, itemised)
-    assert (
-        refusal(compute, bridge.parse_inputs(raw, SHA), import_itemised=itemised, import_sha=sha)
-        == "rounding_item_forged"
-    )
-    # the itemised file is not the one the receipt names
+
+    def with_items(items):
+        raw = {"version": 1, "snapshot_sha256": SHA, "rounding_account_code": "6900", "items": items}
+        return bridge.with_snapshot(bridge.parse_inputs(raw, SHA), inp.legacy, inp.universe)
+
+    # an item whose fingerprint the #68 file does not carry
+    forged = [{**i, "evidence_sha256": "e" * 64} if i["item_id"] == "r1" else i for i in ROUND_ITEMS]
+    assert refusal(compute, with_items(forged), import_itemised=itemised, import_sha=sha) == "rounding_item_forged"
+    # an amount altered after binding (honest fingerprint, changed amount)
+    altered = [{**i, "v2_amount": "-100.009"} if i["item_id"] == "r1" else i for i in inp_items(inp)]
+    assert refusal(compute, with_items(altered), import_itemised=itemised, import_sha=sha) == "rounding_item_forged"
+    # an item pointing at another invoice
+    moved = [{**i, "source_invoice_id": "ZZ"} if i["item_id"] == "r1" else i for i in inp_items(inp)]
+    assert refusal(compute, with_items(moved), import_itemised=itemised, import_sha=sha) == "rounding_item_forged"
+    # the itemised file is not the one the receipt names; none at all; another snapshot
     assert refusal(compute, inp, import_itemised=itemised, import_sha="0" * 64) == "import_itemised_digest_mismatch"
-    # no itemised file at all
     assert refusal(compute, inp, import_itemised=None, import_sha=None) == "rounding_binding_required"
-    # another snapshot
     other = {**itemised, "binding": {"snapshot_sha256": "9" * 64}}
     assert (
         refusal(compute, inp, import_itemised=other, import_sha=bridge.canonical_sha(other))
         == "import_itemised_snapshot_mismatch"
     )
+
+
+def inp_items(inp):
+    return [
+        i.as_dict() | {"legacy_amount": i.as_dict()["legacy_amount"], "evidence_sha256": i.evidence_sha256}
+        for i in inp.items
+    ]
 
 
 def test_an_oversize_rounding_delta_is_refused():
@@ -352,45 +351,6 @@ def test_the_opening_period_is_carried_by_the_ledger_and_ias8_is_itemised():
 # --- register -----------------------------------------------------------------------------------------------------
 
 
-def held_receipt(**over):
-    line = {
-        "journal_id": "j1",
-        "rule_id": "R-QUEUE",
-        "outcome": "queued",
-        "reason_code": "no_published_rule",
-        "amount": "1.000000",
-        "evidence_sha256": SHA,
-    }
-    receipt = {
-        "mode": "apply",
-        "bridge_lines": [line, {**line, "journal_id": "j2", "outcome": "voided", "rule_id": "R-BANK-FEE"}],
-        "e17_findings": [
-            {
-                "finding": "E17",
-                "key_sha256": SHA,
-                "statement_lines": 1,
-                "posted_fee_journals": 2,
-                "excess_posted_fee_journals": 1,
-                "posted_journal_ids_sha256": SHA,
-            }
-        ],
-    }
-    receipt.update(over)
-    return receipt
-
-
-def test_held_drafts_adapter_maps_queued_open_voided_resolved_and_e17_open():
-    facts = {f.legacy_key: f for f in register.from_held_drafts(held_receipt())}
-    assert facts["held_draft:j1"].terminal_outcome is None and facts["held_draft:j1"].class_code == "E16a"
-    assert facts["held_draft:j2"].terminal_outcome == "voided"
-    e17 = facts[f"e17:{SHA}"]
-    assert e17.class_code == "E17" and e17.terminal_outcome is None
-
-
-def test_a_plan_receipt_is_never_loaded():
-    assert refusal(register.from_held_drafts, held_receipt(mode="plan")) == "receipt_not_applied"
-
-
 def test_import_adapter_refuses_an_unknown_queue_reason_instead_of_guessing():
     ok = {
         "queue": [
@@ -430,3 +390,36 @@ def test_no_estate_address_literals_in_the_package():
 
 def test_canonical_sha_is_key_order_independent():
     assert canonical_sha({"a": 1, "b": 2}) == canonical_sha({"b": 2, "a": 1})
+
+
+def test_the_class_list_is_the_plan_inventory_ids_and_carries_the_plan_sha():
+    import hashlib
+    import os
+    import re
+
+    from erp_v2.migration_ledger.classes import CLASSES, PLAN_SHA256
+
+    assert (
+        len(CLASSES) == len(set(CLASSES)) == 46
+        and PLAN_SHA256 == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"
+    )
+    plan = Path(
+        os.environ.get(
+            "EXCEPTIONS_ZERO_PLAN",
+            Path(__file__).resolve().parents[2]
+            / ".cutover-private/erp-v2-step4-workflows-20261114/EXCEPTIONS-ZERO-PLAN.md",
+        )
+    )
+    if not plan.exists():
+        pytest.skip("the private plan file is not available (CI); the constant is pinned by its sha above")
+    data = plan.read_bytes()
+    assert hashlib.sha256(data).hexdigest() == PLAN_SHA256, "the plan changed: re-derive the class list"
+    ids = re.findall(r"^\| (E\d+[a-z]?) ", data.decode(), flags=re.M)
+    assert tuple(ids) == CLASSES
+
+
+def test_the_gate_control_lists_are_code_constants():
+    from erp_v2 import ledger_roles
+
+    assert ledger_roles.GATE_TIE_CODES == ("1400", "1410", "2000", "2040", "2045")
+    assert ledger_roles.GATE_ZERO_CODES == ("2030",) and ledger_roles.GATE_WHT_CODES == ("2110",)

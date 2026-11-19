@@ -33,7 +33,7 @@ from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (host
 
 from erp_v2.journals import service as journals
 from erp_v2.journals.service import JournalRefused
-from erp_v2.migration_ledger import bridge, opening, register, rounding_verify
+from erp_v2.migration_ledger import bridge, ledger_check, opening, register, rounding_verify
 from erp_v2.migration_ledger import models as m
 from erp_v2.migration_ledger.common import LedgerRefused
 from erp_v2.migration_ledger.opening_cli import main as opening_main
@@ -287,11 +287,51 @@ def item(item_id, bucket, ref, account, period, legacy, v2, *, rule=None, scope=
         "legacy_amount": legacy,
         "v2_amount": v2,
         "evidence_sha256": SHA,
+        "source_invoice_id": ref if rule == "T-ROUND-2DP" and scope == "header" else None,
     }
 
 
-CLEAN_ITEMS = [item("1", "carry", "J1", "5000", "2026-01", "10.00", "10.00")]
-CLEAN_LEGACY = {("5000", "2026-01"): "10.00"}
+REF = "dotmac-debt-register v1700"
+CLEAN_ITEMS = [
+    item("1", "carry", "J1", "5000", "2026-01", "10.00", "10.00"),
+    item("1b", "carry", "J1", "1000", "2026-01", "-10.00", "-10.00"),
+]
+CLEAN_LEGACY = {("5000", "2026-01"): "10.00", ("1000", "2026-01"): "-10.00"}
+
+
+def post_legacy(engine, env, day, lines, *, owner="legacy-erp"):
+    """Post one balanced journal straight through accounting, as the legacy import (or another owner) would."""
+    from dotmac_accounting.contracts import CreateJournal, JournalKind, JournalLineInput, SourceIdentity
+
+    with Session(engine) as db:
+        scope = TenantScope(env.tenant_id)
+        journal = accounting.create_journal(
+            db, scope=scope,
+            command=CreateJournal(
+                number=f"LG-{uuid4().hex[:12]}", kind=JournalKind.STANDARD, entry_date=day, posting_date=day,
+                currency_code="USD", exchange_rate=Decimal(1), description="legacy", reference="legacy",
+                source=SourceIdentity(owner=owner, document_kind="t", document_id=f"d-{uuid4().hex}", version="1",
+                    fingerprint="f" * 64),
+                lines=tuple(
+                    JournalLineInput(
+                        env.accounts[code], max(Decimal(net), Decimal(0)), max(-Decimal(net), Decimal(0)), None
+                    )
+                    for code, net in lines
+                ),
+            ),
+            idempotency_key=f"t:{uuid4()}", idempotency_expires_at=None, recorded_at=NOW,
+        )  # fmt: skip
+        accounting.post_journal(
+            db, scope=scope, journal_id=journal.id, approval_reference="t", posted_by="t",
+            idempotency_key=f"p:{uuid4()}", idempotency_expires_at=None, posted_at=NOW,
+        )  # fmt: skip
+        db.commit()
+
+
+def seed_clean(engine, env):
+    post_legacy(engine, env, date(2026, 1, 15), [("5000", "10.00"), ("1000", "-10.00")])
+
+
 ROUND_ITEMS = [
     item("r1", "transform", "A", "2000", "2026-01", "-100.005", "-100.01", rule="T-ROUND-2DP", scope="header"),
     item("r2", "transform", "B", "2000", "2026-02", "-50.004", "-50.00", rule="T-ROUND-2DP", scope="header"),
@@ -299,17 +339,34 @@ ROUND_ITEMS = [
 ROUND_LEGACY = {("2000", "2026-01"): "-100.005", ("2000", "2026-02"): "-50.004"}
 
 
+ROUND_FULL_ITEMS = [
+    *ROUND_ITEMS,
+    item("e1", "transform", "A", "5000", "2026-01", "100.005", "100.005", rule="T-EXP-LEGACY", scope="line"),
+    item("e2", "transform", "B", "5000", "2026-02", "50.004", "50.004", rule="T-EXP-LEGACY", scope="line"),
+]
+ROUND_FULL_LEGACY = {**ROUND_LEGACY, ("5000", "2026-01"): "100.005", ("5000", "2026-02"): "50.004"}
+
+
+def seed_round_ledger(engine, env):
+    """The legacy journals behind ROUND_FULL_*: Dr expense / Cr 2000 at the legacy (sub-cent) amounts."""
+    with Session(engine) as db:
+        journals.open_period(
+            db, tenant_id=env.tenant_id, period_id=env.periods[2], actor=env.parties["approver"], now=NOW
+        )
+        db.commit()
+    post_legacy(engine, env, date(2026, 1, 15), [("5000", "100.005"), ("2000", "-100.005")])
+    post_legacy(engine, env, date(2026, 2, 15), [("5000", "50.004"), ("2000", "-50.004")])
+
+
 def store(engine, env, items, legacy, *, rounding="6900", extra_legacy=None, inputs_sha=None):
-    raw = {
-        "version": 1,
-        "snapshot_sha256": SHA,
-        "rounding_account_code": rounding,
-        "universe_refs": sorted({i["ref"] for i in items}),
-        "legacy": [{"account": a, "period": p, "net": n} for (a, p), n in {**legacy, **(extra_legacy or {})}.items()],
-        "items": items,
-    }
-    raw["items"], itemised_68, import_sha = bind_rounding(items, SHA)
-    inputs = bridge.parse_inputs(raw, inputs_sha or uuid4().hex * 2)
+    items, itemised_68, import_sha = bind_rounding(items, SHA)
+    raw = {"version": 1, "snapshot_sha256": SHA, "rounding_account_code": rounding, "items": items}
+    # the legacy side and the universe stand in for the snapshot recomputation (the file never carries them)
+    inputs = bridge.with_snapshot(
+        bridge.parse_inputs(raw, inputs_sha or uuid4().hex * 2),
+        {k: Decimal(v) for k, v in {**legacy, **(extra_legacy or {})}.items()},
+        frozenset(i["ref"] for i in items),
+    )
     with Session(engine) as db:
         opening_net, ias8, tb_sha, ias8_sha = bridge.ledger_inputs(db, env.tenant_id)
         body, _itemised = bridge.compute(
@@ -328,7 +385,9 @@ def store(engine, env, items, legacy, *, rounding="6900", extra_legacy=None, inp
 
 def sign(engine, env, version, sha, who="Michael"):
     with Session(engine) as db:
-        _row, now = bridge.sign_version(db, env.tenant_id, version=version, expect_sha=sha, signed_by=who)
+        _row, now = bridge.sign_version(
+            db, env.tenant_id, version=version, expect_sha=sha, signed_by=who, approval_reference=REF
+        )
         db.commit()
         return now
 
@@ -341,13 +400,20 @@ def refusal_code(fn, *a, **kw):
 
 def test_a_ready_bridge_signs_once_and_a_signed_version_is_immutable(engine):
     env = world(engine)
+    seed_clean(engine, env)
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     assert sign(engine, env, version, sha) is True
     assert sign(engine, env, version, sha) is False  # same signer: a replay
     with Session(engine) as db:
         assert (
             refusal_code(
-                bridge.sign_version, db, env.tenant_id, version=version, expect_sha=sha, signed_by="Someone Else"
+                bridge.sign_version,
+                db,
+                env.tenant_id,
+                version=version,
+                expect_sha=sha,
+                signed_by="Someone Else",
+                approval_reference=REF,
             )
             == "bridge_already_signed"
         )
@@ -374,11 +440,27 @@ def test_an_unsigned_version_body_is_immutable_too_and_only_the_latest_signs(eng
     assert (v1, v2) == (1, 2) and sha1 != sha2
     with Session(engine) as db:
         assert (
-            refusal_code(bridge.sign_version, db, env.tenant_id, version=v1, expect_sha=sha1, signed_by="Michael")
+            refusal_code(
+                bridge.sign_version,
+                db,
+                env.tenant_id,
+                version=v1,
+                expect_sha=sha1,
+                signed_by="Michael",
+                approval_reference=REF,
+            )
             == "bridge_version_not_latest"
         )
         assert (
-            refusal_code(bridge.sign_version, db, env.tenant_id, version=v2, expect_sha="0" * 64, signed_by="Michael")
+            refusal_code(
+                bridge.sign_version,
+                db,
+                env.tenant_id,
+                version=v2,
+                expect_sha="0" * 64,
+                signed_by="Michael",
+                approval_reference=REF,
+            )
             == "bridge_sha_mismatch"
         )
     # the same inputs replay the latest version instead of minting another
@@ -392,7 +474,15 @@ def test_a_bridge_with_a_gap_or_a_queue_cannot_be_signed(engine):
     version, sha = store(engine, env, CLEAN_ITEMS, {("5000", "2026-01"): "10.000001"})  # one micro off: no tolerance
     with Session(engine) as db:
         assert (
-            refusal_code(bridge.sign_version, db, env.tenant_id, version=version, expect_sha=sha, signed_by="Michael")
+            refusal_code(
+                bridge.sign_version,
+                db,
+                env.tenant_id,
+                version=version,
+                expect_sha=sha,
+                signed_by="Michael",
+                approval_reference=REF,
+            )
             == "bridge_not_ready"
         )
         assert (
@@ -423,6 +513,8 @@ def test_the_opening_period_of_the_bridge_is_carried_by_the_posted_ledger(engine
     ap = next(r for r in body["rows"] if r["account"] == "2000" and r["period"] == "OPENING")
     assert (ap["carry"], ap["ias8"], ap["partition_gap"]) == ("-400.000000", "1.000000", "0.000000")
     assert body["ready"]
+    with Session(engine) as db:
+        assert ledger_check.difference_rows(db, env.tenant_id, body) == []
     assert sign(engine, env, version, sha)
 
 
@@ -447,9 +539,41 @@ def gate(engine, env):
         return register.gate(db, env.tenant_id)
 
 
-def test_the_gate_refuses_with_one_open_item_even_when_the_bridge_is_signed(engine):
+@pytest.fixture
+def owners_available(monkeypatch):
+    """The owner subledgers not built in v2 yet (1400, 2045, 2110) stand in as zero; the gate REFUSES without them."""
+    from erp_v2.migration_ledger import ledger_check
+
+    zero = lambda db, tenant: Decimal(0)  # noqa: E731
+    monkeypatch.setitem(ledger_check._SUBLEDGERS, "1400", zero)
+    monkeypatch.setitem(ledger_check._SUBLEDGERS, "2045", zero)
+    monkeypatch.setitem(ledger_check._SUBLEDGERS, "2110", zero)
+
+
+def cover_all(engine, env, *, except_classes=()):
+    """Declare every inventory class not applicable (except those the test loads itself)."""
+    from erp_v2.migration_ledger.classes import CLASSES
+
+    with Session(engine) as db:
+        have = {
+            c
+            for (c,) in db.execute(
+                sa.text("SELECT class_code FROM erp_migration_exceptions WHERE tenant_id = :t"), {"t": env.tenant_id}
+            )
+        }
+        for code in CLASSES:
+            if code not in have and code not in except_classes:
+                register.declare_na(
+                    db, env.tenant_id, class_code=code, reason="test", evidence_sha256=SHA, operator="o"
+                )
+        db.commit()
+
+
+def test_the_gate_refuses_with_one_open_item_even_when_the_bridge_is_signed(engine, owners_available):
     env = world(engine)
+    seed_clean(engine, env)
     load(engine, env, [fact()])
+    cover_all(engine, env)
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     sign(engine, env, version, sha)
     g = gate(engine, env)
@@ -464,8 +588,10 @@ def test_the_gate_refuses_with_one_open_item_even_when_the_bridge_is_signed(engi
     assert gate(engine, env)["passed"]
 
 
-def test_the_gate_needs_a_signed_latest_bridge_even_at_zero_open(engine):
+def test_the_gate_needs_a_signed_latest_bridge_even_at_zero_open(engine, owners_available):
     env = world(engine)
+    seed_clean(engine, env)
+    cover_all(engine, env)
     assert gate(engine, env)["reasons"] == ["no_bridge_version"]
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     assert gate(engine, env)["reasons"] == ["latest_bridge_not_signed"]
@@ -474,6 +600,185 @@ def test_the_gate_needs_a_signed_latest_bridge_even_at_zero_open(engine):
     store(engine, env, [item("1", "carry", "J1", "5000", "2026-01", "12.00", "12.00")], {("5000", "2026-01"): "12.00"})
     g = gate(engine, env)  # a new version supersedes the signed one: Michael must sign it
     assert not g["passed"] and g["reasons"] == ["latest_bridge_not_signed"] and g["latest_bridge_version"] == 2
+
+
+def test_the_gate_refuses_an_incomplete_class_coverage_until_every_class_is_loaded_or_declared_na(
+    engine, owners_available
+):
+    from erp_v2.migration_ledger.classes import CLASSES
+
+    env = world(engine)
+    seed_clean(engine, env)
+    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    sign(engine, env, version, sha)
+    g = gate(engine, env)
+    assert g["reasons"] == ["class_coverage_incomplete"] and g["classes_missing"] == list(CLASSES)
+    cover_all(engine, env, except_classes=("E27",))
+    assert gate(engine, env)["classes_missing"] == ["E27"]
+    with Session(engine) as db:
+        assert (
+            refusal_code(
+                register.declare_na, db, env.tenant_id, class_code="E99", reason="x", evidence_sha256=SHA, operator="o"
+            )
+            == "unknown_exception_class"
+        )
+        assert (
+            refusal_code(
+                register.declare_na,
+                db,
+                env.tenant_id,
+                class_code="E27",
+                reason="x" * 501,
+                evidence_sha256=SHA,
+                operator="o",
+            )
+            == "reason_required"
+        )
+        row = register.declare_na(
+            db,
+            env.tenant_id,
+            class_code="E27",
+            reason="retained earnings is 3100 (ruled)",
+            evidence_sha256=SHA,
+            operator="o",
+        )
+        assert row.state == "resolved" and row.terminal_outcome == "not_applicable" and row.legacy_key == "class:E27"
+        assert row.detail["plan_sha256"] == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"
+        db.commit()
+    assert gate(engine, env)["passed"]
+    with engine.connect() as c, pytest.raises(DBAPIError, match="never deleted"):
+        c.execute(
+            sa.text("DELETE FROM erp_migration_exceptions WHERE class_code = 'E27' AND tenant_id = :t"),
+            {"t": env.tenant_id},
+        )
+
+
+def test_manual_add_takes_only_a_class_from_the_closed_list_and_opens_the_gate_back_up(engine, owners_available):
+    env = world(engine)
+    seed_clean(engine, env)
+    cover_all(engine, env)
+    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    sign(engine, env, version, sha)
+    assert gate(engine, env)["passed"]
+    with Session(engine) as db:
+        assert (
+            refusal_code(
+                register.add_item,
+                db,
+                env.tenant_id,
+                class_code="E99",
+                legacy_key="k",
+                evidence_sha256=SHA,
+                operator="o",
+            )
+            == "unknown_exception_class"
+        )
+        assert (
+            refusal_code(
+                register.add_item,
+                db,
+                env.tenant_id,
+                class_code="E26",
+                legacy_key="class:E26",
+                evidence_sha256=SHA,
+                operator="o",
+            )
+            == "legacy_key_reserved"
+        )
+        register.add_item(
+            db, env.tenant_id, class_code="E26", legacy_key="fallback-account", evidence_sha256=SHA, operator="o"
+        )
+        db.commit()
+    assert gate(engine, env)["reasons"] == ["open_exceptions"]
+
+
+def test_the_gate_refuses_when_the_ledger_moved_since_signature(engine, owners_available):
+    env = world(engine)
+    seed_clean(engine, env)
+    cover_all(engine, env)
+    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    sign(engine, env, version, sha)
+    assert gate(engine, env)["passed"]
+    post_legacy(engine, env, date(2026, 1, 20), [("5000", "1.00"), ("1000", "-1.00")], owner="erp.test-native")
+    g = gate(engine, env)  # a v2-native posting is expected by the bridge, but it moved the ledger after signing
+    assert g["reasons"] == ["ledger_moved_since_signature"]
+
+
+def test_the_gate_refuses_when_the_recomputed_ledger_differs_from_the_bridge(engine, owners_available):
+    env = world(engine)
+    seed_clean(engine, env)
+    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    post_legacy(
+        engine, env, date(2026, 1, 20), [("5000", "0.01"), ("1000", "-0.01")]
+    )  # a legacy-owned line the bridge lacks
+    with Session(engine) as db:
+        assert (
+            refusal_code(
+                bridge.sign_version,
+                db,
+                env.tenant_id,
+                version=version,
+                expect_sha=sha,
+                signed_by="Michael",
+                approval_reference=REF,
+            )
+            == "v2_ledger_differs_from_bridge"
+        )
+
+
+def test_control_accounts_are_tied_to_the_owner_subledgers_and_unavailable_ones_refuse_by_name(engine):
+    from erp_v2.migration_ledger import ledger_check
+
+    env = world(engine)
+    with Session(engine) as db:
+        state = ledger_check.control_state(db, env.tenant_id)
+    # nothing posted: 2000, 2040, 1410 tie at 0 (the owner tables are read); 2030 is 0; the unbuilt owners refuse
+    assert [c for c, v in state.items() if v["ok"]] == ["1410", "2000", "2040", "2030"] or {
+        c for c, v in state.items() if v["ok"]
+    } == {"1410", "2000", "2040", "2030"}
+    assert state["1400"]["reason"] == "control_subledger_unavailable:1400"
+    assert state["2045"]["reason"] == "control_subledger_unavailable:2045"
+    assert state["2110"]["reason"] == "control_subledger_unavailable:2110"
+    # a GL posting on 2000 with no payables document breaks the tie; a posting on 2030 breaks the zero rule
+    post_legacy(engine, env, date(2026, 1, 15), [("2000", "-5.00"), ("1000", "5.00")])
+    with Session(engine) as db:
+        assert ledger_check.control_state(db, env.tenant_id)["2000"]["reason"] == "control_not_tied:2000"
+
+
+def test_sign_binds_an_approval_reference_in_the_register_version_format(engine):
+    env = world(engine)
+    seed_clean(engine, env)
+    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    with Session(engine) as db:
+        for bad in ("Michael said so", "dotmac-debt-register v", "dotmac-debt-register 1700", ""):
+            assert (
+                refusal_code(
+                    bridge.sign_version,
+                    db,
+                    env.tenant_id,
+                    version=version,
+                    expect_sha=sha,
+                    signed_by="Michael",
+                    approval_reference=bad,
+                )
+                == "invalid_approval_reference"
+            )
+    sign(engine, env, version, sha)
+    with Session(engine) as db:
+        row = bridge.latest(db, env.tenant_id)
+        assert row.approval_reference == REF and row.signed_state["control_lists"]["tie"] == [
+            "1400",
+            "1410",
+            "2000",
+            "2040",
+            "2045",
+        ]
+        assert row.signed_state["register"]["missing_classes"]  # the signature covers the register counts too
+    with engine.connect() as c, pytest.raises(DBAPIError, match="immutable"):  # a signed version never changes
+        c.execute(
+            sa.text("UPDATE erp_bridge_versions SET approval_reference = NULL WHERE tenant_id = :t"),
+            {"t": env.tenant_id},
+        )
 
 
 def test_reconcile_carries_resolved_reopens_on_changed_facts_and_reports_orphans(engine):
@@ -569,7 +874,8 @@ def rounding_journals(engine, env):
 
 def test_the_rounding_journal_posts_once_against_the_named_account_and_clears_the_residue(engine):
     env = world(engine)
-    version, sha = store(engine, env, ROUND_ITEMS, ROUND_LEGACY)
+    seed_round_ledger(engine, env)
+    version, sha = store(engine, env, ROUND_FULL_ITEMS, ROUND_FULL_LEGACY)
     # residue Jan = subledger - legacy GL on 2000 = -0.005 (the subledger holds more credit): the GL must move by -0.005
     out = prepare(engine, env, sha, "2026-01")
     assert out.state == "PREPARED" and not out.replayed
@@ -578,8 +884,8 @@ def test_the_rounding_journal_posts_once_against_the_named_account_and_clears_th
     (journal,) = [j for j in rounding_journals(engine, env) if j.source_document_id.endswith("2026-01")]
     assert journal.source_owner == "erp.manual" and journal.source_document_id == f"{sha}:2026-01"
     assert journal.posting_date == date(2026, 1, 1) and journal.status.value == "POSTED"
-    assert ledger_net(engine, env, "2000") == Decimal("-0.005")  # Cr 2000 0.005
-    assert ledger_net(engine, env, "6900") == Decimal("0.005")  # Dr rounding account
+    assert ledger_net(engine, env, "2000", owner="erp.manual") == Decimal("-0.005")  # Cr 2000 0.005
+    assert ledger_net(engine, env, "6900", owner="erp.manual") == Decimal("0.005")  # Dr rounding account
     with Session(engine) as db:
         body = bridge.verified_body(bridge.latest(db, env.tenant_id))
         assert rounding_verify.pending_periods(db, env.tenant_id, body) == ["2026-02"]
@@ -601,13 +907,22 @@ def test_the_rounding_journal_posts_once_against_the_named_account_and_clears_th
     # sign refuses while Feb is outstanding, passes after it posts
     with Session(engine) as db:
         assert (
-            refusal_code(bridge.sign_version, db, env.tenant_id, version=version, expect_sha=sha, signed_by="Michael")
+            refusal_code(
+                bridge.sign_version,
+                db,
+                env.tenant_id,
+                version=version,
+                expect_sha=sha,
+                signed_by="Michael",
+                approval_reference=REF,
+            )
             == "rounding_journal_pending"
         )
     request_and_post(engine, env, prepare(engine, env, sha, "2026-02").manual_id)
     assert sign(engine, env, version, sha)
     # Jan: Cr 2000 0.005; Feb: Dr 2000 0.004 (the subledger carries 0.004 less credit)
-    assert ledger_net(engine, env, "2000") == Decimal("-0.001") and ledger_net(engine, env, "6900") == Decimal("0.001")
+    assert ledger_net(engine, env, "2000", owner="erp.manual") == Decimal("-0.001")
+    assert ledger_net(engine, env, "6900", owner="erp.manual") == Decimal("0.001")
 
 
 def test_the_correction_is_dated_in_the_invoices_period_when_open_otherwise_the_first_open_period(engine):
@@ -651,13 +966,15 @@ def test_the_correction_is_dated_in_the_invoices_period_when_open_otherwise_the_
 
 def test_after_the_correction_gl_2000_equals_the_subledger_and_a_not_ready_bridge_cannot_anchor(engine):
     env = world(engine)
-    version, sha = store(engine, env, ROUND_ITEMS, ROUND_LEGACY)
+    seed_round_ledger(engine, env)
+    version, sha = store(engine, env, ROUND_FULL_ITEMS, ROUND_FULL_LEGACY)
     for period in ("2026-01", "2026-02"):
         request_and_post(engine, env, prepare(engine, env, sha, period).manual_id)
-    # GL(2000) = legacy GL + the corrections; the subledger = legacy GL + (v2 - legacy) of every header item
-    subledger_delta = sum((Decimal(i["v2_amount"]) - Decimal(i["legacy_amount"]) for i in ROUND_ITEMS), Decimal(0))
-    assert ledger_net(engine, env, "2000") == subledger_delta == Decimal("-0.001")
-    assert ledger_net(engine, env, "2000") + ledger_net(engine, env, "6900") == 0
+    # GL(2000) = the legacy journals + the corrections; the subledger = the v2 (2 dp) totals of the rounded invoices
+    subledger = sum((Decimal(i["v2_amount"]) for i in ROUND_ITEMS), Decimal(0))
+    assert ledger_net(engine, env, "2000") == subledger == Decimal("-150.01")
+    assert ledger_net(engine, env, "2000", owner="erp.manual") + ledger_net(engine, env, "6900") == 0
+    assert sign(engine, env, version, sha)  # the recomputed v2 ledger equals the bridge exactly
     # a bridge with a queued item is not ready: it can no longer anchor a correction
     queued = [*ROUND_ITEMS, item("q1", "queue", "Q", "5000", "2026-01", "3.00", "0")]
     env2 = world(engine)
@@ -739,12 +1056,12 @@ def test_a_missing_rounding_account_is_refused_everywhere(engine):
         "version": 1,
         "snapshot_sha256": SHA,
         "rounding_account_code": None,
-        "universe_refs": ["A", "B"],
-        "legacy": [{"account": a, "period": p, "net": n} for (a, p), n in ROUND_LEGACY.items()],
         "items": ROUND_ITEMS,
     }
     raw["items"], itemised_68, import_sha = bind_rounding(ROUND_ITEMS, SHA)
-    inputs = bridge.parse_inputs(raw, "3" * 64)
+    inputs = bridge.with_snapshot(
+        bridge.parse_inputs(raw, "3" * 64), {k: Decimal(v) for k, v in ROUND_LEGACY.items()}, frozenset({"A", "B"})
+    )
     assert (
         refusal_code(
             bridge.compute,
@@ -1057,15 +1374,17 @@ def test_opening_cli_refuses_an_untied_control_before_touching_the_database(engi
     assert code == 3 and out["refusal"] == "opening_tb_not_zero_sum" and not out["ready"]
 
 
-def test_gate_cli_exit_codes(engine, monkeypatch, tmp_path):
+def test_gate_cli_exit_codes(engine, monkeypatch, tmp_path, owners_available):
     from erp_v2.migration_ledger.exceptions_register import main as register_main
 
     env = world(engine)
+    seed_clean(engine, env)
     spec = tmp_path / "spec.json"
     write(spec, {"version": 1, "tenant_id": str(env.tenant_id), "receipts": [], "include_admission_reviews": False})
     monkeypatch.setenv("MIGRATION_DATABASE_URL", engine.url.render_as_string(hide_password=False))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     load(engine, env, [fact()])
+    cover_all(engine, env)
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     sign(engine, env, version, sha)
     receipt = tmp_path / "g1.json"
@@ -1147,3 +1466,217 @@ def test_migration_downgrade_refuses_while_evidence_exists(engine):
                     migration.downgrade()
         finally:
             transaction.rollback()
+
+
+def test_declare_na_and_add_clis_are_governed_and_private(engine, monkeypatch, tmp_path):
+    from erp_v2.migration_ledger.exceptions_register import main as register_main
+
+    env = world(engine)
+    spec = tmp_path / "spec.json"
+    write(spec, {"version": 1, "tenant_id": str(env.tenant_id), "receipts": [], "include_admission_reviews": False})
+    base = ["--spec", str(spec), "--evidence-sha256", SHA, "--operator-ref", "o"]
+
+    def run(args, name, *, apply=True):
+        monkeypatch.setenv("MIGRATION_DATABASE_URL", engine.url.render_as_string(hide_password=False))
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        out = tmp_path / name
+        code = register_main([*args, *base, "--receipt", str(out), *(["--apply"] if apply else [])])
+        return code, out
+
+    assert run(["declare-na", "--class", "E27", "--reason", "ruled"], "a.json")[0] == 2  # no environment switch
+    monkeypatch.setenv("ERP_MIGRATION_LEDGER_APPLY", "1")
+    assert run(["declare-na", "--class", "E27", "--reason", "ruled"], "b.json", apply=False)[0] == 2  # no --apply
+    code, out = run(["declare-na", "--class", "E27", "--reason", "ruled"], "c.json")
+    assert code == 0 and (os.stat(out).st_mode & 0o777) == 0o600
+    assert run(["declare-na", "--class", "E99", "--reason", "x"], "d.json")[0] == 2
+    assert run(["add", "--class", "E26", "--key", "fallback-account"], "e.json")[0] == 0
+    with Session(engine) as db:
+        rows = {
+            r.class_code: r
+            for r in db.scalars(sa.select(m.MigrationException).where(m.MigrationException.tenant_id == env.tenant_id))
+        }
+    assert rows["E27"].terminal_outcome == "not_applicable" and rows["E26"].state == "open"
+
+
+def test_b2_outcomes_load_from_the_decisions_table_and_e17_is_derived(engine):
+    from erp_v2.held_drafts.models import HeldDraftDecision
+
+    env = world(engine)
+    ev = {
+        "key_sha256": "a" * 64,
+        "statement_lines": 1,
+        "posted_fee_journals": 2,
+        "excess_posted_fee_journals": 1,
+        "posted_journal_ids_sha256": "c" * 64,
+    }
+    with Session(engine) as db:
+        for outcome, reason, jid in (
+            ("queued", "no_published_rule", uuid4()),
+            ("voided", "duplicate_of_posted_fee_excess", uuid4()),
+            ("voided", "already_posted_duplicate", uuid4()),
+        ):
+            db.add(
+                HeldDraftDecision(
+                    tenant_id=env.tenant_id,
+                    journal_id=jid,
+                    rule_id="R",
+                    outcome=outcome,
+                    reason_code=reason,
+                    amount=Decimal(1),
+                    evidence=ev,
+                    evidence_sha256="d" * 64,
+                    rules_sha256="e" * 64,
+                    plan_sha256="f" * 64,
+                    plan_receipt_sha256="1" * 64,
+                    manual_journal_id=None,
+                    dual_control=False,
+                    planned_by="a",
+                    applied_by="b",
+                )
+            )
+        db.commit()
+        facts = register.from_held_decisions(db, env.tenant_id)
+    by = {(f.class_code, f.terminal_outcome) for f in facts}
+    assert by == {("E16a", None), ("E16", "voided"), ("E17", None)}
+    assert sum(1 for f in facts if f.class_code == "E17") == 1 and sum(1 for f in facts if f.class_code == "E16") == 2
+
+
+# --- recomputed legacy side and the #68 adapter ------------------------------------------------------------------
+
+
+@pytest.fixture
+def legacy_schema(engine):
+    with engine.begin() as c:
+        c.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS gl")
+        c.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS ap")
+        c.exec_driver_sql("CREATE TABLE gl.journal_entry (journal_entry_id uuid PRIMARY KEY, posting_date date)")
+        c.exec_driver_sql(
+            "CREATE TABLE gl.posted_ledger_line (account_id uuid, debit_amount numeric, credit_amount numeric, "
+            "posting_date date, journal_entry_id uuid)"
+        )
+        c.exec_driver_sql(
+            "CREATE TABLE ap.supplier_invoice "
+            "(invoice_id uuid PRIMARY KEY, journal_entry_id uuid, ap_control_account_id uuid)"
+        )
+    yield
+    with engine.begin() as c:
+        c.exec_driver_sql("DROP SCHEMA gl CASCADE")
+        c.exec_driver_sql("DROP SCHEMA ap CASCADE")
+
+
+def legacy_post(engine, jid, day, lines):
+    with engine.begin() as c:
+        c.execute(sa.text("INSERT INTO gl.journal_entry VALUES (:j, :d)"), {"j": jid, "d": day})
+        for account, debit, credit in lines:
+            c.execute(
+                sa.text("INSERT INTO gl.posted_ledger_line VALUES (:a, :d, :c, :p, :j)"),
+                {"a": account, "d": Decimal(debit), "c": Decimal(credit), "p": day, "j": jid},
+            )
+
+
+def test_the_legacy_side_is_recomputed_from_the_snapshot_by_account_id_and_period(engine, legacy_schema):
+    from erp_v2.migration_ledger import legacy_ledger
+
+    env = world(engine)
+    j1, j2, j3 = uuid4(), uuid4(), uuid4()
+    legacy_post(engine, j1, date(2025, 12, 20), [(env.accounts["5000"], "7", "0"), (env.accounts["1000"], "0", "7")])
+    legacy_post(engine, j2, date(2026, 1, 5), [(env.accounts["5000"], "3.5", "0"), (env.accounts["2000"], "0", "3.5")])
+    legacy_post(engine, j3, date(2026, 2, 6), [(env.accounts["5000"], "1", "0"), (env.accounts["2000"], "0", "1")])
+    with engine.connect() as legacy, Session(engine) as db:
+        net, universe = legacy_ledger.recompute(legacy, db, env.tenant_id, opening_as_of=date(2025, 12, 31))
+    assert net == {
+        ("5000", "OPENING"): Decimal("7"), ("1000", "OPENING"): Decimal("-7"),
+        ("5000", "2026-01"): Decimal("3.5"), ("2000", "2026-01"): Decimal("-3.5"),
+        ("5000", "2026-02"): Decimal("1"), ("2000", "2026-02"): Decimal("-1"),
+    }  # fmt: skip
+    assert universe == {str(j2), str(j3)}  # the FY2026 journal ids; the opening-year journal is not a bridge ref
+    legacy_post(engine, uuid4(), date(2026, 3, 1), [(uuid4(), "1", "0")])  # an account the destination chart lacks
+    with engine.connect() as legacy, Session(engine) as db:
+        assert (
+            refusal_code(legacy_ledger.recompute, legacy, db, env.tenant_id, opening_as_of=None)
+            == "legacy_account_unmapped"
+        )
+
+
+def test_the_68_adapter_takes_period_and_account_from_the_snapshot(engine, legacy_schema):
+    from erp_v2.migration_ledger import bridge_inputs
+
+    env = world(engine)
+    posted, unposted, wrong = uuid4(), uuid4(), uuid4()
+    j = uuid4()
+    legacy_post(
+        engine, j, date(2026, 1, 9), [(env.accounts["5000"], "100.005", "0"), (env.accounts["2000"], "0", "100.005")]
+    )
+    with engine.begin() as c:
+        for invoice, journal, control in (
+            (posted, j, env.accounts["2000"]),
+            (unposted, None, env.accounts["2000"]),
+            (wrong, j, env.accounts["1000"]),
+        ):
+            c.execute(
+                sa.text("INSERT INTO ap.supplier_invoice VALUES (:i, :j, :a)"),
+                {"i": invoice, "j": journal, "a": control},
+            )
+    line = lambda inv, legacy_t, v2_t: {  # noqa: E731
+        **{
+            "rule": "T-ROUND-2DP",
+            "scope": "header",
+            "invoice_id": str(inv),
+            "line_id": None,
+            "legacy_account": None,
+            "v2_account": None,
+            "legacy_amount": legacy_t,
+            "v2_amount": v2_t,
+            "delta": format(Decimal(v2_t) - Decimal(legacy_t), "f"),
+            "note": "n",
+        }
+    }
+
+    def fingerprinted(lines):
+        from migration_ledger_support import fingerprint_of
+
+        out = []
+        for ln in lines:
+            ln = {**ln}
+            ln["fingerprint"] = fingerprint_of(ln)
+            out.append(ln)
+        return out
+
+    def run(lines, snapshot=SHA):
+        itemised = {"binding": {"snapshot_sha256": SHA}, "bridge_lines": fingerprinted(lines), "queue": []}
+        with engine.connect() as legacy, Session(engine) as db:
+            return bridge_inputs.rounding_items(
+                itemised, bridge.canonical_sha(itemised), snapshot, legacy, db, env.tenant_id
+            )
+
+    out = run([line(posted, "100.005", "100.01"), line(unposted, "20.004", "20.00")])
+    assert out["excluded_not_legacy_posted"] == 1  # never legacy-posted: no GL residue, subledger-only
+    (it,) = out["items"]
+    assert (it["period"], it["account"], it["ref"], it["source_invoice_id"]) == ("2026-01", "2000", str(j), str(posted))
+    assert (it["legacy_amount"], it["v2_amount"]) == ("-100.005000", "-100.010000")  # 2000 net terms: a credit
+    assert refusal_code(run, [line(wrong, "1.005", "1.01")]) == "rounding_invoice_control_account_not_2000"
+    assert refusal_code(run, [line(uuid4(), "1.005", "1.01")]) == "rounding_invoice_not_in_snapshot"
+    assert (
+        refusal_code(run, [line(posted, "100.005", "100.01")], snapshot="9" * 64) == "import_itemised_snapshot_mismatch"
+    )
+    # the produced item is exactly what the bridge's rounding door accepts
+    items = [{**it, "evidence_sha256": it["evidence_sha256"]}]
+    raw = {"version": 1, "snapshot_sha256": SHA, "rounding_account_code": "6900", "items": items}
+    itemised = {
+        "binding": {"snapshot_sha256": SHA},
+        "bridge_lines": fingerprinted([line(posted, "100.005", "100.01")]),
+        "queue": [],
+    }
+    inputs = bridge.with_snapshot(
+        bridge.parse_inputs(raw, SHA), {("2000", "2026-01"): Decimal("-100.005")}, frozenset({str(j)})
+    )
+    body, _ = bridge.compute(
+        inputs,
+        opening_net=None,
+        ias8=[],
+        opening_tb_sha=None,
+        ias8_sha=None,
+        import_itemised=itemised,
+        import_sha=bridge.canonical_sha(itemised),
+    )
+    assert body["rounding_residue_by_period"] == {"2026-01": "-0.005000"}

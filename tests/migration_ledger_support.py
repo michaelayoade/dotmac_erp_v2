@@ -15,7 +15,7 @@ def line_for(item: dict) -> dict:
     """The #68 header line (positive invoice totals) behind a 2000 net item."""
     legacy, v2 = -Decimal(item["legacy_amount"]), -Decimal(item["v2_amount"])
     body = {
-        "rule": "T-ROUND-2DP", "scope": "header", "invoice_id": item["ref"], "line_id": None,
+        "rule": "T-ROUND-2DP", "scope": "header", "invoice_id": item["source_invoice_id"], "line_id": None,
         "legacy_account": None, "v2_account": None, "legacy_amount": format(legacy, "f"),
         "v2_amount": format(v2, "f"), "delta": format(v2 - legacy, "f"), "note": "header total rounded",
     }  # fmt: skip

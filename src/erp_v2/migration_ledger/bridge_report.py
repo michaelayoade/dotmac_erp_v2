@@ -26,7 +26,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from erp_v2.migration_ledger import bridge, rounding_verify
+from erp_v2.migration_ledger import bridge, bridge_inputs, legacy_ledger, rounding_verify
 from erp_v2.migration_ledger import cli_common as cli
 from erp_v2.migration_ledger.common import keys_exactly, refuse, sha_text, strict_json, text, uuid_text
 
@@ -70,20 +70,44 @@ def _run(args) -> dict[str, Any]:
     operator = cli.operator(args.operator_ref)
     tenant, spec = _spec(args.spec)
     eng = cli.engine()  # the DSN leaves the environment BEFORE the assembly is imported
+    legacy_eng = cli.legacy_engine() if args.mode == "build" else None
     cli.install_registries()
     try:
         with Session(eng) as db:
             if not db.scalar(sa.text("SELECT is_active FROM tenants WHERE id = :t"), {"t": tenant}):
                 refuse("tenant_missing_or_inactive")
             if args.mode == "build":
-                data, inputs_sha = cli.read_bound(args.inputs)
-                inputs = bridge.parse_inputs(strict_json(data, "invalid_bridge_inputs_json"), inputs_sha)
-                opening_net, ias8, tb_sha, ias8_sha = bridge.ledger_inputs(db, tenant)
                 import_body = import_sha = None
-                if args.import_itemised:
-                    data_i, _ = cli.read_bound(args.import_itemised)
-                    import_body = strict_json(data_i, "invalid_import_itemised")
-                    import_sha = sha_text(args.import_itemised_sha256, "invalid_import_itemised_sha256")
+                raw_items: dict[str, Any] = {}
+                data, inputs_sha = cli.read_bound(args.inputs)
+                raw = strict_json(data, "invalid_bridge_inputs_json")
+                opening_net, ias8, tb_sha, ias8_sha = bridge.ledger_inputs(db, tenant)
+                opening_day = db.scalar(
+                    sa.text(
+                        "SELECT je.posting_date FROM erp_opening_journals o JOIN mod_accounting.journal_entries je "
+                        "ON je.tenant_id = o.tenant_id AND je.id = o.journal_id "
+                        "WHERE o.tenant_id = :t AND o.kind = 'opening'"
+                    ),
+                    {"t": tenant},
+                )
+                with legacy_eng.connect() as legacy, legacy.begin():
+                    legacy.execute(sa.text("SET TRANSACTION READ ONLY"))
+                    legacy.execute(sa.text("SET LOCAL row_security = off"))
+                    if args.import_itemised:
+                        data_i, _ = cli.read_bound(args.import_itemised)
+                        import_body = strict_json(data_i, "invalid_import_itemised")
+                        import_sha = sha_text(args.import_itemised_sha256, "invalid_import_itemised_sha256")
+                        if any(
+                            i.get("rule") == "T-ROUND-2DP" and i.get("scope") == "header" for i in raw.get("items", [])
+                        ):
+                            refuse("rounding_items_come_from_the_adapter")
+                        raw_items = bridge_inputs.rounding_items(
+                            import_body, import_sha, raw.get("snapshot_sha256", ""), legacy, db, tenant
+                        )
+                        raw = {**raw, "items": [*raw.get("items", []), *raw_items["items"]]}
+                    inputs = bridge.parse_inputs(raw, inputs_sha)
+                    legacy_net, universe = legacy_ledger.recompute(legacy, db, tenant, opening_as_of=opening_day)
+                inputs = bridge.with_snapshot(inputs, legacy_net, universe)
                 body, itemised = bridge.compute(
                     inputs,
                     opening_net=opening_net,
@@ -93,7 +117,12 @@ def _run(args) -> dict[str, Any]:
                     import_itemised=import_body,
                     import_sha=import_sha,
                 )
-                out = {"mode": "build", "applied": False, **_summary(body)}
+                out = {
+                    "mode": "build",
+                    "applied": False,
+                    "rounding_invoices_excluded_not_legacy_posted": raw_items.get("excluded_not_legacy_posted", 0),
+                    **_summary(body),
+                }
                 if not args.apply:
                     db.rollback()
                     return out
@@ -115,6 +144,7 @@ def _run(args) -> dict[str, Any]:
                     version=args.version,
                     expect_sha=sha_text(args.expect_sha, "invalid_expect_sha"),
                     signed_by=text(args.signed_by, "signed_by_required"),
+                    approval_reference=args.approval_reference or "",
                 )
                 db.commit()
                 return {
@@ -175,6 +205,8 @@ def _run(args) -> dict[str, Any]:
             }
     finally:
         eng.dispose()
+        if legacy_eng is not None:
+            legacy_eng.dispose()
 
 
 def main(argv=None) -> int:
@@ -191,12 +223,15 @@ def main(argv=None) -> int:
     parser.add_argument("--version", type=int)
     parser.add_argument("--expect-sha")
     parser.add_argument("--signed-by")
+    parser.add_argument("--approval-reference", help="dotmac-debt-register v<N> (format-checked only)")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     if args.mode == "build" and not args.inputs:
         parser.error("build needs --inputs")
-    if args.mode == "sign" and (args.version is None or not args.expect_sha or not args.signed_by):
-        parser.error("sign needs --version, --expect-sha and --signed-by")
+    if args.mode == "sign" and (
+        args.version is None or not args.expect_sha or not args.signed_by or not args.approval_reference
+    ):
+        parser.error("sign needs --version, --expect-sha, --signed-by and --approval-reference")
     return cli.run(
         args.receipt,
         lambda: _run(args),
