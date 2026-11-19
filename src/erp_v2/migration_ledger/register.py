@@ -174,13 +174,24 @@ def from_ar_census(body: Any) -> list[Fact]:
     if not isinstance(body, dict) or body.get("kind") != "ar-census" or not isinstance(body.get("census_sha256"), str):
         refuse("invalid_ar_census")
     census_sha = body["census_sha256"]
-    for name in ("excluded_partitions", "unapplied_credit_notes", "unposted_documents", "variances"):
+    for name in (
+        "excluded_partitions",
+        "unapplied_credit_notes",
+        "unposted_documents",
+        "posted_after_cutoff",
+        "variances",
+    ):
         if not isinstance(body.get(name, []), list):
             refuse("invalid_ar_census")
+    attribution = body.get("gl_attribution")
+    if not isinstance(attribution, dict):  # without the GL attribution the E36a items cannot be derived: refuse
+        refuse("ar_census_without_gl_attribution", "run the census with the destination chart so 1400 is attributed")
     facts: list[Fact] = []
 
     def add(class_code: str, key: str, detail: dict[str, Any]) -> None:
         facts.append(Fact(class_code, key, SRC_AR_CENSUS, None, census_sha, detail))
+
+    signed = {str(h["legacy_key"]): int(h["amount_minor"]) for h in attribution.get("held", []) if isinstance(h, dict)}
 
     for item in body.get("excluded_partitions", []):
         cust, ccy = (str(x) for x in item["partition"])
@@ -204,6 +215,8 @@ def from_ar_census(body: Any) -> list[Fact]:
                 "party": list(item["partition"]) if item.get("partition") else None,
                 "document_number": item.get("document_number"),
                 "amount_minor": item.get("gross_minor"),
+                "gl_signed_minor": signed.get(str(item["key"])),  # the amount B-14 itemises on 1400
+                "currency": item["partition"][1] if item.get("partition") else None,
                 "residual_minor": item.get("residual_minor"),
                 "reason": item.get("reason"),
             },
@@ -214,28 +227,44 @@ def from_ar_census(body: Any) -> list[Fact]:
             f"doc:{text(item['key'], 'invalid_ar_census', 255)}",
             {"holding": "H-DOC", "status": item.get("status"), "amount_minor": item.get("gross_minor")},
         )
-    attribution = body.get("gl_attribution")
-    if attribution is not None:
-        if not isinstance(attribution, dict):
-            refuse("invalid_ar_census")
-        for item in attribution.get("parties", []):
-            if int(item["custgap_minor"]) != 0:  # GL not explained by the carried or refused items of this party
-                cust, ccy = (
-                    text(item["customer"], "invalid_ar_census", 255),
-                    text(item["currency"], "invalid_ar_census", 3),
-                )
-                add(
-                    AR_CLASS_GL_GAP,
-                    f"custgap:{cust}:{ccy}",
-                    {"amount_minor": int(item["custgap_minor"]), "holding": "H-SUB", "currency": ccy},
-                )
-        for item in attribution.get("unattributed", []):  # includes shared journals (flagged), never split
-            journal = text(item["gljournal_id"], "invalid_ar_census", 255)
+    for item in body.get("posted_after_cutoff", []):  # posted by D but dated after it: GL is in the ledger, held
+        key = text(item["key"], "invalid_ar_census", 255)
+        add(
+            AR_CLASS_PARTITION,
+            f"row:{key}",
+            {
+                "holding": "H-SUB",
+                "reason": "row_after_cutoff",
+                "kind": item.get("kind"),
+                "document_number": item.get("document_number"),
+                "amount_minor": item.get("gross_minor"),
+                "gl_signed_minor": signed.get(key),
+                "currency": item["partition"][1] if item.get("partition") else None,
+            },
+        )
+    for item in attribution.get("parties", []):
+        if int(item["custgap_minor"]) != 0:  # GL not explained by the carried or refused items of this party
+            cust, ccy = (
+                text(item["customer"], "invalid_ar_census", 255),
+                text(item["currency"], "invalid_ar_census", 3),
+            )
             add(
                 AR_CLASS_GL_GAP,
-                f"gljournal:{journal}",
-                {"amount_minor": int(item["amount_minor"]), "holding": "H-SUB", "shared": bool(item.get("shared"))},
+                f"custgap:{cust}:{ccy}",
+                {"amount_minor": int(item["custgap_minor"]), "holding": "H-SUB", "currency": ccy},
             )
+    for item in attribution.get("unattributed", []):  # includes shared journals (flagged), never split
+        journal = text(item["gljournal_id"], "invalid_ar_census", 255)
+        add(
+            AR_CLASS_GL_GAP,
+            f"gljournal:{journal}",
+            {
+                "amount_minor": int(item["amount_minor"]),
+                "holding": "H-SUB",
+                "shared": bool(item.get("shared")),
+                "currency": item.get("currency"),
+            },
+        )
     for item in body.get("variances", []):
         add(
             AR_CLASS_VARIANCE,

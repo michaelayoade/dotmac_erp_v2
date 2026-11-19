@@ -33,7 +33,14 @@ def _receipt():
         customer_snapshot=lambda _k: SNAPSHOT,
         seller=SNAPSHOT,
     )
-    return census, json.loads(json.dumps(census.receipt(), default=str))
+    body = json.loads(json.dumps(census.receipt(), default=str))
+    body["gl_attribution"] = {
+        "parties": [],
+        "held": [{"reason": "ar_unapplied_credit_note", "legacy_key": "cn-1", "amount_minor": -2000}],
+        "unattributed": [],
+        "shared_ar_journal": [],
+    }
+    return census, body
 
 
 def test_receipt_becomes_open_work_items_by_class_and_key():
@@ -47,6 +54,7 @@ def test_receipt_becomes_open_work_items_by_class_and_key():
     assert ("E35", "ar_unapplied_credit_note:cn-1") in by_key and ("E35", "ar_unapplied_credit_note:cn-only") in by_key
     credit = by_key[("E35", "ar_unapplied_credit_note:cn-1")].detail
     assert credit["document_number"] == "CN-1" and credit["amount_minor"] == -2000
+    assert credit["gl_signed_minor"] == -2000 and credit["currency"] == "NGN"
     assert by_key[("E35", "doc:draft-1")].detail == {"holding": "H-DOC", "status": "DRAFT", "amount_minor": 100000}
     assert by_key[("E35", "doc:sub-1")].detail["status"] == "SUBMITTED"
     (variance,) = [f for f in facts if f.class_code == "E36b"]
@@ -66,6 +74,7 @@ def test_the_census_carries_the_credit_note_partition_while_the_inexact_one_is_e
 def test_gl_attribution_gaps_are_e36a_items():
     _, body = _receipt()
     body["gl_attribution"] = {
+        "held": [],
         "parties": [
             {"customer": "cust-1", "currency": "NGN", "custgap_minor": 0},
             {"customer": "cust-9", "currency": "NGN", "custgap_minor": 5},
@@ -81,6 +90,24 @@ def test_gl_attribution_gaps_are_e36a_items():
     body["gl_attribution"] = "x"
     with pytest.raises(LedgerRefused):
         register.from_ar_census(body)
+
+
+def test_a_census_without_gl_attribution_is_refused():
+    _, body = _receipt()
+    del body["gl_attribution"]
+    with pytest.raises(LedgerRefused) as caught:
+        register.from_ar_census(body)
+    assert caught.value.code == "ar_census_without_gl_attribution"
+
+
+def test_posted_after_cutoff_rows_become_e35_row_items():
+    _, body = _receipt()
+    body["posted_after_cutoff"] = [
+        {"kind": "invoice", "key": "late-1", "partition": ["cust-1", "NGN"], "gross_minor": 4000}
+    ]
+    body["gl_attribution"]["held"].append({"reason": "row_after_cutoff", "legacy_key": "late-1", "amount_minor": 4000})
+    (fact,) = [f for f in register.from_ar_census(body) if f.legacy_key == "row:late-1"]
+    assert fact.class_code == "E35" and fact.detail["gl_signed_minor"] == 4000 and fact.detail["currency"] == "NGN"
 
 
 def test_wrong_receipt_kind_is_refused_and_the_kind_is_registered():

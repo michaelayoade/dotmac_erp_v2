@@ -71,7 +71,7 @@ def test_every_row_lands_in_exactly_one_bucket_with_all_buckets_exercised() -> N
     assert _bucket(census, "invoice", "sub-1").bucket == NOT_RECEIVABLE
     assert _bucket(census, "invoice", "late-1").bucket == NOT_RECEIVABLE  # issued after the cutoff
     assert _bucket(census, "invoice", "void-1").bucket == CLOSED
-    assert _bucket(census, "payment", "p-draft").bucket == CLOSED
+    assert _bucket(census, "payment", "p-draft").bucket == NOT_RECEIVABLE  # an unposted payment is a work item
     # cust-2: bad-1 is inexact (a dependency blocker for the partition); the unapplied credit note rides along
     assert _bucket(census, "invoice", "bad-1").bucket == EXCLUDED_PARTITION
     assert _bucket(census, "invoice", "cn-1").bucket == EXCLUDED_PARTITION
@@ -182,3 +182,31 @@ def test_collection_block_lists_carried_partitions_with_a_left_out_credit_note()
     ]  # cust-9 carries nothing: no billing account, nothing to collect
     block = census.collection_block({("cust-1", "NGN"): "acct-1"})
     assert block[0]["billing_account"] == "acct-1" and census.receipt()["collection_block"] == census.collection_block()
+
+
+def test_nothing_legacy_recorded_is_dropped_silently() -> None:
+    invoices = [
+        _inv("approved-1", posted=False, status="APPROVED"),  # non-draft, no posted journal, may owe
+        _inv("void-1", posted=False, status="VOID"),
+        _inv("rev-1", posted=False, status="PAID", reversed=True),
+        _inv("late-1", total="40.00", invoice_date=datetime(2026, 2, 1, tzinfo=UTC)),  # posted by D, dated after
+    ]
+    payments = [
+        _pay("p-unposted", "5.00", posted=False, status="PENDING"),
+        _pay("p-void", "6.00", posted=False, status="VOID"),
+        _pay("p-late", "7.00", payment_date=datetime(2026, 2, 2, tzinfo=UTC)),
+    ]
+    census = _census(invoices, payments)
+    by = {(r.kind, r.key): (r.bucket, r.reason) for r in census.rows}
+    assert by[("invoice", "approved-1")] == (NOT_RECEIVABLE, "unposted_approved")
+    assert by[("invoice", "void-1")] == (CLOSED, "void") and by[("invoice", "rev-1")] == (CLOSED, "reversed")
+    assert by[("invoice", "late-1")] == (NOT_RECEIVABLE, "posted_after_cutoff")
+    assert by[("payment", "p-unposted")] == (NOT_RECEIVABLE, "unposted_pending")
+    assert by[("payment", "p-void")] == (CLOSED, "void")
+    assert by[("payment", "p-late")] == (NOT_RECEIVABLE, "posted_after_cutoff")
+    receipt = census.receipt()
+    assert sorted((d["kind"], d["key"], d["status"]) for d in receipt["unposted_documents"]) == [
+        ("invoice", "approved-1", "APPROVED"),
+        ("payment", "p-unposted", "PENDING"),
+    ]
+    assert sorted(d["key"] for d in receipt["posted_after_cutoff"]) == ["late-1", "p-late"]

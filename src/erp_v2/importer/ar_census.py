@@ -8,8 +8,10 @@ Pure over already-read legacy rows (the read-only loader is `load_legacy_rows`).
   of the billing manifest (billing a13 cannot hold a row inside a partition: P-1 = NO) and does not stop its
   partition from being carried; it is a work-queue item (`ar_unapplied_credit_note`) and part of the 1400 holding;
 - `EXCLUDED_PARTITION(reason)`: its partition has a DEPENDENCY blocker, so the WHOLE partition is excluded (E35);
-- `NOT_RECEIVABLE`: DRAFT or SUBMITTED, or issued after the capture cutoff (no GL, Finance re-issues or voids);
-- `CLOSED`: residual 0 (history, no item), or not posted at the cutoff and not a draft.
+- `NOT_RECEIVABLE`: nothing the opening can carry, and never dropped: a document with no posted journal
+  (`unposted_<status>`, an H-DOC work item with its status) or a document posted by D but dated after it
+  (`posted_after_cutoff`, an E35 `row:` item whose GL-signed amount is held);
+- `CLOSED`: residual 0 (history, no item), or a void / reversed document (own reason: `void`, `reversed`).
 
 "Posted by D" and the allocation rules of MIGRATION-REVIEWED-CONVERSION 12.3b-addendum are applied by the loader
 (it sets `posted` and filters allocations to `allocation_date <= cutoff` whose payment is posted by the cutoff);
@@ -47,7 +49,8 @@ UNAPPLIED_CREDIT_NOTE = "UNAPPLIED_CREDIT_NOTE"
 NOT_RECEIVABLE = "NOT_RECEIVABLE"
 CLOSED = "CLOSED"
 BUCKETS = (CARRY_ITEM, CARRY_LOT, EXCLUDED_PARTITION, UNAPPLIED_CREDIT_NOTE, NOT_RECEIVABLE, CLOSED)
-UNPOSTED_STATUSES = frozenset({"DRAFT", "SUBMITTED"})
+VOID_STATUSES = frozenset({"VOID", "VOIDED", "CANCELLED", "CANCELED"})
+POSTED_AFTER_CUTOFF = "posted_after_cutoff"
 _SHA = re.compile(r"[0-9a-f]{64}")
 
 PartitionKey = tuple[str, str]  # (legacy customer key, currency)
@@ -164,6 +167,17 @@ class ArCensus:
                 }
                 for r in self.rows
                 if r.bucket == UNAPPLIED_CREDIT_NOTE
+            ],
+            "posted_after_cutoff": [
+                {
+                    "kind": r.kind,
+                    "key": r.key,
+                    "partition": list(r.partition) if r.partition else None,
+                    "gross_minor": r.gross_minor,
+                    "document_number": r.document_number,
+                }
+                for r in self.rows
+                if r.bucket == NOT_RECEIVABLE and r.reason == POSTED_AFTER_CUTOFF
             ],
             "unposted_documents": [
                 {
@@ -345,17 +359,36 @@ def build_census(
         gross = _minor(inv["total_amount"], precision)
         status = str(inv.get("status", "")).upper()
         issued = _as_dt(inv["invoice_date"])
+        party = (str(inv["customer_key"]), str(inv["currency_code"]))
         if not inv.get("posted"):
-            bucket, reason = (
-                (NOT_RECEIVABLE, f"unposted_{status.lower()}")
-                if status in UNPOSTED_STATUSES
-                else (CLOSED, "not_posted_at_cutoff")
-            )
-            put(CensusRow("invoice", key, bucket, reason, origin, None, gross, None))
+            # Nothing is dropped silently: a document with no posted journal is a work item (H-DOC) with its status;
+            # CLOSED only for void or reversed documents, each with its own reason.
+            if inv.get("reversed"):
+                row = CensusRow("invoice", key, CLOSED, "reversed", origin, None, gross, None)
+            elif status in VOID_STATUSES:
+                row = CensusRow("invoice", key, CLOSED, "void", origin, None, gross, None)
+            else:
+                row = CensusRow(
+                    "invoice", key, NOT_RECEIVABLE, f"unposted_{status.lower() or 'unknown'}", origin, None, gross, None
+                )
+            put(row)
         elif issued > cutoff:
-            put(CensusRow("invoice", key, NOT_RECEIVABLE, "after_cutoff", origin, None, gross, None))
+            # posted by D but dated after it: its GL is in the ledger, so it is held (E35 row), never dropped.
+            put(
+                CensusRow(
+                    "invoice",
+                    key,
+                    NOT_RECEIVABLE,
+                    POSTED_AFTER_CUTOFF,
+                    origin,
+                    party,
+                    gross,
+                    gross,
+                    str(inv.get("invoice_number") or ""),
+                )
+            )
         else:
-            in_play_invoices[(str(inv["customer_key"]), str(inv["currency_code"]))].append(inv)
+            in_play_invoices[party].append(inv)
     for pay in payments:
         key = str(pay["payment_id"])
         for required in ("dotmac_sub_id", "splynx_id"):
@@ -363,10 +396,22 @@ def build_census(
                 raise OpeningTranslationError(f"payment {key}: row lacks {required}; refusing")
         origin = origin_of(pay)
         gross = _minor(pay["amount"], precision)
-        if not pay.get("posted") or _as_dt(pay["payment_date"]) > cutoff:
-            put(CensusRow("payment", key, CLOSED, "not_posted_at_cutoff", origin, None, gross, None))
+        status = str(pay.get("status", "")).upper()
+        party = (str(pay["customer_key"]), str(pay["currency_code"]))
+        if not pay.get("posted"):
+            if pay.get("reversed"):
+                row = CensusRow("payment", key, CLOSED, "reversed", origin, None, gross, None)
+            elif status in VOID_STATUSES:
+                row = CensusRow("payment", key, CLOSED, "void", origin, None, gross, None)
+            else:
+                row = CensusRow(
+                    "payment", key, NOT_RECEIVABLE, f"unposted_{status.lower() or 'unknown'}", origin, None, gross, None
+                )
+            put(row)
+        elif _as_dt(pay["payment_date"]) > cutoff:
+            put(CensusRow("payment", key, NOT_RECEIVABLE, POSTED_AFTER_CUTOFF, origin, party, gross, gross))
         else:
-            in_play_payments[(str(pay["customer_key"]), str(pay["currency_code"]))].append(pay)
+            in_play_payments[party].append(pay)
 
     partitions = sorted(set(in_play_invoices) | set(in_play_payments))
     carry: list[PartitionKey] = []
@@ -549,22 +594,28 @@ INVOICE_SQL = """
 SELECT i.invoice_id, i.invoice_number, i.customer_id AS customer_key, i.invoice_date, i.due_date,
        i.currency_code, i.subtotal, i.tax_amount, i.total_amount, i.balance_due, i.status, i.invoice_type,
        i.dotmac_sub_id, i.splynx_id,
-       (j.journal_entry_id IS NOT NULL) AS posted
+       (j.journal_entry_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM gl.journal_entry r WHERE r.journal_entry_id = j.reversal_journal_id
+              AND r.status IN ('POSTED', 'REVERSED') AND r.posting_date <= :cutoff)) AS posted,
+       (j.journal_entry_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM gl.journal_entry r WHERE r.journal_entry_id = j.reversal_journal_id
+              AND r.status IN ('POSTED', 'REVERSED') AND r.posting_date <= :cutoff)) AS reversed
 FROM ar.invoice i
 LEFT JOIN gl.journal_entry j ON j.journal_entry_id = i.journal_entry_id
  AND j.status IN ('POSTED', 'REVERSED') AND j.posting_date <= :cutoff
- AND NOT EXISTS (SELECT 1 FROM gl.journal_entry r WHERE r.journal_entry_id = j.reversal_journal_id
-                 AND r.status IN ('POSTED', 'REVERSED') AND r.posting_date <= :cutoff)
 """
 PAYMENT_SQL = """
 SELECT p.payment_id, p.customer_id AS customer_key, p.gross_amount AS amount, p.payment_date, p.reference,
        p.currency_code, p.status, p.dotmac_sub_id, p.splynx_id,
-       (j.journal_entry_id IS NOT NULL) AS posted
+       (j.journal_entry_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM gl.journal_entry r WHERE r.journal_entry_id = j.reversal_journal_id
+              AND r.status IN ('POSTED', 'REVERSED') AND r.posting_date <= :cutoff)) AS posted,
+       (j.journal_entry_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM gl.journal_entry r WHERE r.journal_entry_id = j.reversal_journal_id
+              AND r.status IN ('POSTED', 'REVERSED') AND r.posting_date <= :cutoff)) AS reversed
 FROM ar.customer_payment p
 LEFT JOIN gl.journal_entry j ON j.journal_entry_id = p.journal_entry_id
  AND j.status IN ('POSTED', 'REVERSED') AND j.posting_date <= :cutoff
- AND NOT EXISTS (SELECT 1 FROM gl.journal_entry r WHERE r.journal_entry_id = j.reversal_journal_id
-                 AND r.status IN ('POSTED', 'REVERSED') AND r.posting_date <= :cutoff)
 """
 ALLOCATION_SQL = """
 SELECT a.payment_id, a.invoice_id,
@@ -603,7 +654,9 @@ __all__ = [
     "CLOSED",
     "EXCLUDED_PARTITION",
     "NOT_RECEIVABLE",
+    "POSTED_AFTER_CUTOFF",
     "UNAPPLIED_CREDIT_NOTE",
+    "VOID_STATUSES",
     "ArCensus",
     "CensusError",
     "CensusRow",

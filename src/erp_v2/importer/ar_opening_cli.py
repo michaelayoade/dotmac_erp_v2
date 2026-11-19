@@ -43,6 +43,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from erp_v2.importer import ar_opening_role as role_guard
+from erp_v2.importer.ar_census import CensusError
 from erp_v2.importer.ar_opening_models import TABLE, WRITER_ROLE
 
 ADDRESS_NOT_RECORDED = "Not recorded in legacy ERP"
@@ -53,8 +55,9 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class OperatorRefusal(ValueError):
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, receipt: dict | None = None):
         self.reason = reason
+        self.receipt = receipt  # apply: what was admitted before the refusal (an abort never loses its evidence)
         super().__init__(reason)
 
 
@@ -78,13 +81,21 @@ def customer_snapshot_from(rows):
     return by_key.get
 
 
-def plan_sha256(manifest_fingerprint: str, command_digests: dict[str, str], variances: list[dict] | None = None) -> str:
+def plan_sha256(
+    manifest_fingerprint: str,
+    command_digests: dict[str, str],
+    variances: list[dict] | None = None,
+    dual_control: str = "on",
+) -> str:
+    """The plan sha binds the manifest, every command digest, every variance and the window's two-person policy."""
+
     body = json.dumps(
         {
-            "domain": "erp.ar-opening.plan.v2",
+            "domain": "erp.ar-opening.plan.v3",
             "manifest": manifest_fingerprint,
             "commands": command_digests,
             "variances": variances or [],
+            "dual_control": dual_control,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -188,7 +199,9 @@ def existing_account_ids(db, *, scope, partitions) -> dict[tuple[str, str], UUID
 # --- plan ----------------------------------------------------------------------------------------------------------
 
 
-def build_plan(assembly, db, *, scope, migration_authority_ref: str, occurred_at: datetime, params: dict) -> dict:
+def build_plan(
+    assembly, db, *, scope, migration_authority_ref: str, occurred_at: datetime, params: dict, dual_control: str
+) -> dict:
     """Pure over the assembly plus read-only target lookups. Writes nothing."""
 
     from dotmac_billing import get_opening_cash_target, opening_account_command_digest_v2
@@ -219,7 +232,8 @@ def build_plan(assembly, db, *, scope, migration_authority_ref: str, occurred_at
         "snapshot_sha256": assembly.census.snapshot_sha256,
         "census_sha256": assembly.census.sha256,
         "manifest_fingerprint": fingerprint,
-        "plan_sha256": plan_sha256(fingerprint, digests, variances),
+        "dual_control": dual_control,
+        "plan_sha256": plan_sha256(fingerprint, digests, variances, dual_control),
         "command_digests": digests,
         "partitions": len(commands),
         "excluded_partitions": len(assembly.census.excluded),
@@ -269,9 +283,36 @@ def role_oid(db, name: str = WRITER_ROLE) -> int:
     return int(oid)
 
 
-def apply_opening(
+def _cash_lot_split(manifest) -> dict[str, int]:
+    """Per billing account: sum of the cash-lot residuals (the T1 split B-14 needs)."""
+
+    out: dict[str, int] = {}
+    for lot in manifest.cash_lots:
+        key = str(lot.partition.account_id)
+        out[key] = out.get(key, 0) + lot.residual_minor
+    return dict(sorted(out.items()))
+
+
+def apply_opening(engine, **kwargs) -> dict:
+    """Provision -> import every partition -> seal. A refusal or failure keeps the partial receipt (what was admitted)
+    on the raised OperatorRefusal, so an abort never loses its evidence."""
+
+    receipt: dict = {"kind": "ar-opening-apply", "admitted": [], "sealed": False}
+    try:
+        return _apply_opening(engine, receipt=receipt, **kwargs)
+    except OperatorRefusal as exc:
+        exc.receipt = receipt
+        raise
+    except role_guard.WriterRoleRefused as exc:
+        raise OperatorRefusal(str(exc), receipt) from exc
+    except Exception as exc:
+        raise OperatorRefusal(f"apply_failed:{type(exc).__name__}", receipt) from exc
+
+
+def _apply_opening(
     engine,
     *,
+    receipt: dict,
     assembly,
     authority,
     plan: dict,
@@ -300,20 +341,22 @@ def apply_opening(
     # Every variance must be listed in the plan (so sha-bound, plan_sha256 covers them) and equal the manifest's own.
     _require(plan["variances"] == manifest_variances(assembly.manifest()), "variances_not_listed_in_plan")
     _require(
-        plan["plan_sha256"] == plan_sha256(plan["manifest_fingerprint"], plan["command_digests"], plan["variances"]),
+        plan["plan_sha256"]
+        == plan_sha256(plan["manifest_fingerprint"], plan["command_digests"], plan["variances"], plan["dual_control"]),
         "plan_sha_not_self_consistent",
     )
     scope = assembly.scope
     manifest = assembly.manifest()
     window_id = uuid5(NAMESPACE_URL, f"erp-ar-opening-window:{approved_plan_sha256}")
     epoch = uuid5(NAMESPACE_URL, f"erp-ar-opening-epoch:{assembly.census.sha256}")
-    receipt: dict = {
-        "kind": "ar-opening-apply",
-        "plan_sha256": approved_plan_sha256,
-        "admitted": [],
-        "sealed": False,
-        "variances": plan["variances"],  # each is an E36b work item; recognise/confirm are post-flip (app_user)
-    }
+    receipt.update(
+        {
+            "plan_sha256": approved_plan_sha256,
+            "variances": plan["variances"],  # each is an E36b work item; recognise/confirm are post-flip (app_user)
+            "t1_credit_by_currency": t1_credit_by_currency(manifest),
+            "cash_lot_residual_by_account": _cash_lot_split(manifest),
+        }
+    )
 
     # 1. provision (billing's trigger insists current_user = 'app_admin'; never the restricted principal)
     with Session(engine) as db, db.begin():
@@ -326,7 +369,13 @@ def apply_opening(
             dual_control = read_dual_control(db, scope.tenant_id)
         wanted = "on" if dual_control else "off"
         receipt["dual_control"] = wanted
+        _require(
+            plan["dual_control"] == wanted, "plan_dual_control_differs_from_policy"
+        )  # policy flipped since approval
         _require(authority.expected_dual_control == wanted, "authority_dual_control_differs_from_policy")
+        # The writer role is re-checked now, not trusted from the migration: no SET/INHERIT member except this
+        # session's operator (SET only), no owned objects, exact R5 privileges.
+        role_guard.preflight(db.connection(), WRITER_ROLE, operator=db.scalar(sa.text("SELECT session_user")))
         existing = get_opening_window(db, scope=scope)
         if existing is None:
             window_kwargs = window_dual_control_kwargs(OpeningWindowV1, wanted)
@@ -438,6 +487,7 @@ def apply_opening(
             raise OperatorRefusal(f"seal_refused:{exc.code}") from exc
         db.execute(sa.text("RESET ROLE"))
         receipt["sealed"] = True
+        receipt["window_manifest_fingerprint"] = get_opening_window(db, scope=scope).manifest_fingerprint
         receipt["seal_population_digest"] = seal.population_digest
         receipt["seal_population_count"] = seal.population_count
     return receipt
@@ -484,7 +534,7 @@ def _load_inputs(args, source_url: str, ar_account_ids=None):
             if ar_account_ids:
                 from erp_v2.importer.ar_attribution import load_gl_rows
 
-                gl_rows = load_gl_rows(source, ar_account_ids)
+                gl_rows = load_gl_rows(source, ar_account_ids, cutoff)
     finally:
         engine.dispose()
     from dotmac_billing.contracts import PartyDocumentSnapshotV1, PostalAddressSnapshotV1
@@ -578,15 +628,20 @@ def _run(args) -> dict:
             from erp_v2.importer.ar_attribution import build_attribution
 
             lines, owners = gl_rows
-            receipt.update(
-                build_attribution(
-                    census,
-                    gl_lines=lines,
-                    journal_owners=owners,
-                    invoice_types={str(i["invoice_id"]): str(i.get("invoice_type") or "") for i in rows["invoices"]},
-                    functional_currency=args.functional_currency,
+            try:
+                receipt.update(
+                    build_attribution(
+                        census,
+                        gl_lines=lines,
+                        journal_owners=owners,
+                        invoice_types={
+                            str(i["invoice_id"]): str(i.get("invoice_type") or "") for i in rows["invoices"]
+                        },
+                        functional_currency=args.functional_currency,
+                    )
                 )
-            )
+            except CensusError as exc:
+                raise OperatorRefusal(str(exc).split(":")[0]) from exc
         return receipt
     _require(bool(destination_url), "operator_database_materials_required")
     tenant = UUID(manifest.tenant_extent[0])
@@ -629,6 +684,9 @@ def _run(args) -> dict:
         with Session(engine) as db, db.begin():
             _set_tenant(db, tenant)
             db.execute(sa.text("SET TRANSACTION READ ONLY"))
+            from erp_v2.governance.policy import dual_control as read_dual_control
+
+            policy_dual_control = read_dual_control(db, tenant)
             plan = build_plan(
                 assembly,
                 db,
@@ -636,13 +694,10 @@ def _run(args) -> dict:
                 migration_authority_ref=args.migration_authority_ref,
                 occurred_at=occurred_at,
                 params=params,
+                dual_control="on" if policy_dual_control else "off",  # bound into the plan sha
             )
             oid = role_oid(db)
-            from erp_v2.governance.policy import dual_control as read_dual_control
-
-            policy_dual_control = read_dual_control(db, tenant)
         if args.command == "plan":
-            plan["dual_control_policy"] = "on" if policy_dual_control else "off"
             return plan
         authority = ErpOpeningAuthority(
             assembly=assembly,
@@ -702,6 +757,8 @@ def main(argv=None) -> int:
                 code = 3
         except OperatorRefusal as exc:
             payload, code = {"refusal": exc.reason}, 2
+            if exc.receipt:
+                payload["partial_receipt"] = exc.receipt  # what was admitted before the abort
         except Exception:
             payload, code = {"refusal": "ar_opening_command_refused"}, 2
         json.dump(payload, stream, indent=2, sort_keys=True, default=str)

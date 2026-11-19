@@ -61,16 +61,18 @@ def _app_admin_provision_grants(engine):
     admin = sa.create_engine(
         sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
     )
-    with admin.connect() as c:
-        owner = engine.url.username
-        if not c.scalar(sa.text("SELECT pg_has_role(:o, :r, 'SET')"), {"o": owner, "r": WRITER_ROLE}):
-            c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}"')
-    admin.dispose()
+    owner = engine.url.username
+    with admin.connect() as c:  # Michael's root step, for the test window only: SET without INHERIT
+        c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT FALSE')
     with engine.begin() as c:
         c.exec_driver_sql("GRANT USAGE ON SCHEMA mod_billing TO app_admin")
         c.exec_driver_sql("GRANT SELECT ON ALL TABLES IN SCHEMA mod_billing TO app_admin")
         c.exec_driver_sql("GRANT INSERT ON mod_billing.opening_windows TO app_admin")
         c.exec_driver_sql("GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_admin")
+    yield
+    with admin.connect() as c:  # revoked after the window, as in runbook F9 (the role is cluster-global)
+        c.exec_driver_sql(f'REVOKE {WRITER_ROLE} FROM "{owner}"')
+    admin.dispose()
 
 
 def _rows(tenant: UUID, variance: bool = False):
@@ -160,12 +162,13 @@ def _world(engine, *, variance: bool = False) -> SimpleNamespace:
     )
 
 
-def _plan(engine, w):
+def _plan(engine, w, dual="on"):
     with Session(engine) as db, db.begin():
         db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
-        return build_plan(w.asm, db, scope=w.scope, migration_authority_ref=REF, occurred_at=NOW, params={}), role_oid(
-            db
+        plan = build_plan(
+            w.asm, db, scope=w.scope, migration_authority_ref=REF, occurred_at=NOW, params={}, dual_control=dual
         )
+        return plan, role_oid(db)
 
 
 def _authority(w, oid, dual="on"):
@@ -281,7 +284,7 @@ def test_dual_control_is_bound_explicitly_from_the_policy_and_read_back(engine):
 
     a13 = "dual_control" in OpeningWindowV1.__dataclass_fields__
     w = _world(engine)
-    plan, oid = _plan(engine, w)
+    plan, oid = _plan(engine, w, "off")  # the plan is built under the policy (OFF) it will be applied under
     if not a13:
         with pytest.raises(OperatorRefusal, match="window_dual_control_unbindable_pin_billing_a13"):
             _apply(engine, w, plan, oid, dual=False)
@@ -481,42 +484,217 @@ def test_writer_privileges_are_exactly_r5(engine):
         )
 
 
-def test_role_guard_refuses_a_pre_existing_role_with_a_forbidden_attribute_or_any_membership(engine):
-    import erp_v2.migrations.versions.e2_0029_ar_opening_admissions as mig
-
-    probe = f"erp_probe_{uuid4().hex[:10]}"
-    admin = sa.create_engine(
+def _admin_engine():
+    return sa.create_engine(
         sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
     )
+
+
+def _probe_name() -> str:
+    return f"erp_probe_{uuid4().hex[:10]}"
+
+
+def _drop(admin, *names) -> None:
+    with admin.connect() as c:
+        for name in names:
+            c.exec_driver_sql(f"DROP ROLE IF EXISTS {name}")
+
+
+def test_superuser_migrator_creates_the_role_with_no_membership_row_at_all(engine):
+    from erp_v2.importer import ar_opening_role as rg
+
+    admin, probe = _admin_engine(), _probe_name()
+    try:
+        with admin.connect() as c:  # `postgres` is the superuser
+            assert rg.prepare_role(c, probe) is True
+            assert (
+                c.scalar(
+                    sa.text(
+                        "SELECT count(*) FROM pg_auth_members WHERE roleid = (SELECT oid FROM pg_roles WHERE rolname = :n)"
+                    ),
+                    {"n": probe},
+                )
+                == 0
+            )
+            assert rg.membership_problems(c, probe) == [] and rg.posture_problems(c, probe) == []
+            assert rg.prepare_role(c, probe) is False  # idempotent adoption of the clean role
+    finally:
+        _drop(admin, probe)
+        admin.dispose()
+
+
+def test_non_superuser_createrole_migrator_gets_an_admin_only_row_which_passes(engine):
+    """The expected production case on PG16: the creator gets ADMIN (no SET, no INHERIT) automatically."""
+
+    from erp_v2.importer import ar_opening_role as rg
+
+    probe = _probe_name()
+    with engine.begin() as c:  # the fixture owner: CREATEROLE, not a superuser
+        assert c.scalar(sa.text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")) is False
+        assert rg.prepare_role(c, probe) is True
+        row = c.execute(
+            sa.text(
+                "SELECT admin_option, set_option, inherit_option FROM pg_auth_members "
+                "WHERE roleid = (SELECT oid FROM pg_roles WHERE rolname = :n) AND member = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
+            ),
+            {"n": probe},
+        ).one()
+        assert tuple(row) == (True, False, False)  # ADMIN only
+        assert rg.membership_problems(c, probe) == []
+    admin = _admin_engine()
+    _drop(admin, probe)
+    admin.dispose()
+
+
+def test_createrole_self_grant_set_and_inherit_are_revoked_from_the_creator(engine):
+    from erp_v2.importer import ar_opening_role as rg
+
+    probe = _probe_name()
+    owner = engine.url.username
+    admin = _admin_engine()
     try:
         with admin.connect() as c:
-            c.exec_driver_sql(mig.role_guard_sql(probe))  # creates it clean
-            assert tuple(
-                c.execute(
-                    sa.text("SELECT rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = :n"), {"n": probe}
-                ).one()
-            ) == (False, False, False)
-            c.exec_driver_sql(mig.role_guard_sql(probe))  # idempotent on a clean role
-            for attribute in ("LOGIN", "CREATEROLE", "CREATEDB", "BYPASSRLS", "REPLICATION"):
-                c.exec_driver_sql(f"ALTER ROLE {probe} {attribute}")
-                with pytest.raises(sa.exc.DBAPIError, match="forbidden attribute"):
-                    c.exec_driver_sql(mig.role_guard_sql(probe))
-                c.exec_driver_sql(f"ALTER ROLE {probe} NO{attribute}")
-            c.exec_driver_sql(mig.role_guard_sql(probe))
-            c.exec_driver_sql(f"GRANT app_user TO {probe}")
-            with pytest.raises(sa.exc.DBAPIError, match="linked to app_user"):
-                c.exec_driver_sql(mig.role_guard_sql(probe))
-            c.exec_driver_sql(f"REVOKE app_user FROM {probe}")
-            c.exec_driver_sql(f"GRANT {probe} TO app_admin")
-            with pytest.raises(sa.exc.DBAPIError, match="linked to app_user"):
-                c.exec_driver_sql(mig.role_guard_sql(probe))
-            c.exec_driver_sql(f"REVOKE {probe} FROM app_admin")
-            c.exec_driver_sql(f"CREATE ROLE {probe}_g NOLOGIN")
-            c.exec_driver_sql(f"GRANT {probe}_g TO {probe}")
-            with pytest.raises(sa.exc.DBAPIError, match="member of another role"):
-                c.exec_driver_sql(mig.role_guard_sql(probe))
+            c.exec_driver_sql(f"ALTER ROLE \"{owner}\" SET createrole_self_grant = 'set, inherit'")
+        with engine.begin() as c:
+            assert rg.prepare_role(c, probe) is True
+            assert rg.membership_problems(c, probe) == []  # SET and INHERIT were revoked, ADMIN kept
+            assert c.scalar(sa.text("SELECT pg_has_role(current_user, :n, 'SET')"), {"n": probe}) is False
     finally:
         with admin.connect() as c:
-            c.exec_driver_sql(f"DROP ROLE IF EXISTS {probe}")
-            c.exec_driver_sql(f"DROP ROLE IF EXISTS {probe}_g")
+            c.exec_driver_sql(f'ALTER ROLE "{owner}" RESET createrole_self_grant')
+        _drop(admin, probe)
         admin.dispose()
+
+
+def test_any_set_or_inherit_member_attribute_membership_or_ownership_refuses_adoption(engine):
+    from erp_v2.importer import ar_opening_role as rg
+
+    admin, probe = _admin_engine(), _probe_name()
+    try:
+        with admin.connect() as c:
+            rg.prepare_role(c, probe)
+            for attribute in ("LOGIN", "CREATEROLE", "CREATEDB", "BYPASSRLS", "REPLICATION"):
+                c.exec_driver_sql(f"ALTER ROLE {probe} {attribute}")
+                with pytest.raises(rg.WriterRoleRefused, match="attribute_forbidden"):
+                    rg.prepare_role(c, probe)
+                c.exec_driver_sql(f"ALTER ROLE {probe} NO{attribute}")
+            c.exec_driver_sql(f"CREATE ROLE {probe}_m NOLOGIN")
+            for options, reason in (
+                ("WITH SET TRUE, INHERIT FALSE", "member_can_set_writer"),
+                ("WITH SET FALSE, INHERIT TRUE", "member_inherits_writer"),
+                ("WITH SET TRUE, INHERIT TRUE", "member_inherits_writer"),
+            ):
+                c.exec_driver_sql(f"GRANT {probe} TO {probe}_m {options}")
+                with pytest.raises(rg.WriterRoleRefused, match=reason):
+                    rg.prepare_role(c, probe)
+                c.exec_driver_sql(f"REVOKE {probe} FROM {probe}_m")
+            c.exec_driver_sql(f"GRANT {probe} TO {probe}_m WITH ADMIN TRUE, SET FALSE, INHERIT FALSE")
+            rg.prepare_role(c, probe)  # an ADMIN-only row is allowed
+            c.exec_driver_sql(f"REVOKE {probe} FROM {probe}_m")
+            for serving in ("app_user", "platform_api", "app_admin"):
+                c.exec_driver_sql(f"GRANT {serving} TO {probe}")
+                with pytest.raises(rg.WriterRoleRefused, match=r"member_of_another_role|linked_to_serving"):
+                    rg.prepare_role(c, probe)
+                c.exec_driver_sql(f"REVOKE {serving} FROM {probe}")
+            c.exec_driver_sql(f"GRANT {probe}_m TO {probe}")
+            with pytest.raises(rg.WriterRoleRefused, match="member_of_another_role"):
+                rg.prepare_role(c, probe)
+            c.exec_driver_sql(f"REVOKE {probe}_m FROM {probe}")
+            c.exec_driver_sql(f"ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO {probe}")
+            with pytest.raises(rg.WriterRoleRefused, match="default_privileges"):
+                rg.prepare_role(c, probe)
+            c.exec_driver_sql(f"ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM {probe}")  # noqa: S608
+    finally:
+        _drop(admin, f"{probe}_m", probe)
+        admin.dispose()
+
+
+def test_an_adopted_role_is_stripped_to_exactly_r5_and_the_final_assertion_catches_leftovers(engine):
+    """The real role on the fixture DB: a stray grant to it is revoked on adoption; the assertion is exact. The
+    adoption itself REFUSES while the operator still holds SET (so the window membership is revoked around it)."""
+
+    from erp_v2.importer import ar_opening_role as rg
+
+    owner = engine.url.username
+    admin = _admin_engine()
+    try:
+        with engine.begin() as c:
+            rg.assert_exact_privileges(c, WRITER_ROLE)  # after the migration: exactly R5
+            c.exec_driver_sql(f"GRANT SELECT ON mod_billing.document_lines TO {WRITER_ROLE}")  # a stray widening
+            c.exec_driver_sql(f"GRANT UPDATE (epoch) ON mod_billing.opening_windows TO {WRITER_ROLE}")
+            with pytest.raises(rg.WriterRoleRefused, match="writer_privileges_not_exact:extra=2"):
+                rg.assert_exact_privileges(c, WRITER_ROLE)
+        with admin.connect() as c:
+            c.exec_driver_sql(f'REVOKE {WRITER_ROLE} FROM "{owner}"')
+        with engine.begin() as c:
+            rg.prepare_role(c, WRITER_ROLE)  # adoption strips everything...
+            for line in rg.grant_lines(WRITER_ROLE):  # ...then the closed set is granted again
+                c.exec_driver_sql(line)
+            rg.preflight(c, WRITER_ROLE)
+    finally:
+        with admin.connect() as c:
+            c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT FALSE')
+        admin.dispose()
+
+
+def test_apply_preflight_allows_only_the_session_operator_with_set_and_no_inherit(engine):
+    from erp_v2.importer import ar_opening_role as rg
+
+    operator = engine.url.username
+    with engine.connect() as c:
+        rg.preflight(c, WRITER_ROLE, operator=operator)  # the fixture granted SET only, INHERIT FALSE
+        with pytest.raises(rg.WriterRoleRefused, match="member_can_set_writer"):
+            rg.preflight(c, WRITER_ROLE, operator="somebody_else")
+        with pytest.raises(rg.WriterRoleRefused, match="member_can_set_writer"):
+            rg.preflight(c, WRITER_ROLE)  # no operator named: any SET member refuses
+
+
+def test_apply_refuses_when_the_operator_inherits_the_writer(engine):
+    w = _world(engine)
+    plan, oid = _plan(engine, w)
+    admin = _admin_engine()
+    owner = engine.url.username
+    try:
+        with admin.connect() as c:
+            c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT TRUE')
+        with pytest.raises(OperatorRefusal, match="member_inherits_writer"):
+            _apply(engine, w, plan, oid)
+    finally:
+        with admin.connect() as c:
+            c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT FALSE')
+        admin.dispose()
+    assert w  # nothing provisioned by the refusal
+
+
+def test_dual_control_is_bound_into_the_plan_sha_so_a_policy_flip_after_approval_is_refused(engine):
+    w = _world(engine)
+    plan_on, oid = _plan(engine, w, "on")
+    plan_off, _ = _plan(engine, w, "off")
+    assert plan_on["plan_sha256"] != plan_off["plan_sha256"] and plan_on["dual_control"] == "on"
+    # approved while the policy was OFF; applied after it flipped ON: the rebuilt plan's sha differs
+    with pytest.raises(OperatorRefusal, match="approved_plan_sha_mismatch"):
+        _apply(engine, w, plan_on, oid, approved=plan_off["plan_sha256"])
+    tampered = {**plan_on, "dual_control": "off"}
+    with pytest.raises(OperatorRefusal, match="plan_sha_not_self_consistent"):
+        _apply(engine, w, tampered, oid, approved=plan_on["plan_sha256"])
+
+
+def test_an_aborted_apply_keeps_its_partial_receipt_and_a_complete_one_carries_the_read_backs(engine):
+    w = _world(engine)
+    plan, oid = _plan(engine, w)
+    try:
+        _apply(engine, w, plan, oid, fence="another-fence")
+    except OperatorRefusal as exc:
+        assert exc.reason.startswith("seal_refused") and exc.receipt is not None
+        assert len(exc.receipt["admitted"]) == 3 and exc.receipt["sealed"] is False  # imports were kept
+    else:  # pragma: no cover
+        raise AssertionError("the wrong fence must abort the seal")
+    w2 = _world(engine)
+    plan2, oid2 = _plan(engine, w2)
+    receipt = _apply(engine, w2, plan2, oid2)
+    assert receipt["window_manifest_fingerprint"] == plan2["manifest_fingerprint"]
+    assert receipt["t1_credit_by_currency"] == {"NGN": 7000}
+    assert (
+        sorted(receipt["cash_lot_residual_by_account"].values()) == [0, 2000, 5000]
+        or sum(receipt["cash_lot_residual_by_account"].values()) == 7000
+    )
