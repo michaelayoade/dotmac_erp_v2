@@ -25,6 +25,7 @@ from dotmac_accounting.contracts import (
 from dotmac_accounting.models import Account, AccountCategory, FiscalPeriod, FiscalYear, JournalEntry, PostedLedgerLine
 from dotmac_kernel.cache import TenantScope
 from dual_control_support import set_dual_control_engine
+from migration_ledger_support import bind_rounding
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from test_journals_pg import NOW, _registries, seed  # noqa: F401  (hosted-Postgres fixtures)
@@ -307,11 +308,18 @@ def store(engine, env, items, legacy, *, rounding="6900", extra_legacy=None, inp
         "legacy": [{"account": a, "period": p, "net": n} for (a, p), n in {**legacy, **(extra_legacy or {})}.items()],
         "items": items,
     }
+    raw["items"], itemised_68, import_sha = bind_rounding(items, SHA)
     inputs = bridge.parse_inputs(raw, inputs_sha or uuid4().hex * 2)
     with Session(engine) as db:
         opening_net, ias8, tb_sha, ias8_sha = bridge.ledger_inputs(db, env.tenant_id)
         body, _itemised = bridge.compute(
-            inputs, opening_net=opening_net, ias8=ias8, opening_tb_sha=tb_sha, ias8_sha=ias8_sha
+            inputs,
+            opening_net=opening_net,
+            ias8=ias8,
+            opening_tb_sha=tb_sha,
+            ias8_sha=ias8_sha,
+            import_itemised=itemised_68,
+            import_sha=import_sha,
         )
         row, _created = bridge.store_version(db, env.tenant_id, body, created_by="operator-a")
         db.commit()
@@ -562,7 +570,7 @@ def rounding_journals(engine, env):
 def test_the_rounding_journal_posts_once_against_the_named_account_and_clears_the_residue(engine):
     env = world(engine)
     version, sha = store(engine, env, ROUND_ITEMS, ROUND_LEGACY)
-    # residue Jan (v2 - legacy on 2000): -0.005 (more credit in v2) -> the correction is a debit of 0.005 on 2000
+    # residue Jan = subledger - legacy GL on 2000 = -0.005 (the subledger holds more credit): the GL must move by -0.005
     out = prepare(engine, env, sha, "2026-01")
     assert out.state == "PREPARED" and not out.replayed
     posted = request_and_post(engine, env, out.manual_id)
@@ -570,8 +578,8 @@ def test_the_rounding_journal_posts_once_against_the_named_account_and_clears_th
     (journal,) = [j for j in rounding_journals(engine, env) if j.source_document_id.endswith("2026-01")]
     assert journal.source_owner == "erp.manual" and journal.source_document_id == f"{sha}:2026-01"
     assert journal.posting_date == date(2026, 1, 1) and journal.status.value == "POSTED"
-    assert ledger_net(engine, env, "2000") == Decimal("0.005")  # Dr 2000 0.005
-    assert ledger_net(engine, env, "6900") == Decimal("-0.005")  # Cr rounding account
+    assert ledger_net(engine, env, "2000") == Decimal("-0.005")  # Cr 2000 0.005
+    assert ledger_net(engine, env, "6900") == Decimal("0.005")  # Dr rounding account
     with Session(engine) as db:
         body = bridge.verified_body(bridge.latest(db, env.tenant_id))
         assert rounding_verify.pending_periods(db, env.tenant_id, body) == ["2026-02"]
@@ -598,8 +606,8 @@ def test_the_rounding_journal_posts_once_against_the_named_account_and_clears_th
         )
     request_and_post(engine, env, prepare(engine, env, sha, "2026-02").manual_id)
     assert sign(engine, env, version, sha)
-    # Jan: Dr 2000 0.005 (v2 carried 0.005 more credit); Feb: Cr 2000 0.004 (v2 carried 0.004 less credit)
-    assert ledger_net(engine, env, "2000") == Decimal("0.001") and ledger_net(engine, env, "6900") == Decimal("-0.001")
+    # Jan: Cr 2000 0.005; Feb: Dr 2000 0.004 (the subledger carries 0.004 less credit)
+    assert ledger_net(engine, env, "2000") == Decimal("-0.001") and ledger_net(engine, env, "6900") == Decimal("0.001")
 
 
 def test_the_correction_is_dated_in_the_invoices_period_when_open_otherwise_the_first_open_period(engine):
@@ -636,9 +644,57 @@ def test_the_correction_is_dated_in_the_invoices_period_when_open_otherwise_the_
     # the later bridge version supersedes; a period already cleared leaves only the new difference due
     with Session(engine) as db:
         body = bridge.verified_body(bridge.latest(db, env.tenant_id))
-        # residue Feb is now +0.005 (0.004 + 0.001): 2000 must net -0.005, of which -0.004 is already posted
-        assert rounding_verify.due(db, env.tenant_id, body, "2026-02") == Decimal("-0.001")
+        # residue Feb is now +0.005 (0.004 + 0.001): 2000 must net +0.005, of which +0.004 is already posted
+        assert rounding_verify.due(db, env.tenant_id, body, "2026-02") == Decimal("0.001")
     assert sha2 != sha
+
+
+def test_after_the_correction_gl_2000_equals_the_subledger_and_a_not_ready_bridge_cannot_anchor(engine):
+    env = world(engine)
+    version, sha = store(engine, env, ROUND_ITEMS, ROUND_LEGACY)
+    for period in ("2026-01", "2026-02"):
+        request_and_post(engine, env, prepare(engine, env, sha, period).manual_id)
+    # GL(2000) = legacy GL + the corrections; the subledger = legacy GL + (v2 - legacy) of every header item
+    subledger_delta = sum((Decimal(i["v2_amount"]) - Decimal(i["legacy_amount"]) for i in ROUND_ITEMS), Decimal(0))
+    assert ledger_net(engine, env, "2000") == subledger_delta == Decimal("-0.001")
+    assert ledger_net(engine, env, "2000") + ledger_net(engine, env, "6900") == 0
+    # a bridge with a queued item is not ready: it can no longer anchor a correction
+    queued = [*ROUND_ITEMS, item("q1", "queue", "Q", "5000", "2026-01", "3.00", "0")]
+    env2 = world(engine)
+    _, sha2 = store(engine, env2, queued, {**ROUND_LEGACY, ("5000", "2026-01"): "3.00"})
+    with Session(engine) as db:
+        assert (
+            refusal_code(
+                journals.prepare_rounding_correction,
+                db,
+                tenant_id=env2.tenant_id,
+                actor=env2.parties["preparer"],
+                command=journals.RoundingCorrection(sha2, "2026-01", "6900", "E", "d"),
+            )
+            == "rounding_bridge_not_ready"
+        )
+    assert version == 1
+
+
+def test_ias8_is_dated_exactly_in_the_first_fy2026_period_and_refused_when_it_is_not_open(engine):
+    env = world(engine)
+    with Session(engine) as db:  # Jan 2026 closes, Feb opens: a LATER open period is never used
+        accounting.soft_close_period(
+            db,
+            scope=TenantScope(env.tenant_id),
+            period_id=env.periods[1],
+            evidence=PeriodCloseEvidence((CloseCheck("CHECK1", True, "evidence-1", "e" * 64),)),
+            actor_ref="test",
+            approval_reference="close-1",
+            occurred_at=NOW,
+        )
+        journals.open_period(
+            db, tenant_id=env.tenant_id, period_id=env.periods[2], actor=env.parties["approver"], now=NOW
+        )
+        db.commit()
+    with Session(engine) as db, pytest.raises(LedgerRefused) as caught:
+        opening.apply_opening(db, env.tenant_id, opening_inputs(), apply_inputs(env))
+    assert caught.value.code == "ias8_first_period_not_open" and count_journals(engine, env) == 0
 
 
 def test_the_correction_is_dated_in_the_invoices_period_when_that_period_is_open(engine):
@@ -687,9 +743,19 @@ def test_a_missing_rounding_account_is_refused_everywhere(engine):
         "legacy": [{"account": a, "period": p, "net": n} for (a, p), n in ROUND_LEGACY.items()],
         "items": ROUND_ITEMS,
     }
+    raw["items"], itemised_68, import_sha = bind_rounding(ROUND_ITEMS, SHA)
     inputs = bridge.parse_inputs(raw, "3" * 64)
     assert (
-        refusal_code(bridge.compute, inputs, opening_net=None, ias8=[], opening_tb_sha=None, ias8_sha=None)
+        refusal_code(
+            bridge.compute,
+            inputs,
+            opening_net=None,
+            ias8=[],
+            opening_tb_sha=None,
+            ias8_sha=None,
+            import_itemised=itemised_68,
+            import_sha=import_sha,
+        )
         == "rounding_account_required"
     )
     assert count_journals(engine, env) == 0

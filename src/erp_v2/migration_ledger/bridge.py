@@ -6,6 +6,10 @@ Sign convention: net = debit - credit. Per account x period:
     v2 planned = carry + transform(v2 side) + ias8 + rounding
     difference = v2 planned - legacy = sum(transform delta) + ias8 + rounding - queue - gap
 
+A T-ROUND-2DP header line changes the SUBLEDGER only (the GL keeps the legacy journal), so it adds nothing to the GL
+transform delta; it is itemised as ``subledger_delta`` and cleared by the planned ``rounding`` correction, which moves
+the 2000 GL by (subledger - legacy) so that GL(2000) equals the subledger.
+
 There is NO materiality threshold: any non-zero gap, at any magnitude, makes the version not ``ready`` and so
 unsignable. Every legacy journal or document ref appears in exactly one bucket (carry, transform or queue). The
 opening period (``OPENING``) is carried by the posted opening journal and its IAS 8 journals, read from the ledger.
@@ -17,6 +21,8 @@ correction per period against the Finance-named rounding account (a required dec
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -214,6 +220,57 @@ def rounding_residue(inputs: Inputs) -> dict[str, Decimal]:
     return {p: v for p, v in sorted(out.items()) if v != 0}
 
 
+CENT: Final = Decimal("0.01")
+
+
+def verify_rounding_items(inputs: Inputs, import_itemised: dict[str, Any] | None, import_sha: str | None) -> None:
+    """Bound the rounding door onto 2000 (architect finding 2).
+
+    Every T-ROUND-2DP header item must fingerprint-match a header bridge line of the #68 itemised file, and that file
+    must hash to the import receipt's ``itemised_sha256`` and carry the same snapshot as the bridge inputs. Each
+    |delta| < 0.01 and each period's |residue| <= 0.01 x invoice count. Items may only classify what #68 itemised:
+    the ref, the fingerprint and the amounts are all checked, and one #68 line backs one item.
+    """
+    items = [i for i in inputs.items if i.bucket == "transform" and i.rule == ROUND_RULE and i.scope == "header"]
+    if not items:
+        return
+    if import_itemised is None or import_sha is None:
+        refuse("rounding_binding_required", "the #68 itemised file and its receipt sha are required")
+    if canonical_sha(import_itemised) != import_sha:
+        refuse("import_itemised_digest_mismatch")
+    binding = import_itemised.get("binding")
+    if not isinstance(binding, dict) or binding.get("snapshot_sha256") != inputs.snapshot_sha256:
+        refuse("import_itemised_snapshot_mismatch")
+    lines: dict[str, dict[str, Any]] = {}
+    for line in import_itemised.get("bridge_lines") or []:
+        if not isinstance(line, dict) or line.get("rule") != ROUND_RULE or line.get("scope") != "header":
+            continue
+        body = {k: v for k, v in line.items() if k != "fingerprint"}
+        if hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest() != line.get("fingerprint"):
+            refuse("import_itemised_line_fingerprint_invalid")
+        lines[line["fingerprint"]] = line
+    used: set[str] = set()
+    per_period: dict[str, list[Decimal]] = defaultdict(list)
+    for item in items:
+        line = lines.get(item.evidence_sha256)
+        if line is None or item.evidence_sha256 in used or line.get("invoice_id") != item.ref:
+            refuse("rounding_item_forged", "no matching #68 header bridge line")
+        used.add(item.evidence_sha256)
+        try:
+            delta = Decimal(line["delta"])
+        except (KeyError, ArithmeticError):
+            refuse("import_itemised_line_fingerprint_invalid")
+        # #68 amounts are positive invoice totals; the item is the same move in 2000 net terms (a credit).
+        if item.v2 - item.legacy != -delta or -Decimal(line["legacy_amount"]) != item.legacy:
+            refuse("rounding_item_forged", "amounts differ from the #68 line")
+        if abs(delta) >= CENT:
+            refuse("rounding_delta_oversize")
+        per_period[item.period].append(item.v2 - item.legacy)
+    for deltas in per_period.values():
+        if abs(sum(deltas, ZERO)) > CENT * len(deltas):
+            refuse("rounding_residue_oversize")
+
+
 def compute(
     inputs: Inputs,
     *,
@@ -221,12 +278,15 @@ def compute(
     ias8: list[tuple[str, Decimal]],
     opening_tb_sha: str | None,
     ias8_sha: str | None,
+    import_itemised: dict[str, Any] | None = None,
+    import_sha: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The versioned body and the itemised (private) file. Pure.
 
     ``opening_net`` is the posted opening journal's ledger net per account (the OPENING carry), ``ias8`` the posted
     IAS 8 journals' (account, movement) pairs; both are read from the ledger by the caller.
     """
+    verify_rounding_items(inputs, import_itemised, import_sha)
     residue = rounding_residue(inputs)
     if residue and not inputs.rounding_account_code:
         refuse("rounding_account_required", "Finance must name the rounding account")
@@ -234,12 +294,17 @@ def compute(
         refuse("rounding_account_invalid")
     keys = set(inputs.legacy)
     cols: dict[tuple[str, str], dict[str, Decimal]] = defaultdict(
-        lambda: {k: ZERO for k in ("carry", "t_legacy", "t_v2", "queue", "ias8", "rounding")}
+        lambda: {k: ZERO for k in ("carry", "t_legacy", "t_v2", "queue", "ias8", "rounding", "sub_delta")}
     )
     for item in inputs.items:
         c = cols[(item.account, item.period)]
         if item.bucket == "carry":
             c["carry"] += item.legacy
+        elif item.bucket == "transform" and item.rule == ROUND_RULE and item.scope == "header":
+            # a subledger-only transform: the GL keeps the legacy journal, so the GL v2 side does not move
+            c["t_legacy"] += item.legacy
+            c["t_v2"] += item.legacy
+            c["sub_delta"] += item.v2 - item.legacy
         elif item.bucket == "transform":
             c["t_legacy"] += item.legacy
             c["t_v2"] += item.v2
@@ -250,13 +315,16 @@ def compute(
     for code, move in ias8:
         cols[(code, OPENING_PERIOD)]["ias8"] += move
     for period, value in residue.items():
-        cols[(AP_CONTROL, period)]["rounding"] += -value
-        cols[(inputs.rounding_account_code, period)]["rounding"] += value  # type: ignore[index]
+        # the GL must move by (subledger - legacy) to equal the subledger; the offset is the rounding account
+        cols[(AP_CONTROL, period)]["rounding"] += value
+        cols[(inputs.rounding_account_code, period)]["rounding"] += -value  # type: ignore[index]
     keys |= set(cols)
     rows = []
     gap_total = queue_total = ZERO
     for account, period in sorted(keys):
-        c = cols.get((account, period)) or {k: ZERO for k in ("carry", "t_legacy", "t_v2", "queue", "ias8", "rounding")}
+        c = cols.get((account, period)) or {
+            k: ZERO for k in ("carry", "t_legacy", "t_v2", "queue", "ias8", "rounding", "sub_delta")
+        }
         legacy = inputs.legacy.get((account, period), ZERO)
         gap = legacy - (c["carry"] + c["t_legacy"] + c["queue"])
         planned = c["carry"] + c["t_v2"] + c["ias8"] + c["rounding"]
@@ -271,6 +339,7 @@ def compute(
                 "transform_legacy": fmt(c["t_legacy"]),
                 "transform_v2": fmt(c["t_v2"]),
                 "transform_delta": fmt(c["t_v2"] - c["t_legacy"]),
+                "subledger_delta": fmt(c["sub_delta"]),
                 "queue": fmt(c["queue"]),
                 "ias8": fmt(c["ias8"]),
                 "rounding": fmt(c["rounding"]),
@@ -294,6 +363,7 @@ def compute(
             "inputs_sha256": inputs.inputs_sha256,
             "opening_tb_sha256": opening_tb_sha,
             "ias8_sha256": ias8_sha,
+            "import_itemised_sha256": import_sha,
         },
         "rounding_account_code": inputs.rounding_account_code,
         "rounding_residue_by_period": {p: fmt(v) for p, v in residue.items()},

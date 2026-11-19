@@ -70,13 +70,14 @@ def posted_corrections(db: Session, tenant: UUID, period: str, exclude: UUID | N
 
 
 def due(db: Session, tenant: UUID, body: dict[str, Any], period: str, exclude: UUID | None = None) -> Decimal:
-    """The 2000 net the correction for this period must carry: -(residue) minus what is already posted."""
+    """The 2000 net (debit - credit) the correction for this period must carry: the residue (v2 subledger - legacy GL)
+    minus what is already posted, so that GL(2000) equals the subledger."""
     residue = Decimal(body["rounding_residue_by_period"].get(period, "0"))
     ap = account_id_for_code(db, tenant, AP_CONTROL)
     if ap is None:
         refuse("rounding_ap_control_missing")
     posted = sum((_net(db, tenant, j, ap) for j in posted_corrections(db, tenant, period, exclude)), ZERO)
-    return -residue - posted
+    return residue - posted
 
 
 def pending_periods(db: Session, tenant: UUID, body: dict[str, Any]) -> list[str]:
@@ -91,6 +92,8 @@ def load_bridge(db: Session, tenant: UUID, sha: str) -> dict[str, Any]:
     if row is None:
         refuse("rounding_bridge_unknown")
     body = bridge.verified_body(row)
+    if not row.ready or not body.get("ready"):
+        refuse("rounding_bridge_not_ready", "only a ready bridge version anchors a correction")
     latest = bridge.latest(db, tenant)
     if latest is None or latest.sha256 != sha:
         refuse("rounding_bridge_superseded", "only the latest bridge version anchors a correction")

@@ -79,8 +79,19 @@ def _run(args) -> dict[str, Any]:
                 data, inputs_sha = cli.read_bound(args.inputs)
                 inputs = bridge.parse_inputs(strict_json(data, "invalid_bridge_inputs_json"), inputs_sha)
                 opening_net, ias8, tb_sha, ias8_sha = bridge.ledger_inputs(db, tenant)
+                import_body = import_sha = None
+                if args.import_itemised:
+                    data_i, _ = cli.read_bound(args.import_itemised)
+                    import_body = strict_json(data_i, "invalid_import_itemised")
+                    import_sha = sha_text(args.import_itemised_sha256, "invalid_import_itemised_sha256")
                 body, itemised = bridge.compute(
-                    inputs, opening_net=opening_net, ias8=ias8, opening_tb_sha=tb_sha, ias8_sha=ias8_sha
+                    inputs,
+                    opening_net=opening_net,
+                    ias8=ias8,
+                    opening_tb_sha=tb_sha,
+                    ias8_sha=ias8_sha,
+                    import_itemised=import_body,
+                    import_sha=import_sha,
                 )
                 out = {"mode": "build", "applied": False, **_summary(body)}
                 if not args.apply:
@@ -174,6 +185,8 @@ def main(argv=None) -> int:
     parser.add_argument("--operator-ref", required=True)
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--itemised-out", type=Path)
+    parser.add_argument("--import-itemised", type=Path, help="the #68 itemised file (rounding items are bound to it)")
+    parser.add_argument("--import-itemised-sha256", help="the import receipt's itemised_sha256")
     parser.add_argument("--approved-sha256")
     parser.add_argument("--version", type=int)
     parser.add_argument("--expect-sha")

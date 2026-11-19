@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from migration_ledger_support import bind_rounding
 
 from erp_v2.migration_ledger import bridge, opening, register
 from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, strict_json
@@ -143,7 +144,12 @@ def item(item_id, bucket, ref, account, period, legacy, v2, *, rule=None, scope=
     }
 
 
+LAST: dict = {}
+
+
 def bridge_inputs(items, legacy, refs=None, rounding="6900"):
+    items, itemised, import_sha = bind_rounding(items, SHA)
+    LAST.update(itemised=itemised, sha=import_sha)
     raw = {
         "version": 1,
         "snapshot_sha256": SHA,
@@ -157,7 +163,13 @@ def bridge_inputs(items, legacy, refs=None, rounding="6900"):
 
 def compute(inp, **kw):
     return bridge.compute(
-        inp, opening_net=kw.get("opening_net"), ias8=kw.get("ias8", []), opening_tb_sha=None, ias8_sha=None
+        inp,
+        opening_net=kw.get("opening_net"),
+        ias8=kw.get("ias8", []),
+        opening_tb_sha=None,
+        ias8_sha=None,
+        import_itemised=kw.get("import_itemised", LAST.get("itemised")),
+        import_sha=kw.get("import_sha", LAST.get("sha")),
     )[0]
 
 
@@ -239,11 +251,60 @@ def test_rounding_residue_is_summed_per_period_and_planned_against_the_declared_
     body = compute(bridge_inputs(ROUND_ITEMS, ROUND_LEGACY))
     # header deltas (v2 - legacy net): A -0.005, B +0.004 -> Jan -0.001; C +0.004 -> Feb
     assert body["rounding_residue_by_period"] == {"2026-01": "-0.001000", "2026-02": "0.004000"}
-    assert row(body, "2000", "2026-01")["rounding"] == "0.001000"  # the planned correction clears 2000
-    assert row(body, "6900", "2026-01")["rounding"] == "-0.001000"
+    # the GL moves by (subledger - legacy) so that GL(2000) equals the subledger; the offset is the rounding account
+    assert row(body, "2000", "2026-01")["rounding"] == "-0.001000"
+    assert row(body, "6900", "2026-01")["rounding"] == "0.001000"
     ap = row(body, "2000", "2026-01")
-    assert D(ap["transform_delta"]) + D(ap["rounding"]) == 0  # the header delta is cleared, itemised, no tolerance
+    assert ap["transform_delta"] == "0.000000"  # a subledger-only transform does not move the GL v2 side
+    assert ap["subledger_delta"] == "-0.001000" and D(ap["v2_planned"]) - D(ap["legacy"]) == D(ap["subledger_delta"])
     assert body["ready"]  # nothing queued, no gap
+
+
+def bind_keep(items, itemised):
+    """Keep the original (honest) fingerprints on items whose amounts were then altered."""
+    fp = {line["invoice_id"]: line["fingerprint"] for line in itemised["bridge_lines"]}
+    return [{**i, "evidence_sha256": fp[i["ref"]]} if i["rule"] == "T-ROUND-2DP" else i for i in items]
+
+
+def test_a_forged_rounding_item_is_refused():
+    inp = bridge_inputs(ROUND_ITEMS, ROUND_LEGACY)
+    # same #68 file, but an item whose amount (or fingerprint, or ref) the file does not back
+    itemised, sha = dict(LAST["itemised"]), LAST["sha"]
+    items = [{**i, "evidence_sha256": "e" * 64} if i["item_id"] == "r1" else i for i in ROUND_ITEMS]
+    raw = {
+        "version": 1,
+        "snapshot_sha256": SHA,
+        "rounding_account_code": "6900",
+        "universe_refs": ["A", "B", "C"],
+        "legacy": [{"account": a, "period": p, "net": n} for (a, p), n in ROUND_LEGACY.items()],
+        "items": items,
+    }
+    assert (
+        refusal(compute, bridge.parse_inputs(raw, SHA), import_itemised=itemised, import_sha=sha)
+        == "rounding_item_forged"
+    )
+    # an amount altered after binding is also a forgery
+    items = [{**i, "v2_amount": "-100.009"} if i["item_id"] == "r1" else i for i in ROUND_ITEMS]
+    raw["items"] = bind_keep(items, itemised)
+    assert (
+        refusal(compute, bridge.parse_inputs(raw, SHA), import_itemised=itemised, import_sha=sha)
+        == "rounding_item_forged"
+    )
+    # the itemised file is not the one the receipt names
+    assert refusal(compute, inp, import_itemised=itemised, import_sha="0" * 64) == "import_itemised_digest_mismatch"
+    # no itemised file at all
+    assert refusal(compute, inp, import_itemised=None, import_sha=None) == "rounding_binding_required"
+    # another snapshot
+    other = {**itemised, "binding": {"snapshot_sha256": "9" * 64}}
+    assert (
+        refusal(compute, inp, import_itemised=other, import_sha=bridge.canonical_sha(other))
+        == "import_itemised_snapshot_mismatch"
+    )
+
+
+def test_an_oversize_rounding_delta_is_refused():
+    big = [item("r1", "transform", "A", "2000", "2026-01", "-100.00", "-100.01", rule="T-ROUND-2DP", scope="header")]
+    assert refusal(compute, bridge_inputs(big, {("2000", "2026-01"): "-100.00"})) == "rounding_delta_oversize"
 
 
 def test_a_missing_rounding_account_refuses_when_there_is_a_residue():

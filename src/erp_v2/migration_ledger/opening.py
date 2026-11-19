@@ -238,24 +238,34 @@ def _period_for(db: Session, tenant: UUID, on: date):
 
 
 def ias8_date(db: Session, tenant: UUID, as_of: date) -> date:
-    """D-3: the first day of the first OPEN, non-adjustment period that starts after the opening date."""
+    """D-3: exactly the first day of the FIRST period of FY2026 (the first fiscal year starting after the opening).
+    It must be OPEN and not an adjustment period; otherwise refused (never a later period)."""
     from dotmac_accounting.contracts import PeriodStatus
-    from dotmac_accounting.models import FiscalPeriod
+    from dotmac_accounting.models import FiscalPeriod, FiscalYear
 
-    target = db.scalar(
+    year = db.scalar(
+        sa.select(FiscalYear)
+        .where(FiscalYear.tenant_id == tenant, FiscalYear.start_date > as_of)
+        .order_by(FiscalYear.start_date)
+        .limit(1)
+    )
+    if year is None:
+        refuse("ias8_fiscal_year_missing")
+    first = db.scalar(
         sa.select(FiscalPeriod)
         .where(
             FiscalPeriod.tenant_id == tenant,
-            FiscalPeriod.status == PeriodStatus.OPEN,
+            FiscalPeriod.fiscal_year_id == year.id,
             FiscalPeriod.is_adjustment.is_(False),
-            FiscalPeriod.start_date > as_of,
         )
         .order_by(FiscalPeriod.start_date)
         .limit(1)
     )
-    if target is None:
-        refuse("ias8_no_open_period_after_opening")
-    return target.start_date
+    if first is None:
+        refuse("ias8_first_period_missing")
+    if first.status != PeriodStatus.OPEN:
+        refuse("ias8_first_period_not_open")
+    return first.start_date
 
 
 def existing(db: Session, tenant: UUID) -> dict[tuple[str, str], m.OpeningJournal]:
