@@ -29,11 +29,15 @@ import sqlalchemy as sa
 
 from erp_v2.importer.history_cutoff import (
     REFUSAL_REQUIRED,
+    REFUSAL_UNDATED,
+    UNBALANCED_AMOUNTS_SQL,
     HistoryCutoffRefused,
     bind,
+    c_collated,
     exclusion_predicate,
     keys_sha256,
     undated_predicate,
+    unit_refusal_predicate,
 )
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.sub_origin import (
@@ -247,7 +251,17 @@ class TransformReport:
     history_cutoff_source: int | None = None
     history_cutoff_excluded: int = 0
     history_cutoff_excluded_sha256: str | None = None
-    history_cutoff_undated: int = 0
+    history_cutoff_undated: int = 0  # named refusals (history_cutoff_undated), never landed
+    # Journal pairing only: pre-cutoff journals that were NOT posted in legacy, by legacy status (the E16b drafts and
+    # the like); the CLI writes their keys to a mode-600 side file so the register can itemise them.
+    history_cutoff_excluded_by_status: dict[str, int] = field(default_factory=dict)
+    history_cutoff_nonposted_keys: dict[str, list[str]] = field(default_factory=dict)
+    # Post-cutoff journals whose reversal target is a pre-cutoff journal: (journal key, legacy target id). They land as
+    # is with the link empty; evidence only, not an exception.
+    history_cutoff_reversal_targets: list[tuple[str, str]] = field(default_factory=list)
+    # P-5: rows of unbalanced journals refused as a unit (E15); journal pairing lists (key, debit, credit).
+    history_cutoff_unit_refused: int = 0
+    history_cutoff_unit_refused_journals: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
     def refused(self) -> int:
@@ -433,6 +447,16 @@ def execute_transform(
             spec.history_cutoff, spec.source_table, spec.column_map.get("journal_id")
         )
         conditions.append(f"NOT ({cutoff_exclusion})")
+        unit_refusal = unit_refusal_predicate(
+            spec.history_cutoff,
+            spec.source_table,
+            spec.column_map.get("id", ""),
+            spec.column_map.get("journal_id"),
+        )
+        conditions.append(f"NOT ({unit_refusal})")
+        refused_undated = undated_predicate(spec.history_cutoff, spec.source_table, spec.column_map.get("journal_id"))
+        if refused_undated is not None:
+            conditions.append(f"NOT ({refused_undated})")
     where_sub = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     ref = spec.sub_customer_ref
     select_columns = list(source_columns)
@@ -469,6 +493,7 @@ def execute_transform(
     # feeding the destination `id`, else the first mapped column.
     guards = _fk_guards(destination_connection, spec, dest_columns) if not dry_run else ()
     key_source = spec.column_map.get("id", source_columns[0])
+    excluded_journal_keys: set[str] = set()
     if cutoff_exclusion is not None and history_cutoff is not None:
         # Excluded rows are never silent: counted, with a digest of their keys (legacy journal ids for the journal
         # pairing), so legacy = landed + excluded-by-cutoff + refused is provable, and the closed years are known to
@@ -477,10 +502,13 @@ def execute_transform(
         report.history_cutoff_source = (
             source_connection.execute(sa.text(f"SELECT count(*) FROM {spec.source_table}")).scalar() or 0  # noqa: S608
         )
+        is_journal = spec.history_cutoff == "journal"
+        key_expr = f"{spec.source_table}.{key_source}"
+        status_col = f", {spec.source_table}.status" if is_journal else ""
         excluded = source_connection.execute(
             bind(
-                f"SELECT {spec.source_table}.{key_source} FROM {spec.source_table} "  # noqa: S608
-                f"WHERE {cutoff_exclusion} ORDER BY CAST({spec.source_table}.{key_source} AS TEXT)",
+                f"SELECT {key_expr}{status_col} FROM {spec.source_table} "  # noqa: S608
+                f"WHERE {cutoff_exclusion} ORDER BY {c_collated(source_connection, f'CAST({key_expr} AS TEXT)')}",
                 history_cutoff,
             ),
             execution_options={"stream_results": True, "yield_per": 5000},
@@ -491,16 +519,46 @@ def execute_transform(
             nonlocal count
             for row in excluded:
                 count += 1
-                yield str(row[0])
+                key = str(row[0])
+                if is_journal:
+                    excluded_journal_keys.add(key)
+                    status = str(row[1] or "").upper()
+                    report.history_cutoff_excluded_by_status[status] = (
+                        report.history_cutoff_excluded_by_status.get(status, 0) + 1
+                    )
+                    if status != "POSTED":
+                        report.history_cutoff_nonposted_keys.setdefault(status, []).append(key)
+                yield key
 
         report.history_cutoff_excluded_sha256 = keys_sha256(_counted_keys())
         report.history_cutoff_excluded = count
-        undated = undated_predicate(spec.history_cutoff or "", spec.source_table)
+        report.history_cutoff_unit_refused = (
+            source_connection.execute(
+                bind(
+                    f"SELECT count(*) FROM {spec.source_table} "  # noqa: S608
+                    f"WHERE NOT ({cutoff_exclusion}) AND {unit_refusal}",
+                    history_cutoff,
+                )
+            ).scalar()
+            or 0
+        )
+        if is_journal and report.history_cutoff_unit_refused:
+            for jid, debit, credit in source_connection.execute(
+                bind(
+                    f"SELECT {key_expr}, a.d, a.c FROM {spec.source_table} "  # noqa: S608
+                    f"JOIN ({UNBALANCED_AMOUNTS_SQL}) a ON a.k = {key_expr} WHERE NOT ({cutoff_exclusion})",
+                    history_cutoff,
+                )
+            ):
+                report.history_cutoff_unit_refused_journals.append((str(jid), format(debit, "f"), format(credit, "f")))
+            report.history_cutoff_unit_refused_journals.sort()
+        undated = undated_predicate(spec.history_cutoff or "", spec.source_table, spec.column_map.get("journal_id"))
         if undated is not None:
-            report.history_cutoff_undated = (
-                source_connection.execute(sa.text(f"SELECT count(*) FROM {spec.source_table} WHERE {undated}")).scalar()  # noqa: S608
-                or 0
-            )
+            for row in source_connection.execute(
+                sa.text(f"SELECT {key_expr} FROM {spec.source_table} WHERE {undated}")  # noqa: S608
+            ):
+                report.history_cutoff_undated += 1
+                report.exceptions.append(RowException(spec.source_table, str(row[0]), "posting_date", REFUSAL_UNDATED))
     if exclude_sub:
         # Excluded rows are never silent: counted, with sorted keys, so
         # the census (source = imported + excluded + refused) reconciles.
@@ -706,6 +764,15 @@ def execute_transform(
             deferred_values = {c: params.pop(c) for c in spec.deferred if params.get(c) is not None}
             for c in spec.deferred:
                 params.pop(c, None)
+            if (
+                spec.history_cutoff == "journal"
+                and str(deferred_values.get("reverses_journal_id")) in excluded_journal_keys
+            ):
+                # B-13: the reversal target is a pre-cutoff journal (in the opening, not in v2). Land as is with the
+                # link empty; the legacy target id is census evidence, not an exception.
+                report.history_cutoff_reversal_targets.append(
+                    (str(row[key_source]), str(deferred_values.pop("reverses_journal_id")))
+                )
             if deferred_values:
                 deferred_updates.append((str(row[key_source]), params.get("id"), deferred_values))
             batch.append((str(row[key_source]), params))

@@ -761,19 +761,53 @@ def _history_cutoff(args: argparse.Namespace, executable, source_engine: sa.Engi
     except HistoryCutoffRefused as exc:
         raise CliRefusal(f"{exc.code}: {HISTORY_CUTOFF_HINT}; nothing written") from exc
     straddling = 0
-    if {"mod_accounting.journal_entries", "mod_accounting.posted_ledger_lines"} <= set(needing):
-        try:
-            with source_engine.connect() as conn:
-                _set_search_path(conn, schemas)
-                straddling = straddling_journals(conn, cutoff)
-        except HistoryCutoffRefused as exc:
-            raise CliRefusal(f"{exc.code}: the straddle census could not be read; nothing written") from exc
+    # Whenever ANY cutoff pairing runs (a lines-only or ledger-only batch can split a journal just as well).
+    try:
+        with source_engine.connect() as conn:
+            _set_search_path(conn, schemas)
+            straddling = straddling_journals(conn, cutoff)
+    except HistoryCutoffRefused as exc:
+        raise CliRefusal(f"{exc.code}: the straddle census could not be read; nothing written") from exc
     if straddling:
         raise CliRefusal(
             f"{REFUSAL_STRADDLE}: {straddling} legacy journals have ledger lines on both sides of {cutoff} (or a "
             "date that disagrees with them); a journal cannot land half of itself; nothing written"
         )
     return cutoff, {"history_cutoff": cutoff.isoformat(), "applies_to": sorted(needing), "straddling_journals": 0}
+
+
+def _history_cutoff_side_file(reports, receipt_path: Path) -> str | None:
+    """Mode-600 side file for the register (B-9r loads it): the pre-cutoff NON-posted journal keys split by legacy
+    status (E16b), the unbalanced journals refused as a unit (E15, key and amounts), the post-cutoff reversals whose
+    target is pre-cutoff (``reversal_target_before_cutoff``, info) and any undated refusals. The sha256 of the file
+    is in the receipt. Returns None when no cutoff pairing ran."""
+
+    import hashlib
+
+    body: dict[str, list[str]] = {}
+    ran = False
+    for r in reports:
+        if r.history_cutoff is None:
+            continue
+        ran = True
+        for status, keys in r.history_cutoff_nonposted_keys.items():
+            body[f"pre_cutoff_journal_{status.lower() or 'unknown'}"] = list(keys)
+        if r.history_cutoff_unit_refused_journals:
+            body["E15_unbalanced_journal_unit"] = [
+                f"{j}|debit={d}|credit={c}" for j, d, c in r.history_cutoff_unit_refused_journals
+            ]
+        if r.history_cutoff_reversal_targets:
+            body["reversal_target_before_cutoff"] = [
+                f"{j}|legacy_target={t}" for j, t in r.history_cutoff_reversal_targets
+            ]
+        undated = [e.source_key for e in r.exceptions if e.reason == "history_cutoff_undated"]
+        if undated:
+            body[f"undated_{r.destination_table.rpartition('.')[2]}"] = undated
+    if not ran:
+        return None
+    path = receipt_path.with_name(receipt_path.name + ".history_cutoff.json")
+    write_side_file(path, body)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def cmd_execute(args: argparse.Namespace) -> int:
@@ -885,6 +919,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             dest_conn.rollback()
     transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
     transforms_section, transforms_incomplete = _transforms_receipt(enrolment, Path(args.receipt))
+    cutoff_side_sha = _history_cutoff_side_file(result.reports, Path(args.receipt))
     sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports, Path(args.receipt))
     complete = (
         result.complete
@@ -916,15 +951,24 @@ def cmd_execute(args: argparse.Namespace) -> int:
             for e in (*result.exceptions, *transition_exceptions)
         ],
         "sub_origin": sub_origin,
-        "history_cutoff": {
+        # Top level, an ISO date or null: B-9r requires it and refuses a mismatch with the opening as-of date.
+        "history_cutoff": cutoff_section.get("history_cutoff"),
+        "history_cutoff_census": {
             **cutoff_section,
+            "side_file_sha256": cutoff_side_sha,
             "censuses": [
                 {
                     "destination_table": r.destination_table,
                     "source_rows": r.history_cutoff_source,
                     "excluded_on_or_before_cutoff": r.history_cutoff_excluded,
                     "excluded_keys_sha256": r.history_cutoff_excluded_sha256,
-                    "undated_landed": r.history_cutoff_undated,
+                    "excluded_by_legacy_status": dict(sorted(r.history_cutoff_excluded_by_status.items())),
+                    "undated_refused": r.history_cutoff_undated,
+                    "unbalanced_unit_refused_rows": r.history_cutoff_unit_refused,
+                    "unbalanced_unit_refused_journals": [
+                        {"journal": j, "debit": d, "credit": c} for j, d, c in r.history_cutoff_unit_refused_journals
+                    ],
+                    "reversal_target_before_cutoff": len(r.history_cutoff_reversal_targets),
                     "read": r.read,
                     "refused": r.refused,
                 }

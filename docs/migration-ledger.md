@@ -125,13 +125,29 @@ pre-cutoff document keeps its legacy journal id as evidence in the retained snap
 rewritten. PG test: `tests/test_importer_history_cutoff_pg.py` (v2 holds no legacy-owner line on or before the cutoff;
 opening + post-cutoff journals = the legacy TB at cutoff + 1 day).
 
-### P-5: the 3 sub-kobo journals (finding only; no importer change)
+### P-5: the sub-kobo (unbalanced) journals
 
-Read from code, then pinned by `test_p5_a_sub_kobo_unbalanced_journal_copies_its_ledger_lines...` (PG). The destination money columns are `NUMERIC(20,6)`, so the 0.000001 imbalance is stored as legacy
-recorded it. The importer inserts journals as DRAFT, then their journal lines and posted ledger lines (row-level
-checks only: one side per line); only the DRAFT to POSTED transition runs the balanced-evidence trigger
-(`ledger_debit <> ledger_credit` refuses it). So the ledger lines of the 3 journals DO copy, at their legacy amounts;
-the journals stay DRAFT and surface as named `status` exceptions from the transitions step (receipt `complete` is
-false). The plan's fallback (H-GL on the rounding account) is conditional on the ledger NOT copying, so it is not
-implemented. The open point is the DRAFT journals carrying posted ledger lines (they count in the v2 ledger, the bridge
-sees no gap, the transition exceptions remain), to be ruled on with the architect.
+Ruling: each journal whose posted ledger lines do not balance (the 3 sub-kobo journals, 0.000001) is refused as a UNIT
+(journal, journal lines, ledger lines): nothing of it lands. Landing it would leave a DRAFT carrying ledger lines (the
+owner trigger forbids posting it and forbids voiding it). It is not a row exception, so F2 does not exit incomplete: it
+is itemised (key, debit, credit) in the receipt's `history_cutoff_census` and in the side file under
+`E15_unbalanced_journal_unit`, for the E15 register item. Its 2-dp effect and the 6-dp residue go through the rounding
+path (B-9r). If such a journal were dated on or before the cutoff, the opening would refuse `opening_tb_not_zero_sum`.
+
+### Receipt and side file
+
+* `history_cutoff` (top level of the execute receipt): the ISO date or null. B-9r requires it and refuses a mismatch with
+  the opening as-of date.
+* `history_cutoff_census`: per pairing, source rows, excluded count, `excluded_keys_sha256` (keys ordered byte-wise,
+  `COLLATE "C"`), excluded by legacy status, undated refusals, unbalanced-unit counts, reversal-target count.
+* `<receipt>.history_cutoff.json` (mode 600, sha256 in `history_cutoff_census.side_file_sha256`): pre-cutoff
+  non-posted journal keys split by legacy status (`pre_cutoff_journal_draft`, ... for E16b), `E15_unbalanced_journal_unit`,
+  `reversal_target_before_cutoff` (post-cutoff reversals whose legacy target is pre-cutoff: they land as is, link empty,
+  info register rows, not counted against completeness) and `undated_*`.
+* Undated rows (no `posting_date`/`entry_date`) are named row refusals `history_cutoff_undated`;
+  `legacy_ledger.recompute` refuses a NULL-dated ledger line instead of omitting it.
+* The straddle census runs whenever any cutoff pairing runs; a straddling journal refuses the run (no treatment yet).
+* AP verifiers: a journal the cutoff excluded is proven on the snapshot (same predicate, the receipt cutoff carried in the
+  transform manifest binding as `history_cutoff`, all ledger lines on or before it) and asserted ABSENT in v2.
+* A transform manifest with no `import.unposted_wht` in its binding is a pre-B-13 manifest: `remove` is the only legal
+  default (the binding is under the manifest sha256).

@@ -57,6 +57,10 @@ def recompute(
     legacy: sa.Connection, db: Session, tenant: UUID, *, opening_as_of: date | None
 ) -> tuple[dict[tuple[str, str], Decimal], frozenset[str]]:
     codes = account_codes(db, tenant)
+    undated = legacy.execute(sa.text("SELECT count(*) FROM gl.posted_ledger_line WHERE posting_date IS NULL")).scalar()
+    if undated:
+        # An undated ledger line would be omitted from BOTH the opening and the post-cutoff TB by the date filters.
+        refuse("legacy_ledger_line_undated", f"{undated} legacy ledger lines carry no posting_date")
     after = opening_as_of or date.min
     rows = legacy.execute(
         sa.text(

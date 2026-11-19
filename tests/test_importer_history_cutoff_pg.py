@@ -71,7 +71,7 @@ def legacy(engine):
         c.exec_driver_sql("DROP SCHEMA gl CASCADE")
 
 
-def post_legacy(engine, env, jid, day, lines, *, number, status="POSTED", ledger=True):
+def post_legacy(engine, env, jid, day, lines, *, number, status="POSTED", ledger=True, reverses=None):
     """One legacy journal: lines (account code, debit, credit); posted journals also carry posted ledger lines."""
     total = sum(Decimal(d) for _, d, _ in lines)
     period = env.periods[1]
@@ -79,9 +79,19 @@ def post_legacy(engine, env, jid, day, lines, *, number, status="POSTED", ledger
         c.execute(
             sa.text(
                 "INSERT INTO gl.journal_entry VALUES (:j, :o, :p, :n, 'STANDARD', :s, :d, :d, :n, 'NGN', 1, :t, :t, :t, :t, "
-                "'JOURNAL', :j, 'legacy-user', :at, NULL, NULL, NULL, NULL)"
+                "'JOURNAL', :j, 'legacy-user', :at, :rv, NULL, NULL, NULL)"
             ),
-            {"j": jid, "o": env.tenant_id, "p": period, "n": number, "s": status, "d": day, "t": total, "at": NOW},
+            {
+                "j": jid,
+                "o": env.tenant_id,
+                "p": period,
+                "n": number,
+                "s": status,
+                "d": day,
+                "t": total,
+                "at": NOW,
+                "rv": reverses,
+            },
         )
         for n, (code, debit, credit) in enumerate(lines, 1):
             line_id = uuid4()
@@ -134,7 +144,11 @@ def seed_legacy(engine, env):
         ("j6", NEXT_DAY, [("2000", "100", "0"), ("1000", "0", "100")], {}),
         ("j7", date(2026, 1, 15), [("1000", "9", "0"), ("4000", "0", "9")], {}),
         ("jd_new", date(2026, 1, 20), [("1000", "3", "0"), ("2000", "0", "3")], {"status": "DRAFT", "ledger": False}),
+        # a post-cutoff reversal of a pre-cutoff journal (a routine 1-Jan accrual reversal)
+        ("j8", date(2026, 1, 12), [("4000", "600", "0"), ("1000", "0", "600")], {"reverses": "j1"}),
     ):
+        if kwargs.get("reverses"):
+            kwargs = {**kwargs, "reverses": ids[kwargs["reverses"]]}
         ids[key] = uuid4()
         post_legacy(engine, env, ids[key], day, lines, number=f"JE-{key}", **kwargs)
     return ids
@@ -275,14 +289,14 @@ def test_v2_has_no_legacy_owner_lines_on_or_before_the_cutoff_and_the_opening_pl
         )
     assert pre_ledger == 0 and pre_lines == 0
     # exactly the post-cutoff legacy journals landed, including the held post-cutoff draft; no pre-cutoff draft did
-    assert landed == {str(ids[k]) for k in ("j5", "j6", "j7", "jd_new")}
+    assert landed == {str(ids[k]) for k in ("j5", "j6", "j7", "j8", "jd_new")}
 
     # 2. the receipt census: the excluded pre-cutoff journals are counted with their legacy ids as evidence
     census = {r.destination_table: r for r in receipt.reports}
     journals = census["mod_accounting.journal_entries"]
     assert (
         journals.history_cutoff == "2025-12-31"
-        and journals.history_cutoff_source == 10
+        and journals.history_cutoff_source == 11
         and journals.history_cutoff_excluded == 6
     )
     assert journals.history_cutoff_excluded_sha256 == history_cutoff.keys_sha256(
@@ -290,13 +304,19 @@ def test_v2_has_no_legacy_owner_lines_on_or_before_the_cutoff_and_the_opening_pl
     )
     ledger = census["mod_accounting.posted_ledger_lines"]
     assert (ledger.history_cutoff_source, ledger.history_cutoff_excluded, ledger.written) == (
-        16,
+        18,
         10,
-        6,
+        8,
     )  # 5 closed journals x 2 lines
     lines = census["mod_accounting.journal_lines"]
-    assert lines.history_cutoff_excluded == 12 and lines.written == 8  # the closed draft's two lines are excluded too
-    assert journals.read == journals.written == 4
+    assert lines.history_cutoff_excluded == 12 and lines.written == 10  # the closed draft's two lines are excluded too
+    assert journals.read == journals.written == 5
+    assert journals.history_cutoff_excluded_by_status == {"POSTED": 5, "DRAFT": 1}
+    assert journals.history_cutoff_nonposted_keys == {"DRAFT": [str(ids["jd_old"])]}  # E16b itemised, not just counted
+    # a post-cutoff reversal of a pre-cutoff journal lands as is, link empty, target kept as evidence, NOT an exception
+    assert journals.history_cutoff_reversal_targets == [(str(ids["j8"]), str(ids["j1"]))]
+    with Session(engine) as db:
+        assert db.scalar(sa.select(JournalEntry.reverses_journal_id).where(JournalEntry.id == ids["j8"])) is None
 
     # 3. the B-9 opening carries the closed years, and opening + post-cutoff journals = the legacy TB at cutoff + 1
     out, _tb = post_opening_from_legacy(engine, env)
@@ -343,24 +363,56 @@ def test_a_journal_straddling_the_cutoff_is_refused_before_any_write(engine, leg
     assert str(exc.value).startswith(history_cutoff.REFUSAL_STRADDLE) and "nothing written" in str(exc.value)
 
 
-def test_p5_a_sub_kobo_unbalanced_journal_copies_its_ledger_lines_and_stays_draft_with_a_named_transition_exception(
-    engine, legacy
-):
-    """P-5 finding: the ledger lines of a 0.000001-unbalanced legacy journal DO copy (NUMERIC(20,6) keeps the amounts,
-    only the DRAFT -> POSTED trigger checks balance), so the plan's H-GL fallback (for a ledger that does NOT copy)
-    does not apply; the journal itself stays DRAFT and is named."""
+def test_p5_a_sub_kobo_unbalanced_journal_is_refused_as_a_unit_e15_and_the_run_stays_complete(engine, legacy, tmp_path):
+    """P-5: an unbalanced journal (here 0.000001) is refused as a UNIT (journal, lines, ledger lines): nothing of it
+    lands, it is itemised with its amounts for the E15 register item, and it is NOT a row exception, so F2 is not
+    incomplete because of it. (Before this ruling the ledger lines copied and the journal stayed a DRAFT dead end.)"""
     env = world(engine)
     jid = uuid4()
     post_legacy(engine, env, jid, NEXT_DAY, [("1000", "10.000001", "0"), ("2000", "0", "10")], number="JE-subkobo")
     specs = journal_specs(engine)
     receipt, transitions = run_importer(engine, env, specs, CUTOFF)
-    ledger = {r.destination_table: r for r in receipt.reports}["mod_accounting.posted_ledger_lines"]
-    assert ledger.written == 2 and ledger.read == 2  # both ledger lines copied at their legacy amounts
-    assert v2_net_by_code(engine, env, through=NEXT_DAY, owner=OWNER) == {
-        "1000": Decimal("10.000001"),
-        "2000": Decimal("-10"),
-    }
-    with Session(engine) as db:
-        assert db.scalar(sa.select(JournalEntry.status).where(JournalEntry.id == jid)) == "DRAFT"
-    journal_outcome = next(t for t in transitions if t.destination_table == "mod_accounting.journal_entries")
-    assert [e.source_key for e in journal_outcome.exceptions] == [str(jid)]
+    census = {r.destination_table: r for r in receipt.reports}
+    assert receipt.complete and all(not t.exceptions for t in transitions)
+    assert all(r.written == 0 for r in receipt.reports)
+    assert v2_net_by_code(engine, env, through=NEXT_DAY, owner=OWNER) == {}
+    journals = census["mod_accounting.journal_entries"]
+    assert journals.history_cutoff_unit_refused_journals == [(str(jid), "10.000001", "10")]
+    assert census["mod_accounting.journal_lines"].history_cutoff_unit_refused == 2
+    assert census["mod_accounting.posted_ledger_lines"].history_cutoff_unit_refused == 2
+    receipt_path = tmp_path / "receipt.json"
+    side = cli._history_cutoff_side_file(receipt.reports, receipt_path)
+    side_path = tmp_path / "receipt.json.history_cutoff.json"
+    assert str(jid) in side_path.read_text() and "E15_unbalanced_journal_unit" in side_path.read_text()
+    assert len(side) == 64 and (side_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_recompute_refuses_a_null_dated_legacy_ledger_line_instead_of_omitting_it(engine, legacy):
+    env = world(engine)
+    post_legacy(engine, env, uuid4(), NEXT_DAY, [("1000", "10", "0"), ("2000", "0", "10")], number="JE-x")
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "UPDATE gl.posted_ledger_line SET posting_date = NULL WHERE ctid = (SELECT min(ctid) FROM gl.posted_ledger_line)"
+            )
+        )
+    with engine.connect() as legacy_conn, Session(engine) as db:
+        with pytest.raises(Exception, match="legacy_ledger_line_undated"):
+            legacy_ledger.recompute(legacy_conn, db, env.tenant_id, opening_as_of=CUTOFF)
+
+
+def test_the_straddle_census_runs_for_a_lines_only_batch_too(engine, legacy):
+    env = world(engine)
+    jid = uuid4()
+    post_legacy(engine, env, jid, NEXT_DAY, [("1000", "10", "0"), ("2000", "0", "10")], number="JE-straddle2")
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "UPDATE gl.posted_ledger_line SET posting_date = :d WHERE ctid = (SELECT min(ctid) FROM gl.posted_ledger_line)"
+            ),
+            {"d": CUTOFF},
+        )
+    lines_only = tuple(s for s in journal_specs(engine) if s.destination_table == "mod_accounting.journal_lines")
+    with pytest.raises(cli.CliRefusal) as exc:
+        cli._history_cutoff(type("A", (), {"history_cutoff": "2025-12-31"})(), lines_only, engine, ["gl"])
+    assert str(exc.value).startswith(history_cutoff.REFUSAL_STRADDLE)

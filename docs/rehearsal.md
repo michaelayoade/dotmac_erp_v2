@@ -71,11 +71,11 @@ store). Exit codes: 0 ok, 2 refusal (named), 3 incomplete receipt.
    `--history-cutoff` (B-13) is REQUIRED whenever the journal pairings run: the run refuses before touching either
    database without it. Legacy journals, journal lines and posted ledger lines dated on or before it are not
    imported (closed years arrive only through the B-9 opening journal, so importing them too would count every
-   closed-year line twice). The receipt's `history_cutoff` section carries, per pairing, the source count, the
-   excluded count and a sha256 over the excluded legacy keys (the legacy journal ids for the journal pairing), plus the
-   undated rows that landed. A legacy journal whose ledger lines straddle the cutoff refuses the run
+   closed-year line twice). The receipt carries `history_cutoff` (ISO date) and `history_cutoff_census` (per pairing: source and excluded
+   counts, a sha256 over the excluded legacy keys, status split, unit refusals) with a mode-600 side file; undated rows are
+   named refusals. A legacy journal whose ledger lines straddle the cutoff refuses the run
    (`history_cutoff_straddling_journals`). A post-cutoff journal whose reversal link points at a pre-cutoff journal
-   is a named deferred-update exception, never silent. `import.unposted_wht` (`--import-params-json`, default `queue`)
+   lands as is with the link empty (target kept in the census and side file). `import.unposted_wht` (`--import-params-json`, default `queue`)
    decides what happens to an unposted supplier invoice with a WHT line: `queue` does not land it (class E04, reason
    `unposted_wht_line`), `remove` is the old D-M2 WHT removal.
 

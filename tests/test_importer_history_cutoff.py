@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+from decimal import Decimal
 
 import pytest
 import sqlalchemy as sa
@@ -49,9 +50,9 @@ def ledger_spec():
     return build_spec(
         source_table="posted_ledger_line",
         destination_table="posted_ledger_lines",
-        source_columns=("ledger_line_id", "journal_entry_id", "posting_date", "debit"),
+        source_columns=("ledger_line_id", "journal_entry_id", "posting_date", "debit_amount", "credit_amount"),
         destination_columns=(col("id"), col("journal_id"), col("posting_date"), col("debit")),
-        renames={"journal_id": "journal_entry_id"},
+        renames={"journal_id": "journal_entry_id", "debit": "debit_amount"},
         history_cutoff=hc.KIND_LEDGER_LINE,
     )
 
@@ -67,7 +68,7 @@ def seed_source(engine):
         c.execute(
             sa.text(
                 "CREATE TABLE posted_ledger_line "
-                "(ledger_line_id TEXT, journal_entry_id TEXT, posting_date TEXT, debit TEXT)"
+                "(ledger_line_id TEXT, journal_entry_id TEXT, posting_date TEXT, debit_amount TEXT, credit_amount TEXT)"
             )
         )
         for jid, posting, entry in (
@@ -80,10 +81,20 @@ def seed_source(engine):
                 sa.text("INSERT INTO journal_entry VALUES (:j, :p, :e, 'POSTED')"), {"j": jid, "p": posting, "e": entry}
             )
             c.execute(sa.text("INSERT INTO journal_entry_line VALUES (:l, :j, '1')"), {"l": "l-" + jid, "j": jid})
-            c.execute(
-                sa.text("INSERT INTO posted_ledger_line VALUES (:l, :j, :p, '1')"),
-                {"l": "pl-" + jid, "j": jid, "p": posting or entry},
-            )
+            for side, debit, credit in (("d", "1", "0"), ("c", "0", "1")):
+                c.execute(
+                    sa.text("INSERT INTO posted_ledger_line VALUES (:l, :j, :p, :d, :c)"),
+                    {"l": f"pl-{jid}-{side}", "j": jid, "p": posting or entry, "d": debit, "c": credit},
+                )
+        # P-5: an unbalanced journal after the cutoff (6-dp residue), refused as a unit
+        c.execute(sa.text("INSERT INTO journal_entry VALUES ('j-unb', '2026-02-01', '2026-02-01', 'POSTED')"))
+        c.execute(sa.text("INSERT INTO journal_entry_line VALUES ('l-j-unb', 'j-unb', '1')"))
+        c.execute(
+            sa.text("INSERT INTO posted_ledger_line VALUES ('pl-j-unb-d', 'j-unb', '2026-02-01', '1.000001', '0')")
+        )
+        c.execute(sa.text("INSERT INTO posted_ledger_line VALUES ('pl-j-unb-c', 'j-unb', '2026-02-01', '0', '1')"))
+        # a pre-cutoff DRAFT journal: excluded, and itemised by legacy status
+        c.execute(sa.text("INSERT INTO journal_entry VALUES ('j-draft', '2025-02-02', '2025-02-02', 'DRAFT')"))
         # an orphan line (no parent journal row) is never silently dropped by the cutoff
         c.execute(sa.text("INSERT INTO journal_entry_line VALUES ('l-orphan', 'j-missing', '1')"))
 
@@ -121,27 +132,34 @@ def test_journals_on_or_before_the_cutoff_are_not_landed_and_are_counted_with_a_
     report, landed = run(
         journal_spec(), "journal_entries", ["id", "posting_date", "entry_date", "status"], history_cutoff=CUTOFF
     )
-    assert landed == ["j-new", "j-undated"]  # the undated journal is not provably pre-cutoff
-    assert report.history_cutoff == "2025-12-31" and report.history_cutoff_source == 4
-    assert report.history_cutoff_excluded == 2 and report.history_cutoff_undated == 1
-    assert report.history_cutoff_excluded_sha256 == hc.keys_sha256(["j-old", "j-older"])  # ordered by key text
-    assert report.read == 2 and report.written == 2 and report.complete
+    assert landed == ["j-new"]  # the undated journal is a named refusal, the unbalanced one a unit refusal
+    assert report.history_cutoff == "2025-12-31" and report.history_cutoff_source == 6
+    assert report.history_cutoff_excluded == 3 and report.history_cutoff_undated == 1
+    assert report.history_cutoff_excluded_sha256 == hc.keys_sha256(["j-draft", "j-old", "j-older"])  # key order
+    assert report.history_cutoff_excluded_by_status == {"POSTED": 2, "DRAFT": 1}
+    assert report.history_cutoff_nonposted_keys == {"DRAFT": ["j-draft"]}
+    ((unit, debit, credit),) = report.history_cutoff_unit_refused_journals
+    assert (unit, Decimal(debit), Decimal(credit)) == ("j-unb", Decimal("1.000001"), Decimal(1))
+    assert [(e.source_key, e.reason) for e in report.exceptions] == [("j-undated", hc.REFUSAL_UNDATED)]
+    assert report.read == 1 and report.written == 1 and not report.complete
 
 
 def test_journal_lines_follow_their_parent_and_an_orphan_line_is_never_silently_dropped():
     report, landed = run(line_spec(), "journal_lines", ["id", "journal_id", "debit"], history_cutoff=CUTOFF)
     # the orphan line is read; it fails only if the destination refuses it, it is not excluded by the cutoff
-    assert landed == ["l-j-new", "l-j-undated", "l-orphan"]
-    assert report.history_cutoff_excluded == 2
+    assert landed == ["l-j-new", "l-orphan"]  # the undated parent's line is refused; j-unb's line is a unit refusal
+    assert report.history_cutoff_excluded == 2 and report.history_cutoff_undated == 1
+    assert report.history_cutoff_unit_refused == 1
 
 
 def test_ledger_lines_are_filtered_on_their_own_posting_date():
     report, landed = run(
         ledger_spec(), "posted_ledger_lines", ["id", "journal_id", "posting_date", "debit"], history_cutoff=CUTOFF
     )
-    # the undated journal's line carries no posting_date: not provably pre-cutoff, so it lands and is counted
-    assert landed == ["pl-j-new", "pl-j-undated"]
-    assert report.history_cutoff_excluded == 2 and report.history_cutoff_undated == 1
+    # undated ledger lines are named refusals; the unbalanced journal's lines are a unit refusal
+    assert landed == ["pl-j-new-c", "pl-j-new-d"]
+    assert report.history_cutoff_excluded == 4 and report.history_cutoff_undated == 2
+    assert report.history_cutoff_unit_refused == 2
 
 
 def test_the_cutoff_is_a_bound_parameter_not_sql_text():
@@ -151,7 +169,7 @@ def test_the_cutoff_is_a_bound_parameter_not_sql_text():
         ["id", "posting_date", "entry_date", "status"],
         history_cutoff=date(2026, 1, 1),
     )
-    assert landed == ["j-undated"]
+    assert landed == ["j-unb"] or landed == []  # the unbalanced journal is a unit refusal
     assert "2026" not in hc.exclusion_predicate(hc.KIND_JOURNAL, "journal_entry", None)
 
 
