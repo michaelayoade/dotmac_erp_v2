@@ -56,12 +56,18 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
 - residue (14): bank_category, bank_code, categorization_status, check_number, matched_by, notes, payee_payer, raw_data, running_balance, suggested_account_id, suggested_confidence, suggested_match_reason, suggested_rule_id, transaction_id
 
 ## public.supplier_invoice -> mod_payables.supplier_invoices
-- executable: True; mapped: 18; missing: none
-- residue (30): amount_paid, approval_request_id, approved_by_user_id, auto_create_inventory_receipt, balance_due, comments, correlation_id, created_by_user_id, due_date, exchange_rate_type_id, functional_currency_amount, intercompany_org_id, inventory_receipt_mode, invoice_type, is_intercompany, is_prepayment, journal_entry_id, posted_at, posted_by_user_id, posting_batch_id, posting_status, prepayment_applied, purpose, stamp_duty_amount ...
+- executable: True; mapped: 15; missing: none
+- residue (33): amount_paid, approval_request_id, approved_by_user_id, auto_create_inventory_receipt, balance_due, comments, correlation_id, created_by_user_id, due_date, exchange_rate_type_id, functional_currency_amount, intercompany_org_id, inventory_receipt_mode, invoice_type, is_intercompany, is_prepayment, journal_entry_id, posted_at, posted_by_user_id, posting_batch_id, posting_status, prepayment_applied, purpose, stamp_duty_amount ...
+- B-3: `subtotal`, `tax_amount` and `total_amount` land through the `supplier_invoice_transforms` lookup map (the
+  legacy value unchanged unless a ruled transform applies; see "Importer transforms (B-3)" below), so the three
+  source columns are consumed by that map and appear in the residue count above (they are not dropped).
 
 ## public.supplier_invoice_line -> mod_payables.supplier_invoice_lines
-- executable: True; mapped: 11; missing: none
-- residue (15): asset_account_id, asset_category_id, auto_receipt_transaction_id, capitalize_flag, cost_center_id, created_asset_id, goods_receipt_line_id, item_id, po_line_id, project_id, receipt_auto_generate_serials, receipt_reference, receipt_serial_numbers, receipt_warehouse_id, segment_id
+- executable: True; mapped: 8; missing: none
+- residue (18): asset_account_id, asset_category_id, auto_receipt_transaction_id, capitalize_flag, cost_center_id, created_asset_id, expense_account_id, goods_receipt_line_id, item_id, line_amount, po_line_id, project_id, receipt_auto_generate_serials, receipt_reference, receipt_serial_numbers, receipt_warehouse_id, segment_id, tax_amount
+- B-3: `posting_account_ref`, `tax_account_ref`, `line_amount` and `tax_amount` land through the
+  `supplier_line_transforms` lookup map (`expense_account_id`, `line_amount` and `tax_amount` are consumed by it);
+  `item_id` is provenance carried in the `T-ITEM-NONSTOCK` bridge line.
 
 `tax_account_ref` is derived from `tax_code_id` by the `supplier_line_tax_accounts` enrolment map
 (`erp_v2.importer.tax_accounts`, shared with the three verifiers). Two regimes, per invoice:
@@ -95,6 +101,50 @@ legacy census and released module models. Same reading rules as mapping-wave2.md
   `gl.account.deferral_pair_account_id` when set (D4), else the paid account; B2 folded maps the line's
   expense account (D1).
 - Untaxed lines are NULL. A referenced tax code or account row that is absent refuses the map by name.
+
+### Importer transforms (B-3, `erp_v2.importer.transforms`)
+
+Five Michael-ruled transforms act on the v2 subledger documents (never on the legacy GL), each a pure function with a
+receipt count and its own bridge line (rule id, legacy and v2 amounts, delta). Every invoice lands in exactly one
+bucket, so `legacy = carried + transformed + queued` (receipt `transforms.partition`).
+
+| Rule | Applies to | Effect |
+|---|---|---|
+| `T-EXP-LEGACY` | legacy-posted A1/A1D with `expense_elsewhere` | the line's `posting_account_ref` is the legacy GL account the ledger debited, only where the mapping is unambiguous (one expense account, or own-account groups pair one-to-one with legacy debits by distinct sums); else the lines keep their accounts and the invoice is queued (`expense_elsewhere_ambiguous`; it still lands) |
+| `T-ROUND-2DP` | any invoice with a >2 dp amount | half-even to 2 dp per amount; the residue goes on the largest line; a line moving by 0.01 or more queues the invoice |
+| `T-ITEM-NONSTOCK` | item-linked lines | land as plain expense lines; the item id is provenance in the bridge line (the verifiers' `source_item_link` acceptance is B-1) |
+| `T-EXP-FALLBACK` | a line with no expense account | lands on `import.fallback_expense_account` |
+| `T-UNPOSTED-CORRECT` (D-M2) | never-posted invoices (DRAFT/SUBMITTED/APPROVED, no ledger lines) | VAT lines on the split account which must be 1455; a WHT-type tax removed from the line and the header so the total is the gross (the WHT is a payment-time fact, recorded in the bridge line); a taxed line without a valid code, an expense on a control or tax-role account, or a deferral journal already in the v2 ledger queues the invoice; no folded form lands |
+
+`import.fallback_expense_account` is a REQUIRED declared input (Finance F-1, `--import-params-json`): `execute`
+refuses, dry-run and apply, before any write when it is missing or is not, in the DESTINATION `mod_accounting` chart, an
+account of the run's tenant that is active, posting-allowed, of expense class, and neither a control account
+(2000/2040/1410) nor a tax-role code (1455/1440). A queued invoice is not landed: its header and every line
+are named row exceptions `transform_queue:<reason>`, so the receipt is incomplete until Finance resolves it.
+
+**Parity.** Before B-3 a NULL-expense line never landed (`posting_account_ref` is required). The dest6 parity oracle
+is dest6 plus the declared NET deltas in the receipt, which can be negative:
+`declared_written_delta_lines` = NULL-expense lines landed (fallback or legacy GL account) minus the lines dest6 landed
+that a queued, not-landed invoice no longer lands; `declared_written_delta_headers` = minus the newly not-landed
+headers. `changed_header_values` counts landed headers whose values change (WHT removal, rounding), itemised in the
+side file. The partition universe is every source header id (line-less invoices included) and the source line count.
+An unposted invoice whose WHT was removed to gross lands but is also queued (`wht_payment_fact_pending`) until the a6
+WHT table carries the fact; rounding rounds the tax first and derives the subtotal from the 2-dp total, and
+`total_mismatch_after_transform` is counted in the queue. The itemised bridge is the
+mode-600 side file `<receipt>.transforms.json` (sha256 in the receipt).
+
+**Transform manifest and the verifier gate.** The itemised file's `landed` section, `binding` (snapshot sha256) and
+`fallback_account` are the manifest the B1b, settled and unpaid verifiers read (`--transform-manifest PATH`,
+`--transform-manifest-sha256` = the import receipt's `itemised_sha256`, `--import-params-json` = the declared
+fallback). Receipt and manifest use ONE digest, `canonical_digest` over the whole body. The manifest is evidence, not
+authority: each verifier RE-DERIVES the invoice with the pure `transform_invoice` from the snapshot (header, lines,
+tax-code and account rows, GL, items) and the declared fallback, and requires manifest == re-derived == destination, so
+a forged or edited manifest cannot launder a difference (every rule precondition is re-run: WITHHOLDING-type only,
+rounding under a cent, the declared fallback, the legacy GL mapping, items link-only). The snapshot sha in the
+binding must equal the verifier's. `T-ROUND-2DP` fixes `source_amount_scale` through `WaiverGate(transform=)`: no
+waiver is needed and `waiver_not_needed` does not trip. Transforms and Finance waivers are recorded separately in the
+evidence fingerprint. The owner admission (unpaid and settled) receives the LANDED subtotal, tax and total, with the
+source values kept as provenance in the facts fingerprint; the payment schedule lands at the transformed total.
 
 VAT is cash basis; deferred input VAT is released on payment by the B3 extension (follow-up, not here).
 Supplier credit-note lines are GENERATED by the payables service (legacy credit notes of invoice type are split

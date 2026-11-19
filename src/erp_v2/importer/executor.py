@@ -36,6 +36,7 @@ from erp_v2.importer.sub_origin import (
 )
 
 _MISSING = object()
+TRANSFORM_REFUSAL_KEY = "_refusal"  # == transforms.REFUSAL_KEY (kept here to avoid an import cycle)
 
 _BATCH_SIZE = 500
 
@@ -525,6 +526,17 @@ def execute_transform(
             if dest_col in values:
                 continue
             entry = _map_get(id_maps.get(map_name, {}), values.get(key_col))
+            if isinstance(entry, dict) and TRANSFORM_REFUSAL_KEY in entry:
+                # An importer transform queued this row: a named refusal, never a guess (importer/transforms.py).
+                row_exceptions.append(
+                    RowException(
+                        source_table=spec.source_table,
+                        source_key=str(row[key_source]),
+                        column=dest_col,
+                        reason=f"transform_queue:{entry[TRANSFORM_REFUSAL_KEY]}",
+                    )
+                )
+                break
             if entry is _MISSING or entry is None or lookup_field not in entry:
                 row_exceptions.append(
                     RowException(

@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from erp_v2.importer import admission_waivers, tax_accounts
 from erp_v2.importer.payables_reconciliation import _money, _reflect, _sum
 from erp_v2.importer.snapshot import SnapshotManifest
+from erp_v2.legacy_ap.transform_manifest import InvoiceTransform, TransformManifest
 
 ADMISSION = frozenset({"admit_residual", "admit_with_waivers"})
 STATUS_WAIVERS = frozenset({"inconsistent_status_pair", "legacy_journal_link_unposted"})
@@ -392,22 +393,9 @@ def _id(value: object) -> str:
         return str(value)
 
 
-def invoice_tax(
-    src: sa.Connection,
-    organization: object,
-    journal_id: object,
-    lines: list[dict],
-    invoice_id: object = None,
-    control_account: object = None,
-    header_subtotal: object = None,
-    header_total: object = None,
-) -> tuple[tax_accounts.InvoiceTax, list[dict]]:
-    """Tax-account classification of one invoice from the snapshot (the importer's rule, shared).
-
-    ``journal_id`` is the legacy invoice journal, or None for an invoice with no GL footprint. The
-    legacy-posted regime follows the posted ledger debits; a missing tax code or account row is a
-    named refusal. Also returns the tax facts that enter the evidence fingerprint.
-    """
+def line_facts(src: sa.Connection, lines: list[dict]) -> tuple[list[tax_accounts.LineFacts], list[dict]]:
+    """The tax-rule facts of each source line (tax code and account rows read from the snapshot) and the evidence
+    entries that enter the fingerprint. A missing referenced row is a named refusal."""
 
     def one(name: str, key: str, value: object, reason: str) -> dict:
         return _one(_read(src, name, key=key, value=value), reason)
@@ -441,6 +429,93 @@ def invoice_tax(
                 line["line_id"], line["line_amount"], line["tax_amount"], line["expense_account_id"], code
             )
         )
+    return facts, evidence
+
+
+def rederive_transform(
+    verifier,
+    tenant: UUID,
+    invoice_id: UUID,
+    header: dict,
+):
+    """Re-derive the importer's transform for this invoice from the SNAPSHOT (never from the manifest file) and
+    require manifest == re-derived. Returns the verified ``InvoiceTransform`` (None: no rule changed anything).
+
+    The declared fallback account is bound in the plan (``verifier.fallback_expense_account``) and must be the one
+    the manifest was built with. Each rule's precondition (WITHHOLDING-type tax only, rounding under a cent, the
+    declared fallback, the legacy GL mapping, items link-only) is exactly the pure rule re-run here, so a forged
+    or edited manifest cannot launder a destination that the rules would not have produced.
+    """
+    from erp_v2.importer import transforms as rules
+    from erp_v2.legacy_ap.transform_manifest import InvoiceTransform
+
+    tm = verifier.transform_manifest
+    if tm is None:
+        return None
+    src = verifier.source
+    _require(tm.snapshot_sha256 == verifier.manifest.snapshot_sha256, "transform_manifest_snapshot")
+    declared = getattr(verifier, "fallback_expense_account", None)
+    _require(bool(declared) and tax_accounts.canonical(declared) == tm.fallback_account, "transform_fallback_account")
+    lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
+    facts, _evidence = line_facts(src, lines)
+    outcome, _tax_evidence = invoice_tax(
+        src,
+        tenant,
+        header["journal_entry_id"],
+        lines,
+        invoice_id,
+        header["ap_control_account_id"],
+        header["subtotal"],
+        header["total_amount"],
+    )
+    accounts = {
+        tax_accounts.canonical(r["account_id"]) or "": rules.legacy_account_facts(r)
+        for r in _read(src, "account", fields=["account_id", "account_code", "is_active", "is_posting_allowed"])
+    }
+    items = {
+        tax_accounts.canonical(r["line_id"]) or "": str(r["item_id"])
+        for r in _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id, fields=["line_id", "item_id"])
+        if r["item_id"] is not None
+    }
+    derived = rules.transform_invoice(
+        rules.InvoiceFacts(
+            tax_accounts.canonical(invoice_id) or "",
+            header["organization_id"],
+            str(header["status"] or ""),
+            header["subtotal"],
+            header["tax_amount"],
+            header["total_amount"],
+            tuple(facts),
+            outcome,
+            items,
+        ),
+        tm.fallback_account,
+        accounts,
+    )
+    _require(derived.lands, "transform_invoice_not_landable")
+    expected = InvoiceTransform.from_outcome(derived)
+    _require(expected == tm.for_invoice(invoice_id), "transform_manifest_mismatch")
+    return expected
+
+
+def invoice_tax(
+    src: sa.Connection,
+    organization: object,
+    journal_id: object,
+    lines: list[dict],
+    invoice_id: object = None,
+    control_account: object = None,
+    header_subtotal: object = None,
+    header_total: object = None,
+) -> tuple[tax_accounts.InvoiceTax, list[dict]]:
+    """Tax-account classification of one invoice from the snapshot (the importer's rule, shared).
+
+    ``journal_id`` is the legacy invoice journal, or None for an invoice with no GL footprint. The
+    legacy-posted regime follows the posted ledger debits; a missing tax code or account row is a
+    named refusal. Also returns the tax facts that enter the evidence fingerprint.
+    """
+
+    facts, evidence = line_facts(src, lines)
     # Every tax code's paid/deferral accounts, not only this invoice's codes: a debit on another code's
     # VAT account must keep the invoice out of A1 and A2.
     every_tax_account: list = []
@@ -512,14 +587,39 @@ def _deferral_evidence(outcome: tax_accounts.InvoiceTax) -> dict:
     )
 
 
-def require_line_tax_account(outcome: tax_accounts.InvoiceTax, line_id: object, imported: dict) -> tax_accounts.LineTax:
-    """The destination ref must equal the derived ref exactly (untaxed lines: NULL)."""
+def transform_facts(found: InvoiceTransform, manifest: TransformManifest) -> dict:
+    """Fingerprint evidence of the importer transforms that explain this invoice (separate from ``review``)."""
+    return dict(
+        manifest_sha256=manifest.sha256,
+        rules=sorted(found.rules),
+        header=sorted((k, format(v, "f")) for k, v in found.header.items()),
+        lines=sorted(
+            (
+                k,
+                v["posting_account_ref"],
+                v["tax_account_ref"],
+                format(v["line_amount"], "f"),
+                format(v["tax_amount"], "f"),
+            )
+            for k, v in found.lines.items()
+        ),
+        item_lines=sorted(found.item_lines),
+    )
+
+
+def require_line_tax_account(
+    outcome: tax_accounts.InvoiceTax, line_id: object, imported: dict, transform=None
+) -> tax_accounts.LineTax:
+    """The destination ref must equal the derived ref exactly (untaxed lines: NULL). A line the importer transformed
+    (``transform``: an ``InvoiceTransform`` of the transform manifest) must carry the ref the manifest names."""
 
     derived = outcome.lines[tax_accounts.canonical(line_id)]
     actual = imported["tax_account_ref"]
+    explained, landed = transform.landed_tax_ref(line_id) if transform is not None else (False, None)
+    expected = landed if explained else derived.ref
     _require(
-        (actual is None and derived.ref is None)
-        or (actual is not None and derived.ref is not None and _id(actual) == derived.ref),
+        (actual is None and expected is None)
+        or (actual is not None and expected is not None and _id(actual) == expected),
         "invoice_line_tax_account",
     )
     return derived
@@ -695,6 +795,20 @@ class HistoricalPayablesVerifier:
     # (waivable check name, transform rule id) pairs from the importer transform manifest (#68); a failure the
     # transform fixed needs no waiver. Empty until the transform manifest is wired in.
     transforms: tuple[tuple[str, str], ...] = ()
+    # The importer's transform manifest (B-3): per-invoice rules and landed values. A destination that differs from the
+    # source is accepted only where the manifest names the same values; kept apart from Finance waivers.
+    transform_manifest: TransformManifest | None = None
+    # The declared fallback expense account (``import.fallback_expense_account``), bound in the plan: the verifier
+    # re-derives every transform with it and requires manifest == re-derived == destination.
+    fallback_expense_account: str | None = None
+
+    def invoice_transform(self, invoice_id: UUID) -> InvoiceTransform | None:
+        """The manifest's entry, UNVERIFIED (used only to open the gate); ``rederive_transform`` verifies it."""
+        return self.transform_manifest.for_invoice(invoice_id) if self.transform_manifest is not None else None
+
+    def gate_for(self, review: ReviewFacts | None, invoice_id: UUID) -> WaiverGate:
+        found = self.invoice_transform(invoice_id)
+        return WaiverGate(review, {**dict(self.transforms), **(found.waivable_checks() if found else {})})
 
     @staticmethod
     def command(evidence: HistoricalUnpaidInvoiceEvidence) -> HistoricalUnpaidInvoiceCommand:
@@ -735,9 +849,8 @@ class HistoricalPayablesVerifier:
         with destination.no_autoflush:
             connection = destination.connection()
             _require(_database(connection) == manifest.destination_database, "destination_database")
-            gate = WaiverGate(
-                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=ADMISSION),
-                dict(self.transforms),
+            gate = self.gate_for(
+                load_review(connection, tenant, invoice_id, manifest.snapshot_sha256, allowed=ADMISSION), invoice_id
             )
             try:
                 result = self._evidence(tenant, invoice_id, connection, gate)
@@ -868,7 +981,9 @@ class HistoricalPayablesVerifier:
                 )
             }
         )
-        _match(header, target, mapping, "header")
+        found = rederive_transform(self, tenant, invoice_id, header)
+        effective = found.header_values(header) if found else header
+        _match(effective, target, mapping, "header")
         _require(target["supplier_name_snapshot"] == name, "header_supplier_name_snapshot")
         # The legacy approval request is optional evidence, never a fabricated stamp.
         _require(_equal(target["approval_reference"], header["approval_request_id"]), "header_approval_reference")
@@ -886,7 +1001,7 @@ class HistoricalPayablesVerifier:
         )
         _require(
             _day(schedule[0]["due_date"], "header_due_date") == due
-            and _amount(schedule[0]["amount"], "header_schedule_amount") == header["total_amount"],
+            and _amount(schedule[0]["amount"], "header_schedule_amount") == effective["total_amount"],
             "header_payment_schedule",
         )
         lines = _read(src, "supplier_invoice_line", key="invoice_id", value=invoice_id)
@@ -925,12 +1040,12 @@ class HistoricalPayablesVerifier:
                 and original["quantity"] > 0,
                 "source_invoice_line_amounts",
             )
-            _match(original, imported, line_mapping, "invoice_line")
+            _match(found.line_values(original) if found else original, imported, line_mapping, "invoice_line")
             _require(
                 original["po_line_id"] is None and original["goods_receipt_line_id"] is None,
                 "unsupported_procurement_link",
             )
-            require_line_tax_account(outcome, original["line_id"], imported)
+            require_line_tax_account(outcome, original["line_id"], imported, found)
             dimensions = sorted(
                 [[code, _id(original[col])] for code, col in DIMENSIONS[1:] if original[col] is not None]
             )
@@ -981,6 +1096,7 @@ class HistoricalPayablesVerifier:
                     codes=tax_evidence,
                 ),
                 **gate.facts(),
+                **({"transform_manifest": transform_facts(found, self.transform_manifest)} if found else {}),
             ),
         )
         common = dict(
@@ -1000,9 +1116,11 @@ class HistoricalPayablesVerifier:
             due_date=due,
             currency_code=header["currency_code"],
             exchange_rate=header["exchange_rate"],
-            subtotal=header["subtotal"],
-            tax_amount=header["tax_amount"],
-            total_amount=header["total_amount"],
+            # What the owner admission receives is the LANDED invoice (the destination carries it); the source values
+            # stay as provenance in ``facts_fingerprint`` (source_header).
+            subtotal=effective["subtotal"],
+            tax_amount=effective["tax_amount"],
+            total_amount=effective["total_amount"],
             liability_account_ref=target["liability_account_ref"],
             procurement_ref=None,
             receipt_evidence_fingerprint=None,

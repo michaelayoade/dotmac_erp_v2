@@ -258,8 +258,14 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         lookups={
             "supplier_name_snapshot": ("supplier", "supplier_ref", "name"),
             "payment_schedule": ("supplier_payment_schedule", "id", "payment_schedule"),
+            "subtotal": ("supplier_invoice_transforms", "id", "subtotal"),
+            "tax_amount": ("supplier_invoice_transforms", "id", "tax_amount"),
+            "total_amount": ("supplier_invoice_transforms", "id", "total_amount"),
         },
-        note="payment_schedule: single-instalment JSON assembled at enrolment "
+        note="subtotal/tax_amount/total_amount: the supplier_invoice_transforms map (B-3, importer/transforms.py): "
+        "the legacy values unchanged unless a ruled transform (T-ROUND-2DP, T-UNPOSTED-CORRECT WHT removal) "
+        "applies; a queued invoice is a named row exception, never landed. "
+        "payment_schedule: single-instalment JSON assembled at enrolment "
         "from due_date + total (module schedule shape, sums to the total); "
         "invoices without a due date exception. Lifecycle-staged DRAFT; "
         "transitions step walks SUBMITTED/APPROVED/VOID after lines land",
@@ -267,12 +273,18 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_payables.supplier_invoice_lines",
         "public.supplier_invoice_line",
-        renames={"posting_account_ref": "expense_account_id"},
         lookups={
             "dimension_refs": ("supplier_line_dimensions", "id", "dimension_refs"),
-            "tax_account_ref": ("supplier_line_tax_accounts", "id", "tax_account_ref"),
+            "posting_account_ref": ("supplier_line_transforms", "id", "posting_account_ref"),
+            "tax_account_ref": ("supplier_line_transforms", "id", "tax_account_ref"),
+            "line_amount": ("supplier_line_transforms", "id", "line_amount"),
+            "tax_amount": ("supplier_line_transforms", "id", "tax_amount"),
         },
-        note="dimension_refs: enrolment-assembled sorted [CODE, value] JSON "
+        note="posting_account_ref / tax_account_ref / line_amount / tax_amount: the supplier_line_transforms map "
+        "(B-3, importer/transforms.py, five ruled transforms each itemised for the bridge; the legacy expense "
+        "account, tax account and amounts unchanged where none applies). expense_account_id, line_amount and "
+        "tax_amount are therefore source residue consumed by that map. "
+        "dimension_refs: enrolment-assembled sorted [CODE, value] JSON "
         "from cost_center_id/project_id/segment_id (declared codes "
         "COST_CENTER/PROJECT/SEGMENT). tax_account_ref: enrolment-derived from "
         "tax_code_id under the two-regime rule (legacy-posted invoices follow the "

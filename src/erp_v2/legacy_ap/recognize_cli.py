@@ -543,6 +543,8 @@ def run_cohort(
     bindings: dict | None = None,
     now: datetime | None = None,
     plan_sink=None,
+    transform_manifest=None,
+    fallback_expense_account=None,
 ) -> dict:
     """Core of both modes; caller owns the transaction and (for plan) its READ ONLY setting."""
     from dotmac_kernel.cache import TenantScope
@@ -567,7 +569,13 @@ def run_cohort(
     )
     _require(held is not None, "approver_lacks_finance_approver")
     evidence_ref = evidence_reference(list_sha256)
-    verifier = ApprovedInvoiceVerifier(source, manifest, evidence_ref)
+    verifier = ApprovedInvoiceVerifier(
+        source,
+        manifest,
+        evidence_ref,
+        transform_manifest=transform_manifest,
+        fallback_expense_account=fallback_expense_account,
+    )
     if apply:
         # One apply at a time per list, taken BEFORE the plan is built: a concurrent identical apply
         # waits here, then classifies every invoice as already done (a no-op), instead of planning
@@ -594,6 +602,21 @@ def run_cohort(
         now=now or datetime.now(UTC),
     )
     return receipt_of(plan, mode="apply", applied=len(plan["eligible"]), posted_total=posted_total)
+
+
+def _fallback_account(args) -> str:
+    """The declared ``import.fallback_expense_account`` (the importer's params file), bound in the plan: the
+    verifiers re-derive every transform with it."""
+    from erp_v2.importer.transforms import TransformParams, TransformParamsError
+
+    try:
+        raw = json.loads(Path(args.import_params_json).read_text()) if args.import_params_json else None
+        found = TransformParams.from_mapping(raw if isinstance(raw, dict) else None).fallback_expense_account
+    except (OSError, ValueError, TransformParamsError) as exc:
+        raise RecognizeRefusal("transform_fallback_account") from exc
+    if found is None:
+        raise RecognizeRefusal("transform_fallback_account")
+    return found
 
 
 def _authorized(args) -> bool:
@@ -662,6 +685,17 @@ def _run(args) -> dict:
     if args.apply:
         _require(bool(re.fullmatch(r"[0-9a-f]{64}", args.reviewed_plan_sha256 or "")), "reviewed_plan_required")
     _require(version("dotmac-payables") == REQUIRED_PAYABLES_VERSION, "released_payables_version_required")
+    transform_manifest, fallback = None, None
+    if getattr(args, "transform_manifest", None) is not None:
+        from erp_v2.legacy_ap.transform_manifest import TransformManifest, TransformManifestError
+
+        try:
+            transform_manifest = TransformManifest.load(
+                args.transform_manifest, getattr(args, "transform_manifest_sha256", None)
+            )
+            fallback = _fallback_account(args)
+        except TransformManifestError as exc:
+            raise RecognizeRefusal(str(exc)) from exc
     bindings = dict(
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         list_sha256=args.list_sha256,
@@ -670,6 +704,11 @@ def _run(args) -> dict:
         tenant_id=str(tenant),
         approver_party_id=str(actor),
         source_owner="legacy-erp",
+        **(
+            {"transform_manifest_sha256": transform_manifest.sha256, "fallback_expense_account": fallback}
+            if transform_manifest
+            else {}
+        ),
     )
     source_engine = _safe_engine(source_url)
     try:
@@ -702,6 +741,8 @@ def _run(args) -> dict:
                         reviewed_digest=args.reviewed_plan_sha256,
                         bindings=bindings,
                         plan_sink=lambda payload: _dump(args.plan_fd, payload),
+                        transform_manifest=transform_manifest,
+                        fallback_expense_account=fallback,
                     )
         finally:
             destination_engine.dispose()
@@ -730,6 +771,13 @@ def main(argv=None) -> int:
     parser.add_argument("--approver-party-id", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--reviewed-plan-sha256")
+    parser.add_argument(
+        "--transform-manifest-sha256", help="the import receipt's itemised_sha256 (required with --transform-manifest)"
+    )
+    parser.add_argument(
+        "--import-params-json", type=Path, help="the importer's params file (declares the fallback account)"
+    )
+    parser.add_argument("--transform-manifest", type=Path, help="the importer's .transforms.json (B-3), optional")
     args = parser.parse_args(argv)
     try:
         _require(_authorized(args), "explicit_apply_authorization_required")

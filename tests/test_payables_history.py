@@ -81,6 +81,7 @@ def facts():
                 segment_id=None,
                 po_line_id=None,
                 goods_receipt_line_id=None,
+                item_id=None,
             )
         ],
         "payment_allocation": [],
