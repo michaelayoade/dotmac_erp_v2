@@ -119,7 +119,27 @@ class ArCensus:
             counts[row.bucket] += 1
         return counts
 
-    def receipt(self) -> dict[str, object]:
+    def collection_block(self, account_ids: Mapping[PartitionKey, object] | None = None) -> list[dict[str, object]]:
+        """Michael's ruling: a customer whose unapplied credit note is left out of the manifest has collection and
+        dunning suppressed until its queue item clears. One entry per such note on a CARRIED partition (a partition
+        with nothing carried has no billing account and nothing to collect). `billing_account` is the minted id when
+        known (plan / apply), else None (census alone). The a13 mechanism is NOT built here."""
+
+        carried = set(self.carry_partitions)
+        return [
+            {
+                "customer": r.partition[0],
+                "currency": r.partition[1],
+                "billing_account": str(account_ids[r.partition])
+                if account_ids and r.partition in account_ids
+                else None,
+                "legacy_key": r.key,
+            }
+            for r in self.rows
+            if r.bucket == UNAPPLIED_CREDIT_NOTE and r.partition in carried
+        ]
+
+    def receipt(self, account_ids: Mapping[PartitionKey, object] | None = None) -> dict[str, object]:
         """Counts and amounts only (no names): the 0600 census receipt body."""
 
         return {
@@ -130,6 +150,7 @@ class ArCensus:
             "buckets": self.counts(),
             "totals_by_origin": self.totals(),
             "carry_partitions": len(self.carry_partitions),
+            "collection_block": self.collection_block(account_ids),
             "credit_note_only_partitions": [list(p) for p in self.credit_note_only_partitions],
             "unapplied_credit_notes": [
                 {

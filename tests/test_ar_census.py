@@ -167,3 +167,18 @@ def test_inexact_amount_excludes_the_partition_and_is_counted_in_the_proof_as_ze
     census = _census([_inv("a", total="1.005")])
     assert _bucket(census, "invoice", "a").bucket == EXCLUDED_PARTITION
     assert census.excluded[0].blockers == (("a", "amount_not_exact"),)
+
+
+def test_collection_block_lists_carried_partitions_with_a_left_out_credit_note() -> None:
+    census = _census(
+        [
+            _inv("open-1", total="100.00"),
+            _inv("cn-1", total="-20.00", invoice_type="CREDIT_NOTE"),
+            _inv("cn-only", customer="cust-9", total="-5.00", invoice_type="CREDIT_NOTE"),
+        ]
+    )
+    assert census.collection_block() == [
+        {"customer": "cust-1", "currency": "NGN", "billing_account": None, "legacy_key": "cn-1"}
+    ]  # cust-9 carries nothing: no billing account, nothing to collect
+    block = census.collection_block({("cust-1", "NGN"): "acct-1"})
+    assert block[0]["billing_account"] == "acct-1" and census.receipt()["collection_block"] == census.collection_block()

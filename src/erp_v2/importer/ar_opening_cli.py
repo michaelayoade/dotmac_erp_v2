@@ -223,6 +223,7 @@ def build_plan(assembly, db, *, scope, migration_authority_ref: str, occurred_at
         "command_digests": digests,
         "partitions": len(commands),
         "excluded_partitions": len(assembly.census.excluded),
+        "collection_block": assembly.census.collection_block(assembly.account_ids),
         "unapplied_credit_notes": sum(1 for r in assembly.census.rows if r.bucket == "UNAPPLIED_CREDIT_NOTE"),
         "receivable_items": len(manifest.receivables),
         "cash_lots": len(manifest.cash_lots),
