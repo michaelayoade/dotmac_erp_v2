@@ -47,6 +47,7 @@ from erp_v2.importer import ar_opening_role as role_guard
 from erp_v2.importer.ar_census import CensusError
 from erp_v2.importer.ar_opening_models import TABLE, WRITER_ROLE
 
+FUNCTIONAL_CURRENCY = "NGN"  # P-4/P-7: non-functional AR is refused until ruled on
 ADDRESS_NOT_RECORDED = "Not recorded in legacy ERP"
 CUSTOMER_SQL = (
     "SELECT customer_id AS customer_key, legal_name, trading_name, dotmac_sub_id FROM customer"  # legacy ERP public
@@ -202,7 +203,13 @@ def existing_account_ids(db, *, scope, partitions) -> dict[tuple[str, str], UUID
 def build_plan(
     assembly, db, *, scope, migration_authority_ref: str, occurred_at: datetime, params: dict, dual_control: str
 ) -> dict:
-    """Pure over the assembly plus read-only target lookups. Writes nothing."""
+    """Pure over the assembly plus read-only target lookups. Writes nothing.
+
+    Fail closed on FX (replan T5): any partition whose currency is not the functional one is refused BEFORE anything
+    is imported or sealed (the seal is irreversible); lifted only by an explicit P-4/P-7 ruling."""
+
+    if any(p.currency != FUNCTIONAL_CURRENCY for p in assembly.partitions()):
+        raise OperatorRefusal("ar_opening_fx_unsupported")
 
     from dotmac_billing import get_opening_cash_target, opening_account_command_digest_v2
     from dotmac_billing.opening_receivable_validation import preview_opening_account_import_batch_v2
@@ -375,7 +382,12 @@ def _apply_opening(
         _require(authority.expected_dual_control == wanted, "authority_dual_control_differs_from_policy")
         # The writer role is re-checked now, not trusted from the migration: no SET/INHERIT member except this
         # session's operator (SET only), no owned objects, exact R5 privileges.
-        role_guard.preflight(db.connection(), WRITER_ROLE, operator=db.scalar(sa.text("SELECT session_user")))
+        role_guard.preflight(
+            db.connection(),
+            WRITER_ROLE,
+            operator=db.scalar(sa.text("SELECT session_user")),
+            forbid_session_admin=True,
+        )
         existing = get_opening_window(db, scope=scope)
         if existing is None:
             window_kwargs = window_dual_control_kwargs(OpeningWindowV1, wanted)

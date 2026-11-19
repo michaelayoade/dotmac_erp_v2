@@ -62,8 +62,9 @@ def _app_admin_provision_grants(engine):
         sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
     )
     owner = engine.url.username
-    with admin.connect() as c:  # Michael's root step, for the test window only: SET without INHERIT
-        c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT FALSE')
+    with admin.connect() as c:  # Michael's root steps: drop the creator's ADMIN row, then SET without INHERIT/ADMIN
+        c.exec_driver_sql(f'REVOKE {WRITER_ROLE} FROM "{owner}"')
+        c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT FALSE, ADMIN FALSE')
     with engine.begin() as c:
         c.exec_driver_sql("GRANT USAGE ON SCHEMA mod_billing TO app_admin")
         c.exec_driver_sql("GRANT SELECT ON ALL TABLES IN SCHEMA mod_billing TO app_admin")
@@ -698,3 +699,30 @@ def test_an_aborted_apply_keeps_its_partial_receipt_and_a_complete_one_carries_t
         sorted(receipt["cash_lot_residual_by_account"].values()) == [0, 2000, 5000]
         or sum(receipt["cash_lot_residual_by_account"].values()) == 7000
     )
+
+
+def test_plan_refuses_a_non_functional_currency_before_anything_is_imported(engine):
+    w = _world(engine)
+    usd = SimpleNamespace(partitions=lambda: [SimpleNamespace(currency="USD")])
+    with Session(engine) as db, db.begin():
+        with pytest.raises(OperatorRefusal, match="ar_opening_fx_unsupported"):
+            build_plan(
+                usd, db, scope=w.scope, migration_authority_ref=REF, occurred_at=NOW, params={}, dual_control="on"
+            )
+
+
+def test_apply_preflight_refuses_while_the_session_user_holds_admin_on_the_writer(engine):
+    from erp_v2.importer import ar_opening_role as rg
+
+    owner = engine.url.username
+    admin = _admin_engine()
+    try:
+        with admin.connect() as c:
+            c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH ADMIN TRUE, SET TRUE, INHERIT FALSE')
+        with engine.connect() as c, pytest.raises(rg.WriterRoleRefused, match="session_user_holds_admin_on_writer"):
+            rg.preflight(c, WRITER_ROLE, operator=owner, forbid_session_admin=True)
+    finally:
+        with admin.connect() as c:
+            c.exec_driver_sql(f'REVOKE {WRITER_ROLE} FROM "{owner}"')
+            c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT FALSE, ADMIN FALSE')
+        admin.dispose()

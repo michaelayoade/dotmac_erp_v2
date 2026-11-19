@@ -196,3 +196,32 @@ def test_every_held_entry_carries_its_customer_and_currency():
         assert {"reason", "legacy_key", "amount_minor"} <= set(h)
     by_key = {h["legacy_key"]: h["customer"] for h in a["held"]}
     assert by_key["cn-1"] == "cust-1" and by_key["partition:cust-2:NGN"] == "cust-2" and by_key["draft-1"] == "cust-3"
+
+
+def test_a_posted_after_cutoff_row_of_a_refused_party_is_not_counted_twice():
+    invoices = [
+        invoice("inv-1", customer="cust-2", total="100.00", posted=True),
+        invoice("bad", customer="cust-2", total="10.005", posted=True),  # inexact: the partition is refused
+        invoice("late-1", customer="cust-2", total="40.00", posted=True, invoice_date=datetime(2026, 2, 1, tzinfo=UTC)),
+    ]
+    census = build_census(
+        snapshot_sha256="d" * 64,
+        cutoff=CUTOFF,
+        invoices=invoices,
+        payments=[],
+        allocations=[],
+        customer_snapshot=lambda _k: SNAPSHOT,
+        seller=SNAPSHOT,
+    )
+    a = build_attribution(
+        census,
+        gl_lines=[("j1", Decimal("100.00")), ("j2", Decimal("10.00")), ("j3", Decimal("40.00"))],
+        journal_owners={"j1": [C2], "j2": [C2], "j3": [C2]},
+        invoice_types={i["invoice_id"]: i["invoice_type"] for i in invoices},
+        functional_currency="NGN",
+    )["gl_attribution"]
+    held = {h["legacy_key"]: h["amount_minor"] for h in a["held"]}
+    assert held["late-1"] == 4000
+    assert held["partition:cust-2:NGN"] == 15000 - 4000  # the whole GL minus the row held on its own
+    (party,) = a["parties"]
+    assert party["gl_minor"] == 15000 and sum(held.values()) == party["gl_minor"] and party["custgap_minor"] == 0
