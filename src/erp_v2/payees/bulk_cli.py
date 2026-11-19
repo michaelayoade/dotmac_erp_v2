@@ -32,6 +32,7 @@ Rules (all refuse the whole file; apply writes nothing unless every row is eligi
   refused. Rows that change an approved instruction are proposed and left for per-row approval in the B8 UI with
   a call-back reference (counted as ``changes_to_approved`` / ``left_for_ui_approval``);
 * ``--expect new=N,replace=N,change=N`` must equal the plan counts exactly or apply is refused (exit 3).
+  It is REQUIRED with ``--approve`` (``expect_required``, plan and apply); optional for propose-only runs.
 
     python -m erp_v2.payees.bulk_cli --file F.json --file-sha256 S --bank-reference B.json --bank-reference-sha256 T \
         --receipt R.json \
@@ -438,6 +439,7 @@ def run(
     dual = dual_control(db, file.tenant_id)
     if approve:
         _require(bool(operator_ref), "operator_ref_required")
+        _require(expect is not None, "expect_required")
         _require(not dual, "approve_refused_dual_control_on")
     check_proposer(db, file, approve=approve)
     outcomes = classify(db, file, banks)
@@ -473,6 +475,7 @@ def _run(args) -> dict:
     file = parse_file(read_private_file(args.file), args.file_sha256)
     banks = load_bank_reference(args.bank_reference, args.bank_reference_sha256)
     expect = parse_expect(args.expect)
+    _require(not args.approve or expect is not None, "expect_required")
     import sqlalchemy as sa
     from dotmac_kernel.audit_actions import (
         AuditActionRegistry,

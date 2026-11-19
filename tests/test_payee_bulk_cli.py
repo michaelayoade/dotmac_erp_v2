@@ -40,6 +40,7 @@ BANKS_RAW = json.dumps(
 BANKS_SHA = hashlib.sha256(BANKS_RAW).hexdigest()
 BANKS = parse_bank_reference(BANKS_RAW, BANKS_SHA)
 PROPOSER = uuid4()
+NEW1 = dict(new=1, replace=0, change=0)
 EMP = str(uuid4())
 
 
@@ -236,7 +237,7 @@ def test_same_payee_twice_in_one_file_refused():
 
 def test_unchanged_row_is_a_noop_when_approved_details_match(env):
     db, tenant = env
-    go(db, tenant, [row()], approve=True)
+    go(db, tenant, [row()], approve=True, expect=NEW1)
     out = go(db, tenant, [row()])
     assert out["counts"]["unchanged"] == 1 and out["written"]["proposed"] == 0
 
@@ -244,7 +245,7 @@ def test_unchanged_row_is_a_noop_when_approved_details_match(env):
 def test_statutory_path(env):
     db, tenant = env
     paye = row("statutory", "dest:PAYE", GOOD4, account_name="STATE IRS")
-    out = go(db, tenant, [paye], approve=True)
+    out = go(db, tenant, [paye], approve=True, expect=NEW1)
     assert out["written"] == dict(proposed=1, replaced=0, approved=1, left_for_ui_approval=0)
     (inst,) = instructions(db, "approved")
     assert (inst.payee_kind, inst.payee_ref, inst.evidence_ref) == (
@@ -258,10 +259,10 @@ def test_statutory_path(env):
 
 def test_approve_only_with_policy_off_and_operator_ref(env):
     db, tenant = env
-    out = go(db, tenant, [row()], approve=True)
+    out = go(db, tenant, [row()], approve=True, expect=NEW1)
     assert out["written"]["approved"] == 1 and instructions(db, "approved")[0].decided_by_party_id == PROPOSER
     with pytest.raises(bulk_cli.BulkRefusal, match="operator_ref_required"):
-        go(db, tenant, [row("supplier", "sup-2", GOOD2)], approve=True, operator=None)
+        go(db, tenant, [row("supplier", "sup-2", GOOD2)], approve=True, operator=None, expect=NEW1)
 
 
 def test_policy_on_refuses_approve_but_still_allows_proposals(env):
@@ -269,7 +270,7 @@ def test_policy_on_refuses_approve_but_still_allows_proposals(env):
     set_dual_control(db, tenant, True)
     for apply in (False, True):
         with pytest.raises(bulk_cli.BulkRefusal, match="approve_refused_dual_control_on"):
-            go(db, tenant, [row()], apply=apply, approve=True)
+            go(db, tenant, [row()], apply=apply, approve=True, expect=NEW1)
     assert instructions(db) == []
     assert go(db, tenant, [row()])["written"]["proposed"] == 1
 
@@ -374,7 +375,7 @@ def test_proposer_must_be_an_active_authorised_party_of_the_tenant(env):
             dict(version=1, tenant_id=str(tenant), proposer_party_id=str(party), file_ref="b", rows=[row()])
         ).encode()
         f = bulk_cli.parse_file(raw, hashlib.sha256(raw).hexdigest())
-        return go(db, tenant, None, apply=False, approve=approve, file=f)
+        return go(db, tenant, None, apply=False, approve=approve, file=f, expect=NEW1 if approve else None)
 
     for party in (uuid4(), other, inactive):  # unknown, another tenant's party, inactive
         with pytest.raises(bulk_cli.BulkRefusal, match="proposer_not_authorised"):
@@ -387,21 +388,27 @@ def test_proposer_must_be_an_active_authorised_party_of_the_tenant(env):
 
 def test_operator_ref_is_in_the_audit_details_of_every_bulk_event(env):
     db, tenant = env
-    go(db, tenant, [row()], approve=True, operator="op-7")
+    go(db, tenant, [row()], approve=True, operator="op-7", expect=NEW1)
     go(db, tenant, [row(number=GOOD2)], operator="op-7")
     events = db.scalars(sa.select(AuditEvent)).all()
     assert len(events) >= 3 and all(e.details.get("operator_ref") == "op-7" for e in events)
 
 
 def approved_instruction(db, tenant):
-    go(db, tenant, [row(), row("employee", EMP, GOOD3, account_name="ADA TEST")], approve=True)
+    go(
+        db,
+        tenant,
+        [row(), row("employee", EMP, GOOD3, account_name="ADA TEST")],
+        approve=True,
+        expect=dict(new=2, replace=0, change=0),
+    )
 
 
 def test_approve_skips_rows_that_change_an_approved_instruction(env):
     db, tenant = env
     approved_instruction(db, tenant)
     rows = [row(number=GOOD2), row("supplier", "sup-2", GOOD4)]  # sup-1: change; sup-2: onboarding
-    out = go(db, tenant, rows, approve=True)
+    out = go(db, tenant, rows, approve=True, expect=dict(new=1, replace=0, change=1))
     assert out["counts"]["changes_to_approved"] == 1 and out["counts"]["new"] == 1
     assert out["written"]["approved"] == 1 and out["written"]["left_for_ui_approval"] == 1
     by_ref = {i.payee_ref: i for i in instructions(db) if i.status in ("proposed", "approved")}
@@ -453,7 +460,9 @@ def test_expect_must_match_the_plan_counts_exactly(env):
 def test_name_differs_is_reported_and_proposed_not_skipped(env):
     db, tenant = env
     approved_instruction(db, tenant)
-    out = go(db, tenant, [row(account_name="ACME SUPPLIES LIMITED")], approve=True)
+    out = go(
+        db, tenant, [row(account_name="ACME SUPPLIES LIMITED")], approve=True, expect=dict(new=0, replace=0, change=1)
+    )
     assert out["counts"]["name_differs"] == 1 and out["counts"]["changes_to_approved"] == 1
     assert [r["outcome"] for r in out["rows"]] == ["name_differs"]
     assert out["written"]["proposed"] == 1 and out["written"]["approved"] == 0  # never auto-approved
@@ -473,3 +482,32 @@ def test_revised_nuban_scheme_pads_three_digit_codes_and_covers_six_digit_codes(
     assert not valid_nuban(six, serial + str((digit + 1) % 10), check_digit=True)
     with pytest.raises(ValueError):
         nuban_check_digit("50211", serial)
+
+
+def test_expect_is_required_with_approve_in_plan_and_apply_but_optional_without(env):
+    db, tenant = env
+    for apply in (False, True):
+        with pytest.raises(bulk_cli.BulkRefusal, match="expect_required"):
+            go(db, tenant, [row()], apply=apply, approve=True)
+    assert instructions(db) == []
+    assert go(db, tenant, [row()], approve=False)["written"]["proposed"] == 1  # propose-only: optional
+
+
+def test_cli_refuses_approve_without_expect_before_any_database_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("ERP_IMPORT_APPROVED", "1")
+    monkeypatch.setenv("ERP_IMPORT_APPLY_OK", "1")
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql://unused.invalid/none")
+    src, banks = tmp_path / "in.json", tmp_path / "b.json"
+    raw = json.dumps(
+        dict(version=1, tenant_id=str(uuid4()), proposer_party_id=str(PROPOSER), file_ref="b", rows=[row()])
+    ).encode()
+    src.write_bytes(raw)
+    os.chmod(src, 0o600)
+    banks.write_bytes(BANKS_RAW)
+    receipt = tmp_path / "r.json"
+    code = bulk_cli.main(
+        ["--file", str(src), "--file-sha256", hashlib.sha256(raw).hexdigest(), "--bank-reference", str(banks),
+         "--bank-reference-sha256", BANKS_SHA, "--receipt", str(receipt), "--apply", "--approve",
+         "--operator-ref", "op-1"]
+    )  # fmt: skip
+    assert code == 2 and json.loads(receipt.read_text())["refusal"] == "expect_required"

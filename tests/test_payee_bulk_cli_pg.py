@@ -144,7 +144,7 @@ def test_approve_with_policy_off_approves_and_the_db_checks_accept_it(engine):
     tenant = new_tenant(engine)
     emp = seed(engine, tenant, dual=False)
     rows = [row("supplier", "sup-1", N1), row("employee", emp, N2), row("statutory", "dest:PAYE", N3)]
-    out = go(engine, tenant, rows, apply=True, approve=True)
+    out = go(engine, tenant, rows, apply=True, approve=True, expect=dict(new=3, replace=0, change=0))
     assert out["dual_control"] is False and out["written"] == dict(
         proposed=3, replaced=0, approved=3, left_for_ui_approval=0
     )
@@ -160,7 +160,14 @@ def test_approve_with_policy_on_is_refused_and_nothing_is_written(engine):
     seed(engine, tenant, dual=True)
     for apply in (False, True):
         try:
-            go(engine, tenant, [row("supplier", "sup-1", N1)], apply=apply, approve=True)
+            go(
+                engine,
+                tenant,
+                [row("supplier", "sup-1", N1)],
+                apply=apply,
+                approve=True,
+                expect=dict(new=1, replace=0, change=0),
+            )
         except bulk_cli.BulkRefusal as exc:
             assert exc.reason == "approve_refused_dual_control_on"
         else:
@@ -201,7 +208,14 @@ def test_unauthorised_proposer_is_refused_on_postgres(engine):
 def test_approve_leaves_changes_to_approved_instructions_for_the_ui(engine):
     tenant = new_tenant(engine)
     seed(engine, tenant, dual=False)
-    go(engine, tenant, [row("supplier", "sup-1", N1)], apply=True, approve=True)
+    go(
+        engine,
+        tenant,
+        [row("supplier", "sup-1", N1)],
+        apply=True,
+        approve=True,
+        expect=dict(new=1, replace=0, change=0),
+    )
     rows = [row("supplier", "sup-1", N2), row("supplier", "sup-2", N3)]
     out = go(engine, tenant, rows, apply=True, approve=True, expect=dict(new=1, replace=0, change=1))
     assert out["counts"]["changes_to_approved"] == 1 and out["written"]["left_for_ui_approval"] == 1
