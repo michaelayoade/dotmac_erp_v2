@@ -1,8 +1,8 @@
 """Operator plan/apply of a sha-bound Finance payee file: bulk bank-instruction proposals (B-11).
 
 About 551 employees and the suppliers need payee bank instructions before the first payroll or payment run.
-Each file row becomes ONE B8 ``propose`` (``erp_v2.payees.service``); approval stays in the UI. There is no
-migration and no new write path: this command only calls the existing governed service.
+Each file row becomes ONE B8 ``propose`` (``erp_v2.payees.service``); approval stays in the UI except
+onboarding. There is no migration and no new write path: this command only calls the existing governed service.
 
 Finance file (JSON, at most 1500 rows, mode 0600, duplicate keys refused, bound by ``--file-sha256``)::
 
@@ -18,18 +18,24 @@ Rules (all refuse the whole file; apply writes nothing unless every row is eligi
   sha256 is recorded in the receipt; no reference, no run;
 * unknown payee (employee id, supplier ref, or a statutory ref that does not resolve), unknown bank code,
   invalid NUBAN (format, plus the check digit where the reference marks it applicable) are refused per row;
-* supplier rows need ``callback_ref``: supplier bank changes need a call-back verification. It is stored in the
-  instruction evidence (``<evidence_ref> | callback:<callback_ref>``, at most 240 characters) because there is
-  no separate column and no migration;
+* ``callback_ref`` (call-back verification) is REQUIRED for supplier rows, statutory rows and any row that changes
+  an existing APPROVED instruction. It is stored in the instruction evidence
+  (``<evidence_ref> | callback:<callback_ref>``, at most 240 characters): there is no column and no migration;
 * the same payee twice in one file is refused (ambiguous);
-* a payee that already has an OPEN proposal has it REJECTED ("replaced by bulk file") and a new one proposed in
-  the same transaction; a row identical to the payee's approved instruction is a no-op (``unchanged``).
-* ``--approve`` approves each new proposal in the same run, only when the tenant dual-control policy is OFF
-  and ``--operator-ref`` is given; with the policy ON it is refused (approval stays a second person in the UI).
+* ``proposer_party_id`` must be an active party of the tenant holding the B8 propose permission (and the approve
+  permission when ``--approve``), else ``proposer_not_authorised``. ``operator_ref`` goes in every audit event;
+* outcomes: ``new`` (no live instruction), ``replace`` (an open proposal is rejected and a new one proposed),
+  ``change`` (would change an APPROVED instruction), ``name_differs`` (same bank and account as the approved
+  one, different account name; counted as a change), ``unchanged`` (identical to the approved one: no-op);
+* ``--approve`` approves ONLY onboarding rows (``new`` / ``replace``: payees with no approved instruction yet),
+  and only when the tenant dual-control policy is OFF and ``--operator-ref`` is given; with the policy ON it is
+  refused. Rows that change an approved instruction are proposed and left for per-row approval in the B8 UI with
+  a call-back reference (counted as ``changes_to_approved`` / ``left_for_ui_approval``);
+* ``--expect new=N,replace=N,change=N`` must equal the plan counts exactly or apply is refused (exit 3).
 
     python -m erp_v2.payees.bulk_cli --file F.json --file-sha256 S --bank-reference B.json --bank-reference-sha256 T \
         --receipt R.json \
-        [--apply --operator-ref <who>] [--approve]
+        [--apply --operator-ref <who>] [--approve] [--expect new=N,replace=N,change=N]
 
 Apply needs ``--apply``, ERP_IMPORT_APPROVED=1 and ERP_IMPORT_APPLY_OK=1. The DSN is environment-only
 (MIGRATION_DATABASE_URL). The receipt (0600, created exclusively before any work) holds counts, refusal reasons
@@ -199,16 +205,25 @@ def parse_file(raw: bytes, expected_sha256: str) -> PayeeFile:
     return PayeeFile(tenant, proposer, ref, expected_sha256, tuple(parsed))
 
 
+ONBOARDING_APPROVABLE = ("new", "replace")  # payees with NO approved instruction yet
+_OK = ("new", "replace", "change", "name_differs", "unchanged")
+_CHANGES = ("change", "name_differs")
+_EXPECT_KEYS = ("new", "replace", "change")
+
+
 def classify_row(db, tenant_id: UUID, row: PayeeRow, banks: BankReference) -> str:
-    """One outcome per row, read-only: 'new' | 'replace' | 'unchanged' | a refusal reason."""
+    """One outcome per row, read-only.
+
+    'new' (no live instruction) | 'replace' (an open proposal, no approved one: onboarding) |
+    'change' (would change an APPROVED instruction: never auto-approved) | 'name_differs' (same bank and account
+    as the approved one, different account name: a change too) | 'unchanged' | a refusal reason.
+    """
     import sqlalchemy as sa
 
     if banks.name(row.bank_code) is None:
         return "unknown_bank_code"
     if not banks.valid_nuban(row.bank_code, row.account_number):
         return "invalid_nuban"
-    if row.kind == PayeeKind.SUPPLIER.value and row.callback_ref is None:
-        return "callback_ref_required"
     if len(row.evidence) > EVIDENCE_MAX:
         return "evidence_too_long"
     if service.resolve_payee(db, tenant_id, row.kind, row.ref) is None:
@@ -223,31 +238,59 @@ def classify_row(db, tenant_id: UUID, row: PayeeRow, banks: BankReference) -> st
     ).all()
     approved = next((i for i in live if i.status == InstructionStatus.APPROVED.value), None)
     open_proposal = next((i for i in live if i.status == InstructionStatus.PROPOSED.value), None)
-    if open_proposal is None and approved is not None:
-        if (approved.bank_code, approved.account_number) == (row.bank_code, row.account_number):
+    if approved is None:
+        outcome = "replace" if open_proposal is not None else "new"
+    elif (approved.bank_code, approved.account_number) == (row.bank_code, row.account_number):
+        if (approved.account_name or "").strip() == row.account_name.strip():
             return "unchanged"
-    return "replace" if open_proposal is not None else "new"
-
-
-_OK = ("new", "replace", "unchanged")
+        outcome = "name_differs"
+    else:
+        outcome = "change"
+    # Call-back verification: suppliers, statutory bodies, and any change to an approved instruction.
+    if row.callback_ref is None and (
+        row.kind in (PayeeKind.SUPPLIER.value, PayeeKind.STATUTORY.value) or outcome in _CHANGES
+    ):
+        return "callback_ref_required"
+    return outcome
 
 
 def classify(db, file: PayeeFile, banks: BankReference) -> list[tuple[PayeeRow, str]]:
     return [(row, classify_row(db, file.tenant_id, row, banks)) for row in file.rows]
 
 
+def parse_expect(text: str | None) -> dict[str, int] | None:
+    """``new=N,replace=N,change=N`` (all three, non-negative integers) or a refusal."""
+    if text is None:
+        return None
+    parts = [p.split("=", 1) for p in text.split(",")]
+    _require(all(len(p) == 2 for p in parts), "invalid_expect")
+    keys = [k for k, _ in parts]
+    _require(sorted(keys) == sorted(_EXPECT_KEYS), "invalid_expect")
+    _require(all(v.isascii() and v.isdigit() and len(v) <= 6 for _, v in parts), "invalid_expect")
+    return {k: int(v) for k, v in parts}
+
+
+def plan_counts(outcomes) -> dict[str, int]:
+    tally = Counter(reason for _row, reason in outcomes)
+    return {
+        "new": tally["new"],
+        "replace": tally["replace"],
+        "change": tally["change"] + tally["name_differs"],
+    }
+
+
 def apply_rows(
     db, file: PayeeFile, outcomes, *, banks: BankReference, operator_ref: str | None, approve: bool
 ) -> Counter:
-    """Propose (and, with --approve and the policy off, approve) every eligible row in the caller's transaction."""
-    _require(all(reason in _OK for _row, reason in outcomes), "file_not_fully_eligible")
+    """Propose (and, with --approve and the policy off, approve ONBOARDING rows only) in the caller's transaction."""
     import sqlalchemy as sa
 
+    _require(all(reason in _OK for _row, reason in outcomes), "file_not_fully_eligible")
     written: Counter = Counter()
     for row, reason in outcomes:
         if reason == "unchanged":
             continue
-        if reason == "replace":
+        if reason in ("replace", "change", "name_differs"):
             open_proposal = db.scalar(
                 sa.select(PayeeBankInstruction).where(
                     PayeeBankInstruction.tenant_id == file.tenant_id,
@@ -263,6 +306,7 @@ def apply_rows(
                     instruction_id=open_proposal.id,
                     decider_party_id=file.proposer_party_id,
                     reason=f"replaced by bulk file {file.file_ref}"[:500],
+                    operator_ref=operator_ref,
                 )
                 written["replaced"] += 1
             # a legacy-import open proposal is replaced by service.propose itself
@@ -277,17 +321,21 @@ def apply_rows(
             account_number=row.account_number,
             account_name=row.account_name,
             evidence_ref=row.evidence,
+            operator_ref=operator_ref,
         )
         written["proposed"] += 1
-        if approve:
+        if approve and reason in ONBOARDING_APPROVABLE:
             service.approve(
                 db,
                 tenant_id=file.tenant_id,
                 instruction_id=proposed.id,
                 approver_party_id=file.proposer_party_id,
                 note=f"bulk approve by {operator_ref}; file {file.file_ref}"[:500],
+                operator_ref=operator_ref,
             )
             written["approved"] += 1
+        elif approve:
+            written["left_for_ui_approval"] += 1
     return written
 
 
@@ -299,12 +347,14 @@ def receipt_of(
     mode: str,
     dual: bool,
     approve: bool,
+    expect: dict[str, int] | None = None,
     written: Counter | None = None,
 ):
     """Counts, digests and per-row (row number, kind, outcome, last four digits). Nothing else about a payee."""
     counts = Counter(reason for _row, reason in outcomes)
     refused = {k: v for k, v in counts.items() if k not in _OK}
     written = written or Counter()
+    planned = plan_counts(outcomes)
     return dict(
         mode=mode,
         production_ready=False,
@@ -314,14 +364,23 @@ def receipt_of(
         approve_requested=approve,
         counts=dict(
             requested=len(file.rows),
-            new=counts.get("new", 0),
-            replace=counts.get("replace", 0),
-            unchanged=counts.get("unchanged", 0),
+            new=planned["new"],
+            replace=planned["replace"],
+            changes_to_approved=planned["change"],
+            name_differs=counts["name_differs"],
+            unchanged=counts["unchanged"],
             refused=sum(refused.values()),
         ),
+        expect=expect,
+        expect_matches=None if expect is None else expect == planned,
         by_kind=dict(sorted(Counter(row.kind for row in file.rows).items())),
         refusals_by_reason=dict(sorted(refused.items())),
-        written=dict(proposed=written["proposed"], replaced=written["replaced"], approved=written["approved"]),
+        written=dict(
+            proposed=written["proposed"],
+            replaced=written["replaced"],
+            approved=written["approved"],
+            left_for_ui_approval=written["left_for_ui_approval"],
+        ),
         rows=[
             dict(row=i, kind=row.kind, outcome=reason, account_last4=row.last4)
             for i, (row, reason) in enumerate(outcomes, start=1)
@@ -329,7 +388,38 @@ def receipt_of(
     )
 
 
-def run(db, file: PayeeFile, banks: BankReference, *, apply: bool, operator_ref: str | None, approve: bool) -> dict:
+def check_proposer(db, file: PayeeFile, *, approve: bool) -> None:
+    """The proposer must be an active person of THIS tenant holding the B8 propose permission (and the approve
+    permission when --approve makes them the approver). Roles come from the declared permission specs."""
+    import sqlalchemy as sa
+    from dotmac_kernel.models import Party, PartyRoleGrant, Role
+
+    from erp_v2.access import PAYEE_BANK_APPROVE, PAYEE_BANK_PROPOSE, PERMISSION_SPECS
+
+    party = db.scalar(sa.select(Party).where(Party.tenant_id == file.tenant_id, Party.id == file.proposer_party_id))
+    _require(party is not None and party.is_active, "proposer_not_authorised")
+    held = set(
+        db.scalars(
+            sa.select(Role.slug)
+            .join(PartyRoleGrant, (PartyRoleGrant.role_id == Role.id) & (PartyRoleGrant.tenant_id == Role.tenant_id))
+            .where(PartyRoleGrant.tenant_id == file.tenant_id, PartyRoleGrant.party_id == file.proposer_party_id)
+        )
+    )
+    roles_for = {spec.code: set(spec.default_roles) for spec in PERMISSION_SPECS}
+    needed = [PAYEE_BANK_PROPOSE] + ([PAYEE_BANK_APPROVE] if approve else [])
+    _require(all(held & roles_for[code] for code in needed), "proposer_not_authorised")
+
+
+def run(
+    db,
+    file: PayeeFile,
+    banks: BankReference,
+    *,
+    apply: bool,
+    operator_ref: str | None,
+    approve: bool,
+    expect: dict[str, int] | None = None,
+) -> dict:
     """Core of both modes; the caller owns the transaction (plan is rolled back by the caller)."""
     import sqlalchemy as sa
 
@@ -349,14 +439,18 @@ def run(db, file: PayeeFile, banks: BankReference, *, apply: bool, operator_ref:
     if approve:
         _require(bool(operator_ref), "operator_ref_required")
         _require(not dual, "approve_refused_dual_control_on")
+    check_proposer(db, file, approve=approve)
     outcomes = classify(db, file, banks)
+    common = dict(banks=banks, dual=dual, approve=approve, expect=expect)
     if not apply:
-        return receipt_of(file, outcomes, banks=banks, mode="plan", dual=dual, approve=approve)
+        return receipt_of(file, outcomes, mode="plan", **common)
     if any(reason not in _OK for _row, reason in outcomes):
         # Fail closed and whole-file: nothing is written, and the receipt says why (counts, never values).
-        return receipt_of(file, outcomes, banks=banks, mode="apply_refused", dual=dual, approve=approve)
+        return receipt_of(file, outcomes, mode="apply_refused", **common)
+    if expect is not None and expect != plan_counts(outcomes):
+        return receipt_of(file, outcomes, mode="apply_refused_expect_mismatch", **common)
     written = apply_rows(db, file, outcomes, banks=banks, operator_ref=operator_ref, approve=approve)
-    return receipt_of(file, outcomes, banks=banks, mode="apply", dual=dual, approve=approve, written=written)
+    return receipt_of(file, outcomes, mode="apply", written=written, **common)
 
 
 def _authorized(args) -> bool:
@@ -378,6 +472,7 @@ def _run(args) -> dict:
     _require(not (args.apply or args.approve) or operator_ref is not None, "operator_ref_required")
     file = parse_file(read_private_file(args.file), args.file_sha256)
     banks = load_bank_reference(args.bank_reference, args.bank_reference_sha256)
+    expect = parse_expect(args.expect)
     import sqlalchemy as sa
     from dotmac_kernel.audit_actions import (
         AuditActionRegistry,
@@ -399,7 +494,9 @@ def _run(args) -> dict:
         with Session(engine) as db, db.begin():
             if not args.apply:
                 db.execute(sa.text("SET TRANSACTION READ ONLY"))
-            return run(db, file, banks, apply=args.apply, operator_ref=operator_ref, approve=args.approve)
+            return run(
+                db, file, banks, apply=args.apply, operator_ref=operator_ref, approve=args.approve, expect=expect
+            )
     finally:
         engine.dispose()
 
@@ -417,6 +514,7 @@ def main(argv=None) -> int:
     parser.add_argument("--bank-reference-sha256")
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--operator-ref")
+    parser.add_argument("--expect", help="new=N,replace=N,change=N: must equal the plan counts exactly at apply")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--approve", action="store_true")
     args = parser.parse_args(argv)
@@ -429,7 +527,7 @@ def main(argv=None) -> int:
     with os.fdopen(fd, "w") as stream:
         try:
             payload = _run(args)
-            code = 0 if payload["counts"]["refused"] == 0 else 3
+            code = 0 if payload["counts"]["refused"] == 0 and payload.get("expect_matches") is not False else 3
         except BulkRefusal as exc:
             payload, code = dict(production_ready=False, refusal=exc.reason), 2
         except PayeeBankError as exc:
@@ -445,6 +543,7 @@ def main(argv=None) -> int:
         "bulk payees: "
         + (
             f"requested={counts.get('requested', 0)} new={counts.get('new', 0)} replace={counts.get('replace', 0)} "
+            f"changes_to_approved={counts.get('changes_to_approved', 0)} "
             f"unchanged={counts.get('unchanged', 0)} refused={counts.get('refused', 0)}"
             if counts
             else "command refused"
