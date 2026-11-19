@@ -107,7 +107,11 @@ def upgrade() -> None:
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
         "RETURN NEW; END",
     )
-    op.execute(f"GRANT SELECT ON public.{POSTINGS_TABLE} TO app_user")
+    op.execute(f"GRANT SELECT, INSERT ON public.{POSTINGS_TABLE} TO app_user")
+    op.execute(
+        f"GRANT UPDATE (disposition, reason, journal_id, map_digest, attempts, updated_at) "
+        f"ON public.{POSTINGS_TABLE} TO app_user"
+    )
 
     op.create_table(
         WINDOWS_TABLE,
@@ -137,7 +141,8 @@ def upgrade() -> None:
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
         "RETURN NEW; END",
     )
-    op.execute(f"GRANT SELECT ON public.{WINDOWS_TABLE} TO app_user")
+    op.execute(f"GRANT SELECT, INSERT ON public.{WINDOWS_TABLE} TO app_user")
+    op.execute(f"GRANT UPDATE (count, digest, closed_at, rechecked_at) ON public.{WINDOWS_TABLE} TO app_user")
 
 
 def downgrade() -> None:
