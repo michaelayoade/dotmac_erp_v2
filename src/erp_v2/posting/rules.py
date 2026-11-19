@@ -94,6 +94,13 @@ POLICIES: Final = MappingProxyType(
         # bank account's cash GL (advance) or a Finance-chosen non-control offset (adjustment, control
         # difference). Both refs are Account UUIDs, resolved from the tenant's records, never typed.
         ("erp", "staff_loan_entry"): RefPolicy(),
+        # B-14 migration holdings (W1: four new system doors onto control accounts). Lines are system-built from
+        # re-derived owner state, once-only uuid5 identities, Account UUIDs resolved from the tenant. ONLY
+        # erp_v2.holdings builds these kinds (a test greps).
+        ("erp.migration", "migration_holding"): RefPolicy(),
+        ("erp.migration", "holding_release"): RefPolicy(),
+        ("erp.migration", "holding_writeoff"): RefPolicy(),
+        ("erp.migration", "ar_opening_credit"): RefPolicy(),
     }
 )
 
