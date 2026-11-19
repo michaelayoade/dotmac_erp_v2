@@ -213,6 +213,12 @@ def missing_for_approval(row: PayeeBankInstruction) -> list[str]:
     return missing_fields(row.bank_code, row.account_number, row.account_name)
 
 
+def _operator(operator_ref: str | None) -> dict[str, str]:
+    """Audit detail for an operator-run (CLI) command; empty for the UI."""
+
+    return {} if operator_ref is None else {"operator_ref": operator_ref}
+
+
 def _audit(db: Session, *, tenant_id: UUID, actor: UUID, action: str, row: PayeeBankInstruction, **details) -> None:
     from dotmac_kernel.audit import write_audit_event
 
@@ -300,6 +306,7 @@ def propose(
     account_name: str,
     evidence_ref: str,
     now: datetime | None = None,
+    operator_ref: str | None = None,
 ) -> PayeeBankInstruction:
     try:
         kind = PayeeKind(payee_kind)
@@ -324,10 +331,12 @@ def propose(
             PayeeBankInstruction.status == InstructionStatus.APPROVED.value,
         )
     )
-    if existing_approved is not None and (existing_approved.bank_code, existing_approved.account_number) == (
-        code,
-        number,
-    ):
+    # Same bank and account but a different account NAME is a change (a name-only edit is still a new proposal).
+    if existing_approved is not None and (
+        existing_approved.bank_code,
+        existing_approved.account_number,
+        (existing_approved.account_name or "").strip(),
+    ) == (code, number, (account_name or "").strip()):
         raise PayeeBankError("unchanged", "the approved instruction already has these bank details")
     row = PayeeBankInstruction(
         id=uuid4(),
@@ -375,10 +384,11 @@ def propose(
             action=AUDIT_REJECTED,
             row=open_proposal,
             replaced_by=str(row.id),
+            **_operator(operator_ref),
         )
     db.add(row)
     db.flush()
-    _audit(db, tenant_id=tenant_id, actor=proposer_party_id, action=AUDIT_PROPOSED, row=row)
+    _audit(db, tenant_id=tenant_id, actor=proposer_party_id, action=AUDIT_PROPOSED, row=row, **_operator(operator_ref))
     return row
 
 
@@ -390,6 +400,7 @@ def approve(
     approver_party_id: UUID,
     note: str | None = None,
     now: datetime | None = None,
+    operator_ref: str | None = None,
 ) -> PayeeBankInstruction:
     row = _locked(db, tenant_id, instruction_id)
     if row.status != InstructionStatus.PROPOSED.value:
@@ -440,6 +451,7 @@ def approve(
         superseded=str(previous.id) if previous is not None else None,
         origin=row.origin,
         shared_account_payees=_shared_count(db, row),
+        **_operator(operator_ref),
     )
     return row
 
@@ -452,6 +464,7 @@ def reject(
     decider_party_id: UUID,
     reason: str,
     now: datetime | None = None,
+    operator_ref: str | None = None,
 ) -> PayeeBankInstruction:
     row = _locked(db, tenant_id, instruction_id)
     if row.status != InstructionStatus.PROPOSED.value:
@@ -462,7 +475,7 @@ def reject(
     row.decided_at = now or _now()
     row.decision_note = note
     db.flush()
-    _audit(db, tenant_id=tenant_id, actor=decider_party_id, action=AUDIT_REJECTED, row=row)
+    _audit(db, tenant_id=tenant_id, actor=decider_party_id, action=AUDIT_REJECTED, row=row, **_operator(operator_ref))
     return row
 
 
