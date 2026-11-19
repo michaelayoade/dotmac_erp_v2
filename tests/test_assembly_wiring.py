@@ -15,6 +15,7 @@ EXPECTED_MODULE_VERSIONS = {
     "erp_academy_sync": None,
     "erp_web": None,
     "erp_revenue": None,
+    "erp_receivables_producer": None,
     "erp_revenue_approval": None,
     "erp_supplier_credit_notes": None,
     "erp_legacy_reentry": None,
