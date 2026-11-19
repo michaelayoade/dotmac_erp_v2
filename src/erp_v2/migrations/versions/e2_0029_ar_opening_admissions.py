@@ -86,6 +86,48 @@ def _grant_lines() -> list[str]:
     return lines
 
 
+def role_guard_sql(role: str) -> str:
+    """Create the NOLOGIN writer role, or verify an existing one (the role name is a closed literal)."""
+
+    return f"""
+        DO $$
+        DECLARE
+            server_major integer := current_setting('server_version_num')::integer / 10000;
+            r record;
+        BEGIN
+            IF server_major < 15 THEN
+                RAISE EXCEPTION 'erp_billing_opening_writer requires PostgreSQL 15 or newer';
+            END IF;
+            SELECT * INTO r FROM pg_catalog.pg_roles WHERE rolname = '{role}';
+            IF NOT FOUND THEN
+                CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+            ELSIF r.rolcanlogin OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb
+                  OR r.rolreplication THEN
+                RAISE EXCEPTION 'existing role {role} has a forbidden attribute: refusing to adopt it';
+            END IF;
+            -- never a member (even transitively) of the serving or admin roles, and none of them a member of it
+            IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{role}') THEN
+                IF EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_roles g
+                    WHERE g.rolname IN ('app_user', 'platform_api', 'app_admin')
+                      AND (pg_catalog.pg_has_role('{role}', g.oid, 'MEMBER')
+                           OR pg_catalog.pg_has_role(g.oid, '{role}', 'MEMBER'))
+                ) THEN
+                    RAISE EXCEPTION '{role} is linked to app_user, platform_api or app_admin: refusing';
+                END IF;
+                -- membership of ANY role (e.g. one granted to the pipeline migrator) is a widening: refuse
+                IF EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_auth_members m
+                    WHERE m.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{role}')
+                ) THEN
+                    RAISE EXCEPTION '{role} is a member of another role: refusing to adopt it';
+                END IF;
+            END IF;
+        END
+        $$
+    """
+
+
 def upgrade() -> None:
     op.create_table(
         TABLE,
@@ -138,45 +180,7 @@ def upgrade() -> None:
     )
     op.execute(f"GRANT SELECT ON public.{TABLE} TO app_user")
     # The restricted opening principal (billing R5). An existing role is verified, never altered or widened.
-    op.execute(
-        f"""
-        DO $$
-        DECLARE
-            server_major integer := current_setting('server_version_num')::integer / 10000;
-            r pg_catalog.pg_roles%ROWTYPE;
-        BEGIN
-            IF server_major < 15 THEN
-                RAISE EXCEPTION 'erp_billing_opening_writer requires PostgreSQL 15 or newer';
-            END IF;
-            SELECT * INTO r FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}';
-            IF NOT FOUND THEN
-                CREATE ROLE {WRITER_ROLE} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-            ELSIF r.rolcanlogin OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb
-                  OR r.rolreplication THEN
-                RAISE EXCEPTION 'existing role {WRITER_ROLE} has a forbidden attribute: refusing to adopt it';
-            END IF;
-            -- never a member (even transitively) of the serving or admin roles, and none of them a member of it
-            IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}') THEN
-                IF EXISTS (
-                    SELECT 1 FROM pg_catalog.pg_roles g
-                    WHERE g.rolname IN ('app_user', 'platform_api', 'app_admin')
-                      AND (pg_catalog.pg_has_role('{WRITER_ROLE}', g.oid, 'MEMBER')
-                           OR pg_catalog.pg_has_role(g.oid, '{WRITER_ROLE}', 'MEMBER'))
-                ) THEN
-                    RAISE EXCEPTION '{WRITER_ROLE} is linked to app_user, platform_api or app_admin: refusing';
-                END IF;
-                -- membership of ANY role (e.g. one granted to the pipeline migrator) is a widening: refuse
-                IF EXISTS (
-                    SELECT 1 FROM pg_catalog.pg_auth_members m
-                    WHERE m.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{WRITER_ROLE}')
-                ) THEN
-                    RAISE EXCEPTION '{WRITER_ROLE} is a member of another role: refusing to adopt it';
-                END IF;
-            END IF;
-        END
-        $$
-        """
-    )
+    op.execute(role_guard_sql(WRITER_ROLE))
     for line in _grant_lines():
         op.execute(line)
     # NO membership is granted here, to the migration role or anyone else. A standing, inheriting membership of the

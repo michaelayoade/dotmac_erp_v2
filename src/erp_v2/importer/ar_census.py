@@ -139,6 +139,7 @@ class ArCensus:
                     "document_number": r.document_number,
                     "partition": list(r.partition) if r.partition else None,
                     "gross_minor": r.gross_minor,
+                    "residual_minor": r.residual_minor,
                 }
                 for r in self.rows
                 if r.bucket == UNAPPLIED_CREDIT_NOTE

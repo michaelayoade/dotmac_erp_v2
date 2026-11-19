@@ -184,6 +184,9 @@ class ErpOpeningAuthority:
     migration_authority_ref: str  # "dotmac-debt-register v<N>" of Michael's go
     role_oid: int  # read from pg_roles at run time for WRITER_ROLE
     expected_coupled_watermark: str
+    # The ERP #62 two-person policy as billing a13's per-window "off" | "on". Must be explicit: a provision whose
+    # window binds anything else (or any value while this is None) is refused. a12 windows carry no such field.
+    expected_dual_control: str | None = None
 
     # --- OpeningLaneAssemblyAuthorityV1 ----------------------------------------------------------------------
     def import_verifier(self) -> ErpImportVerifier:
@@ -197,7 +200,9 @@ class ErpOpeningAuthority:
 
     # --- provision (billing's `OpeningWindowProvisionVerifier`) ----------------------------------------------
     def provision_verifier(self) -> ErpProvisionVerifier:
-        return ErpProvisionVerifier(self.assembly, self.migration_authority_ref, self.role_oid)
+        return ErpProvisionVerifier(
+            self.assembly, self.migration_authority_ref, self.role_oid, self.expected_dual_control
+        )
 
 
 @dataclass(frozen=True)
@@ -267,6 +272,7 @@ class ErpProvisionVerifier:
     assembly: ArAssembly
     migration_authority_ref: str
     role_oid: int
+    expected_dual_control: str | None = None
 
     def verify_provision(
         self, request: OpeningWindowProvisionVerificationRequestV1
@@ -286,6 +292,7 @@ class ErpProvisionVerifier:
             or window.principal_name != WRITER_ROLE
             or window.principal_oid != self.role_oid
             or window.provision_authority_ref != self.migration_authority_ref
+            or (hasattr(window, "dual_control") and window.dual_control != self.expected_dual_control)
         ):
             return None
         return OpeningWindowProvisionVerificationV1(

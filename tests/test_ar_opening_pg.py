@@ -5,16 +5,20 @@ mint -> plan -> provision (app_admin) -> import every partition (restricted writ
 
 from __future__ import annotations
 
+# ruff: noqa: E501
 import os
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 import sqlalchemy as sa
 from ar_opening_support import CUTOFF, SNAPSHOT, UTC, alloc, capture, invoice, payment
 from dotmac_billing import get_opening_window, get_opening_window_seal
+from dotmac_customers import AccountStatus
+from dotmac_customers.models import CustomerAccount
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.models import Tenant
 from sqlalchemy.orm import Session
@@ -27,9 +31,15 @@ from erp_v2.importer.ar_opening_cli import (
     apply_opening,
     build_plan,
     existing_account_ids,
-    mint_customers_and_accounts,
+    mint_billing_accounts,
     role_oid,
 )
+
+
+# Legacy customer ids are UUIDs; the wave-4 import preserves them as customer_accounts.id.
+def _cust(tenant: UUID, name: str) -> UUID:
+    return uuid5(tenant, name)  # customer account ids are global primary keys: derive them per tenant
+
 
 REF = "dotmac-debt-register v1"
 FENCE = "fence-1"
@@ -63,7 +73,7 @@ def _app_admin_provision_grants(engine):
         c.exec_driver_sql("GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_admin")
 
 
-def _rows(variance: bool = False):
+def _rows(tenant: UUID, variance: bool = False):
     invoices = [
         invoice("inv-1", total="1000.00", dotmac_sub_id="sub-9", posted=True),
         invoice("inv-2", total="500.00", splynx_id="spx-1", posted=True),
@@ -78,6 +88,7 @@ def _rows(variance: bool = False):
         ),
         invoice("cn-1", customer="cust-3", total="-5.00", invoice_type="CREDIT_NOTE", posted=True),
         invoice("inv-6", customer="cust-3", total="10.00", posted=True),
+        invoice("inv-7", customer="cust-4", total="10.005", posted=True),  # inexact: whole partition is excluded
     ]
     payments = [
         payment("pay-1", "450.00", posted=True),
@@ -90,7 +101,26 @@ def _rows(variance: bool = False):
         alloc("pay-closed", "inv-closed", "30.00"),
         alloc("pay-2", "inv-3", "10.00"),
     ]
+    for row in (*invoices, *payments):
+        row["customer_key"] = str(_cust(tenant, row["customer_key"]))
     return invoices, payments, allocations
+
+
+def _wave4_customers(engine, tenant, keys) -> None:
+    """The wave-4 import already landed these accounts (id = the legacy customer id); the AR mint only reuses them."""
+
+    with Session(engine) as db, db.begin():
+        db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant)})
+        for key in keys:
+            db.add(
+                CustomerAccount(
+                    id=_cust(tenant, key),
+                    tenant_id=tenant,
+                    account_number=f"W4-{tenant.hex[:8]}-{key}".upper(),
+                    display_name=f"Customer {key}",
+                    status=AccountStatus.ACTIVE,
+                )
+            )
 
 
 def _world(engine, *, variance: bool = False) -> SimpleNamespace:
@@ -99,7 +129,7 @@ def _world(engine, *, variance: bool = False) -> SimpleNamespace:
         db.add(Tenant(id=tenant, slug=f"t{tenant.hex[:24]}", name="AR opening"))
         db.commit()
     scope = TenantScope(tenant)
-    invoices, payments, allocations = _rows(variance)
+    invoices, payments, allocations = _rows(tenant, variance)
     census = build_census(
         snapshot_sha256="b" * 64,
         cutoff=CUTOFF,
@@ -109,15 +139,10 @@ def _world(engine, *, variance: bool = False) -> SimpleNamespace:
         customer_snapshot=lambda _k: SNAPSHOT,
         seller=SNAPSHOT,
     )
-    customers = {
-        k: {"customer_key": k, "legal_name": f"Customer {k}", "dotmac_sub_id": "ext-1" if k == "cust-1" else None}
-        for k in ("cust-1", "cust-2", "cust-3")
-    }
+    _wave4_customers(engine, tenant, ("cust-1", "cust-2", "cust-3", "cust-4"))
     with Session(engine) as db, db.begin():
         db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant)})
-        minted = mint_customers_and_accounts(
-            db, scope=scope, partitions=list(census.carry_partitions), customers=customers
-        )
+        minted = mint_billing_accounts(db, scope=scope, partitions=list(census.carry_partitions))
     ni, np_, na = normalise_rows(invoices, payments, allocations)
     asm = ArAssembly(
         tenant_id=tenant,
@@ -130,7 +155,9 @@ def _world(engine, *, variance: bool = False) -> SimpleNamespace:
         customer_snapshot=lambda _k: SNAPSHOT,
         seller=SNAPSHOT,
     )
-    return SimpleNamespace(tenant=tenant, scope=scope, census=census, asm=asm, minted=minted)
+    return SimpleNamespace(
+        tenant=tenant, scope=scope, census=census, asm=asm, minted=minted, k=lambda n: str(_cust(tenant, n))
+    )
 
 
 def _plan(engine, w):
@@ -141,9 +168,13 @@ def _plan(engine, w):
         )
 
 
-def _authority(w, oid):
+def _authority(w, oid, dual="on"):
     return ErpOpeningAuthority(
-        assembly=w.asm, migration_authority_ref=REF, role_oid=oid, expected_coupled_watermark=FENCE
+        assembly=w.asm,
+        migration_authority_ref=REF,
+        role_oid=oid,
+        expected_coupled_watermark=FENCE,
+        expected_dual_control=dual,
     )
 
 
@@ -151,36 +182,55 @@ def _apply(engine, w, plan, oid, **kw):
     return apply_opening(
         engine,
         assembly=w.asm,
-        authority=_authority(w, oid),
+        authority=_authority(w, oid, "on" if kw.get("dual", True) else "off"),
         plan=plan,
         approved_plan_sha256=kw.pop("approved", plan["plan_sha256"]),
         occurred_at=NOW,
         applied_by="tester",
         coupled_watermark=kw.pop("fence", FENCE),
+        dual_control=kw.pop("dual", True),  # pinned a12 windows are two-person; a13 binds the policy per window
         env=kw.pop("env", {"ERP_AR_OPENING_APPLY": "1"}),
     )
 
 
-def test_census_excludes_the_credit_note_partition_and_mint_creates_only_carryable_accounts(engine):
+def test_census_carries_the_credit_note_customer_and_excludes_only_the_inexact_partition(engine):
     w = _world(engine)
-    assert w.census.carry_partitions == (("cust-1", "NGN"), ("cust-2", "NGN"))
-    assert [e.partition for e in w.census.excluded] == [("cust-3", "NGN")]
+    assert w.census.carry_partitions == tuple(sorted((w.k(n), "NGN") for n in ("cust-1", "cust-2", "cust-3")))
+    assert [e.partition for e in w.census.excluded] == [(w.k("cust-4"), "NGN")]
     with Session(engine) as db:
         found = existing_account_ids(
-            db, scope=w.scope, partitions=[("cust-1", "NGN"), ("cust-2", "NGN"), ("cust-3", "NGN")]
+            db, scope=w.scope, partitions=[(w.k(n), "NGN") for n in ("cust-1", "cust-2", "cust-3", "cust-4")]
         )
-    assert set(found) == {("cust-1", "NGN"), ("cust-2", "NGN")} and found == w.minted
-    with Session(engine) as db, db.begin():  # mint is idempotent
+    assert set(found) == set(w.minted) and found == w.minted  # cust-4 was never minted
+    with Session(engine) as db, db.begin():  # mint is idempotent and reuses the wave-4 accounts
         db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
-        again = mint_customers_and_accounts(db, scope=w.scope, partitions=list(w.census.carry_partitions), customers={})
-    assert again == w.minted
+        again = mint_billing_accounts(db, scope=w.scope, partitions=list(w.census.carry_partitions))
+        assert again == w.minted
+        assert (
+            db.scalar(
+                sa.text("SELECT count(*) FROM mod_customers.customer_accounts WHERE tenant_id = :t"), {"t": w.tenant}
+            )
+            == 4
+        )
 
 
-def test_plan_previews_clean_and_apply_refuses_without_authorisation_or_with_a_wrong_sha(engine):
+def test_mint_refuses_a_customer_the_wave4_import_did_not_land(engine):
+    w = _world(engine)
+    with Session(engine) as db, db.begin():
+        db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
+        with pytest.raises(OperatorRefusal, match="customer_not_imported"):
+            mint_billing_accounts(db, scope=w.scope, partitions=[(str(UUID(int=0xDEAD)), "NGN")])
+
+
+def test_plan_previews_clean_with_the_unapplied_credit_note_out_of_the_manifest_p1(engine):
+    """P-1 against the pinned billing (a12): a partition carried WITHOUT its unapplied credit note previews clean."""
+
     w = _world(engine)
     plan, oid = _plan(engine, w)
-    assert plan["preview_ok"] and plan["partitions"] == 2 and plan["excluded_partitions"] == 1
-    assert plan["receivable_items"] == 4 and plan["cash_lots"] == 3 and plan["variances"] == []
+    assert plan["preview_ok"] and plan["manifest_blockers"] == [] and plan["partition_blockers"] == []
+    assert plan["partitions"] == 3 and plan["excluded_partitions"] == 1 and plan["unapplied_credit_notes"] == 1
+    assert plan["receivable_items"] == 5 and plan["cash_lots"] == 3 and plan["variances"] == []
+    assert plan["t1_credit_by_currency"] == {"NGN": 5000 + 0 + 2000}  # pay-1 50.00 + pay-2 0 + pay-9 20.00
     with pytest.raises(OperatorRefusal, match="explicit_apply_authorization_required"):
         _apply(engine, w, plan, oid, env={})
     with pytest.raises(OperatorRefusal, match="approved_plan_sha_mismatch"):
@@ -194,13 +244,12 @@ def test_provision_import_seal_with_the_restricted_writer_and_zero_gl(engine):
     w = _world(engine)
     plan, oid = _plan(engine, w)
     receipt = _apply(engine, w, plan, oid)
-    assert receipt["sealed"] and len(receipt["admitted"]) == 2
+    assert receipt["sealed"] and len(receipt["admitted"]) == 3 and receipt["dual_control"] == "on"
     with Session(engine) as db:
         db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
         window = get_opening_window(db, scope=w.scope)
         assert window is not None and window.principal_name == WRITER_ROLE and window.principal_oid == oid
         assert get_opening_window_seal(db, scope=w.scope) is not None
-        # the receivable position equals the census per partition (residual minor / 100)
         total = db.execute(
             sa.text(
                 "SELECT coalesce(sum(initial_receivable), 0) FROM mod_billing.opening_receivable_bases "
@@ -213,12 +262,49 @@ def test_provision_import_seal_with_the_restricted_writer_and_zero_gl(engine):
             sa.text("SELECT source_account_key, posting_group_id FROM erp_ar_opening_admissions WHERE tenant_id = :t"),
             {"t": w.tenant},
         ).all()
-        assert sorted(r[0] for r in rows) == ["cust-1", "cust-2"]
-        # 0 GL: the opening posted no journal at all (and billing posts none by itself)
+        assert sorted(r[0] for r in rows) == sorted(w.k(n) for n in ("cust-1", "cust-2", "cust-3"))
         journals = db.execute(
             sa.text("SELECT count(*) FROM mod_accounting.journal_entries WHERE tenant_id = :t"), {"t": w.tenant}
         ).scalar()
         assert journals == 0
+    # T1 anchor: the per-currency amount is the sealed manifest's cash-lot residual sum, also per-partition controls
+    assert plan["t1_credit_by_currency"] == {
+        "NGN": sum(c.available_cash_credit_minor for c in w.asm.manifest().controls)
+    }
+
+
+def test_policy_off_cannot_be_bound_on_the_pinned_a12_and_nothing_is_provisioned(engine):
+    w = _world(engine)
+    plan, oid = _plan(engine, w)
+    with pytest.raises(OperatorRefusal, match="window_dual_control_unbindable_pin_billing_a13"):
+        _apply(engine, w, plan, oid, dual=False)
+    with Session(engine) as db:
+        db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
+        assert get_opening_window(db, scope=w.scope) is None
+
+
+def test_apply_refuses_a_plan_whose_variances_are_not_the_manifests(engine):
+    w = _world(engine, variance=True)
+    plan, oid = _plan(engine, w)
+    assert [(v["partition"], v["reason"], v["amount_minor"]) for v in plan["variances"]] == [
+        (w.k("cust-2"), "stored_balance_difference", -550)
+    ]
+    tampered = {**plan, "variances": []}
+    with pytest.raises(OperatorRefusal, match="variances_not_listed_in_plan"):
+        _apply(engine, w, tampered, oid, approved=plan["plan_sha256"])
+
+
+def test_variances_are_listed_sha_bound_and_apply_proceeds_without_any_env_switch(engine):
+    w = _world(engine, variance=True)
+    plan, oid = _plan(engine, w)
+    assert plan["preview_ok"]
+    receipt = _apply(engine, w, plan, oid)  # only ERP_AR_OPENING_APPLY: no allow-variances switch exists
+    assert receipt["sealed"] and receipt["variances"] == plan["variances"]
+    with Session(engine) as db:  # recorded by billing at the seal; recognised/confirmed post-flip, not in this run
+        count = db.execute(
+            sa.text("SELECT count(*) FROM mod_billing.opening_variances WHERE tenant_id = :t"), {"t": w.tenant}
+        ).scalar()
+        assert count == 1
 
 
 def test_admission_receipts_are_immutable(engine):
@@ -245,7 +331,17 @@ def test_wrong_principal_oid_is_refused_at_provision_and_a_wrong_fence_at_seal(e
         _apply(engine, w2, plan2, oid2, fence="some-other-fence")
 
 
-def test_the_writer_role_is_nologin_unprivileged_and_not_an_ordinary_member(engine):
+# --- the writer role (billing R5) -----------------------------------------------------------------------------------
+
+
+_NEVER_INSERT = (
+    "document_lines document_events confirmed_settlements allocation_effects non_cash_credit_grants "
+    "non_cash_credit_effects withholding_discharges opening_hold_admissions opening_authority_switch_receipts "
+    "rated_obligations billing_accounts opening_windows"
+).split()
+
+
+def test_the_writer_role_is_nologin_unprivileged_and_not_linked_to_the_serving_roles(engine):
     with engine.connect() as c:
         row = c.execute(
             sa.text(
@@ -255,27 +351,146 @@ def test_the_writer_role_is_nologin_unprivileged_and_not_an_ordinary_member(engi
             {"n": WRITER_ROLE},
         ).one()
         assert tuple(row) == (False, False, False, False, False, False)
-        assert c.scalar(sa.text("SELECT pg_has_role(:n, 'app_user', 'MEMBER')"), {"n": WRITER_ROLE}) is False
-        assert c.scalar(sa.text("SELECT pg_has_role(:n, 'platform_api', 'MEMBER')"), {"n": WRITER_ROLE}) is False
-        assert c.scalar(sa.text("SELECT pg_has_role(:n, 'app_admin', 'MEMBER')"), {"n": WRITER_ROLE}) is False
-        assert UUID(int=0) is not None and uuid4() is not None
+        for other in ("app_user", "platform_api", "app_admin"):
+            assert c.scalar(sa.text("SELECT pg_has_role(:n, :o, 'MEMBER')"), {"n": WRITER_ROLE, "o": other}) is False
+            assert c.scalar(sa.text("SELECT pg_has_role(:o, :n, 'MEMBER')"), {"n": WRITER_ROLE, "o": other}) is False
+        # the role is a member of NOTHING (not even transitively)
+        assert (
+            c.scalar(
+                sa.text(
+                    "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = :n"
+                ),
+                {"n": WRITER_ROLE},
+            )
+            == 0
+        )
 
 
-def test_variances_are_carried_in_the_manifest_and_apply_refuses_them_unless_explicitly_allowed(engine):
-    w = _world(engine, variance=True)
-    plan, oid = _plan(engine, w)
-    assert plan["preview_ok"]
-    assert [(v["partition"], v["reason"], v["amount_minor"]) for v in plan["variances"]] == [
-        ("cust-2", "stored_balance_difference", -550)
-    ]
-    with pytest.raises(OperatorRefusal, match="variances_need_post_seal_resolution"):
-        _apply(engine, w, plan, oid)
-    receipt = _apply(
-        engine, w, plan, oid, env={"ERP_AR_OPENING_APPLY": "1", "ERP_AR_OPENING_ALLOW_OPEN_VARIANCES": "1"}
+def test_the_migration_grants_no_membership_of_the_writer_to_the_migrator_or_anyone_else(engine):
+    """The fixture (as an operator would) grants the migrator SET out of band for this test cluster; the MIGRATION
+    itself must not. Proved on a fresh role pair via the same code path the migration uses."""
+
+    import erp_v2.migrations.versions.e2_0029_ar_opening_admissions as mig
+
+    source = Path(mig.__file__).read_text()
+    assert "TO ' || quote_ident(current_user)" not in source and "GRANT {WRITER_ROLE} TO" not in source
+    lines = mig._grant_lines()
+    assert not any(line.startswith("GRANT") and f"GRANT {WRITER_ROLE}" in line for line in lines)
+
+
+def test_writer_privileges_are_exactly_r5(engine):
+    schema = "mod_billing"
+    with engine.connect() as c:
+
+        def has(table, priv, *, schema_=schema):
+            return c.scalar(
+                sa.text("SELECT has_table_privilege(:r, :t, :p)"),
+                {"r": WRITER_ROLE, "t": f"{schema_}.{table}", "p": priv},
+            )
+
+        def col(table, column, priv):
+            return c.scalar(
+                sa.text("SELECT has_column_privilege(:r, :t, :c, :p)"),
+                {"r": WRITER_ROLE, "t": f"{schema}.{table}", "c": column, "p": priv},
+            )
+
+        import erp_v2.migrations.versions.e2_0029_ar_opening_admissions as mig
+
+        assert len(mig.INSERT_TABLES) == 20 and "opening_hold_admissions" not in mig.INSERT_TABLES
+        for table in mig.INSERT_TABLES:
+            assert has(table, "SELECT") and has(table, "INSERT"), table
+            assert not any(has(table, p) for p in ("UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")), table
+        for table in mig.SELECT_ONLY_TABLES:
+            assert has(table, "SELECT") and not has(table, "INSERT"), table
+        for table in _NEVER_INSERT:
+            assert not has(table, "INSERT"), table
+        for table in (*mig.INSERT_TABLES, *mig.SELECT_ONLY_TABLES, "document_lines"):
+            assert not any(has(table, p) for p in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")), table
+        assert col("opening_windows", "generation", "UPDATE") and not col("opening_windows", "id", "UPDATE")
+        assert col("billing_accounts", "id", "UPDATE") and not col("billing_accounts", "currency", "UPDATE")
+        assert not has("opening_windows", "UPDATE")
+        for table in ("idempotency_records", "outbox_events"):
+            assert has(table, "SELECT", schema_="public") and has(table, "INSERT", schema_="public")
+            assert not has(table, "UPDATE", schema_="public") and not has(table, "DELETE", schema_="public")
+        assert not c.scalar(
+            sa.text("SELECT has_table_privilege(:r, 'public.erp_ar_opening_admissions', 'INSERT')"), {"r": WRITER_ROLE}
+        )
+        # no platform_ table, no CREATE on any schema, no sequence, no WITH GRANT OPTION
+        assert (
+            c.scalar(
+                sa.text(
+                    "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee = :r AND table_name LIKE 'platform\\_%'"
+                ),
+                {"r": WRITER_ROLE},
+            )
+            == 0
+        )
+        for sch in ("public", "mod_billing"):
+            assert c.scalar(sa.text("SELECT has_schema_privilege(:r, :s, 'USAGE')"), {"r": WRITER_ROLE, "s": sch})
+            assert not c.scalar(sa.text("SELECT has_schema_privilege(:r, :s, 'CREATE')"), {"r": WRITER_ROLE, "s": sch})
+        seqs = c.execute(
+            sa.text(
+                "SELECT quote_ident(n.nspname) || '.' || quote_ident(cl.relname) FROM pg_class cl "
+                "JOIN pg_namespace n ON n.oid = cl.relnamespace WHERE cl.relkind = 'S' AND n.nspname IN ('public', 'mod_billing')"
+            )
+        ).scalars()
+        for seq in seqs:
+            assert not c.scalar(
+                sa.text("SELECT has_sequence_privilege(:r, :s, 'USAGE')"), {"r": WRITER_ROLE, "s": seq}
+            ), seq
+            assert not c.scalar(
+                sa.text("SELECT has_sequence_privilege(:r, :s, 'SELECT')"), {"r": WRITER_ROLE, "s": seq}
+            ), seq
+            assert not c.scalar(
+                sa.text("SELECT has_sequence_privilege(:r, :s, 'UPDATE')"), {"r": WRITER_ROLE, "s": seq}
+            ), seq
+        assert (
+            c.scalar(
+                sa.text(
+                    "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee = :r AND is_grantable = 'YES'"
+                ),
+                {"r": WRITER_ROLE},
+            )
+            == 0
+        )
+
+
+def test_role_guard_refuses_a_pre_existing_role_with_a_forbidden_attribute_or_any_membership(engine):
+    import erp_v2.migrations.versions.e2_0029_ar_opening_admissions as mig
+
+    probe = f"erp_probe_{uuid4().hex[:10]}"
+    admin = sa.create_engine(
+        sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
     )
-    assert receipt["sealed"]
-    with Session(engine) as db:  # recorded by billing at the seal, awaiting post-seal resolution
-        count = db.execute(
-            sa.text("SELECT count(*) FROM mod_billing.opening_variances WHERE tenant_id = :t"), {"t": w.tenant}
-        ).scalar()
-        assert count == 1
+    try:
+        with admin.connect() as c:
+            c.exec_driver_sql(mig.role_guard_sql(probe))  # creates it clean
+            assert tuple(
+                c.execute(
+                    sa.text("SELECT rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = :n"), {"n": probe}
+                ).one()
+            ) == (False, False, False)
+            c.exec_driver_sql(mig.role_guard_sql(probe))  # idempotent on a clean role
+            for attribute in ("LOGIN", "CREATEROLE", "CREATEDB", "BYPASSRLS", "REPLICATION"):
+                c.exec_driver_sql(f"ALTER ROLE {probe} {attribute}")
+                with pytest.raises(sa.exc.DBAPIError, match="forbidden attribute"):
+                    c.exec_driver_sql(mig.role_guard_sql(probe))
+                c.exec_driver_sql(f"ALTER ROLE {probe} NO{attribute}")
+            c.exec_driver_sql(mig.role_guard_sql(probe))
+            c.exec_driver_sql(f"GRANT app_user TO {probe}")
+            with pytest.raises(sa.exc.DBAPIError, match="linked to app_user"):
+                c.exec_driver_sql(mig.role_guard_sql(probe))
+            c.exec_driver_sql(f"REVOKE app_user FROM {probe}")
+            c.exec_driver_sql(f"GRANT {probe} TO app_admin")
+            with pytest.raises(sa.exc.DBAPIError, match="linked to app_user"):
+                c.exec_driver_sql(mig.role_guard_sql(probe))
+            c.exec_driver_sql(f"REVOKE {probe} FROM app_admin")
+            c.exec_driver_sql(f"CREATE ROLE {probe}_g NOLOGIN")
+            c.exec_driver_sql(f"GRANT {probe}_g TO {probe}")
+            with pytest.raises(sa.exc.DBAPIError, match="member of another role"):
+                c.exec_driver_sql(mig.role_guard_sql(probe))
+    finally:
+        with admin.connect() as c:
+            c.exec_driver_sql(f"DROP ROLE IF EXISTS {probe}")
+            c.exec_driver_sql(f"DROP ROLE IF EXISTS {probe}_g")
+        admin.dispose()

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import stat
+from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
+
+import pytest
 
 from erp_v2.importer import ar_opening_cli as cli
 
@@ -54,11 +58,30 @@ def test_plan_and_apply_need_authority_refs_and_apply_needs_the_fence(tmp_path, 
     assert code == 2 and json.loads((tmp_path / "r.json").read_text())["refusal"] == "coupled_watermark_required"
 
 
-def test_customer_account_number_is_a_uuid5_not_the_legacy_id_and_is_stable() -> None:
-    one = cli.customer_account_number(TENANT, "legacy-1")
-    assert one == cli.customer_account_number(TENANT, "legacy-1")
-    assert one != cli.customer_account_number(TENANT, "legacy-2") and "legacy" not in one.lower()
-    assert len(one) <= 40
+def test_the_cli_no_longer_creates_customers_or_numbers_them() -> None:
+    assert not hasattr(cli, "customer_account_number") and not hasattr(cli, "mint_customers_and_accounts")
+    source = (Path(cli.__file__)).read_text()
+    assert "LEG-" not in source and "CustomerAccount(" not in source and "ALLOW_OPEN_VARIANCES" not in source
+
+
+def test_non_uuid_legacy_customer_key_is_customer_not_imported() -> None:
+    with pytest.raises(cli.OperatorRefusal, match="customer_not_imported"):
+        cli.wave4_account_id(None, scope=SimpleNamespace(tenant_id=TENANT), legacy_customer_key="cust-1")
+
+
+def test_a12_window_cannot_bind_dual_control_off_and_a13_field_is_passed_explicitly() -> None:
+    from dataclasses import make_dataclass
+
+    a12 = make_dataclass("W12", [("x", int)])
+    a13 = make_dataclass("W13", [("x", int), ("dual_control", str)])
+    assert cli.window_dual_control_kwargs(a13, "off") == {"dual_control": "off"}
+    assert cli.window_dual_control_kwargs(a13, "on") == {"dual_control": "on"}
+    assert cli.window_dual_control_kwargs(a12, "on") == {}
+    with pytest.raises(cli.OperatorRefusal, match="window_dual_control_unbindable_pin_billing_a13"):
+        cli.window_dual_control_kwargs(a12, "off")
+    with pytest.raises(cli.OperatorRefusal, match="window_dual_control_differs_from_policy"):
+        cli._verify_window_dual_control(SimpleNamespace(dual_control="off"), "on")
+    cli._verify_window_dual_control(SimpleNamespace(dual_control="off"), "off")
 
 
 def test_plan_sha_binds_the_manifest_and_every_command_digest() -> None:
@@ -66,3 +89,5 @@ def test_plan_sha_binds_the_manifest_and_every_command_digest() -> None:
     assert a == cli.plan_sha256("f" * 64, {"2": "b" * 64, "1": "a" * 64})
     assert a != cli.plan_sha256("e" * 64, {"1": "a" * 64, "2": "b" * 64})
     assert a != cli.plan_sha256("f" * 64, {"1": "a" * 64, "2": "c" * 64})
+    variance = [{"partition": "c", "source_key": "i", "basis": "stored_balance", "amount_minor": 5}]
+    assert cli.plan_sha256("f" * 64, {"1": "a" * 64}, variance) != cli.plan_sha256("f" * 64, {"1": "a" * 64}, [])

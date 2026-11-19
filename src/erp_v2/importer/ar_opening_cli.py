@@ -1,28 +1,30 @@
-"""AR opening operator boundary: census / mint / plan / apply over dotmac-billing a12's opening window and lane.
+"""AR opening operator boundary: census / mint / plan / apply over dotmac-billing's opening window and lane.
 
 Same discipline as the payables historical CLIs: env-only DSNs (`LEGACY_DATABASE_URL`, read only;
 `MIGRATION_DATABASE_URL`), receipts created 0600 BEFORE any database action, plan then apply, every step bound to
 the snapshot sha, the census sha and the plan sha. Dry-run by default: `apply` needs `ERP_AR_OPENING_APPLY=1` AND
 the approved plan sha.
 
-Flow (rev 2 section 4.2):
-- `census`  read-only: bucket every legacy invoice/payment exactly once; writes the census receipt.
-- `mint`    (apply-gated) one dotmac-customers account per legacy customer + one billing account per customer x
-            currency, for the CARRYABLE partitions only; idempotent on deterministic keys.
-- `plan`    census -> the ONE manifest -> `preview_opening_account_import_batch_v2` (expect 0 blockers); variance
-            lines; plan sha over the manifest fingerprint and every partition's command digest. Writes nothing.
-- `apply`   provision the window (as the migration role = app_admin, by billing's trigger), import every partition
-            as the restricted `erp_billing_opening_writer`, then seal. Resumable (billing's key is idempotent).
-            There is NO hold path: an operational hold (`target_not_pristine`, `import_refused`) or any refusal
-            aborts the run for a re-plan. 0 GL: nothing here posts a journal.
+Flow (AS-IS migration replan, section 2):
+- `census`  read-only: bucket every legacy invoice/payment exactly once; writes the census receipt (the input of the
+            register source `ar_census`: E35 partitions and documents, unapplied credit notes, E36b variances).
+- `mint`    (apply-gated) one billing account per customer x currency for the CARRYABLE partitions. It REUSES the
+            wave-4 `customer_accounts` (the importer preserves the legacy customer id as the account id) and
+            refuses `customer_not_imported`; it never creates a customer.
+- `plan`    census -> the ONE manifest -> `preview_opening_account_import_batch_v2` (expect 0 blockers); every
+            variance listed and sha-bound; plan sha over the manifest fingerprint, the variances and every
+            partition's command digest. Writes nothing.
+- `apply`   provision the window (as app_admin, by billing's trigger) with the ERP two-person policy passed
+            explicitly (`dual_control`, a13), import every partition as the restricted `erp_billing_opening_writer`
+            (operator `SET ROLE` membership is granted by Michael for the window only), then seal. Resumable.
+            There is NO hold path: an operational hold or any refusal aborts the run for a re-plan. 0 GL.
 
-Open items kept fail-closed, not decided here (reported to the architect):
-- Variances: a12 records them at the SEAL and resolves them after it, through an Approvals maker-checker port.
-  So `apply` REFUSES a plan with variances unless `ERP_AR_OPENING_ALLOW_OPEN_VARIANCES=1` (they are then carried
-  open for Finance, listed in the receipt).
-- The coupled writer watermark (`--coupled-watermark`) is an opaque fence the operator asserts; billing and the
-  seal verifier only require the same value on both sides.
-- T-AR-OPENING-CREDIT (reclass of Σ available_credit) and the B-9 ties are the B-9 builder's, not built here.
+Variances (stored-balance differences, memo basis: no accounting fact, never suspense; billing a13 P-3) are
+recorded by billing at the seal. `apply` proceeds only when every variance is listed in the plan (and so
+sha-bound); each one becomes an E36b work item. Recognise and confirm are post-flip, as app_user, NOT in this run.
+
+Seams (not built here): T1 `ar_opening_credit` reclass journal and the holding reclass (B-14, e2_0030), the live
+mapper T2/T3 (B-15). `t1_credit_by_currency` gives B-14 the sealed-manifest amounts (T1 anchoring).
 """
 
 from __future__ import annotations
@@ -61,12 +63,6 @@ def _require(ok: bool, reason: str) -> None:
         raise OperatorRefusal(reason)
 
 
-def customer_account_number(tenant_id: UUID, legacy_key: str) -> str:
-    """Deterministic customer account number: uuid5 of the legacy id (never the legacy id itself)."""
-
-    return "LEG-" + uuid5(NAMESPACE_URL, f"erp-v2-ar-customer:{tenant_id}:{legacy_key}").hex.upper()
-
-
 def customer_snapshot_from(rows):
     """Documentary customer snapshot per legacy customer key (legal name; address is not held by legacy)."""
 
@@ -82,71 +78,85 @@ def customer_snapshot_from(rows):
     return by_key.get
 
 
-def plan_sha256(manifest_fingerprint: str, command_digests: dict[str, str]) -> str:
+def plan_sha256(manifest_fingerprint: str, command_digests: dict[str, str], variances: list[dict] | None = None) -> str:
     body = json.dumps(
-        {"domain": "erp.ar-opening.plan.v1", "manifest": manifest_fingerprint, "commands": command_digests},
+        {
+            "domain": "erp.ar-opening.plan.v2",
+            "manifest": manifest_fingerprint,
+            "commands": command_digests,
+            "variances": variances or [],
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(body.encode()).hexdigest()
 
 
+def manifest_variances(manifest) -> list[dict]:
+    """Every variance of the manifest as plain data (the plan lists them; the E36b work items come from this)."""
+
+    return sorted(
+        (
+            {
+                "partition": v.partition.source_account_key if v.partition else None,
+                "currency": v.currency,
+                "reason": v.reason_code,
+                "basis": v.basis,
+                "amount_minor": v.amount_minor,
+                "source_key": v.source.key,
+            }
+            for v in manifest.variances
+        ),
+        key=lambda v: (str(v["partition"]), v["source_key"], v["basis"]),
+    )
+
+
+def t1_credit_by_currency(manifest) -> dict[str, int]:
+    """T1 seam: the Dr 1400 / Cr prepayment amount per currency = sum of cash-lot `residual_minor` of the admitted
+    partitions, read from the manifest the window sealed (never from operator input). The B-14 `ar_opening_credit`
+    journal kind consumes this; it may be cross-checked against R1 `available_credit_minor` ONLY between the seal
+    and the opening of the app (writer fence held). Built here as a pure function; no journal is posted."""
+
+    out: dict[str, int] = {}
+    for lot in manifest.cash_lots:
+        out[lot.partition.currency] = out.get(lot.partition.currency, 0) + lot.residual_minor
+    return dict(sorted(out.items()))
+
+
 # --- accounts (mint) ----------------------------------------------------------------------------------------------
 
 
-def mint_customers_and_accounts(db, *, scope, partitions, customers, precision: int = 2):
-    """One customer per legacy customer id, one billing account per customer x currency. Idempotent.
+def wave4_account_id(db, *, scope, legacy_customer_key: str) -> UUID:
+    """The wave-4 `customer_accounts` row of a legacy customer (the importer preserves the legacy id as the account
+    id). A key that is not a UUID or has no account is `customer_not_imported`: this CLI never creates a customer."""
 
-    `partitions` is [(legacy customer key, currency)] (carryable ones only); `customers` maps the legacy key to its
-    legacy customer row (legal name, `dotmac_sub_id` kept only as an immutable external reference).
-    Returns {(key, currency): billing account id}.
-    """
+    from dotmac_customers.models import CustomerAccount
+
+    try:
+        candidate = UUID(str(legacy_customer_key))
+    except ValueError:
+        raise OperatorRefusal("customer_not_imported") from None
+    found = db.scalar(
+        sa.select(CustomerAccount.id).where(
+            CustomerAccount.tenant_id == scope.tenant_id, CustomerAccount.id == candidate
+        )
+    )
+    if found is None:
+        raise OperatorRefusal("customer_not_imported")
+    return found
+
+
+def mint_billing_accounts(db, *, scope, partitions, precision: int = 2):
+    """One billing account per customer x currency over the imported wave-4 customer. Idempotent.
+
+    Returns {(key, currency): billing account id}. Refuses `customer_not_imported` for any partition whose customer
+    the wave-4 import did not land (checked for ALL partitions before any account is created)."""
 
     from dotmac_billing import service as billing
-    from dotmac_customers import AccountStatus, PartyReferenceRole
-    from dotmac_customers.models import CustomerAccount, CustomerPartyReference
 
-    # Direct owner rows through dotmac-customers' own models: its `create_account` / `link_party_reference`
-    # import the kernel's reference runtime (`dotmac_kernel.db`, which requires DATABASE_URL), which a composed ERP
-    # process must not construct (same precedent as the accounting a1 seed helpers). The rules mirrored from them:
-    # upper-cased account number, required non-empty display name, one reference per (account, system, role).
+    customer_ids = {key: wave4_account_id(db, scope=scope, legacy_customer_key=key) for key, _c in sorted(partitions)}
     minted: dict[tuple[str, str], UUID] = {}
-    customer_ids: dict[str, UUID] = {}
     for key, currency in sorted(partitions):
-        if key not in customer_ids:
-            number = customer_account_number(scope.tenant_id, key).upper()
-            row = customers.get(key) or {}
-            name = str(row.get("legal_name") or row.get("trading_name") or key).strip()
-            existing = db.scalar(
-                sa.select(CustomerAccount.id).where(
-                    CustomerAccount.tenant_id == scope.tenant_id, CustomerAccount.account_number == number
-                )
-            )
-            if existing is None:
-                account = CustomerAccount(
-                    tenant_id=scope.tenant_id,
-                    account_number=number,
-                    display_name=name[:200],
-                    status=AccountStatus.ACTIVE,
-                )
-                db.add(account)
-                db.flush()
-                references = [("legacy-erp", key)]
-                if row.get("dotmac_sub_id") is not None:  # immutable external reference only (v1677: no sync)
-                    references.append(("dotmac-sub-external", str(row["dotmac_sub_id"])))
-                for system, reference in references:
-                    db.add(
-                        CustomerPartyReference(
-                            tenant_id=scope.tenant_id,
-                            account_id=account.id,
-                            party_system=system,
-                            party_reference=reference,
-                            role=PartyReferenceRole.ACCOUNT_HOLDER,
-                        )
-                    )
-                db.flush()
-                existing = account.id
-            customer_ids[key] = existing
         billing_account = billing.create_billing_account(
             db, scope=scope, external_account_ref=str(customer_ids[key]), currency=currency, minor_units=precision
         )
@@ -157,17 +167,11 @@ def mint_customers_and_accounts(db, *, scope, partitions, customers, precision: 
 def existing_account_ids(db, *, scope, partitions) -> dict[tuple[str, str], UUID]:
     """Read-only lookup of the minted billing accounts (the plan needs the real ids)."""
 
-    from dotmac_customers.models import CustomerAccount
-
     found: dict[tuple[str, str], UUID] = {}
     for key, currency in sorted(partitions):
-        customer = db.scalar(
-            sa.select(CustomerAccount.id).where(
-                CustomerAccount.tenant_id == scope.tenant_id,
-                CustomerAccount.account_number == customer_account_number(scope.tenant_id, key),
-            )
-        )
-        if customer is None:
+        try:
+            customer = wave4_account_id(db, scope=scope, legacy_customer_key=key)
+        except OperatorRefusal:
             continue
         account = db.scalar(
             sa.text(
@@ -208,31 +212,24 @@ def build_plan(assembly, db, *, scope, migration_authority_ref: str, occurred_at
     digests = {str(c.partition.account_id): opening_account_command_digest_v2(c) for c in commands}
     fingerprint = assembly.fingerprint()
     manifest = assembly.manifest()
-    variances = [
-        {
-            "partition": v.partition.source_account_key if v.partition else None,
-            "reason": v.reason_code,
-            "basis": v.basis,
-            "amount_minor": v.amount_minor,
-            "source_key": v.source.key,
-        }
-        for v in manifest.variances
-    ]
+    variances = manifest_variances(manifest)
     return {
         "kind": "ar-opening-plan",
         "params": params,
         "snapshot_sha256": assembly.census.snapshot_sha256,
         "census_sha256": assembly.census.sha256,
         "manifest_fingerprint": fingerprint,
-        "plan_sha256": plan_sha256(fingerprint, digests),
+        "plan_sha256": plan_sha256(fingerprint, digests, variances),
         "command_digests": digests,
         "partitions": len(commands),
         "excluded_partitions": len(assembly.census.excluded),
+        "unapplied_credit_notes": sum(1 for r in assembly.census.rows if r.bucket == "UNAPPLIED_CREDIT_NOTE"),
         "receivable_items": len(manifest.receivables),
         "cash_lots": len(manifest.cash_lots),
         "open_ar_minor": sum(c.open_ar_minor for c in manifest.controls),
         "available_credit_minor": sum(c.available_cash_credit_minor for c in manifest.controls),
         "variances": variances,
+        "t1_credit_by_currency": t1_credit_by_currency(manifest),
         "manifest_blockers": manifest_blockers,
         "partition_blockers": partition_blockers,
         "preview_ok": not manifest_blockers and not partition_blockers,
@@ -244,6 +241,25 @@ def build_plan(assembly, db, *, scope, migration_authority_ref: str, occurred_at
 
 def _set_tenant(db, tenant_id: UUID) -> None:
     db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant_id)})
+
+
+def window_dual_control_kwargs(window_cls, wanted: str) -> dict:
+    """a13 binds `dual_control` per window ("off" | "on") and it is immutable. a12 has no such field and its windows
+    behave as two-person ("on", the legacy default): then only a policy of ON can be honoured; OFF is refused so the
+    policy is never silently overridden. (Remove this fallback with the a13 pin.)"""
+
+    if "dual_control" in getattr(window_cls, "__dataclass_fields__", {}):
+        return {"dual_control": wanted}
+    _require(wanted == "on", "window_dual_control_unbindable_pin_billing_a13")
+    return {}
+
+
+def _verify_window_dual_control(window, wanted: str) -> None:
+    """Read-back: the window's bound `dual_control` must equal the ERP policy (a12 windows carry none: "on")."""
+
+    _require(window is not None, "window_missing")
+    bound = getattr(window, "dual_control", "on")
+    _require(bound == wanted, "window_dual_control_differs_from_policy")
 
 
 def role_oid(db, name: str = WRITER_ROLE) -> int:
@@ -262,6 +278,7 @@ def apply_opening(
     occurred_at: datetime,
     applied_by: str,
     coupled_watermark: str,
+    dual_control: bool | None = None,
     env: dict | None = None,
 ) -> dict:
     """Provision -> import every partition -> seal. Raises OperatorRefusal on any refusal (aborts for a re-plan)."""
@@ -279,21 +296,39 @@ def apply_opening(
     _require(plan["census_sha256"] == assembly.census.sha256, "census_sha_mismatch")
     _require(plan["manifest_fingerprint"] == assembly.fingerprint(), "manifest_fingerprint_mismatch")
     _require(plan["preview_ok"] is True, "plan_has_blockers")
+    # Every variance must be listed in the plan (so sha-bound, plan_sha256 covers them) and equal the manifest's own.
+    _require(plan["variances"] == manifest_variances(assembly.manifest()), "variances_not_listed_in_plan")
     _require(
-        not plan["variances"] or env.get("ERP_AR_OPENING_ALLOW_OPEN_VARIANCES") == "1",
-        "variances_need_post_seal_resolution",
+        plan["plan_sha256"] == plan_sha256(plan["manifest_fingerprint"], plan["command_digests"], plan["variances"]),
+        "plan_sha_not_self_consistent",
     )
     scope = assembly.scope
     manifest = assembly.manifest()
     window_id = uuid5(NAMESPACE_URL, f"erp-ar-opening-window:{approved_plan_sha256}")
     epoch = uuid5(NAMESPACE_URL, f"erp-ar-opening-epoch:{assembly.census.sha256}")
-    receipt: dict = {"kind": "ar-opening-apply", "plan_sha256": approved_plan_sha256, "admitted": [], "sealed": False}
+    receipt: dict = {
+        "kind": "ar-opening-apply",
+        "plan_sha256": approved_plan_sha256,
+        "admitted": [],
+        "sealed": False,
+        "variances": plan["variances"],  # each is an E36b work item; recognise/confirm are post-flip (app_user)
+    }
 
     # 1. provision (billing's trigger insists current_user = 'app_admin'; never the restricted principal)
     with Session(engine) as db, db.begin():
         _set_tenant(db, scope.tenant_id)
+        # The ERP two-person policy (#62; default OFF per tenant) is bound at provision and immutable afterwards
+        # (billing a13 `dual_control`). Read it here and pass it EXPLICITLY; never rely on billing's default.
+        if dual_control is None:
+            from erp_v2.governance.policy import dual_control as read_dual_control
+
+            dual_control = read_dual_control(db, scope.tenant_id)
+        wanted = "on" if dual_control else "off"
+        receipt["dual_control"] = wanted
+        _require(authority.expected_dual_control == wanted, "authority_dual_control_differs_from_policy")
         existing = get_opening_window(db, scope=scope)
         if existing is None:
+            window_kwargs = window_dual_control_kwargs(OpeningWindowV1, wanted)
             db.execute(sa.text("SET LOCAL ROLE app_admin"))
             window = OpeningWindowV1(
                 scope=scope,
@@ -306,6 +341,7 @@ def apply_opening(
                 principal_oid=role_oid(db),
                 provision_authority_ref=authority.migration_authority_ref,
                 recorded_at=occurred_at,
+                **window_kwargs,
             )
             billing.provision_opening_window(
                 db, scope=scope, command=ProvisionOpeningWindowV1(window), verifier=authority.provision_verifier()
@@ -317,6 +353,7 @@ def apply_opening(
                 "existing_window_differs",
             )
             receipt["window"] = "resumed"
+        _verify_window_dual_control(get_opening_window(db, scope=scope), wanted)
     receipt["window_id"] = str(window_id)
 
     # 2. import every partition as the restricted principal (idempotent: a re-run replays the stored receipt)
@@ -501,7 +538,7 @@ def _run(args) -> dict:
         "DATABASE_URL" not in os.environ and "PLATFORM_DATABASE_URL" not in os.environ,
         "serving_database_materials_forbidden",
     )
-    manifest, rows, customers, census, snapshot, seller = _load_inputs(args, source_url)
+    manifest, rows, _customers, census, snapshot, seller = _load_inputs(args, source_url)
     if args.command == "census":
         return census.receipt()
     _require(bool(destination_url), "operator_database_materials_required")
@@ -520,10 +557,9 @@ def _run(args) -> dict:
         carry = list(census.carry_partitions)
         if args.command == "mint":
             _require(os.environ.get("ERP_AR_OPENING_APPLY") == "1", "explicit_apply_authorization_required")
-            by_key = {str(c["customer_key"]): c for c in customers}
             with Session(engine) as db, db.begin():
                 _set_tenant(db, tenant)
-                minted = mint_customers_and_accounts(db, scope=scope, partitions=carry, customers=by_key)
+                minted = mint_billing_accounts(db, scope=scope, partitions=carry)
             return {"kind": "ar-opening-mint", "census_sha256": census.sha256, "accounts": len(minted)}
         with Session(engine) as db, db.begin():
             _set_tenant(db, tenant)
@@ -555,13 +591,18 @@ def _run(args) -> dict:
                 params=params,
             )
             oid = role_oid(db)
+            from erp_v2.governance.policy import dual_control as read_dual_control
+
+            policy_dual_control = read_dual_control(db, tenant)
         if args.command == "plan":
+            plan["dual_control_policy"] = "on" if policy_dual_control else "off"
             return plan
         authority = ErpOpeningAuthority(
             assembly=assembly,
             migration_authority_ref=args.migration_authority_ref,
             role_oid=oid,
             expected_coupled_watermark=args.coupled_watermark,
+            expected_dual_control="on" if policy_dual_control else "off",
         )
         return apply_opening(
             engine,
@@ -572,6 +613,7 @@ def _run(args) -> dict:
             occurred_at=occurred_at,
             applied_by=args.applied_by,
             coupled_watermark=args.coupled_watermark,
+            dual_control=policy_dual_control,
         )
     finally:
         engine.dispose()
