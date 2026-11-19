@@ -58,6 +58,7 @@ class RunSpec:
     params: dict[str, Any]
     census: ReceiptRef | None
     gl_attribution: dict[str, ReceiptRef]
+    straddle: ReceiptRef | None = None
 
 
 def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
@@ -67,7 +68,7 @@ def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
     if not isinstance(body, dict) or set(body) != SPEC_KEYS or body["version"] != 1:
         refuse("invalid_spec_schema")
     receipts = body["receipts"]
-    if not isinstance(receipts, dict) or not set(receipts) <= {"census", "gl_attribution"}:
+    if not isinstance(receipts, dict) or not set(receipts) <= {"census", "gl_attribution", "straddle"}:
         refuse("invalid_spec_schema")
     params = body["params"]
     if not isinstance(params, dict):
@@ -92,6 +93,7 @@ def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
             params,
             ref(receipts["census"]) if "census" in receipts else None,
             {c: ref(v) for c, v in attributions.items()},
+            ref(receipts["straddle"]) if "straddle" in receipts else None,
         ),
         sha,
     )
@@ -123,6 +125,58 @@ def posting_date(db: Session, tenant: UUID, capture: date) -> date:
 
 def select_periods(tenant: UUID):
     return sa.select(FiscalPeriod).where(FiscalPeriod.tenant_id == tenant)
+
+
+# --- F1: the local anchor against the #72 admission rows ----------------------------------------------------------
+
+
+def anchor_census(db: Session, tenant: UUID, census: Census) -> str:
+    """Prove the census file is the one #72 admitted from. Every ``erp_ar_opening_admissions`` row of the tenant must
+    carry the census receipt's own digest (its ``census_sha256`` field, which is not the file sha) and exactly one
+    manifest fingerprint, and the admitted (source_account_key, currency) set must equal the census parties that carry
+    open items or cash lots. Returns the manifest fingerprint for the billing window check (a13 reader)."""
+    from erp_v2.importer.ar_opening_models import ArOpeningAdmission
+
+    if census.digest is None:
+        refuse("census_digest_missing", "the census receipt carries no census_sha256")
+    rows = list(db.scalars(sa.select(ArOpeningAdmission).where(ArOpeningAdmission.tenant_id == tenant)))
+    if not rows:
+        refuse("ar_admissions_missing", "no e2_0029 admission rows: the AR opening has not been applied")
+    if {r.census_sha256 for r in rows} != {census.digest}:
+        refuse("census_sha_mismatch", "the admission rows were made from a different census")
+    manifests = {r.manifest_fingerprint for r in rows}
+    if len(manifests) != 1:
+        refuse("manifest_fingerprint_not_unique")
+    admitted = {(r.source_account_key, r.currency) for r in rows}
+    expected = {(p.customer, p.currency) for p in census.parties if p.carried_minor or p.cash_lot_minor}
+    if admitted != expected:
+        refuse("admissions_differ_from_census", "admitted partitions differ from the census parties")
+    return next(iter(manifests))
+
+
+# --- F6: held[] must be in the register ----------------------------------------------------------------------------
+
+
+def check_held_in_register(db: Session, tenant: UUID, attribution: GlAttribution, *, census: Census | None) -> None:
+    """Each explained item must match an OPEN register exception (class, legacy_key) and, where the source records a
+    GL-signed amount (``gl_signed_minor`` on #72 census items), carry an equal amount. A hand-written receipt cannot
+    invent explained items."""
+    from erp_v2.migration_ledger import models as m
+
+    for explained in attribution.explained.values():
+        for e in explained:
+            row = db.scalar(
+                sa.select(m.MigrationException).where(
+                    m.MigrationException.tenant_id == tenant,
+                    m.MigrationException.class_code == e.class_code,
+                    m.MigrationException.legacy_key == e.source_key,
+                )
+            )
+            if row is None or row.state != m.STATE_OPEN:
+                refuse("held_not_in_register", e.source_key)
+            signed = (row.detail or {}).get("gl_signed_minor")
+            if signed is not None and Decimal(int(signed)).scaleb(-attr.MINOR_EXPONENT) != e.amount:
+                refuse("held_amount_differs_from_register", e.source_key)
 
 
 # --- snapshot -----------------------------------------------------------------------------------------------------

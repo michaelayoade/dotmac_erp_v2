@@ -108,9 +108,15 @@ def net(engine, env, code) -> Decimal:
         return positions.gl_net(db, env.tenant_id, env.accounts[code])
 
 
+DIGEST, MANIFEST = "d" * 64, "e" * 64
+
+
 class FakeBilling:
-    def __init__(self, cur, per, fingerprints=("f" * 64,)):
-        self.cur, self.per, self.fingerprints, self.calls = cur, per, list(fingerprints), 0
+    def __init__(self, cur, per, fingerprints=("f" * 64,), manifest=MANIFEST):
+        self.cur, self.per, self.fingerprints, self.calls, self.manifest = cur, per, list(fingerprints), 0, manifest
+
+    def window_manifest_fingerprint(self, db, window_id):
+        return self.manifest
 
     def r1(self, db):
         fp = self.fingerprints[min(self.calls, len(self.fingerprints) - 1)]
@@ -124,7 +130,9 @@ class FakeBilling:
 def billing(**kw):
     cur = {"NGN": Position(140000, 0, 20000, 0)}
     per = {("C1", "NGN"): Position(90000, 0, 20000, 0), ("C2", "NGN"): Position(50000, 0, 0, 0)}
-    return FakeBilling(kw.get("cur", cur), kw.get("per", per), kw.get("fingerprints", ("f" * 64,)))
+    return FakeBilling(
+        kw.get("cur", cur), kw.get("per", per), kw.get("fingerprints", ("f" * 64,)), kw.get("manifest", MANIFEST)
+    )
 
 
 SUB_2000 = {(Party("supplier", "A"), "NGN"): D("-500"), (Party("supplier", "B"), "NGN"): D("-300")}
@@ -146,7 +154,7 @@ def write(path, body):
 
 
 def make_spec(tmp_path, *, window="w1", params=None):
-    census = write(tmp_path / "census.json", {"gl_attribution": {
+    census = write(tmp_path / "census.json", {"census_sha256": DIGEST, "gl_attribution": {
         "parties": [
             {"customer": "C1", "currency": "NGN", "gl_minor": 100000, "carried_minor": 90000, "cash_lot_minor": 20000},
             {"customer": "C2", "currency": "NGN", "gl_minor": 50000, "carried_minor": 50000, "cash_lot_minor": 0},
@@ -185,8 +193,39 @@ def spec_bytes(env, spec):
     return json.dumps({**spec, "tenant_id": str(env.tenant_id)}).encode()
 
 
-def flip_world(engine, tmp_path, *, dual=False, window="w1", params=None):
+def seed_admissions(engine, env, parties=(("C1", "NGN"), ("C2", "NGN")), *, digest=DIGEST, manifest=MANIFEST):
+    from erp_v2.importer.ar_opening_models import ArOpeningAdmission
+
+    with Session(engine) as db:
+        for key, ccy in parties:
+            db.add(
+                ArOpeningAdmission(
+                    tenant_id=env.tenant_id, source_account_key=key, currency=ccy, billing_account_id=uuid4(),
+                    billing_receipt_id=uuid4(), posting_group_id=uuid4(), window_id=uuid4(), command_digest=SHA,
+                    manifest_fingerprint=manifest, census_sha256=digest, snapshot_sha256=SHA, plan_sha256=SHA, applied_by=OP_A,
+                )
+            )  # fmt: skip
+        db.commit()
+
+
+def seed_register(engine, env, items):
+    with Session(engine) as db:
+        for class_code, key, detail in items:
+            db.add(
+                m.MigrationException(
+                    tenant_id=env.tenant_id, class_code=class_code, legacy_key=key, source_kind="ar_census", state="open",
+                    fingerprint=SHA, source_receipt_sha256=SHA, detail=detail,
+                )
+            )  # fmt: skip
+        db.commit()
+
+
+def flip_world(engine, tmp_path, *, dual=False, window="w1", params=None, register=None):
     env = world(engine, dual=dual)
+    seed_admissions(engine, env)
+    seed_register(
+        engine, env, register if register is not None else [("E35", "partition:C1:NGN", {}), ("E02", "inv-1", {})]
+    )
     seed_gl(engine, env, "2000", D("-1100"))
     seed_gl(engine, env, "1400", D("1530"))
     seed_gl(engine, env, "1410", D("80"))
@@ -213,7 +252,9 @@ def holding_plan(engine, env, bill=None, planned_by=OP_A):
 def holding_apply(engine, env, plan, applied_by=OP_A):
     spec, _ = planning.parse_spec(env.spec)
     with Session(engine) as db, db.begin():
-        return applying.apply(db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=applied_by)
+        return applying.apply(
+            db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=applied_by, owner_readers=env.readers
+        )
 
 
 def holding_verify(engine, env, bill=None):
@@ -289,6 +330,7 @@ def test_t1_on_a_moving_ledger_or_r1_refuses_moved_during_plan(engine, tmp_path)
 
 def test_a_zero_cash_lot_posts_nothing(engine, tmp_path):
     env = world(engine)
+    seed_admissions(engine, env)
     seed_gl(engine, env, "1400", D("1500"))
     spec = make_spec(tmp_path)
     census = json.loads((tmp_path / "census.json").read_text())
@@ -364,7 +406,9 @@ def test_a_repeat_is_a_replay_and_a_different_plan_for_the_same_window_refuses(e
     env, plan, _ = flipped(engine, tmp_path)
     spec, _ = planning.parse_spec(env.spec)
     with Session(engine) as db, db.begin():  # the exact plan again: bridge replay, no new rows
-        out = applying.apply(db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=OP_A)
+        out = applying.apply(
+            db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=OP_A, owner_readers=env.readers
+        )
     assert all(p["replayed"] and p["rows"] == 0 for p in out["posted"]) and len(rows(engine, env)) == 9
     other = json.loads(json.dumps(plan))
     other["plan"]["codes"][0]["lines"][0]["debit"] = "1.000000"
@@ -372,7 +416,7 @@ def test_a_repeat_is_a_replay_and_a_different_plan_for_the_same_window_refuses(e
     other["plan_sha256"] = __import__("erp_v2.migration_ledger.common", fromlist=["x"]).canonical_sha(other["plan"])
     with pytest.raises(HoldingRefused) as e, Session(engine) as db, db.begin():
         applying.apply(db, spec, other, approved_sha=other["plan_sha256"], applied_by=OP_A)
-    assert e.value.code == "version_conflict"
+    assert e.value.code == "window_already_applied"  # F2: the window is closed to a different plan
     assert len(rows(engine, env)) == 9
 
 
@@ -992,3 +1036,336 @@ def test_the_cli_refuses_serving_dsns_and_a_missing_receipt_path_is_not_overwrit
         cli.main(["plan", "--spec", str(spec_path), "--receipt", str(receipt), "--operator-ref", OP_A]) == 2
     )  # exists: refused, untouched
     assert json.loads(receipt.read_text())["refusal"] == "serving_database_materials_forbidden"
+
+
+# --- review fixes: F1 anchor, F3 re-read, F4 dual, F6 register, L1-L6 -------------------------------------------------
+
+
+def test_f1_t1_refuses_when_the_admission_rows_disagree_with_the_census_or_billing(engine, tmp_path):
+    env = world(engine)
+    seed_gl(engine, env, "1400", D("1530"))
+    env.spec = spec_bytes(env, make_spec(tmp_path))
+    with pytest.raises(HoldingRefused) as e:
+        t1_mod.run_t1_plan(engine, env.spec, cli.load_receipts, billing(), planned_by=OP_A)
+    assert e.value.code == "ar_admissions_missing"
+    seed_admissions(engine, env, digest="9" * 64)
+    with pytest.raises(HoldingRefused) as e:
+        t1_mod.run_t1_plan(engine, env.spec, cli.load_receipts, billing(), planned_by=OP_A)
+    assert e.value.code == "census_sha_mismatch"
+    env2 = flip_world(engine, tmp_path)
+    with pytest.raises(HoldingRefused) as e:
+        t1_mod.run_t1_plan(engine, env2.spec, cli.load_receipts, billing(manifest="1" * 64), planned_by=OP_A)
+    assert e.value.code == "manifest_fingerprint_mismatch"
+    from erp_v2.holdings.billing import UnavailableBilling
+
+    with pytest.raises(HoldingRefused) as e:
+        UnavailableBilling().window_manifest_fingerprint(None, "w")  # type: ignore[arg-type]
+    assert e.value.code == "manifest_fingerprint_unavailable"
+
+
+def test_f1_the_admitted_partition_set_must_equal_the_census_carrying_parties(engine, tmp_path):
+    env = world(engine)
+    seed_gl(engine, env, "1400", D("1530"))
+    seed_admissions(engine, env, parties=(("C1", "NGN"),))  # C2 carries items in the census but was not admitted
+    env.spec = spec_bytes(env, make_spec(tmp_path))
+    with pytest.raises(HoldingRefused) as e:
+        t1_mod.run_t1_plan(engine, env.spec, cli.load_receipts, billing(), planned_by=OP_A)
+    assert e.value.code == "admissions_differ_from_census"
+
+
+def test_f6_held_rows_must_match_an_open_register_exception_with_an_equal_amount(engine, tmp_path):
+    env = flip_world(engine, tmp_path)
+    t1(engine, env)
+    with Session(engine) as db:
+        row = db.scalar(
+            sa.select(m.MigrationException).where(
+                m.MigrationException.tenant_id == env.tenant_id, m.MigrationException.legacy_key == "inv-1"
+            )
+        )
+        row.state, row.terminal_outcome, row.evidence_sha256 = "resolved", "no_action", SHA
+        row.resolved_at = sa.func.now()
+        db.commit()
+    with pytest.raises(HoldingRefused) as e:
+        holding_plan(engine, env)
+    assert e.value.code == "held_not_in_register"
+    env2 = flip_world(engine, tmp_path, register=[("E02", "inv-1", {})])  # the census partition has no register item
+    t1(engine, env2)
+    with pytest.raises(HoldingRefused) as e:
+        holding_plan(engine, env2)
+    assert e.value.code == "held_not_in_register"
+    env3 = flip_world(engine, tmp_path)
+    t1(engine, env3)
+    with Session(engine) as db:
+        db.execute(
+            sa.text(
+                "UPDATE erp_migration_exceptions SET detail = '{\"gl_signed_minor\": 1}'::jsonb WHERE tenant_id = :t AND legacy_key = 'partition:C1:NGN'"
+            ),
+            {"t": env3.tenant_id},
+        )
+        db.commit()
+    with pytest.raises(HoldingRefused) as e:
+        holding_plan(engine, env3)
+    assert e.value.code == "held_amount_differs_from_register"
+
+
+def test_f3_the_post_condition_rereads_the_owner_subledger_inside_the_apply_transaction(engine, tmp_path):
+    env = flip_world(engine, tmp_path)
+    t1(engine, env)
+    plan = holding_plan(engine, env)
+    env.sub["2000"][(Party("supplier", "A"), "NGN")] = D("-501")  # the owner moved after the plan
+    with pytest.raises(HoldingRefused) as e:
+        holding_apply(engine, env, plan)
+    assert e.value.code == "holding_postcondition_failed"
+    assert rows(engine, env) == [] and net(engine, env, "2000") == D("-1100")  # rolled back whole
+
+
+def test_f4_a_release_refuses_while_dual_control_is_on_and_stamps_the_policy(engine, tmp_path):
+    env, *_ = flipped(engine, tmp_path)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    with pytest.raises(HoldingRefused) as e:
+        do_release(engine, env, "held:2000:NGN:inv-1", "-60")
+    assert e.value.code == "release_dual_control_unbuilt" and rows(engine, env, "release") == []
+    set_dual_control_engine(engine, env.tenant_id, False)
+    do_release(engine, env, "held:2000:NGN:inv-1", "-60")
+    assert rows(engine, env, "release")[0].dual_control is False
+
+
+def test_l1_a_t1_replay_needs_the_posted_journals_fingerprint(engine, tmp_path, monkeypatch):
+    env = flip_world(engine, tmp_path)
+    plan, _ = t1(engine, env)
+    again = t1_mod.run_t1_plan(engine, env.spec, cli.load_receipts, billing(), planned_by=OP_A)
+    assert again["plan"]["posted_fingerprint"] == plan["plan_sha256"]
+
+
+def test_l2_the_owner_command_sha_is_in_the_identity_and_the_receipt(engine, tmp_path):
+    env, *_ = flipped(engine, tmp_path)
+    out = do_release(engine, env, "held:2000:NGN:inv-1", "-25")
+    assert len(out["owner_command_sha256"]) == 64
+
+
+def test_l3_truncate_is_refused_and_l4_an_item_with_an_outstanding_amount_cannot_be_resolved(engine, tmp_path):
+    env, *_ = flipped(engine, tmp_path)
+    with pytest.raises(DBAPIError, match="append-only"), engine.begin() as c:
+        c.execute(sa.text(f"TRUNCATE public.{HOLDINGS_TABLE}"))
+    from erp_v2.migration_ledger import register
+
+    with pytest.raises(DBAPIError, match="outstanding amount cannot be resolved"), Session(engine) as db:
+        register.resolve(
+            db,
+            env.tenant_id,
+            class_code="E37",
+            legacy_key="partygap:2000:NGN:A",
+            outcome="no_action",
+            evidence_sha256=SHA,
+        )
+        db.commit()
+
+
+def test_l5_verify_flags_a_prepayment_account_that_moved_after_t1(engine, tmp_path):
+    env, *_ = flipped(engine, tmp_path)
+    assert next(c for c in holding_verify(engine, env)["checks"] if c["check"] == "prepayment_account_unmoved")["ok"]
+    with Session(engine) as db:  # Finance renames another account to "Customer prepayments" and the old one away
+        db.execute(
+            sa.text("UPDATE mod_accounting.accounts SET name = 'old' WHERE id = :i"), {"i": env.accounts["2105"]}
+        ) if False else None
+        from dotmac_accounting.models import Account
+
+        db.get(Account, env.accounts["2105"]).name = "old prepayments"
+        db.get(Account, env.accounts["6900"]).name = "Customer prepayments"
+        db.commit()
+    verified = holding_verify(engine, env)
+    assert (
+        not next(c for c in verified["checks"] if c["check"] == "prepayment_account_unmoved")["ok"]
+        and not verified["ready"]
+    )
+
+
+def test_l6_a_configured_holding_account_is_guarded_even_with_no_rows(engine, tmp_path):
+    env, *_ = flipped(engine, tmp_path)
+    with Session(engine) as db:
+        persisted = {
+            r.control_code
+            for r in db.scalars(sa.select(__import__("erp_v2.holdings.models", fromlist=["x"]).HoldingAccount))
+        }
+    assert {"2000", "1400", "2040", "2045", "1410", "prepayment"} <= persisted
+    cmd = journals.PrepareJournal(
+        request_id=uuid4(), posting_date=date(2026, 1, 20), kind=journals.JournalKind.STANDARD, description="x", evidence_ref="E",
+        lines=(journals.LineInput(env.accounts["2902"], credit=D("1")), journals.LineInput(env.accounts["6900"], debit=D("1"))),
+    )  # fmt: skip
+    with Session(engine) as db:  # 2902 (employee clearing) has no rows: X = 0 for 2040 and 2045
+        with pytest.raises(JournalRefused) as e:
+            journals.prepare_journal(db, tenant_id=env.tenant_id, actor=env.parties["preparer"], command=cmd, now=NOW)
+        assert e.value.code == "holding_account_requires_holding_command"
+
+
+# --- straddle reproduction (W8, simplified) ---------------------------------------------------------------------------
+
+
+def straddle_world(engine, tmp_path, *, lines=None, status="POSTED"):
+    env = world(engine)
+    # three non-control accounts standing in for 1207 / 1211 / 6080
+    from dotmac_accounting.models import Account
+
+    with Session(engine) as db:
+        cat = db.scalar(
+            sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "EXP")
+        )
+        for code in ("1207", "1211", "6080"):
+            row = Account(
+                tenant_id=env.tenant_id,
+                category_id=cat.id,
+                code=code,
+                name=f"Acct {code}",
+                kind=AccountKind.POSTING,
+                normal_balance=NormalBalance.DEBIT,
+            )
+            db.add(row)
+            db.flush()
+            env.accounts[code] = row.id
+        db.commit()
+    a, b, c = (str(env.accounts[k]) for k in ("1207", "1211", "6080"))
+    day = "2026-01-13"
+    lines = lines(env.accounts) if callable(lines) else lines
+    lines = lines or [
+        {"account_id": a, "date": day, "debit": "100.00", "credit": "0.00"},
+        {"account_id": b, "date": day, "debit": "0.00", "credit": "60.00"},
+        {"account_id": c, "date": day, "debit": "0.00", "credit": "40.00"},
+    ]
+    side = write(tmp_path / "straddle.json", {"version": 1, "cutoff": "2025-12-31", "currency": "NGN", "journals": [
+        {"journal_id": "LJ-1", "legacy_status": status, "source_module": "GL", "lines": lines},
+        {"journal_id": "LJ-2", "legacy_status": status, "source_module": "GL", "lines": [
+            {"account_id": a, "date": "2026-01-14", "debit": "5.00", "credit": "0.00"},
+            {"account_id": b, "date": "2026-01-14", "debit": "0.00", "credit": "5.00"}]},
+    ]})  # fmt: skip
+    import hashlib
+
+    spec = make_spec(tmp_path)
+    spec["receipts"] = {"straddle": {"path": str(side), "sha256": hashlib.sha256(side.read_bytes()).hexdigest()}}
+    env.spec = spec_bytes(env, spec)
+    return env
+
+
+def straddle_apply(engine, env, planned_by=OP_A, applied_by=OP_A):
+    from erp_v2.holdings import straddle
+
+    plan = straddle.run_plan(engine, env.spec, planned_by=planned_by)
+    spec, _ = planning.parse_spec(env.spec)
+    with Session(engine) as db, db.begin():
+        return plan, straddle.apply(db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=applied_by)
+
+
+def test_straddle_reproduces_each_journal_balanced_on_its_legacy_day_and_registers_e39(engine, tmp_path):
+    from erp_v2.holdings import straddle
+
+    env = straddle_world(engine, tmp_path)
+    plan, out = straddle_apply(engine, env)
+    assert out["journals"] == 2 and out["posted_journals"] == 2
+    assert (
+        net(engine, env, "1207") == D("105")
+        and net(engine, env, "1211") == D("-65")
+        and net(engine, env, "6080") == D("-40")
+    )
+    with Session(engine) as db:
+        days = sorted(
+            j.posting_date.isoformat()
+            for j in db.scalars(
+                sa.select(JournalEntry).where(
+                    JournalEntry.tenant_id == env.tenant_id, JournalEntry.source_document_kind == "migration_straddle"
+                )
+            )
+        )
+    assert days == ["2026-01-13", "2026-01-14"]
+    item = key_of(engine, env, "straddle:LJ-1")
+    assert (item.class_code, item.state, item.source_kind) == ("E39", "open", "migration_straddle")
+    assert len(item.detail["reproduction_journal_ids"]) == 1 and len(item.detail["evidence_sha256"]) == 64
+    spec, _ = planning.parse_spec(env.spec)
+    raw = open(spec.straddle.path, "rb").read()
+    with applying.read_only_session(engine) as db:
+        assert straddle.verify(db, spec, raw)["ready"]
+        db.rollback()
+    with Session(engine) as db, db.begin():  # replay is a no-op
+        again = straddle.apply(db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=OP_A)
+    assert again["ready"] and net(engine, env, "1207") == D("105")
+    assert holding_rows_count(engine, env) == 0  # no holdings rows: the suspense tie is dropped
+
+
+def holding_rows_count(engine, env):
+    return len(rows(engine, env))
+
+
+def test_straddle_refuses_control_lines_nonzero_nets_split_journals_and_closed_periods(engine, tmp_path):
+    from erp_v2.holdings import straddle
+
+    def two(day_a, da, day_b, cr, first="1207", second="1211"):
+        return lambda acc: [
+            {"account_id": str(acc[first]), "date": day_a, "debit": da, "credit": "0.00"},
+            {"account_id": str(acc[second]), "date": day_b, "debit": "0.00", "credit": cr},
+        ]
+
+    cases = {
+        "straddle_control_line": two("2026-01-13", "7.00", "2026-01-13", "7.00", second="2000"),
+        "straddle_nonzero_net": two("2026-01-13", "7.00", "2026-01-13", "6.00"),
+        "straddle_splits_cutoff": two("2025-12-30", "7.00", "2026-01-13", "7.00"),
+    }
+    for code, lines in cases.items():
+        env = straddle_world(engine, tmp_path, lines=lines)
+        before = count_journals(engine, env)
+        with pytest.raises(HoldingRefused) as e:
+            straddle.run_plan(engine, env.spec, planned_by=OP_A)
+        assert e.value.code == code
+        assert count_journals(engine, env) == before
+    day_skew = two("2026-01-13", "7.00", "2026-01-14", "7.00")
+    env = straddle_world(engine, tmp_path, lines=day_skew)
+    with pytest.raises(HoldingRefused) as e:
+        straddle.run_plan(engine, env.spec, planned_by=OP_A)
+    assert e.value.code == "straddle_nonzero_net"
+    closed = two("2026-03-13", "7.00", "2026-03-13", "7.00")
+    env = straddle_world(engine, tmp_path, lines=closed)  # no period covers March in the seed
+    with pytest.raises(HoldingRefused) as e:
+        straddle.run_plan(engine, env.spec, planned_by=OP_A)
+    assert e.value.code == "straddle_period_not_postable"
+
+
+def test_straddle_refuses_a_holding_account_and_honours_dual_control_and_the_cli(engine, tmp_path, monkeypatch):
+    env = straddle_world(engine, tmp_path)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    with pytest.raises(HoldingRefused) as e:
+        straddle_apply(engine, env, planned_by=OP_A, applied_by=OP_A)
+    assert e.value.code == "dual_control_requires_distinct_operators" and net(engine, env, "1207") == 0
+    set_dual_control_engine(engine, env.tenant_id, False)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_bytes(env.spec)
+
+    def dsn():
+        os.environ["MIGRATION_DATABASE_URL"] = engine.url.render_as_string(hide_password=False)
+        os.environ.pop("DATABASE_URL", None)
+        os.environ.pop("PLATFORM_DATABASE_URL", None)
+
+    dsn()
+    plan_r = tmp_path / "sp.json"
+    assert (
+        cli.main(["straddle", "plan", "--spec", str(spec_path), "--receipt", str(plan_r), "--operator-ref", OP_A]) == 0
+    )
+    sha = json.loads(plan_r.read_text())["plan_sha256"]
+    assert net(engine, env, "1207") == 0
+    monkeypatch.delenv("ERP_HOLDING_APPLY", raising=False)
+    dsn()
+    args = [
+        "straddle",
+        "apply",
+        "--apply",
+        "--spec",
+        str(spec_path),
+        "--operator-ref",
+        OP_A,
+        "--plan-receipt",
+        str(plan_r),
+        "--plan-sha",
+        sha,
+    ]
+    assert cli.main([*args, "--receipt", str(tmp_path / "sa0.json")]) == 2 and net(engine, env, "1207") == 0
+    monkeypatch.setenv("ERP_HOLDING_APPLY", "1")
+    dsn()
+    assert cli.main([*args, "--receipt", str(tmp_path / "sa1.json")]) == 0 and net(engine, env, "1207") == D("105")
+    dsn()
+    assert cli.main(["straddle", "verify", "--spec", str(spec_path), "--receipt", str(tmp_path / "sv.json")]) == 0

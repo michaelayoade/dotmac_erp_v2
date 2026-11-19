@@ -48,6 +48,10 @@ class BillingReader(Protocol):
         """Per (legacy customer key, currency); the caller opens a READ COMMITTED read-write transaction it rolls
         back (``get_current_receivable_position`` needs read-write [E R1.1])."""
 
+    def window_manifest_fingerprint(self, db: Session, window_id: str) -> str:
+        """The billing window's bound manifest fingerprint (the a13 reader; ``manifest_fingerprint_unavailable`` until
+        then). T1 compares it with the e2_0029 admission rows."""
+
 
 class UnavailableBilling:
     """Billing a12: no R1. Every read refuses ``r1_unavailable``."""
@@ -57,6 +61,9 @@ class UnavailableBilling:
 
     def account_positions(self, db: Session) -> Mapping[tuple[str, str], Position]:
         return refuse("r1_unavailable")
+
+    def window_manifest_fingerprint(self, db: Session, window_id: str) -> str:
+        return refuse("manifest_fingerprint_unavailable")
 
 
 def default_reader() -> BillingReader:

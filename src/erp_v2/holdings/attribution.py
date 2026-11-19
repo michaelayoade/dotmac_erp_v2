@@ -53,6 +53,11 @@ class Explained:
     reason: str
     legacy_key: str
     amount: Decimal
+    origin_key: str | None = None  # the source register exception's legacy_key (defaults to ``legacy_key``)
+
+    @property
+    def source_key(self) -> str:
+        return self.origin_key or self.legacy_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +96,7 @@ class HoldingItem:
     holding_account_code: str
     evidence_refs: tuple[str, ...] = ()
     source_receipt_sha256: str = ""
+    origin: tuple[str, str] | None = None  # (class, legacy_key) of the source register exception (L6)
 
     def detail(self) -> dict[str, Any]:
         return {
@@ -102,6 +108,7 @@ class HoldingItem:
             "holding_account_code": self.holding_account_code,
             "legacy_evidence_refs": list(self.evidence_refs),
             "source_receipt_sha256": self.source_receipt_sha256,
+            "origin": None if self.origin is None else {"class": self.origin[0], "legacy_key": self.origin[1]},
         }
 
     def as_plan(self) -> dict[str, Any]:
@@ -146,6 +153,7 @@ def itemise(
                     party=party,
                     amount=e.amount,
                     reason=e.reason,
+                    origin=(e.class_code, e.source_key),
                     **common,
                 )
             )
@@ -267,7 +275,26 @@ def _rows(value: object, keys: set[str]) -> list[dict[str, Any]]:
 
 # --- the #72 census receipt (B14.4 fields only) -------------------------------------------------------------------
 
-CENSUS_HELD_CLASS: Final = (("partition_held:", "E35"), ("ar_unapplied_credit_note", "E35"), ("variance", "E36b"))
+CENSUS_HELD_CLASS: Final = (
+    ("partition_held:", "E35"),
+    ("ar_unapplied_credit_note", "E35"),
+    ("row_after_cutoff", "E35"),
+    ("variance", "E36b"),
+)
+UNAPPLIED_CN: Final = "ar_unapplied_credit_note"
+
+
+def census_register_key(reason: str, legacy_key: str) -> str:
+    """The register legacy_key of the #72 ``ar_census`` exception a held[] row came from."""
+    if reason.startswith("partition_held:"):
+        return legacy_key  # already ``partition:<cust>:<ccy>``
+    if reason == UNAPPLIED_CN:
+        return f"{UNAPPLIED_CN}:{legacy_key}"
+    if reason == "row_after_cutoff":
+        return f"row:{legacy_key}"
+    return legacy_key
+
+
 CENSUS_PARTY_KIND: Final = "customer"
 MINOR_EXPONENT: Final = 2  # NGN is the only supported currency (holding_fx_unsupported otherwise)
 
@@ -304,6 +331,7 @@ class Census:
     held: tuple[dict[str, Any], ...]
     unattributed: tuple[dict[str, Any], ...]
     shared_ar_journal: tuple[dict[str, Any], ...]
+    digest: str | None = None  # the receipt's own ``census_sha256`` field (what e2_0029 rows carry), NOT the file sha
 
     def currencies(self) -> set[str]:
         return {p.currency for p in self.parties}
@@ -319,7 +347,7 @@ class Census:
         return total
 
 
-def parse_census(body: Mapping[str, Any], sha256: str) -> Census:
+def parse_census(body: Mapping[str, Any], sha256: str, digest: str | None = None) -> Census:
     """``body`` is the census receipt's ``gl_attribution`` object."""
     sha_text(sha256, "invalid_census")
     if not isinstance(body, Mapping):
@@ -358,6 +386,7 @@ def parse_census(body: Mapping[str, Any], sha256: str) -> Census:
     return Census(
         sha256, tuple(parties), tuple(dict(h) for h in body["held"]), tuple(dict(u) for u in body["unattributed"]),
         tuple(dict(s) for s in body["shared_ar_journal"]),
+        None if digest is None else sha_text(digest, "invalid_census"),
     )  # fmt: skip
 
 
@@ -381,14 +410,17 @@ def census_attribution(census: Census, *, code: str, currency: str, functional: 
                 continue
             amount = _minor(h["amount_minor"])
             reason = str(h["reason"])
-            if str(h["legacy_key"]).startswith("ar_unapplied_credit_note:"):
-                reason = "ar_unapplied_credit_note"  # #72 keys unapplied credit notes by legacy_key prefix (class E35)
+            key = str(h["legacy_key"])
+            # Credit notes are keyed on the distinct reason; a legacy_key prefix that disagrees refuses (it never
+            # overrides the reason).
+            if key.startswith(f"{UNAPPLIED_CN}:") and reason != UNAPPLIED_CN:
+                refuse("census_reason_mismatch", "legacy_key prefix disagrees with the reason")
             if reason == "doc_unposted":
                 if amount != 0:
                     refuse("invalid_census", "an unposted document carries no GL")
                 continue  # H-DOC: a work-queue item only (no GL, no holding)
             explained[Party(CENSUS_PARTY_KIND, str(h["customer"]))].append(
-                Explained(census_class(reason), reason, str(h["legacy_key"]), amount)
+                Explained(census_class(reason), reason, key, amount, census_register_key(reason, key))
             )
     unattributed: tuple[UnattributedJournal, ...] = ()
     if code == "1400" and currency == functional:

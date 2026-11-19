@@ -17,11 +17,12 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from dotmac_accounting.contracts import JournalStatus
-from dotmac_accounting.models import JournalEntry
+from dotmac_accounting.models import JournalEntry, PostedLedgerLine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from erp_v2.governance import policy as governance
+from erp_v2.holdings import attribution as attr
 from erp_v2.holdings import plan as planning
 from erp_v2.holdings import positions
 from erp_v2.holdings.attribution import ZERO
@@ -31,10 +32,13 @@ from erp_v2.holdings.models import (
     HOLDINGS_TABLE,
     KIND_HOLDING_POST,
     KIND_RECLASS,
+    KIND_T1_POST,
     OWNER,
     PREPAYMENT,
     SOURCE_KIND,
     Holding,
+    HoldingAccount,
+    holding_document_id,
 )
 from erp_v2.migration_ledger import models as m
 from erp_v2.migration_ledger import register
@@ -64,6 +68,18 @@ def run_plan(
     receipts = receipts_loader(spec)
     with read_only_session(engine) as db:
         snap = planning.read_snapshot(db, spec, billing, owner_readers=owner_readers)
+        if receipts.census is not None:
+            planning.anchor_census(db, spec.tenant_id, receipts.census)  # F1
+            planning.check_held_in_register(  # F6
+                db,
+                spec.tenant_id,
+                attr.census_attribution(
+                    receipts.census, code="1400", currency=snap.functional, functional=snap.functional
+                ),
+                census=receipts.census,
+            )
+        for att in receipts.gl_attribution.values():
+            planning.check_held_in_register(db, spec.tenant_id, att, census=None)  # F6
         db.rollback()
     with Session(engine) as db:  # READ COMMITTED (the default), read-write, rolled back
         try:
@@ -91,6 +107,20 @@ def _facts(plan: dict[str, Any]) -> list[register.Fact]:
     return facts
 
 
+def applied_fingerprints(db: Session, tenant: UUID, window_id: str, functional: str) -> dict[str, str]:
+    """Per control code, the fingerprint of the ``migration_holding`` journal already posted for this window."""
+    from erp_v2.holdings import posting
+
+    out: dict[str, str] = {}
+    for code in planning.ORDER:
+        journal = posting.existing_journal(
+            db, tenant, KIND_HOLDING_POST, holding_document_id(window_id, code, functional)
+        )
+        if journal is not None:
+            out[code] = journal.source_fingerprint
+    return out
+
+
 def apply(
     db: Session,
     spec: planning.RunSpec,
@@ -99,6 +129,7 @@ def apply(
     approved_sha: str,
     applied_by: str,
     now=None,
+    owner_readers: Mapping[str, planning.OwnerReader] | None = None,
 ) -> dict[str, Any]:
     """Apply an already re-planned ``plan`` (the CLI re-runs the plan and passes it). Caller owns the transaction."""
     from erp_v2.holdings import posting
@@ -113,6 +144,12 @@ def apply(
     if dual and planned_by == applied_by:
         refuse("dual_control_requires_distinct_operators")
     body = plan["plan"]
+    # F2: a window that was applied with a different plan is closed; a code with X = 0 at the flip cannot get a first
+    # journal later from a new plan.
+    prior = applied_fingerprints(db, tenant, spec.window_id, body["functional_currency"])
+    if any(fp != approved_sha for fp in prior.values()):
+        refuse("window_already_applied", "this window was applied from a different plan")
+    _persist_config(db, tenant, body, approved_sha)
     facts = _facts(plan)
     register.reconcile(db, tenant, facts, loaded_sources={SOURCE_KIND}, receipt_sha=approved_sha, apply=True)
     ids = {
@@ -178,10 +215,33 @@ def apply(
             {"code": entry["code"], "currency": entry["currency"], "replayed": result.replayed, "rows": inserted}
         )
         if entry["code"] in IN_TX_TIED:
+            # F3: re-read the owner subledger INSIDE this transaction; the plan's figure is not the witness.
             after = positions.gl_net(db, tenant, UUID(entry["control_account_id"]))
-            if after != money(entry["subledger"]):
+            reader = (owner_readers or {}).get(entry["code"])
+            owner = (
+                reader(db, tenant, entry["code"], body["functional_currency"])
+                if reader
+                else positions.owner_sub(db, tenant, entry["code"], body["functional_currency"])
+            )
+            live = sum((v for (_p, c), v in owner.items() if c == body["functional_currency"]), ZERO)
+            if after != live:
                 refuse("holding_postcondition_failed", f"{entry['code']}: control differs from the subledger")
     return {"ready": True, "plan_sha256": approved_sha, "posted": posted, "dual_control": dual}
+
+
+def _persist_config(db: Session, tenant: UUID, body: dict[str, Any], sha: str) -> None:
+    """L6: persist the resolved holding accounts (once per control code), covering codes with X = 0 too."""
+    for code, ref in sorted(body["config"]["holding_accounts"].items()):
+        row = db.scalar(
+            sa.select(HoldingAccount).where(HoldingAccount.tenant_id == tenant, HoldingAccount.control_code == code)
+        )
+        if row is None:
+            db.add(
+                HoldingAccount(tenant_id=tenant, control_code=code, holding_account_id=UUID(ref["id"]), plan_sha256=sha)
+            )
+        elif str(row.holding_account_id) != ref["id"]:
+            refuse("holding_config_changed", code)
+    db.flush()
 
 
 def _date(value: str):
@@ -255,6 +315,26 @@ def verify(
             {"t": tenant},
         )
     )
+    t1_credit = {
+        a
+        for (a,) in db.execute(
+            sa.select(PostedLedgerLine.account_id)
+            .join(
+                JournalEntry,
+                (JournalEntry.tenant_id == PostedLedgerLine.tenant_id)
+                & (JournalEntry.id == PostedLedgerLine.journal_id),
+            )
+            .where(
+                PostedLedgerLine.tenant_id == tenant,
+                JournalEntry.source_owner == OWNER,
+                JournalEntry.source_document_kind == KIND_T1_POST,
+                PostedLedgerLine.credit > 0,
+            )
+            .distinct()
+        )
+    }
+    moved = bool(t1_credit) and t1_credit != {snap.controls[PREPAYMENT].id}
+    checks.append({"check": "prepayment_account_unmoved", "ok": not moved})  # L5
     checks.append({"check": "item_state_matches_outstanding", "ok": not bad_state, "violations": len(bad_state)})
     docs = list(
         db.execute(

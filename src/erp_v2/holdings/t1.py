@@ -59,7 +59,14 @@ def run_t1_plan(
         from erp_v2.holdings import posting
 
         existing = posting.existing_journal(db, tenant, KIND_T1_POST, doc)
+        posted_fingerprint = None if existing is None else existing.source_fingerprint
+        already_posted = existing is not None
+        # F1: the census must be the one #72 admitted from, and the billing window must carry the same manifest.
+        admitted_manifest = planning.anchor_census(db, tenant, census)
+        window_manifest = billing.window_manifest_fingerprint(db, spec.window_id)
         db.rollback()
+    if window_manifest != admitted_manifest:
+        refuse("manifest_fingerprint_mismatch", "the billing window manifest differs from the admission rows")
     with read_only_session(engine) as db:
         again = billing.r1(db)
         ledger_again = positions.v2_posted_sha(db, tenant)
@@ -92,7 +99,9 @@ def run_t1_plan(
         "debit_account_id": str(receivable.id),
         "credit_account_id": str(prepayment.id),
         "document_id": doc,
-        "already_posted": existing is not None,
+        "manifest_fingerprint": admitted_manifest,
+        "already_posted": already_posted,
+        "posted_fingerprint": posted_fingerprint,
         "per_account": [
             {"customer_ref_sha256": canonical_sha(p.customer), "cash_lot_minor": p.cash_lot_minor}
             for p in sorted(census.parties, key=lambda p: p.customer)
