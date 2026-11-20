@@ -590,7 +590,8 @@ def test_any_set_or_inherit_member_attribute_membership_or_ownership_refuses_ado
                     rg.prepare_role(c, probe)
                 c.exec_driver_sql(f"REVOKE {probe} FROM {probe}_m")
             c.exec_driver_sql(f"GRANT {probe} TO {probe}_m WITH ADMIN TRUE, SET FALSE, INHERIT FALSE")
-            rg.prepare_role(c, probe)  # an ADMIN-only row is allowed
+            with pytest.raises(rg.WriterRoleRefused, match="writer_admin_reachable"):  # adoption: no exceptions
+                rg.prepare_role(c, probe)
             c.exec_driver_sql(f"REVOKE {probe} FROM {probe}_m")
             for serving in ("app_user", "platform_api", "app_admin"):
                 c.exec_driver_sql(f"GRANT {serving} TO {probe}")
@@ -711,18 +712,97 @@ def test_plan_refuses_a_non_functional_currency_before_anything_is_imported(engi
             )
 
 
-def test_apply_preflight_refuses_while_the_session_user_holds_admin_on_the_writer(engine):
+def test_apply_preflight_refuses_when_any_role_reaches_admin_on_the_writer_directly_or_transitively(engine):
     from erp_v2.importer import ar_opening_role as rg
 
     owner = engine.url.username
+    reach = _probe_name()
     admin = _admin_engine()
     try:
         with admin.connect() as c:
             c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH ADMIN TRUE, SET TRUE, INHERIT FALSE')
-        with engine.connect() as c, pytest.raises(rg.WriterRoleRefused, match="session_user_holds_admin_on_writer"):
-            rg.preflight(c, WRITER_ROLE, operator=owner, forbid_session_admin=True)
+            c.exec_driver_sql(f"CREATE ROLE {reach} NOLOGIN")
+        with engine.connect() as c:
+            with pytest.raises(rg.WriterRoleRefused, match=f"writer_admin_reachable:{owner}"):
+                rg.preflight(c, WRITER_ROLE, operator=owner)  # direct holder
+        with admin.connect() as c:  # SET-only chain: reach can SET ROLE to the holder and then GRANT
+            c.exec_driver_sql(f'GRANT "{owner}" TO {reach} WITH SET TRUE, INHERIT FALSE')
+        with engine.connect() as c:
+            with pytest.raises(rg.WriterRoleRefused, match=f"writer_admin_reachable:{reach}"):
+                rg.preflight(c, WRITER_ROLE, operator=owner)
     finally:
         with admin.connect() as c:
             c.exec_driver_sql(f'REVOKE {WRITER_ROLE} FROM "{owner}"')
             c.exec_driver_sql(f'GRANT {WRITER_ROLE} TO "{owner}" WITH SET TRUE, INHERIT FALSE, ADMIN FALSE')
+        _drop(admin, reach)
         admin.dispose()
+
+
+def _prod_graph(admin, migrator):
+    """The probed production graph: a non-superuser CREATEROLE migrator, app_admin a member of it (admin, inherit, set)."""
+
+    with admin.connect() as c:
+        c.exec_driver_sql(f"CREATE ROLE {migrator} NOLOGIN CREATEROLE")
+        c.exec_driver_sql(f"GRANT {migrator} TO app_admin WITH ADMIN TRUE, INHERIT TRUE, SET TRUE")
+
+
+def test_prod_graph_the_writer_created_by_the_migrator_is_refused(engine):
+    """Settles whether e2_0029 refuses in the probed graph: it does (app_admin reaches the creator's ADMIN row)."""
+
+    from erp_v2.importer import ar_opening_role as rg
+
+    admin, migrator, probe = _admin_engine(), _probe_name(), _probe_name()
+    _prod_graph(admin, migrator)
+    try:
+        with admin.connect() as c:
+            c.exec_driver_sql(f"SET ROLE {migrator}")
+            assert c.scalar(sa.text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")) is False
+            with pytest.raises(rg.WriterRoleRefused, match=r"writer_(admin_reachable|role_refused)") as caught:
+                rg.prepare_role(c, probe)
+            assert "app_admin" in str(caught.value) or "linked_to_serving_role" in str(caught.value)
+            c.exec_driver_sql("RESET ROLE")
+    finally:
+        with admin.connect() as c:
+            c.exec_driver_sql(f"REVOKE {migrator} FROM app_admin")
+        _drop(admin, probe, migrator)
+        admin.dispose()
+
+
+def test_prod_graph_a_superuser_pre_created_writer_is_adopted_with_no_admin_rows(engine):
+    from erp_v2.importer import ar_opening_role as rg
+
+    admin, migrator, probe = _admin_engine(), _probe_name(), _probe_name()
+    _prod_graph(admin, migrator)
+    try:
+        with admin.connect() as c:
+            assert rg.prepare_role(c, probe) is True  # R1: the superuser creates it, no membership row at all
+            assert (
+                c.scalar(
+                    sa.text(
+                        "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid IN (m.roleid, m.member) WHERE r.rolname = :n"
+                    ),
+                    {"n": probe},
+                )
+                == 0
+            )
+            c.exec_driver_sql(f"SET ROLE {migrator}")
+            assert rg.prepare_role(c, probe) is False  # the migration takes the adopt path and passes
+            assert rg.admin_reachable(c, probe) == []
+            c.exec_driver_sql("RESET ROLE")
+    finally:
+        with admin.connect() as c:
+            c.exec_driver_sql(f"REVOKE {migrator} FROM app_admin")
+        _drop(admin, probe, migrator)
+        admin.dispose()
+
+
+def test_a_fresh_creator_row_is_tolerated_only_when_nobody_else_reaches_the_creator(engine):
+    from erp_v2.importer import ar_opening_role as rg
+
+    probe = _probe_name()
+    with engine.begin() as c:  # fresh CI cluster: the fixture owner is not reachable from any other role
+        assert rg.prepare_role(c, probe) is True
+        assert rg.admin_reachable(c, probe) == [engine.url.username]
+    admin = _admin_engine()
+    _drop(admin, probe)
+    admin.dispose()

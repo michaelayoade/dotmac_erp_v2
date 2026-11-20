@@ -177,6 +177,28 @@ def membership_problems(conn, role: str = WRITER_ROLE, *, only_set_member: str |
     return problems
 
 
+def admin_reachable(conn, role: str = WRITER_ROLE) -> list[str]:
+    """Non-superuser roles that can REACH a role holding ADMIN on the writer, by any membership chain.
+
+    `pg_has_role(r, holder, 'MEMBER')` follows INHERIT and SET chains alike (a SET-only chain can `SET ROLE` to the
+    holder and then GRANT), so this is MEMBER, not USAGE. The holder itself counts (a role reaches itself)."""
+
+    return sorted(
+        conn.scalars(
+            sa.text(
+                "SELECT r.rolname FROM pg_roles r WHERE NOT r.rolsuper AND EXISTS ("
+                " SELECT 1 FROM pg_auth_members m WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = :w)"
+                " AND m.admin_option AND pg_has_role(r.oid, m.member, 'MEMBER'))"
+            ),
+            {"w": role},
+        )
+    )
+
+
+def admin_reachable_problems(conn, role: str, *, allow: frozenset[str] = frozenset()) -> list[str]:
+    return [f"writer_admin_reachable:{r}" for r in admin_reachable(conn, role) if r not in allow]
+
+
 def posture_problems(conn, role: str = WRITER_ROLE) -> list[str]:
     """Attribute, ownership and default-privilege problems of the role itself."""
 
@@ -221,24 +243,13 @@ def assert_exact_privileges(conn, role: str = WRITER_ROLE, expected: set | None 
         raise WriterRoleRefused(f"writer_privileges_not_exact:extra={len(have - want)}:missing={len(want - have)}")
 
 
-def preflight(
-    conn, role: str = WRITER_ROLE, *, operator: str | None = None, forbid_session_admin: bool = False
-) -> None:
-    """Apply-time check (also the final check of the migration): membership, posture, exact privileges."""
+def preflight(conn, role: str = WRITER_ROLE, *, operator: str | None = None, allow_creator: str | None = None) -> None:
+    """Apply-time check (also the final check of the migration): membership, posture, exact privileges, and that no
+    non-superuser role can reach ADMIN on the writer. Apply allows NO exception. The migration passes `allow_creator`
+    (current_user) only for the creator row it created in this very run, and only if no OTHER role reaches it."""
 
     problems = [*membership_problems(conn, role, only_set_member=operator), *posture_problems(conn, role)]
-    # The ADMIN-only creator row lets its holder GRANT the writer to itself. If the operator session still holds ADMIN,
-    # "membership only by Michael" would be procedure, not a control: refuse (apply only; the migration's own creator
-    # row is expected and legitimate at that point). (Runbook: after the migration Michael
-    # revokes the migrator's ADMIN row, then grants the operator SET without INHERIT or ADMIN.)
-    if forbid_session_admin and conn.scalar(
-        sa.text(
-            "SELECT count(*) FROM pg_auth_members m WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = :r) "
-            "AND m.admin_option AND m.member = (SELECT oid FROM pg_roles WHERE rolname = session_user)"
-        ),
-        {"r": role},
-    ):
-        problems.append("session_user_holds_admin_on_writer")
+    problems += admin_reachable_problems(conn, role, allow=frozenset({allow_creator} if allow_creator else ()))
     if problems:
         raise WriterRoleRefused("writer_role_refused:" + ",".join(sorted(set(problems))))
     assert_exact_privileges(conn, role)
@@ -269,6 +280,8 @@ def prepare_role(conn, role: str = WRITER_ROLE) -> bool:
             for option in ("SET", "INHERIT"):
                 conn.execute(sa.text(f"REVOKE {option} OPTION FOR {role} FROM {member} GRANTED BY {grantor}"))
     problems = [*membership_problems(conn, role), *posture_problems(conn, role)]
+    creator = conn.scalar(sa.text("SELECT current_user"))
+    problems += admin_reachable_problems(conn, role, allow=frozenset({creator}) if created else frozenset())
     if problems:
         raise WriterRoleRefused("writer_role_refused:" + ",".join(sorted(set(problems))))
     if not created:

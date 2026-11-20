@@ -94,10 +94,14 @@ def upgrade() -> None:
     op.execute(f"GRANT SELECT ON public.{TABLE} TO app_user")
     # The restricted opening principal (billing R5). An existing role is verified, never altered or widened.
     conn = op.get_bind()
-    role_guard.prepare_role(conn, WRITER_ROLE)
+    created = role_guard.prepare_role(conn, WRITER_ROLE)
     for line in _grant_lines():
         op.execute(line)
-    role_guard.preflight(conn, WRITER_ROLE)  # exact privileges, no SET/INHERIT member, no owned objects
+    # exact privileges, no SET/INHERIT member, no owned objects, no non-superuser role reaching ADMIN on the writer
+    # (only a creator row created in THIS run is tolerated, and only if nobody else reaches the creator).
+    role_guard.preflight(
+        conn, WRITER_ROLE, allow_creator=conn.scalar(sa.text("SELECT current_user")) if created else None
+    )
     # NO membership is granted here, to the migration role or anyone else. A standing, inheriting membership of the
     # pipeline migrator would be a permanent widening against R5. The operator's membership is a Michael root step,
     # for the window's lifetime only: GRANT erp_billing_opening_writer TO <operator> WITH SET TRUE, INHERIT FALSE;

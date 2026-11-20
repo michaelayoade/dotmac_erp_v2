@@ -54,8 +54,12 @@ uv run python -m erp_v2.runtime --port 8012
 
 ## Migrate (owner identity, disposable/test database only at wave 0)
 
+The migrating identity is the schema owner (`erp_owner`; provisional until a reader confirms the pipeline's
+identity), not `app_admin`. For `e2_0029` the opening writer role must be pre-created by a superuser first
+(`docs/mapping-billing.md`, runbook R1).
+
 ```sh
-MIGRATION_DATABASE_URL=postgresql+psycopg://app_admin@HOST/DB \
+MIGRATION_DATABASE_URL=postgresql+psycopg://erp_owner@HOST/DB \
     uv run python -m erp_v2.migrate upgrade heads
 ```
 

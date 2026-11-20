@@ -386,7 +386,6 @@ def _apply_opening(
             db.connection(),
             WRITER_ROLE,
             operator=db.scalar(sa.text("SELECT session_user")),
-            forbid_session_admin=True,
         )
         existing = get_opening_window(db, scope=scope)
         if existing is None:
