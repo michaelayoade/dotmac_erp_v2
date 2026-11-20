@@ -1848,3 +1848,43 @@ def test_a_login_member_of_app_user_reads_but_never_writes_and_the_guards_hold_f
             c.exec_driver_sql(f'REVOKE app_user FROM "{role}"')
             c.exec_driver_sql(f'REVOKE "{role}" FROM CURRENT_USER')
             c.exec_driver_sql(f'DROP ROLE "{role}"')
+
+
+def test_subkobo_rounding_account_is_config_not_control_holding_prepayment_and_matches_the_bridge(
+    engine, legacy_schema, tmp_path
+):
+    import hashlib
+
+    from erp_v2.holdings import units
+    from erp_v2.migration_ledger import models as ml
+
+    env = units_world(engine)
+    side, receipt, _jid, _j = subkobo_files(engine, env, tmp_path)
+    for bad in (
+        "2000",
+        "1400",
+        "2105",
+        "1901",
+        "2901",
+        "Customer prepayments",
+    ):  # control, holding (run-spec), prepayment
+        env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": bad})
+        with pytest.raises(HoldingRefused) as e:
+            units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
+        assert e.value.code in {"rounding_account_invalid", "holding_account_invalid"}, bad
+    # the bridge names another rounding account: refuse; the same account: post
+    with Session(engine) as db:
+        db.add(
+            ml.BridgeVersion(
+                tenant_id=env.tenant_id, version=1, sha256=hashlib.sha256(b"b1").hexdigest(),
+                body={"rounding_account_code": "6080", "items": []}, itemised_sha256=SHA, ready=False, created_by="t",
+            )
+        )  # fmt: skip
+        db.commit()
+    env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6999"})
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
+    assert e.value.code == "rounding_account_differs_from_bridge"
+    env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6080"})
+    _plan, out = units_apply(engine, env, units.SUBKOBO)
+    assert out["posted_journals"] == 1 and net(engine, env, "6080") == D("-0.004")
