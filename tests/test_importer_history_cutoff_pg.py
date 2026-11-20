@@ -518,6 +518,10 @@ def test_the_unbalanced_journals_get_their_own_private_side_file_in_the_straddle
         "original_currency",
     }  # fmt: skip
     assert unit["evidence_sha256"] == history_cutoff.unit_evidence_sha(unit["lines"])
+    assert section["subkobo"]["journals"] == [str(jid)]
+    assert section["straddlers"]["journals"] == sorted(
+        j["journal"] for j in json.loads((tmp_path / "receipt.json.straddlers.json").read_text())["journals"]
+    )
     assert section["subkobo"]["count"] == 1 and section["subkobo"]["sum_net"] == "0.000001"
     # the straddlers file is untouched by the E15 work: only the straddlers, same keys, same shared sha
     strad = json.loads((tmp_path / "receipt.json.straddlers.json").read_text())
