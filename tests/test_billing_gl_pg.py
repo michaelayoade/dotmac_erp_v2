@@ -6,7 +6,7 @@ Hosted CI only (ERP_TEST_POSTGRES_URL), like the other hosted PG tests.
 """
 
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
@@ -383,6 +383,8 @@ def test_block_is_per_account_and_a_config_fix_heals_without_staff(engine, invoi
     # The fix is configuration only: set the prepaid-funding account; the next run heals both.
     configure(engine, env, ar={settings.PREPAID_FUNDING_KEY: str(env.accounts["2150"])})
     healed = run(engine, env)
+    closing = datetime(2026, 2, 2, 12, tzinfo=UTC)  # the period can only close after its end plus settle
+    run(engine, env, now=closing)
     assert dispositions(engine, env) == {"POSTED": 3} and healed["blocked"] == 0 and healed["waiting"] == 0
     bal = gl(engine, env)
     assert bal["1010"] == D("105.00") and -bal["2150"] == D("75.00")
@@ -393,7 +395,7 @@ def test_block_is_per_account_and_a_config_fix_heals_without_staff(engine, invoi
             period_id=period,
             actor=env.parties["approver"],
             review_ref="REVIEW-1",
-            now=RUN_AT,
+            now=closing,
         )
         db.commit()
     assert status.lower().startswith("soft")
@@ -635,7 +637,7 @@ def test_a_backdated_fact_is_found_by_the_rolling_rescan_and_staleness_refuses_p
     # ... but the period cannot be closed on that basis: days not rescanned within rescan_days count as missing.
     from erp_v2.billing_gl.checks import facts_incomplete
 
-    later = datetime(2026, 1, 30, 12, tzinfo=UTC)
+    later = datetime(2026, 2, 2, 12, tzinfo=UTC)  # past the period end plus settle
     with Session(engine) as db:
         assert facts_incomplete(db, env.tenant_id, date(2026, 1, 1), date(2026, 1, 31), now=later) is True
     # The rolling rescan (a batch per run) finds it, so nothing is silently never mapped.
@@ -723,3 +725,56 @@ def test_the_period_guard_does_not_apply_to_a_tenant_whose_mapper_was_never_used
     env = world(engine, enabled=False)
     with Session(engine) as db:
         assert facts_incomplete(db, env.tenant_id, date(2026, 1, 1), date(2026, 1, 31), now=RUN_AT) is False
+
+
+# ------------------------------------------------ re-review R1-R3 (architect, 2026-11-20)
+
+
+def test_period_close_waits_for_the_period_end_plus_settle(engine):
+    """R1: days between the settle horizon and the period end have no window yet, so they count as missing."""
+    from erp_v2.billing_gl.checks import facts_incomplete
+
+    env = world(engine)
+    mid_month = datetime(2026, 1, 25, 12, tzinfo=UTC)
+    run(engine, env, now=mid_month)
+    with Session(engine) as db:
+        assert facts_incomplete(db, env.tenant_id, date(2026, 1, 1), date(2026, 1, 31), now=mid_month) is True
+        # Every existing window is fresh and closed; only the not-yet-complete days remain.
+        assert db.scalar(sa.select(sa.func.count()).select_from(FactWindow).where(FactWindow.closed_at.is_(None))) == 0
+
+
+def test_enable_once_rescans_every_stale_window(engine):
+    """R2: while the mapper is idle the rolling batch does not run; --enable-once must heal ALL stale windows."""
+    env = world(engine, enabled=False)
+    run(engine, env, enable_once=True)
+    later = datetime(2026, 2, 10, 12, tzinfo=UTC)
+    report = run(engine, env, now=later, enable_once=True)
+    with Session(engine) as db:
+        stale = db.scalar(
+            sa.select(sa.func.count())
+            .select_from(FactWindow)
+            .where(FactWindow.tenant_id == env.tenant_id, FactWindow.rechecked_at < later - timedelta(days=1))
+        )
+    assert stale == 0 and report["windows_remaining"] == 0
+
+
+def test_the_lock_connection_is_not_idle_in_transaction_during_a_run(engine, monkeypatch):
+    from erp_v2.billing_gl import mapper
+
+    env = world(engine)
+    seen = {}
+    original = mapper.Mapper._run
+
+    def probe(self):
+        with engine.connect() as other:
+            seen["states"] = other.execute(
+                sa.text(
+                    "SELECT state FROM pg_stat_activity WHERE query ILIKE '%pg_try_advisory_lock%' "
+                    "AND pid <> pg_backend_pid()"
+                )
+            ).all()
+        return original(self)
+
+    monkeypatch.setattr(mapper.Mapper, "_run", probe)
+    run(engine, env)
+    assert seen["states"] and all(row[0] == "idle" for row in seen["states"])

@@ -86,6 +86,7 @@ def period_blockers(
     rescanned window, whether or not a window row exists for it.
     """
     now = now or datetime.now(UTC)
+    del settle_seconds  # the horizon is implicit: windows only exist for days before it
     lo, hi = period_bounds_utc(start, end, timezone)
     unclosed = (
         db.scalar(
@@ -114,7 +115,9 @@ def period_blockers(
         or 0
     )
     last = hi.date() if hi == _day_floor(hi) else hi.date() + timedelta(days=1)
-    end_day = min(last, horizon_day(now, settle_seconds))
+    # Days at or after the settle horizon cannot have a closed window yet, so they count as missing: a period cannot be
+    # closed before its end plus settle (a fact that occurs later would otherwise be re-dated into the next period).
+    end_day = last
     missing = missing_days(db, tenant_id, lo.date(), end_day, now=now, rescan_days=rescan_days)
     return {"unclosed_windows": unclosed, "blocked_facts": pending, "missing_windows": missing}
 

@@ -62,7 +62,7 @@ first open date after it with the original date in the description; `hold` BLOCK
 
 ## Completeness, locking and terminal rows (architect review, 2026-11-19)
 
-- **One run at a time.** Each run takes a per-tenant session advisory lock on a dedicated connection; a second run exits
+- **One run at a time.** Each run takes a per-tenant session advisory lock on a dedicated AUTOCOMMIT connection (never idle in transaction); a second run exits
   with `locked: true` and does nothing, so two overlapping runs can never process the same facts.
 - **Retry pages everything.** Pending facts are retried per timestamp slice, paging to the end (opening facts can share
   one timestamp), in billing index order.
@@ -71,6 +71,10 @@ first open date after it with the original date in the description; `hold` BLOCK
   (`soft_close_period` / `lock_period`) and the gate refuse while ANY UTC day up to the settle horizon has no closed window
   checked within `rescan_days`, whether or not a window row exists for it. `history_floor` cannot hide early days: a period
   starting before the floor is refused, and the gate refuses a floor later than 2000-01-01.
+- **Period close waits for the period end plus settle.** Every UTC day of the period, including the days after the
+  settle horizon (which have no window yet), must have a fresh closed window. The guard bites from F8 on (once any
+  window or fact row exists for the tenant), so the runbook re-runs `--enable-once`, which rescans EVERY stale window
+  (the rolling batch only runs while the mapper is live), just before the gate.
 - **Terminal rows are the mapper's only.** The runtime role can INSERT (W4), so the trigger also checks INSERT and UPDATE:
   POSTED needs the posting bridge's own journal for that fact, SKIP is only for opening import/unwind kinds, NO_GL only for V1.
 
