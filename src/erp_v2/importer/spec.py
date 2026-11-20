@@ -241,7 +241,7 @@ def _systematic_candidates(dest: str, source_columns: set[str], source_table: st
 def _sub_origin_gaps(source_columns: set[str], policy: SubOriginPolicy | None) -> tuple[str, ...]:
     """Apply the same source-policy validation to inserts and refusals."""
 
-    if policy is SubOriginPolicy.EXCLUDE and SUB_ORIGIN_COLUMN not in source_columns:
+    if policy in (SubOriginPolicy.EXCLUDE, SubOriginPolicy.INCLUDE) and SUB_ORIGIN_COLUMN not in source_columns:
         return (f"sub_origin_column:{SUB_ORIGIN_COLUMN}",)
     if policy is SubOriginPolicy.NOT_APPLICABLE and SUB_ORIGIN_COLUMN in source_columns:
         return (f"sub_origin_not_applicable_but_column_present:{SUB_ORIGIN_COLUMN}",)

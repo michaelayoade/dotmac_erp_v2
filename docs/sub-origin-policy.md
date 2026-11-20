@@ -20,8 +20,8 @@ tags mirrored Sub records with `dotmac_sub_id`. Code:
 | Pairing | Source | Policy | Reason |
 |---|---|---|---|
 | mod_payments.payment_confirmations | customer_payment | exclude | Sub-origin cash belongs to Sub's Billing |
-| mod_customers.customer_accounts | customer | exclude | pending M11 |
-| mod_customers.customer_profiles | customer | exclude | pending M11 |
+| mod_customers.customer_accounts | customer | include | as-is ruling: the AR opening reuses these accounts |
+| mod_customers.customer_profiles | customer | include | as-is ruling |
 
 The enrolment mint `sales_leads` (one lead per legacy customer) also
 reads only `dotmac_sub_id IS NULL` customers. Invoices and payments for
@@ -30,3 +30,15 @@ Billing go through `billing_opening` (the COMMAND-IMPORT pairing).
 The receipt also reports `sub_origin.customers_referenced_by_native`:
 sorted keys of Sub-tagged customers referenced by ERP-native invoices or
 payments. These customers are not imported (M11).
+
+- `include`: the column is present and Sub-tagged rows are imported like any other (origin stays provenance).
+  Added by the AS-IS rework of the AR opening (replan section 2.4); it replaces `exclude` on the wave-4 customer
+  pairings. A spec declared `include` over a source without the column is not executable.
+
+## AR opening: F1 reversed for Billing (v1677, rev 2)
+
+For the Billing opening (`importer/billing_opening.py`, `ar_census.py`, `ar_opening_cli.py`) the Sub-origin
+exclusion and the Splynx-era block are REVERSED: every open 1400 item (native, Sub-origin, Splynx) is admitted, and
+origin is provenance in the evidence digest, never an identity or a rule. The AR opening REUSES the wave-4
+`customer_accounts` (id = legacy customer id; policy `include` above) and only creates the billing accounts
+(`ar_opening_cli mint` refuses `customer_not_imported`). The `customer_payment` row above is unchanged.

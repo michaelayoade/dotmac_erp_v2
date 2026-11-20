@@ -54,8 +54,12 @@ uv run python -m erp_v2.runtime --port 8012
 
 ## Migrate (owner identity, disposable/test database only at wave 0)
 
+The migrating identity is the schema owner `erp_owner` (it owns `alembic_version` and the `mod_billing` and `public`
+tables), not `app_admin`. The deploy pipeline runs no alembic step: an operator runs migrations as `erp_owner`. For `e2_0029` the opening writer role must be pre-created by a superuser first
+(`docs/mapping-billing.md`, runbook R1).
+
 ```sh
-MIGRATION_DATABASE_URL=postgresql+psycopg://app_admin@HOST/DB \
+MIGRATION_DATABASE_URL=postgresql+psycopg://erp_owner@HOST/DB \
     uv run python -m erp_v2.migrate upgrade heads
 ```
 
