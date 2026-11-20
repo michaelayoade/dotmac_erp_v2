@@ -821,10 +821,11 @@ def test_migration_straddle_journals_are_not_v2_native_in_the_bridge_comparison(
             db.commit()
 
     post("erp.migration", "migration_straddle")
+    post("erp.migration", "migration_subkobo")  # E15 reproduction (T-SUBKOBO items explain its residue)
     post("erp.migration", "something_else")
     with Session(engine) as db:
         total, native = ledger_check.v2_posted(db, env.tenant_id)
-    assert total[("5000", "2026-01")] == Decimal(4)
+    assert total[("5000", "2026-01")] == Decimal(6)
     assert native[("5000", "2026-01")] == Decimal(2)  # only the other kind counts as native
 
 

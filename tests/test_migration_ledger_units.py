@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from migration_ledger_support import bind_rounding
 
-from erp_v2.migration_ledger import bridge, opening, register
+from erp_v2.migration_ledger import bridge, opening, register, subkobo
 from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, strict_json
 
 SHA = "a" * 64
@@ -489,3 +489,93 @@ def test_the_gate_control_lists_are_code_constants():
         "report_zero": ["2030"],
         "report_wht": ["2110"],
     }
+
+
+# --- E15 sub-kobo (T-SUBKOBO, E15-AND-SIDEFILE-RULING) -------------------------------------------------------------
+
+
+def subkobo_file(*, net_debit="100.000000", net_credit="99.999999", day="2026-04-18", cutoff="2025-12-31", **over):
+    import hashlib
+    import json
+
+    lines = [
+        {"ledger_line_id": "l1", "journal_line_id": "j1", "account_id": "a1", "account_code": "5000",
+         "posting_date": day, "debit": net_debit, "credit": "0.000000", "original_currency": None},
+        {"ledger_line_id": "l2", "journal_line_id": "j2", "account_id": "a2", "account_code": "1000",
+         "posting_date": day, "debit": "0.000000", "credit": net_credit, "original_currency": None},
+    ]  # fmt: skip
+    net = D(net_debit) - D(net_credit)
+    journal = {
+        "class": "E15", "reason": "unbalanced_journal_unit", "journal": "J-E15", "type": "UNBALANCED",
+        "legacy_status": "POSTED", "journal_date": day, "source_module": "GL", "source_document_type": "x",
+        "source_document_id": "y", "currency": "NGN", "lines": lines,
+        "evidence_sha256": hashlib.sha256(json.dumps(lines, sort_keys=True).encode()).hexdigest(),
+        "post_net": f"{net:f}", "net": f"{net:f}",
+    }  # fmt: skip
+    journal.update(over)
+    return {"history_cutoff": cutoff, "class": "E15", "reason": "unbalanced_journal_unit", "journals": [journal]}
+
+
+def test_the_subkobo_side_file_is_parsed_strictly_and_the_net_is_recomputed():
+    cutoff, journals = subkobo.parse_side_file(subkobo_file())
+    j = journals[0]
+    assert cutoff.isoformat() == "2025-12-31" and (j.journal_id, j.period) == ("J-E15", "2026-04")
+    assert j.net == D("0.000001") and j.residue == D("-0.000001")
+    assert j.cells == (("1000", "2026-04", D("-99.999999")), ("5000", "2026-04", D("100.000000")))
+    assert refusal(subkobo.parse_side_file, subkobo_file(net="0.5")) == "subkobo_net_differs_from_lines"
+    assert refusal(subkobo.parse_side_file, subkobo_file(evidence_sha256="0" * 64)) == "evidence_sha_mismatch"
+    assert refusal(subkobo.parse_side_file, subkobo_file(day="2025-12-31")) == "subkobo_splits_cutoff"
+    bad = subkobo_file()
+    bad["extra"] = 1
+    assert refusal(subkobo.parse_side_file, bad) == "invalid_subkobo_side_file"
+    balanced = subkobo_file(net_credit="100.000000")
+    assert refusal(subkobo.parse_side_file, balanced) == "subkobo_residue_out_of_range"
+    wide = subkobo_file(net_credit="99.000000")  # net 1.00: out of range (the file's own net would also differ)
+    assert refusal(subkobo.parse_side_file, wide) in {"subkobo_residue_out_of_range", "subkobo_net_differs_from_lines"}
+
+
+def test_the_subkobo_side_file_is_bound_to_the_import_receipt_and_the_opening_date():
+    import hashlib
+    import json
+
+    raw = subkobo_file()
+    sha = hashlib.sha256(json.dumps(raw).encode()).hexdigest()
+    receipt = {"kind": "execute", "dry_run": False, "complete": True, "history_cutoff": "2025-12-31",
+               "history_cutoff_census": {"subkobo": {"side_file_sha256": sha}}}  # fmt: skip
+    d = date(2025, 12, 31)
+    assert len(subkobo.bind_and_parse(raw, sha, receipt, d)) == 1
+    assert refusal(subkobo.bind_and_parse, raw, "0" * 64, receipt, d) == "subkobo_side_file_not_bound_to_receipt"
+    assert refusal(subkobo.bind_and_parse, raw, sha, {**receipt, "history_cutoff_census": {}}, d) == (
+        "subkobo_side_file_not_bound_to_receipt"
+    )
+    assert refusal(subkobo.bind_and_parse, raw, sha, receipt, date(2025, 12, 30)) == "subkobo_cutoff_mismatch"
+
+
+def subkobo_bridge(items_extra=(), legacy_rounding="0"):
+    _c, journals = subkobo.parse_side_file(subkobo_file())
+    derived = [i.as_dict() for i in subkobo.bridge_items(journals, "6900")]
+    items = [*derived, *items_extra]
+    legacy = {("5000", "2026-04"): "100.000000", ("1000", "2026-04"): "-99.999999"}
+    inp = bridge_inputs(items, legacy, refs={"J-E15"})
+    return inp, journals
+
+
+def test_t_subkobo_items_cover_the_journal_and_tie_the_rounding_cell_to_the_residue():
+    inp, journals = subkobo_bridge()
+    body = bridge.compute(inp, opening_net=None, ias8=[], opening_tb_sha=None, ias8_sha=None, subkobo=journals)[0]
+    assert body["partition"]["ok"] and body["partition_gap_abs_total"] == "0.000000" and body["ready"]
+    cell = row(body, "6900", "2026-04")
+    assert cell["v2_planned"] == "-0.000001" and cell["difference"] == "-0.000001" and cell["legacy"] == "0.000000"
+    assert row(body, "5000", "2026-04")["difference"] == "0.000000"  # v2 equals legacy on every touched account
+    assert body["subkobo"]["residue_by_period"] == {"2026-04": "-0.000001"}
+
+
+def test_t_subkobo_items_must_equal_the_side_file_derivation():
+    inp, journals = subkobo_bridge()
+    run = lambda i, j: bridge.compute(i, opening_net=None, ias8=[], opening_tb_sha=None, ias8_sha=None, subkobo=j)  # noqa: E731
+    assert refusal(run, inp, ()) == "subkobo_items_forged"  # items without a side file
+    forged = [dict(i) for i in (x.as_dict() for x in inp.items)]
+    forged[-1]["v2_amount"] = "-0.000002"
+    inp2 = bridge_inputs(forged, {("5000", "2026-04"): "100.000000", ("1000", "2026-04"): "-99.999999"}, refs={"J-E15"})
+    assert refusal(run, inp2, journals) == "subkobo_items_forged"
+    assert refusal(subkobo.bridge_items, journals, None) == "rounding_account_required"

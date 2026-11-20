@@ -34,6 +34,7 @@ LEGACY_OWNER: Final = "legacy-erp"
 OPENING_OWNERS: Final = ("erp.opening", "erp.ias8")
 STRADDLE_OWNER: Final = "erp.migration"  # B-14 kind ``migration_straddle``: explained by T-STRADDLE items, not native
 STRADDLE_KIND: Final = "migration_straddle"
+SUBKOBO_KIND: Final = "migration_subkobo"  # B-14 E15 reproduction: explained by T-SUBKOBO items, not native
 MANUAL_OWNER: Final = "erp.manual"
 _OPEN_OBLIGATION = ("OPEN", "PARTIALLY_SETTLED")
 _OPEN_LIABILITY = ("outstanding", "partially_settled")
@@ -67,7 +68,7 @@ def v2_posted(db: Session, tenant: UUID) -> tuple[dict[tuple[str, str], Decimal]
         if (
             owner not in (LEGACY_OWNER, *OPENING_OWNERS)
             and not (owner == MANUAL_OWNER and kind == ROUNDING_KIND)
-            and not (owner == STRADDLE_OWNER and kind == STRADDLE_KIND)
+            and not (owner == STRADDLE_OWNER and kind in (STRADDLE_KIND, SUBKOBO_KIND))
         ):
             native[(code, period)] += Decimal(net)
     return dict(total), dict(native)
