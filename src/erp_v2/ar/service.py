@@ -496,6 +496,25 @@ def _price_lines(
 # --- drafts -----------------------------------------------------------------------------------------------------
 
 
+def _draft_terms_code(db: Session, tenant_id: UUID, draft: ArDraft, cfg: settings.ArSettings) -> str:
+    """Seam (CUSTOMER-SCREEN-SPEC): the draft's own code, else the customer's finance row, else the tenant default."""
+    return draft.payment_terms_code or default_terms_for_customer(db, tenant_id, draft.customer_account_id, cfg) or ""
+
+
+def default_terms_for_customer(
+    db: Session, tenant_id: UUID, customer_account_id: UUID | None, cfg: settings.ArSettings
+) -> str | None:
+    """Seam: pre-selected terms for a customer. Today the tenant default; the customer screen swaps in the customer's
+    ``erp_customer_finance`` terms here (one hunk), nowhere else."""
+    return cfg.default_terms_code
+
+
+def _customer_document_snapshot(db: Session, tenant_id: UUID, customer: Any) -> PartyDocumentSnapshotV1:
+    """Seam: the customer snapshot on a document. Today the name and an unrecorded address; the customer screen adds
+    its address / TIN fields here (one hunk)."""
+    return _customer_snapshot(customer.display_name)
+
+
 def _customer_snapshot(display_name: str) -> PartyDocumentSnapshotV1:
     return PartyDocumentSnapshotV1(
         legal_name=display_name,
@@ -545,6 +564,7 @@ def _draft_payload(
     reason: str | None,
     allocations: Sequence[AllocationInput],
     payment_terms_code: str | None = None,
+    due_date: date | None = None,
 ) -> dict[str, object]:
     return {
         "kind": kind,
@@ -556,6 +576,7 @@ def _draft_payload(
         "amount": str(amount) if amount is not None else None,
         "reason": reason,
         "payment_terms_code": payment_terms_code,
+        "due_date": due_date.isoformat() if due_date else None,
         "lines": [
             [
                 ln.description,
@@ -583,6 +604,7 @@ def _check_draft_shape(
     amount: Decimal | None,
     now: datetime,
     payment_terms_code: str | None = None,
+    due_date: date | None = None,
 ) -> str:
     """Early validation at draft time (the issue re-validates against the then-current ledger). Returns the currency."""
     code = _functional(db, tenant.id)
@@ -593,6 +615,8 @@ def _check_draft_shape(
     if kind == KIND_INVOICE:
         if payment_terms_code is not None and payment_terms_code not in settings.load(db, tenant.id).terms:
             raise ArRefused("payment_terms_unknown", "Select one of the configured payment terms")
+        if due_date is not None and due_date < document_date:
+            raise ArRefused("due_date_before_invoice", "The due date cannot be before the invoice date")
         _price_lines(db, tenant_id=tenant.id, lines=lines, code=code, on=document_date, source_prefix="draft")
     elif kind == KIND_CREDIT_NOTE:
         if original_document_id is None:
@@ -683,6 +707,7 @@ def _create_draft(
     amount: Decimal | None,
     reason: str | None,
     payment_terms_code: str | None,
+    due_date: date | None,
     now: datetime,
 ) -> Outcome:
     code = _check_draft_shape(
@@ -696,6 +721,7 @@ def _create_draft(
         original_document_id=original_document_id,
         amount=amount,
         payment_terms_code=payment_terms_code,
+        due_date=due_date,
         now=now,
     )
 
@@ -712,6 +738,7 @@ def _create_draft(
             amount=amount,
             reason=reason,
             payment_terms_code=payment_terms_code,
+            due_date=due_date,
             status=STATUS_DRAFT,
             prepared_by=party.id,
             dual_control=governance.dual_control(session, tenant.id),
@@ -740,6 +767,7 @@ def _create_draft(
                 reason,
                 allocations,
                 payment_terms_code,
+                due_date,
             )
         ),
         operation=operation,
@@ -775,6 +803,7 @@ def create_draft(
     amount: Decimal | None = None,
     reason: str | None = None,
     payment_terms_code: str | None = None,
+    due_date: date | None = None,
     now: datetime | None = None,
 ) -> Outcome:
     moment = now or datetime.now(UTC)
@@ -800,6 +829,7 @@ def create_draft(
             amount=amount,
             reason=reason,
             payment_terms_code=payment_terms_code,
+            due_date=due_date,
             now=moment,
         ),
     )
@@ -821,6 +851,7 @@ def _update_draft(
     amount: Decimal | None,
     reason: str | None,
     payment_terms_code: str | None,
+    due_date: date | None,
     now: datetime,
 ) -> Outcome:
     draft = _locked_draft(db, tenant.id, draft_id)
@@ -838,9 +869,11 @@ def _update_draft(
         original_document_id=original_document_id,
         amount=amount,
         payment_terms_code=payment_terms_code,
+        due_date=due_date,
         now=now,
     )
     draft.payment_terms_code = payment_terms_code
+    draft.due_date = due_date
     draft.customer_account_id = customer_account_id
     draft.document_date = document_date
     draft.original_document_id = original_document_id
@@ -879,6 +912,7 @@ def update_draft(
     amount: Decimal | None = None,
     reason: str | None = None,
     payment_terms_code: str | None = None,
+    due_date: date | None = None,
     now: datetime | None = None,
 ) -> Outcome:
     moment = now or datetime.now(UTC)
@@ -903,6 +937,7 @@ def update_draft(
             amount=amount,
             reason=reason,
             payment_terms_code=payment_terms_code,
+            due_date=due_date,
             now=moment,
         ),
     )
@@ -1034,19 +1069,31 @@ def _issue_invoice(db: Session, *, tenant: Tenant, party: Party, draft: ArDraft,
                 accepted_source_kinds=constants.ACCEPTED_SOURCE_KINDS,
             )
         )
-    terms_code = draft.payment_terms_code or cfg.default_terms_code or ""
+    terms_code = _draft_terms_code(db, tenant.id, draft, cfg)
     if terms_code not in cfg.terms:
         raise ArRefused("payment_terms_unknown", "The invoice's payment terms are not configured")
-    basis = terms.net_days_basis(
-        invoice_date=draft.document_date,
-        terms_code=terms_code,
-        terms_version=_terms_version(db, tenant.id),
-        evidence_ref=f"erp_v2.ar.draft:{draft.id}",
-    )
-    days = cfg.terms[terms_code]
+    if draft.due_date is not None:
+        if draft.due_date < draft.document_date:
+            raise ArRefused("due_date_before_invoice", "The due date cannot be before the invoice date")
+        basis = terms.manual_basis(
+            invoice_date=draft.document_date,
+            terms_code=terms_code,
+            terms_version=_terms_version(db, tenant.id),
+            evidence_ref=f"erp_v2.ar.draft:{draft.id}",
+            actor_ref=str(party.id),
+        )
+        due_at = terms.midnight(draft.due_date)
+    else:
+        basis = terms.net_days_basis(
+            invoice_date=draft.document_date,
+            terms_code=terms_code,
+            terms_version=_terms_version(db, tenant.id),
+            evidence_ref=f"erp_v2.ar.draft:{draft.id}",
+        )
+        due_at = terms.due_at(draft.document_date, cfg.terms[terms_code])
     header = {
         "seller_snapshot": _seller_snapshot(cfg),
-        "customer_snapshot": _customer_snapshot(customer.display_name),
+        "customer_snapshot": _customer_document_snapshot(db, tenant.id, customer),
         "payment_instructions": _instructions(cfg),
         "brand_asset": PresentationAssetReferenceV1.none(),
         "locale": constants.LOCALE,
@@ -1095,7 +1142,7 @@ def _issue_invoice(db: Session, *, tenant: Tenant, party: Party, draft: ArDraft,
             document_id=document.id,
             series_code=cfg.series_invoice or "",
             reference_date=draft.document_date,
-            due_at=terms.due_at(draft.document_date, days),
+            due_at=due_at,
             due_date_basis=basis,
             actor_ref=str(party.id),
             correlation_id=key_invoice(draft.id),

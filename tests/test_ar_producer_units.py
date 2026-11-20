@@ -801,3 +801,22 @@ def test_the_f_d_notice_is_a_structural_sql_filter_with_no_truncation():
 def test_the_deallocate_key_carries_the_allocation_and_the_request():
     a, b, r = uuid4(), uuid4(), uuid4()
     assert service.key_dealloc(a, r) != service.key_dealloc(b, r) != service.key_dealloc(a, uuid4())
+
+
+def test_manual_basis_is_verified_and_names_the_manual_policy():
+    basis = terms.manual_basis(
+        invoice_date=date(2026, 1, 12), terms_code="net_30", terms_version="v1", evidence_ref="e", actor_ref="p"
+    )
+    assert basis.status is DueDateBasisStatus.VERIFIED and basis.derivation_policy == "erp_v2.ar.manual_due_date"
+    assert basis.override_actor == "p" and basis.override_reason
+
+
+def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms():
+    cfg = _complete_settings()
+    assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_30"
+    draft = SimpleNamespace(payment_terms_code=None, customer_account_id=uuid4())
+    assert service._draft_terms_code(Mock(), uuid4(), draft, cfg) == "net_30"
+    draft.payment_terms_code = "net_60"
+    assert service._draft_terms_code(Mock(), uuid4(), draft, cfg) == "net_60"
+    snap = service._customer_document_snapshot(Mock(), uuid4(), SimpleNamespace(display_name="Acme"))
+    assert snap.legal_name == "Acme"

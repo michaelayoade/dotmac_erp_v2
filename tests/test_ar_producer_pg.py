@@ -1206,3 +1206,46 @@ def test_d9_on_only_the_preparer_may_edit_or_discard_a_draft(engine):
         document_date=DAY,
         lines=[line(unit="5", env=off)],
     )
+
+
+@needs_a13
+def test_a_manual_due_date_overrides_the_terms_and_is_recorded_as_manual(engine):
+    env = world(engine)
+    customer = env.customers["C-1"]
+    base = dict(kind="invoice", customer_account_id=customer, document_date=DAY, lines=[line(env=env)])
+    assert (
+        refused(engine, env, "preparer", service.create_draft, request_id=uuid4(), due_date=date(2026, 1, 11), **base)
+        == "due_date_before_invoice"
+    )
+    draft = act(engine, env, "preparer", service.create_draft, request_id=uuid4(), due_date=date(2026, 3, 1), **base)
+    doc = act(engine, env, "approver", service.issue_draft, draft_id=draft.id).document_id
+    with Session(engine) as db:
+        document = queries.billing_document(db, env.tenant_id, doc)
+        assert document.due_at.astimezone(terms.LAGOS).date() == date(2026, 3, 1)  # not +30 days
+        basis = document.due_date_basis
+        assert basis["derivation_policy"] == terms.MANUAL_POLICY and basis["override_actor"] == str(
+            env.people["approver"]
+        )
+        assert queries.draft(db, env.tenant_id, draft.id).due_date == date(2026, 3, 1)
+    # the same day is allowed; an edit that moves the invoice date past the due date is refused
+    same = act(engine, env, "preparer", service.create_draft, request_id=uuid4(), due_date=DAY, **base)
+    assert (
+        refused(
+            engine,
+            env,
+            "preparer",
+            service.update_draft,
+            draft_id=same.id,
+            customer_account_id=customer,
+            document_date=date(2026, 1, 13),
+            lines=[line(env=env)],
+            due_date=DAY,
+        )
+        == "due_date_before_invoice"
+    )
+    # no manual date: the terms-derived basis is unchanged
+    plain = issue_invoice(engine, env, [line(env=env)]).document_id
+    with Session(engine) as db:
+        assert queries.billing_document(db, env.tenant_id, plain).due_date_basis["derivation_policy"] == (
+            "erp_v2.ar.net_days"
+        )

@@ -96,3 +96,7 @@ at the a3 pin it reports `ar_setup_incomplete:<key>:not_enrolled`). Wiring it in
 - The F-D notice is a structural SQL filter (`detail.party[0]` = customer account id) with no row cap.
 - Deallocate key is `dealloc:{allocation}:{request}`; deallocate and apply-credit replays return the original without a
   second audit row. Role profile `erp.web` is version 6.
+- Optional per-draft due date (`erp_ar_drafts.due_date`, not before the invoice date) overrides the terms-derived date;
+  the due-date basis then names the policy `erp_v2.ar.manual_due_date` and records who set it.
+- Customer-screen seams (CUSTOMER-SCREEN-SPEC): `service.default_terms_for_customer` / `_draft_terms_code` (terms
+  pre-selection) and `_customer_document_snapshot` (snapshot fields); each is one hunk to replace, nothing else changes.

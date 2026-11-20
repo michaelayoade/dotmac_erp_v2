@@ -44,3 +44,29 @@ def net_days_basis(*, invoice_date: date, terms_code: str, terms_version: str, e
 
 def due_at(invoice_date: date, days: int) -> datetime:
     return midnight(invoice_date + timedelta(days=days))
+
+
+MANUAL_POLICY = "erp_v2.ar.manual_due_date"
+
+
+def manual_basis(
+    *, invoice_date: date, terms_code: str, terms_version: str, evidence_ref: str, actor_ref: str
+) -> DueDateBasisV1:
+    """A due date the preparer typed (legacy: each invoice carries its own due date). Recorded as ``manual``: the
+    derivation policy names it and the override fields carry who set it."""
+    at = midnight(invoice_date)
+    return DueDateBasisV1(
+        status=DueDateBasisStatus.VERIFIED,
+        source_authority="erp_v2.ar.terms",
+        evidence_ref=evidence_ref,
+        payment_terms_code=terms_code,
+        payment_terms_version=terms_version,
+        issued_at=at,
+        effective_at=at,
+        timezone=constants.TIMEZONE,
+        derivation_policy=MANUAL_POLICY,
+        derivation_version=constants.DERIVATION_VERSION,
+        override_actor=actor_ref,
+        override_reason="manual due date",
+        override_evidence_ref=evidence_ref,
+    )

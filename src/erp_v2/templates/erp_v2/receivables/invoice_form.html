@@ -19,6 +19,7 @@
   <p><label>Payment terms <select name="payment_terms_code">
     {% for code, days in terms.items() %}<option value="{{ code }}" {% if (draft and draft.payment_terms_code == code) or (not (draft and draft.payment_terms_code) and default_terms == code) %}selected{% endif %}>{{ code }} ({{ days }} days)</option>{% endfor %}
   </select></label></p>
+  <p><label>Due date (optional; overrides the terms) <input type="date" name="due_date" value="{{ draft.due_date if draft and draft.due_date else '' }}"></label></p>
   <p><label>Invoice date <input type="date" name="document_date" value="{{ draft.document_date if draft else today }}" required></label></p>
   {% include "erp_v2/receivables/_lines.html" %}
   <button type="submit">Save draft</button>
