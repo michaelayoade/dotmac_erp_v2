@@ -226,7 +226,7 @@ def post_opening_from_legacy(engine, env):
     ]
     as_of, parsed = opening.parse_tb({"version": 1, "as_of": CUTOFF.isoformat(), "rows": rows}, SHA)
     sub = {code: tb_net.get(code, Decimal(0)) for code in ("2000", "2040", "1410", "1400")}
-    inputs = opening.OpeningInputs(as_of, parsed, "c" * 64, sub, "d" * 64, (), "e" * 64)
+    inputs = opening.OpeningInputs(as_of, parsed, "c" * 64, sub, "d" * 64, (), "e" * 64, "a" * 64, "b" * 64)
     with Session(engine) as db:
         out = opening.apply_opening(db, env.tenant_id, inputs, apply_inputs(env))
         db.commit()
@@ -528,3 +528,40 @@ def test_the_unbalanced_journals_get_their_own_private_side_file_in_the_straddle
     assert len(strad["journals"]) == 2 and str(s1) in {j["journal"] for j in strad["journals"]}
     assert all(j["evidence_sha256"] == history_cutoff.unit_evidence_sha(j["lines"]) for j in strad["journals"])
     assert all("net" not in j for j in strad["journals"])
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="cross-PR mismatch found by this test: B-9r's subkobo.parse_side_file reads E15 `post_net` as a scalar money "
+    "string, while the E15-AND-SIDEFILE-RULING (and #74) shape it like E39: {day: {account: net}}. One side must change.",
+)
+def test_cross_pr_b9rs_parser_accepts_this_prs_real_subkobo_output_and_refuses_a_tampered_line(
+    engine, legacy, tmp_path
+):
+    """#74's REAL `subkobo.json` (from a seeded legacy schema, not hand-written) through B-9r's `bind_and_parse`."""
+    import json
+
+    from erp_v2.migration_ledger import subkobo
+    from erp_v2.migration_ledger.common import LedgerRefused
+
+    env = world(engine)
+    jid = uuid4()
+    post_legacy(engine, env, jid, NEXT_DAY, [("1000", "10.000001", "0"), ("2000", "0", "10")], number="JE-subkobo")
+    args = type("A", (), {"history_cutoff": "2025-12-31", "receipt": str(tmp_path / "receipt.json")})()
+    _cutoff, section = cli._history_cutoff(args, journal_specs(engine), engine, ["gl"])
+    receipt = {
+        "kind": "execute",
+        "dry_run": False,
+        "complete": True,
+        "history_cutoff": "2025-12-31",
+        "history_cutoff_census": section,
+    }
+    raw = json.loads((tmp_path / "receipt.json.subkobo.json").read_text())
+    sha = section["subkobo"]["side_file_sha256"]
+    (journal,) = subkobo.bind_and_parse(raw, sha, receipt, CUTOFF)
+    assert journal.journal_id == str(jid) and str(journal.net) == "0.000001" and journal.day == NEXT_DAY
+    assert journal.evidence_sha256 == history_cutoff.unit_evidence_sha(raw["journals"][0]["lines"])
+    raw["journals"][0]["lines"][0]["debit"] = "99"
+    with pytest.raises(LedgerRefused) as exc:
+        subkobo.bind_and_parse(raw, sha, receipt, CUTOFF)
+    assert exc.value.code == "evidence_sha_mismatch"

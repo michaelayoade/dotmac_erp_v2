@@ -41,6 +41,8 @@ from typing import Any, Final
 
 import sqlalchemy as sa
 
+from erp_v2.migration_ledger.common import unit_evidence_sha  # one definition; re-exported for B-14
+
 KIND_JOURNAL: Final = "journal"
 KIND_JOURNAL_LINE: Final = "journal_line"
 KIND_LEDGER_LINE: Final = "ledger_line"
@@ -283,14 +285,6 @@ def _day(value: object) -> date | None:
 def _iso(value: object) -> str | None:
     day = _day(value)
     return None if day is None else day.isoformat()
-
-
-def unit_evidence_sha(lines: Any) -> str:
-    """THE evidence sha256 of a unit's ledger lines: ``sha256(json.dumps(lines, sort_keys=True))`` over the line dicts
-    exactly as ``line_payload`` builds them. Shared by the straddler (E39) and unbalanced-unit (E15) side files and by
-    B-14 (#75), which recomputes it from the file and refuses a mismatch."""
-
-    return hashlib.sha256(json.dumps(list(lines), sort_keys=True).encode()).hexdigest()
 
 
 def line_payload(r: Any) -> dict[str, Any]:
