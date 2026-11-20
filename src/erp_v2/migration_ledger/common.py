@@ -34,14 +34,6 @@ def refuse(code: str, detail: str = "") -> Any:
     raise LedgerRefused(code, detail)
 
 
-def unit_evidence_sha(lines: Any) -> str:
-    """THE evidence sha256 of a refused unit's ledger lines (E39 straddlers, E15 sub-kobo): ``sha256(json.dumps(lines,
-    sort_keys=True))`` over the line dicts of the B-13 side files. Defined once here; ``importer.history_cutoff``
-    re-exports it for B-14."""
-
-    return hashlib.sha256(json.dumps(list(lines), sort_keys=True).encode()).hexdigest()
-
-
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

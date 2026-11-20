@@ -530,38 +530,136 @@ def test_the_unbalanced_journals_get_their_own_private_side_file_in_the_straddle
     assert all("net" not in j for j in strad["journals"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="cross-PR mismatch found by this test: B-9r's subkobo.parse_side_file reads E15 `post_net` as a scalar money "
-    "string, while the E15-AND-SIDEFILE-RULING (and #74) shape it like E39: {day: {account: net}}. One side must change.",
-)
-def test_cross_pr_b9rs_parser_accepts_this_prs_real_subkobo_output_and_refuses_a_tampered_line(
-    engine, legacy, tmp_path
-):
-    """#74's REAL `subkobo.json` (from a seeded legacy schema, not hand-written) through B-9r's `bind_and_parse`."""
+def _real_receipt_and_side_files(engine, env, tmp_path):
+    """#74's REAL side files and receipt census from a seeded legacy schema (no hand-written JSON)."""
     import json
 
-    from erp_v2.migration_ledger import subkobo
-    from erp_v2.migration_ledger.common import LedgerRefused
-
-    env = world(engine)
-    jid = uuid4()
-    post_legacy(engine, env, jid, NEXT_DAY, [("1000", "10.000001", "0"), ("2000", "0", "10")], number="JE-subkobo")
     args = type("A", (), {"history_cutoff": "2025-12-31", "receipt": str(tmp_path / "receipt.json")})()
     _cutoff, section = cli._history_cutoff(args, journal_specs(engine), engine, ["gl"])
     receipt = {
         "kind": "execute",
         "dry_run": False,
         "complete": True,
-        "history_cutoff": "2025-12-31",
+        "history_cutoff": section["history_cutoff"],
         "history_cutoff_census": section,
     }
-    raw = json.loads((tmp_path / "receipt.json.subkobo.json").read_text())
-    sha = section["subkobo"]["side_file_sha256"]
-    (journal,) = subkobo.bind_and_parse(raw, sha, receipt, CUTOFF)
-    assert journal.journal_id == str(jid) and str(journal.net) == "0.000001" and journal.day == NEXT_DAY
-    assert journal.evidence_sha256 == history_cutoff.unit_evidence_sha(raw["journals"][0]["lines"])
-    raw["journals"][0]["lines"][0]["debit"] = "99"
+    receipt_path = tmp_path / "import-receipt.json"
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True))
+    return (
+        receipt,
+        receipt_path,
+        tmp_path / "receipt.json.subkobo.json",
+        tmp_path / "receipt.json.straddlers.json",
+        section,
+    )
+
+
+def _seed_units(engine, env):
+    """One S2 straddler (journal in the closed year, all lines after the cutoff: S_j = 0, the real shape) and one E15."""
+    s2, unbalanced = uuid4(), uuid4()
+    post_legacy(engine, env, s2, date(2025, 12, 20), [("1400", "5", "0"), ("2000", "0", "5")], number="JE-S2")
+    with engine.begin() as c:
+        c.execute(
+            sa.text("UPDATE gl.posted_ledger_line SET posting_date = :d WHERE journal_entry_id = :j"),
+            {"d": date(2026, 3, 13), "j": s2},
+        )
+    post_legacy(
+        engine, env, unbalanced, date(2026, 4, 18), [("1000", "7.000001", "0"), ("2000", "0", "7")], number="JE-UNB"
+    )
+    return s2, unbalanced
+
+
+def test_cross_pr_b9rs_parsers_accept_this_prs_real_subkobo_and_straddlers_output(engine, legacy, tmp_path):
+    """#74's real E15 and E39 files through #73's `units.bind_and_parse`; a tampered line refuses."""
+    from erp_v2.migration_ledger import units
+    from erp_v2.migration_ledger.common import LedgerRefused
+
+    env = world(engine)
+    s2, unbalanced = _seed_units(engine, env)
+    receipt, _rp, subkobo_path, straddlers_path, section = _real_receipt_and_side_files(engine, env, tmp_path)
+    import json
+
+    with Session(engine) as db:
+        codes = legacy_ledger.account_codes(db, env.tenant_id)
+    codes = {str(account_id): code for account_id, code in codes.items()}
+    e15_raw = json.loads(subkobo_path.read_text())
+    e39_raw = json.loads(straddlers_path.read_text())
+    (e15,) = units.bind_and_parse("E15", e15_raw, section["subkobo"]["side_file_sha256"], receipt, CUTOFF, codes)
+    (e39,) = units.bind_and_parse("E39", e39_raw, section["straddlers"]["side_file_sha256"], receipt, CUTOFF, codes)
+    assert e15.journal_id == str(unbalanced) and e39.journal_id == str(s2)
+    assert e15.evidence_sha256 == history_cutoff.unit_evidence_sha(e15_raw["journals"][0]["lines"])
+    e39_raw["journals"][0]["lines"][0]["debit"] = "99"
     with pytest.raises(LedgerRefused) as exc:
-        subkobo.bind_and_parse(raw, sha, receipt, CUTOFF)
+        units.bind_and_parse("E39", e39_raw, section["straddlers"]["side_file_sha256"], receipt, CUTOFF, codes)
     assert exc.value.code == "evidence_sha_mismatch"
+
+
+def test_bridge_report_build_wires_the_real_receipt_and_side_files(engine, legacy, tmp_path, monkeypatch):
+    """`bridge_report build --import-receipt-sha256 --subkobo-side-file --straddlers-side-file` against #74's real
+    receipt and side files, a posted B-9 opening and the real importer's v2 ledger (architect gate before the first
+    rehearsal bridge build)."""
+    import hashlib
+    import json
+
+    from erp_v2.migration_ledger import bridge_report
+
+    env = world(engine)
+    seed_legacy(engine, env)
+    _seed_units(engine, env)
+    _receipt, receipt_path, subkobo_path, straddlers_path, _section = _real_receipt_and_side_files(
+        engine, env, tmp_path
+    )
+    run_importer(engine, env, journal_specs(engine), CUTOFF)  # v2 now holds the post-cutoff, non-refused journals
+    post_opening_from_legacy(engine, env)
+
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tenant_id": str(env.tenant_id),
+                "evidence_ref": "FIN-B13-1",
+                "requester_party_id": str(env.parties["requester"]),
+                "approver_party_id": str(env.parties["approver"]),
+            }
+        )
+    )
+    inputs = tmp_path / "inputs.json"
+    inputs.write_text(
+        json.dumps({"version": 1, "snapshot_sha256": "a" * 64, "rounding_account_code": "6900", "items": []})
+    )
+    url = engine.url.render_as_string(hide_password=False)
+
+    def build(*extra, receipt_out):
+        monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
+        monkeypatch.setenv("LEGACY_DATABASE_URL", url)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        argv = [
+            "build", "--spec", str(spec), "--inputs", str(inputs), "--operator-ref", "operator-a",
+            "--receipt", str(receipt_out), *extra,
+        ]  # fmt: skip
+        rc = bridge_report.main(argv)
+        return rc, json.loads(receipt_out.read_text())
+
+    receipt_sha = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    wired = [
+        "--import-receipt", str(receipt_path), "--import-receipt-sha256", receipt_sha,
+        "--subkobo-side-file", str(subkobo_path), "--straddlers-side-file", str(straddlers_path),
+    ]  # fmt: skip
+    rc, out = build(*wired, receipt_out=tmp_path / "bridge-ok.json")
+    assert out.get("refusal") is None, out
+    assert out["mode"] == "build" and out["applied"] is False
+    # the unit items came from the side files: a refused-unit set bound to the receipt, nothing from the operator
+    # E39: 2 line cells (1400, 2000); E15: 2 line cells + 1 residue item. Two refs bridged, all from the side files.
+    assert out["partition"]["items_by_bucket"]["transform"] == 5 and out["partition"]["bridged_refs"] == 2
+    # a wrong receipt sha, a side file not bound to the receipt, and operator-supplied unit items all refuse
+    rc, out = build(*wired[:3], "0" * 64, *wired[4:], receipt_out=tmp_path / "bridge-bad-sha.json")
+    assert rc == 2 and out["refusal"] == "input_sha_mismatch"
+    rc, out = build(
+        "--import-receipt", str(receipt_path), "--import-receipt-sha256", receipt_sha,
+        "--subkobo-side-file", str(straddlers_path),  # the E39 file offered as the E15 one
+        receipt_out=tmp_path / "bridge-swapped.json",
+    )  # fmt: skip
+    assert rc == 2 and out["refusal"]
+    rc, out = build("--subkobo-side-file", str(subkobo_path), receipt_out=tmp_path / "bridge-unbound.json")
+    assert rc == 2 and out["refusal"] == "unit_binding_required"
