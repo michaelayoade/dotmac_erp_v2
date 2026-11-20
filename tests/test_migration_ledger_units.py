@@ -1,13 +1,14 @@
 """B-9 migration ledger, pure parts: opening proof, bridge partition, register adapters, migration shape."""
 
 import re
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from migration_ledger_support import bind_rounding
 
-from erp_v2.migration_ledger import bridge, opening, register
+from erp_v2.migration_ledger import bridge, opening, register, units
 from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, strict_json
 
 SHA = "a" * 64
@@ -44,7 +45,7 @@ SUBLEDGER = {"2000": D("-400.00"), "2040": D("-100.00"), "1410": D("50.00"), "14
 
 def inputs(tb_rows=GOOD_TB, sub=SUBLEDGER, ias8=()):
     as_of, tb = opening.parse_tb(tb_file(tb_rows), SHA)
-    return opening.OpeningInputs(as_of, tb, SHA, dict(sub), SHA, tuple(ias8), SHA)
+    return opening.OpeningInputs(as_of, tb, SHA, dict(sub), SHA, tuple(ias8), SHA, SHA, SHA)
 
 
 def ias8_item(item_id, code, amount):
@@ -69,20 +70,76 @@ def test_a_sub_kobo_imbalance_is_refused_too():
     assert not opening.opening_proof(inputs(rows))["zero_sum"]
 
 
-def test_opening_refuses_when_a_control_account_differs_from_its_subledger():
+def test_an_opening_control_difference_is_report_only_never_a_refusal():
     sub = {**SUBLEDGER, "2000": D("-399.00")}  # the subledger holds 1.00 less than the TB
     proof = opening.opening_proof(inputs(sub=sub))
-    assert not proof["ok"] and proof["zero_sum"]
+    assert proof["ok"] and proof["zero_sum"] and proof["control_differences_report_only"]
     assert proof["control_accounts"]["2000"]["difference"] == "-1.000000"
-    assert refusal(opening.require_proof, proof) == "opening_control_not_subledger"
+    assert proof["control_differences"] == [{"account": "2000", "difference": "-1.000000", "class": "E37"}]
+    opening.require_proof(proof)  # no refusal
+
+
+def test_a_tied_opening_lists_no_control_differences():
+    assert opening.opening_proof(inputs())["control_differences"] == []
+
+
+def test_the_tb_is_generated_from_the_legacy_opening_period_and_a_differing_declared_tb_is_refused():
+    legacy = {
+        ("1000", "OPENING"): D("100.00"),
+        ("3100", "OPENING"): D("-100.00"),
+        ("1000", "2026-01"): D("5.00"),  # not the opening period
+        ("2000", "OPENING"): D("0"),
+    }
+    tb = opening.tb_from_legacy(legacy)
+    assert tb == {"1000": D("100.00"), "3100": D("-100.00")}
+    body = opening.tb_file_body(date(2025, 12, 31), tb)
+    as_of, parsed = opening.parse_tb(body, SHA)  # the generated file round-trips through the strict parser
+    assert as_of == date(2025, 12, 31) and parsed == tb
+    opening.require_declared_tb_matches(tb, dict(tb))
+    assert (
+        refusal(opening.require_declared_tb_matches, {**tb, "1000": D("100.01")}, tb)
+        == "opening_tb_differs_from_legacy"
+    )
+    assert refusal(opening.require_declared_tb_matches, {"1000": D("100.00")}, tb) == "opening_tb_differs_from_legacy"
+    assert opening.tb_canonical_sha(tb) == opening.tb_canonical_sha({**tb, "9999": D("0")})
+
+
+def test_the_import_receipt_cutoff_is_read_both_shapes_and_must_equal_the_opening_date():
+    ok = {"kind": "execute", "dry_run": False, "complete": True}
+    d = date(2025, 12, 31)
+    assert opening.parse_import_receipt({**ok, "history_cutoff": "2025-12-31"}) == d
+    assert opening.parse_import_receipt({**ok, "history_cutoff": {"history_cutoff": "2025-12-31"}}) == d
+    for bad, code in (
+        ({**ok, "dry_run": True, "history_cutoff": "2025-12-31"}, "invalid_import_receipt"),
+        ({**ok, "complete": False, "history_cutoff": "2025-12-31"}, "import_receipt_incomplete"),
+        ({**ok}, "import_receipt_history_cutoff_missing"),
+        ({**ok, "history_cutoff": "2025-13-01"}, "import_receipt_history_cutoff_invalid"),
+        ([], "invalid_import_receipt"),
+    ):
+        assert refusal(opening.parse_import_receipt, bad) == code
+    opening.require_as_of_matches_cutoff(d, d)
+    assert refusal(opening.require_as_of_matches_cutoff, d, date(2025, 12, 30)) == (
+        "opening_as_of_differs_from_history_cutoff"
+    )
+
+
+def test_ias8_is_empty_before_the_flip():
+    opening.require_no_ias8_before_flip(inputs())
+    assert refusal(opening.require_no_ias8_before_flip, inputs(ias8=[ias8_item("I1", "2000", "1.00")])) == (
+        "ias8_not_allowed_before_flip"
+    )
 
 
 def test_an_itemised_ias8_movement_closes_the_control_gap_and_only_exactly():
     sub = {**SUBLEDGER, "2000": D("-399.00")}
+
     # the IAS 8 journal moves 2000 by +1.00 net (a debit), so TB -400 + 1 = -399 = the subledger
-    assert opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "1.00")]))["ok"]
-    assert not opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "0.99")]))["ok"]
-    assert not opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", "-1.00")]))["ok"]
+    def ties(amount):
+        return opening.opening_proof(inputs(sub=sub, ias8=[ias8_item("I1", "2000", amount)]))["control_accounts"][
+            "2000"
+        ]["ties"]
+
+    assert ties("1.00") and not ties("0.99") and not ties("-1.00")  # the IAS 8 arithmetic stays (post-flip tool)
 
 
 def test_every_control_account_must_have_a_recomputed_subledger_opening():
@@ -93,7 +150,8 @@ def test_every_control_account_must_have_a_recomputed_subledger_opening():
 def test_a_missing_control_account_in_the_tb_counts_as_zero_and_must_tie():
     rows = [r for r in GOOD_TB if r[0] != "1410"] + [("3100", "0", "300.00")]
     rows = [r for r in rows if not (r[0] == "3100" and r[2] == "350.00")]
-    assert not opening.opening_proof(inputs(rows))["ok"]  # 1410 subledger is 50, TB has none
+    proof = opening.opening_proof(inputs(rows))
+    assert proof["ok"] and not proof["control_accounts"]["1410"]["ties"]  # 1410 subledger is 50, TB has none: reported
 
 
 def test_tb_and_ias8_parsing_is_strict():
@@ -388,11 +446,20 @@ def test_the_class_list_is_the_plan_inventory_ids_and_carries_the_plan_sha():
     import os
     import re
 
-    from erp_v2.migration_ledger.classes import CLASSES, PLAN_SHA256
+    from erp_v2.migration_ledger.classes import (
+        AS_IS_CLASSES,
+        CLASSES,
+        INVENTORY_CLASSES,
+        INVENTORY_PLAN_SHA256,
+        PLAN_SHA256,
+    )
 
+    assert PLAN_SHA256 == "a28adf06752c43cd69481830c1b0e8d02a36f94a3bbe3c2ce35443d46b28de54"  # AS-IS-MIGRATION-REPLAN
+    assert AS_IS_CLASSES == ("E35", "E36a", "E36b", "E37", "E38", "E39")
+    assert CLASSES == (*INVENTORY_CLASSES, *AS_IS_CLASSES) and len(CLASSES) == len(set(CLASSES)) == 52
     assert (
-        len(CLASSES) == len(set(CLASSES)) == 46
-        and PLAN_SHA256 == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"
+        len(INVENTORY_CLASSES) == 46
+        and INVENTORY_PLAN_SHA256 == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"
     )
     plan = Path(
         os.environ.get(
@@ -404,13 +471,187 @@ def test_the_class_list_is_the_plan_inventory_ids_and_carries_the_plan_sha():
     if not plan.exists():
         pytest.skip("the private plan file is not available (CI); the constant is pinned by its sha above")
     data = plan.read_bytes()
-    assert hashlib.sha256(data).hexdigest() == PLAN_SHA256, "the plan changed: re-derive the class list"
+    assert hashlib.sha256(data).hexdigest() == INVENTORY_PLAN_SHA256, "the plan changed: re-derive the class list"
     ids = re.findall(r"^\| (E\d+[a-z]?) ", data.decode(), flags=re.M)
-    assert tuple(ids) == CLASSES
+    assert tuple(ids) == INVENTORY_CLASSES
 
 
 def test_the_gate_control_lists_are_code_constants():
     from erp_v2 import ledger_roles
 
     assert ledger_roles.GATE_TIE_CODES == ("1400", "1410", "2000", "2040", "2045")
-    assert ledger_roles.GATE_ZERO_CODES == ("2030",) and ledger_roles.GATE_WHT_CODES == ("2110",)
+    assert ledger_roles.REPORT_ZERO_CODES == ("2030",) and ledger_roles.REPORT_WHT_CODES == ("2110",)
+    assert not hasattr(ledger_roles, "GATE_ZERO_CODES") and not hasattr(ledger_roles, "GATE_WHT_CODES")
+    from erp_v2.migration_ledger import ledger_check
+
+    assert ledger_check.GATE_PROFILE == "as_is_v1"
+    assert ledger_check.control_lists() == {
+        "tie": ["1400", "1410", "2000", "2040", "2045"],
+        "report_zero": ["2030"],
+        "report_wht": ["2110"],
+    }
+
+
+# --- refused units: E15 (T-SUBKOBO) and E39 (T-STRADDLE), on #74's REAL side-file output -----------------------------
+# tests/fixtures/b13_*.json were produced by #74's own `classify_unbalanced` / `classify_straddlers` +
+# `write_private_json` (its test_the_unbalanced_journals_get_their_own_private_side_file_in_the_straddlers_shape run),
+# not written by hand: `post_net` is NESTED {posting_date: {account_id: net}}.
+
+
+def _fixture(name):
+    import hashlib
+    import json
+    from pathlib import Path
+
+    data = (Path(__file__).parent / "fixtures" / name).read_bytes()
+    return json.loads(data), hashlib.sha256(data).hexdigest()
+
+
+def _codes(raw):
+    return {ln["account_id"]: ln["account_code"] for j in raw["journals"] for ln in j["lines"]}
+
+
+def _receipt(**sections):
+    return {
+        "kind": "execute", "dry_run": False, "complete": True, "history_cutoff": "2025-12-31",
+        "history_cutoff_census": {k: {"side_file_sha256": v} for k, v in sections.items()},
+    }  # fmt: skip
+
+
+def _s2_only(raw):
+    return {**raw, "journals": [j for j in raw["journals"] if j["type"] == "S2"]}
+
+
+def test_the_real_e15_side_file_parses_with_its_nested_post_net_and_is_rederived_from_the_lines():
+    raw, _sha = _fixture("b13_subkobo.json")
+    cutoff, parsed = units.parse_side_file(raw, "E15", _codes(raw))
+    u = parsed[0]
+    assert cutoff == date(2025, 12, 31) and (u.kind, u.period, u.net, u.residue) == (
+        "UNBALANCED", "2026-01", D("0.000001"), D("-0.000001")
+    )  # fmt: skip
+    assert u.cells == (("1000", "2026-01", D("10.000001")), ("2000", "2026-01", D("-10")))
+    assert isinstance(raw["journals"][0]["post_net"], dict)  # nested, never a scalar
+    import copy
+
+    tampered = copy.deepcopy(raw)
+    day_map = tampered["journals"][0]["post_net"]["2026-01-01"]
+    day_map[next(iter(day_map))] = "99"
+    assert refusal(units.parse_side_file, tampered, "E15", _codes(raw)) == "unit_post_net_differs_from_lines"
+    scalar = copy.deepcopy(raw)
+    scalar["journals"][0]["post_net"] = "0.000001"
+    assert refusal(units.parse_side_file, scalar, "E15", _codes(raw)) == "invalid_unit_journal"
+    bad_sha = copy.deepcopy(raw)
+    bad_sha["journals"][0]["evidence_sha256"] = "0" * 64
+    assert refusal(units.parse_side_file, bad_sha, "E15", _codes(raw)) == "evidence_sha_mismatch"
+    bad_net = copy.deepcopy(raw)
+    bad_net["journals"][0]["net"] = "0.5"
+    assert refusal(units.parse_side_file, bad_net, "E15", _codes(raw)) == "subkobo_net_differs_from_lines"
+    assert refusal(units.parse_side_file, raw, "E15", {}) == "legacy_account_unmapped"
+    assert refusal(units.parse_side_file, raw, "E39", _codes(raw)) == "invalid_unit_side_file"  # wrong class
+    # the account is mapped from account_id, never from the file's account_code
+    remapped = {k: "6000" if v == "2000" else v for k, v in _codes(raw).items()}
+    assert units.parse_side_file(raw, "E15", remapped)[1][0].cells[1][0] == "6000"
+
+
+def test_the_shared_evidence_sha_is_the_importers_bytes():
+    from erp_v2.migration_ledger.common import unit_evidence_sha
+
+    raw, _ = _fixture("b13_subkobo.json")
+    j = raw["journals"][0]
+    assert unit_evidence_sha(j["lines"]) == j["evidence_sha256"]  # identical to #74's computation on its real output
+
+
+def test_the_real_e39_side_file_refuses_an_s1_journal_and_bridges_the_simple_s2_ones():
+    raw, _sha = _fixture("b13_straddlers.json")
+    assert {j["type"] for j in raw["journals"]} == {"S1", "S2"}
+    assert refusal(units.parse_side_file, raw, "E39", _codes(raw)) == "straddle_not_simple"
+    _c, parsed = units.parse_side_file(_s2_only(raw), "E39", _codes(raw))
+    assert len(parsed) == 1 and parsed[0].kind == "S2" and parsed[0].net == 0
+    assert parsed[0].cells == (("1400", "2026-03", D("5")), ("2000", "2026-03", D("-5")))
+
+
+def test_the_side_files_are_bound_to_the_import_receipt_and_the_opening_date():
+    raw, sha = _fixture("b13_subkobo.json")
+    d = date(2025, 12, 31)
+    codes = _codes(raw)
+    assert len(units.bind_and_parse("E15", raw, sha, _receipt(subkobo=sha), d, codes)) == 1
+    assert refusal(units.bind_and_parse, "E15", raw, "0" * 64, _receipt(subkobo=sha), d, codes) == (
+        "unit_side_file_not_bound_to_receipt"
+    )
+    assert refusal(units.bind_and_parse, "E15", raw, sha, _receipt(), d, codes) == "unit_side_file_not_bound_to_receipt"
+    assert refusal(units.bind_and_parse, "E15", raw, sha, _receipt(subkobo=sha), date(2025, 12, 30), codes) == (
+        "unit_cutoff_mismatch"
+    )
+
+
+def _unit_bridge():
+    e15_raw, _ = _fixture("b13_subkobo.json")
+    e39_raw, _ = _fixture("b13_straddlers.json")
+    e39_raw = _s2_only(e39_raw)
+    codes = {**_codes(e15_raw), **_codes(e39_raw)}
+    e15 = units.parse_side_file(e15_raw, "E15", codes)[1]
+    e39 = units.parse_side_file(e39_raw, "E39", codes)[1]
+    derived = [i.as_dict() for i in (*units.bridge_items(e39), *units.bridge_items(e15, "6900"))]
+    legacy = {
+        ("2000", "2026-01"): "-10", ("1000", "2026-01"): "10.000001",  # E15 legacy lines
+        ("2000", "2026-03"): "-5", ("1400", "2026-03"): "5",  # E39 post-cutoff legacy lines
+    }  # fmt: skip
+    return bridge_inputs(derived, legacy, refs={u.journal_id for u in (*e15, *e39)}), (*e39, *e15)
+
+
+def _run_units(inp, us):
+    return bridge.compute(inp, opening_net=None, ias8=[], opening_tb_sha=None, ias8_sha=None, units=us)[0]
+
+
+def test_unit_items_cover_every_refused_journal_and_only_the_residue_is_a_delta():
+    inp, us = _unit_bridge()
+    body = _run_units(inp, us)
+    assert body["partition"]["ok"] and body["partition_gap_abs_total"] == "0.000000" and body["ready"]
+    cell = row(body, "6900", "2026-01")
+    assert (cell["legacy"], cell["v2_planned"], cell["difference"]) == ("0.000000", "-0.000001", "-0.000001")
+    for account, period in (("2000", "2026-01"), ("1000", "2026-01"), ("2000", "2026-03"), ("1400", "2026-03")):
+        assert row(body, account, period)["difference"] == "0.000000"  # v2 equals legacy on every touched account
+    assert body["units"]["E15"]["residue_by_period"] == {"2026-01": "-0.000001"}
+    assert body["units"]["E39"]["journals"] == 1
+
+
+def test_unit_items_must_equal_the_side_file_derivation():
+    inp, us = _unit_bridge()
+    assert refusal(_run_units, inp, ()) == "unit_items_forged"  # items without side files
+    assert refusal(_run_units, inp, tuple(u for u in us if u.cls == "E15")) == "unit_items_forged"  # E39 items alone
+    forged = [x.as_dict() for x in inp.items]
+    forged[-1]["v2_amount"] = "-0.000002"
+    legacy = {("2000", "2026-01"): "-10", ("1000", "2026-01"): "10.000001", ("2000", "2026-03"): "-5",
+              ("1400", "2026-03"): "5"}  # fmt: skip
+    assert (
+        refusal(_run_units, bridge_inputs(forged, legacy, refs={i.ref for i in inp.items}), us) == "unit_items_forged"
+    )
+    e15 = tuple(u for u in us if u.cls == "E15")
+    assert refusal(units.bridge_items, e15, None) == "rounding_account_required"
+
+
+def test_the_signed_body_records_the_receipt_and_side_file_shas():
+    inp, us = _unit_bridge()
+    body = bridge.compute(
+        inp, opening_net=None, ias8=[], opening_tb_sha=None, ias8_sha=None, units=us,
+        side_binding={"import_receipt_sha256": "a" * 64, "subkobo_side_file_sha256": "b" * 64,
+                      "straddlers_side_file_sha256": "c" * 64},
+    )[0]  # fmt: skip
+    assert (body["binding"]["import_receipt_sha256"], body["binding"]["subkobo_side_file_sha256"]) == (
+        "a" * 64,
+        "b" * 64,
+    )
+    assert body["binding"]["straddlers_side_file_sha256"] == "c" * 64
+
+
+def test_the_rounding_account_may_not_be_a_control_account():
+    from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES, GATE_TIE_CODES
+
+    assert set(CONTROL_ACCOUNT_CODES) | set(GATE_TIE_CODES) == bridge.CONTROL_ACCOUNTS_FOR_RESIDUE
+    e15_raw, _ = _fixture("b13_subkobo.json")
+    e15 = units.parse_side_file(e15_raw, "E15", _codes(e15_raw))[1]
+    items = [i.as_dict() for i in units.bridge_items(e15, "1400")]
+    inp = bridge_inputs(
+        items, {("2000", "2026-01"): "-10", ("1000", "2026-01"): "10.000001"}, refs={"x"}, rounding="1400"
+    )
+    assert refusal(_run_units, inp, e15) == "rounding_account_invalid"

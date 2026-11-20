@@ -25,13 +25,16 @@ resolved while its fingerprint is unchanged (fingerprinted decisions carry over,
 facts changed; an open item whose source was loaded but no longer lists it is reported as an orphan and stays open
 (never silently dropped). Finance resolves the rest with ``resolve`` and an evidence sha.
 
-Flip gate: passes only when the open count is 0 AND the latest bridge version is signed.
+Flip gate (profile ``as_is_v1``, AS-IS-MIGRATION-REPLAN section 4): the open work-queue count and the class coverage
+are REPORTS, not gates (Michael's as-is ruling: Finance works the queue after the flip). It passes only when the
+latest bridge version is signed (and was built under this profile), the recomputed ledger equals it and has not moved,
+and every gated control tie holds. The profile is a code constant; no setting can relax it.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -56,6 +59,7 @@ RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS)  # B-2 outcomes load from the
 IMPORT_CLASS: Final = {
     "expense_elsewhere_ambiguous": "E06",
     "wht_payment_fact_pending": "E06a",
+    "unposted_wht_line": "E04",  # AS-IS: an unposted invoice with a WHT line is not landed (H-DOC)
     "expense_account_is_control": "E21",
     "expense_account_is_tax_role": "E21",
     "tax_account_not_input_tax": "E09",
@@ -555,10 +559,58 @@ def counts(db: Session, tenant: UUID) -> dict[str, Any]:
     }
 
 
+def _post_flip_tools_unused(db: Session, tenant: UUID) -> list[str]:
+    """Rule 0.2: B-1 reviews (#67), B-2 void/post decisions (#69) and IAS 8 opening journals are post-flip Finance
+    tools. Any record of their use before the flip means a journal the legacy never posted is in the v2 ledger (it
+    would count as v2-native in the bridge), so the gate refuses."""
+    from erp_v2.held_drafts.models import OUTCOME_QUEUED, HeldDraftDecision
+    from erp_v2.legacy_ap.models import AdmissionReview
+
+    used = (
+        db.scalar(sa.select(sa.func.count()).select_from(AdmissionReview).where(AdmissionReview.tenant_id == tenant))
+        or db.scalar(
+            sa.select(sa.func.count())
+            .select_from(HeldDraftDecision)
+            .where(HeldDraftDecision.tenant_id == tenant, HeldDraftDecision.outcome != OUTCOME_QUEUED)
+        )
+        or db.scalar(
+            sa.select(sa.func.count())
+            .select_from(m.OpeningJournal)
+            .where(m.OpeningJournal.tenant_id == tenant, m.OpeningJournal.kind == m.KIND_IAS8)
+        )
+    )
+    return ["post_flip_tool_used_before_flip"] if used else []
+
+
+# The section-4 checks of profile ``as_is_v1`` (AS-IS-MIGRATION-REPLAN, sections 4.1-4.5): name -> ``check(db, tenant)``
+# returning its refusal reasons, or None while the owner that wires it is not on main. EVERY None refuses the gate
+# (``profile_checks_unbuilt``), so the gate can never pass with an unbuilt check. An owner PR replaces its None with the
+# function; deleting a name fails the pinned test in tests/test_migration_ledger_pg.py (the set is pinned to the spec).
+# The exact ties of the signed bridge, the ledger comparison and the signature are checked inline in ``gate``.
+AS_IS_V1_CHECKS: Final[dict[str, Callable[[Session, UUID], list[str]] | None]] = {
+    "completeness_per_module_currency": None,  # 4.1: legacy = landed + held per module x currency (B-13/B-14/#72)
+    "control_ties_per_currency": None,  # 4.2: every control tie per currency (the inline ties net all currencies)
+    "prepayment_tie_r1": None,  # 4.2: prepayment == R1 available_credit + prepaid_funding (billing a13)
+    "holding_ties": None,  # 4.3: holding account == open register items; migration_holding posted once (B-14)
+    "setup_keyed_accounts": None,  # 4.5: every keyed account exists, active and postable (B-10-lite)
+    "setup_control_and_tax_codes_exist_once": None,  # 4.5
+    "setup_vat_deferral_pair": None,  # 4.5: the VAT codes have the deferral pair set
+    "setup_periods": None,  # 4.5: FY2025 holds the opening and is LOCKED; FY2026 and the cutover month OPEN
+    "setup_writer_role_m1": None,  # 4.5: the writer role passes the M1 checks (#72)
+    "straddle_reproduced": None,  # STRADDLE-SPEC (W8): every E39 journal has its migration_straddle journals (B-14)
+    "e15_subkobo_posted": None,  # E15: one migration_subkobo journal per key = legacy lines (6 dp) + ONE residue line
+    "post_flip_tools_unused": _post_flip_tools_unused,  # rule 0.2 (built)
+}
+
+
+def profile_checks_pending() -> list[str]:
+    return sorted(name for name, check in AS_IS_V1_CHECKS.items() if check is None)
+
+
 def gate(db: Session, tenant: UUID) -> dict[str, Any]:
-    """The flip gate: open count 0, every class covered, the latest bridge signed (body re-hashed), the recomputed v2
-    ledger equal to the bridge and unmoved since signature, and every control account tied (or named-unavailable,
-    which refuses)."""
+    """The flip gate, profile ``as_is_v1``: the latest bridge signed under this profile (body re-hashed), the
+    recomputed v2 ledger equal to the bridge and unmoved since signature, and every gated control account tied (or
+    named-unavailable, which refuses). The open count, class coverage, 2030, 2110 are reported only."""
     from erp_v2.migration_ledger import ledger_check
 
     c = counts(db, tenant)
@@ -567,10 +619,13 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
     signed = False
     version = sha = None
     reasons: list[str] = []
-    if c["open"] != 0:
-        reasons.append("open_exceptions")
-    if not cov["complete"]:
-        reasons.append("class_coverage_incomplete")
+    reports: dict[str, Any] = {}
+    pending = profile_checks_pending()
+    if pending:
+        reasons.append("profile_checks_unbuilt")
+    for check in AS_IS_V1_CHECKS.values():
+        if check is not None:
+            reasons.extend(check(db, tenant))
     if row is None:
         reasons.append("no_bridge_version")
     else:
@@ -583,6 +638,8 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
         if not signed:
             reasons.append("latest_bridge_not_signed")
         else:
+            if body.get("gate_profile") != ledger_check.GATE_PROFILE:
+                reasons.append("gate_profile_changed_since_signature")
             if ledger_check.difference_rows(db, tenant, body):
                 reasons.append("v2_ledger_differs_from_bridge")
             state = ledger_check.ledger_state(db, tenant)
@@ -592,9 +649,19 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
             if body.get("control_lists") != state["control_lists"]:
                 reasons.append("control_lists_changed_since_signature")
             reasons.extend(v["reason"] for v in state["controls"].values() if not v["ok"])
+            reports = state["reports"]
     return {
         "passed": not reasons,
+        "profile": ledger_check.GATE_PROFILE,
         "reasons": reasons,
+        "profile_checks_pending": pending,
+        "reports": {
+            "open_count": c["open"],
+            "resolved_count": c["resolved"],
+            "open_by_class": c["open_by_class"],
+            "classes_missing": cov["missing"],
+            "report_balances": reports,
+        },
         "open_count": c["open"],
         "resolved_count": c["resolved"],
         "open_by_class": c["open_by_class"],

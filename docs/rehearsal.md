@@ -64,9 +64,20 @@ store). Exit codes: 0 ok, 2 refusal (named), 3 incomplete receipt.
    MIGRATION_DATABASE_URL=<dest> ERP_ENROLMENT_ACTOR_ID=<uuid> \
    ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF=<ref> \
    uv run python -m erp_v2.importer execute --mint \
-     --manifest <manifest.json> --receipt <path> \
+     --manifest <manifest.json> --receipt <path> --history-cutoff 2025-12-31 \
      --tax-rule-policy-json <policy.json> --tax-band-binding-json <binding.json>
    ```
+
+   `--history-cutoff` (B-13) is REQUIRED whenever the journal pairings run: the run refuses before touching either
+   database without it. Legacy journals, journal lines and posted ledger lines dated on or before it are not
+   imported (closed years arrive only through the B-9 opening journal, so importing them too would count every
+   closed-year line twice). The receipt carries `history_cutoff` (ISO date) and `history_cutoff_census` (per pairing: source and excluded
+   counts, a sha256 over the excluded legacy keys, status split, unit refusals) with a mode-600 side file; undated rows are
+   named refusals. A legacy journal whose ledger lines straddle the cutoff refuses the run
+   (`history_cutoff_straddling_journals`). A post-cutoff journal whose reversal link points at a pre-cutoff journal
+   lands as is with the link empty (target kept in the census and side file). `import.unposted_wht` (`--import-params-json`, default `queue`)
+   decides what happens to an unposted supplier invoice with a WHT line: `queue` does not land it (class E04, reason
+   `unposted_wht_line`), `remove` is the old D-M2 WHT removal.
 
    Read the receipt as the exception queue: every unresolved
    exception is a rehearsal finding, never edited away.

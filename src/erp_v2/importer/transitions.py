@@ -42,13 +42,14 @@ the row keeps its last legal status.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
 
 from erp_v2.importer.executor import RowException
+from erp_v2.importer.history_cutoff import REFUSAL_REQUIRED, HistoryCutoffRefused, bind, not_landed_predicate
 from erp_v2.importer.spec import TransformSpec
 
 _BATCH = 500
@@ -376,14 +377,25 @@ def _run_family(
     commit: bool = False,
     void_governance: VoidGovernance | None = None,
     legacy_ledger: tuple[str, str] | None = None,
+    history_cutoff: date | None = None,
 ) -> TransitionOutcome:
     paths = _LIFECYCLES[spec.destination_table]
     outcome = TransitionOutcome(destination_table=spec.destination_table)
     id_source = spec.column_map.get("id")
     if id_source is None:  # pragma: no cover - guarded by caller specs
         raise ValueError(f"{spec.destination_table}: spec does not map destination id")
-    select_sql = sa.text(
-        f"SELECT {id_source}, status FROM {spec.source_table}"  # noqa: S608
+    cutoff_where = ""
+    if spec.history_cutoff is not None:
+        if history_cutoff is None:
+            raise HistoryCutoffRefused(REFUSAL_REQUIRED, spec.destination_table)
+        # Pre-cutoff journals were never landed: walking them would name rows that do not exist.
+        cutoff_where = " WHERE NOT " + not_landed_predicate(
+            spec.history_cutoff, spec.source_table, id_source, spec.column_map.get("journal_id")
+        )
+    select_sql = (
+        bind(f"SELECT {id_source}, status FROM {spec.source_table}{cutoff_where}", history_cutoff)  # noqa: S608
+        if cutoff_where and history_cutoff is not None
+        else sa.text(f"SELECT {id_source}, status FROM {spec.source_table}")  # noqa: S608
     )
     by_status: dict[str, list[Any]] = {}
     for row in source.execute(select_sql).mappings():
@@ -592,6 +604,7 @@ def run_transitions(
     commit: bool = False,
     void_governance: VoidGovernance | None = None,
     legacy_ledger: tuple[str, str] | None = None,
+    history_cutoff: date | None = None,
 ) -> tuple[TransitionOutcome, ...]:
     """Walk lifecycle-staged rows to their legacy final states.
 
@@ -647,6 +660,7 @@ def run_transitions(
                 commit=commit,
                 void_governance=void_governance,
                 legacy_ledger=legacy_ledger,
+                history_cutoff=history_cutoff,
             )
         )
         if commit and not dry_run:

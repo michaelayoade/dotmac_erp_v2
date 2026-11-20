@@ -27,8 +27,8 @@ CONTROL_ACCOUNT_CODES: Final = frozenset({AP_CONTROL_CODE, PAYROLL_PAYABLE_CODE,
 # The flip-gate control checks (B-9, section 12.4). A code constant, not a setting and not a per-run declaration, so a
 # run cannot drop an account to pass; each signed bridge records the lists it checked. Changing a list is a code change.
 GATE_TIE_CODES: Final = ("1400", "1410", "2000", "2040", "2045")  # GL must equal the v2 owner subledger
-GATE_ZERO_CODES: Final = ("2030",)  # retired (D-EX-9): ledger net over all periods must be 0
-GATE_WHT_CODES: Final = ("2110",)  # GL must equal the WHT ledger plus named exceptions
+REPORT_ZERO_CODES: Final = ("2030",)  # retired (D-EX-9): REPORTED, not a gate (as_is_v1): net over all periods
+REPORT_WHT_CODES: Final = ("2110",)  # REPORTED, not a gate (as_is_v1): GL against the WHT ledger
 INVOICE_TAX_ACCOUNT_CODES: Final = frozenset({"1455"})
 INPUT_VAT_RELEASE_CODES: Final = frozenset({"1440"})  # where released deferred input VAT is claimed (a6)
 
