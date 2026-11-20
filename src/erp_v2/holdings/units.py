@@ -265,7 +265,7 @@ def bind_to_import_receipt(
 
 
 def bridge_rounding_code(db: Session, tenant: UUID) -> str | None:
-    """The rounding account the latest bridge version names (its T-SUBKOBO items post there); None before any bridge."""
+    """The rounding account the latest bridge version names (its T-SUBKOBO items post there); None before any bridge (callers refuse as unbound)."""
     body = db.scalar(
         sa.select(m.BridgeVersion.body)
         .where(m.BridgeVersion.tenant_id == tenant)
@@ -278,7 +278,9 @@ def bridge_rounding_code(db: Session, tenant: UUID) -> str | None:
 
 def check_rounding_matches_bridge(db: Session, tenant: UUID, rounding_code: str) -> None:
     bridge_code = bridge_rounding_code(db, tenant)
-    if bridge_code is not None and bridge_code != rounding_code:
+    if bridge_code is None:
+        refuse("rounding_account_unbound", "no bridge version names a rounding account yet")
+    if bridge_code != rounding_code:
         refuse("rounding_account_differs_from_bridge", "the bridge's T-SUBKOBO items name another account")
 
 
@@ -563,6 +565,10 @@ def verify(db: Session, spec: planning.RunSpec, mode: Mode) -> dict[str, Any]:
             problems.append(f"{j.journal_id}:no_{mode.klass.lower()}_item")
         elif mode is SUBKOBO and (item.state != "resolved" or item.evidence_sha256 != j.evidence_sha256):
             problems.append(f"{j.journal_id}:e15_not_resolved_with_evidence")
-    if rounding is not None and bridge_rounding_code(db, tenant) not in (None, rounding.code):
-        problems.append("rounding_account_differs_from_bridge")
+    if rounding is not None:
+        bound = bridge_rounding_code(db, tenant)
+        if bound is None:
+            problems.append("rounding_account_unbound")
+        elif bound != rounding.code:
+            problems.append("rounding_account_differs_from_bridge")
     return {"ready": not problems, "journals": len(journals), "problems": sorted(problems)}

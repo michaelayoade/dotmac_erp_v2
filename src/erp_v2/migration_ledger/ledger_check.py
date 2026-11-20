@@ -25,7 +25,6 @@ import sqlalchemy as sa
 from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
 from sqlalchemy.orm import Session
 
-# STRADDLE_OWNER: B-14 kind ``migration_straddle``, explained by T-STRADDLE items, not native
 from erp_v2.holdings.models import KIND_STRADDLE_POST as STRADDLE_KIND
 from erp_v2.holdings.models import KIND_SUBKOBO_POST as SUBKOBO_KIND
 from erp_v2.holdings.models import OWNER as STRADDLE_OWNER

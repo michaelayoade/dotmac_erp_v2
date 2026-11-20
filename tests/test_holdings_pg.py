@@ -1628,6 +1628,22 @@ def subkobo_files(engine, env, tmp_path, *, lines=None, status="POSTED"):
     return side, receipt, str(jid), journal
 
 
+def bind_bridge(engine, env, code):
+    """A bridge version naming ``code`` as the rounding account (subkobo refuses ``rounding_account_unbound`` without)."""
+    import hashlib
+
+    from erp_v2.migration_ledger import models as ml
+
+    with Session(engine) as db:
+        db.add(
+            ml.BridgeVersion(
+                tenant_id=env.tenant_id, version=1, sha256=hashlib.sha256(b"b1").hexdigest(),
+                body={"rounding_account_code": code, "items": []}, itemised_sha256=SHA, ready=False, created_by="t",
+            )
+        )  # fmt: skip
+        db.commit()
+
+
 def test_subkobo_reposts_the_legacy_lines_exactly_plus_one_residue_line_and_resolves_e15(
     engine, legacy_schema, tmp_path
 ):
@@ -1635,6 +1651,7 @@ def test_subkobo_reposts_the_legacy_lines_exactly_plus_one_residue_line_and_reso
 
     env = units_world(engine)
     side, receipt, jid, journal = subkobo_files(engine, env, tmp_path)
+    bind_bridge(engine, env, "6999")
     env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6999"})
     plan, out = units_apply(engine, env, units.SUBKOBO)
     assert out["posted_journals"] == 1
@@ -1694,6 +1711,7 @@ def test_subkobo_refusals(engine, legacy_schema, tmp_path):
     for code, lines in cases.items():
         env = units_world(engine)
         side, receipt, _jid, _j = subkobo_files(engine, env, tmp_path, lines=lines)
+        bind_bridge(engine, env, "6999")
         env.spec = units_spec(
             env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6999"}
         )
@@ -1706,6 +1724,7 @@ def test_subkobo_refusals(engine, legacy_schema, tmp_path):
     side, receipt, _jid, _j = subkobo_files(
         engine, env, tmp_path, lines=[("1207", day_ok, "100.004000", "0"), ("1211", day_ok, "0", "100.000000")]
     )
+    bind_bridge(engine, env, "6999")
     env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt)  # no rounding account named
     with pytest.raises(HoldingRefused) as e:
         units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
@@ -1853,10 +1872,7 @@ def test_a_login_member_of_app_user_reads_but_never_writes_and_the_guards_hold_f
 def test_subkobo_rounding_account_is_config_not_control_holding_prepayment_and_matches_the_bridge(
     engine, legacy_schema, tmp_path
 ):
-    import hashlib
-
     from erp_v2.holdings import units
-    from erp_v2.migration_ledger import models as ml
 
     env = units_world(engine)
     side, receipt, _jid, _j = subkobo_files(engine, env, tmp_path)
@@ -1872,15 +1888,16 @@ def test_subkobo_rounding_account_is_config_not_control_holding_prepayment_and_m
         with pytest.raises(HoldingRefused) as e:
             units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
         assert e.value.code in {"rounding_account_invalid", "holding_account_invalid"}, bad
-    # the bridge names another rounding account: refuse; the same account: post
-    with Session(engine) as db:
-        db.add(
-            ml.BridgeVersion(
-                tenant_id=env.tenant_id, version=1, sha256=hashlib.sha256(b"b1").hexdigest(),
-                body={"rounding_account_code": "6080", "items": []}, itemised_sha256=SHA, ready=False, created_by="t",
-            )
-        )  # fmt: skip
-        db.commit()
+    # no bridge version: refuse as unbound (plan and verify); another code: refuse; the same account: post
+    env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6080"})
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
+    assert e.value.code == "rounding_account_unbound"
+    spec, _ = planning.parse_spec(env.spec)
+    with applying.read_only_session(engine) as db:
+        assert "rounding_account_unbound" in units.verify(db, spec, units.SUBKOBO)["problems"]
+        db.rollback()
+    bind_bridge(engine, env, "6080")
     env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6999"})
     with pytest.raises(HoldingRefused) as e:
         units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
