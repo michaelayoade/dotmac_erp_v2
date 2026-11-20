@@ -36,6 +36,7 @@ down_revision = "e2_0028_migration_ledger"
 branch_labels = None
 depends_on = ("bi_0017_open_documents_index",)
 
+
 def _grant_lines() -> list[str]:
     return grant_lines(WRITER_ROLE)
 

@@ -141,16 +141,19 @@ def build_attribution(
                 }
             )
     for excluded in census.excluded:
-        # A refused partition is held WHOLE: one item equal to the party's entire legacy GL, so none of it falls out
+        # A refused partition is held WHOLE: one item equal to the party's legacy GL
         # as an unexplained custgap (rows without a residual, such as inexact or outside-population payments, included).
         reasons = ",".join(sorted({reason for _key, reason in excluded.blockers})) or "partition_excluded"
+        # ...minus the party's OTHER held items (a posted-after-cutoff row is held on its own and its GL is already in
+        # gl[party]); counting it twice would leave a spurious custgap of the same size.
+        others = sum(int(h["amount_minor"]) for h in held[excluded.partition])
         held[excluded.partition].append(
             {
                 "reason": f"partition_held:{reasons}",
                 "customer": excluded.partition[0],
                 "currency": excluded.partition[1],
                 "legacy_key": f"partition:{excluded.partition[0]}:{excluded.partition[1]}",
-                "amount_minor": gl.get(excluded.partition, 0),
+                "amount_minor": gl.get(excluded.partition, 0) - others,
             }
         )
     unposted = [

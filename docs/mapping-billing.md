@@ -151,3 +151,14 @@ Review af472276 hardening (architect findings):
 - Runbook: an aborted apply followed by a re-plan yields a new window id (the id derives from the plan sha), so the
   existing window is refused (`existing_window_differs`). The only way forward is a restore of the pre-F6 database and a
   fresh run; do not try to edit or reuse the half-provisioned window.
+- Runbook (post-migrate, Michael root): the migrator that created the writer holds an ADMIN-only membership row, which
+  would let it `GRANT` the writer to itself. After the migration run `REVOKE erp_billing_opening_writer FROM <migrator>`
+  (e.g. `erp_owner`), then grant the operator `WITH SET TRUE, INHERIT FALSE, ADMIN FALSE` for the window. The apply
+  preflight refuses while the session user holds ADMIN on the writer (`session_user_holds_admin_on_writer`).
+- Non-functional currency: `plan` refuses any partition whose currency is not NGN (`ar_opening_fx_unsupported`) before
+  anything is imported or sealed, until the P-4/P-7 ruling.
+- Merge precondition (deploy): `e2_0029` runs the role guard on every target. Probe production and rehearsal read-only
+  first: PG >= 16; the migrator has CREATEROLE, is not `app_admin`, and `app_admin` is not a member of the migrator;
+  `createrole_self_grant` unset; no pre-existing writer role with SET/INHERIT members.
+- Before any plan/apply go: a read-only census + attribution dry run on g9 with a 0600 receipt, identical across two
+  runs; confirm the distinct payment and invoice statuses per bucket and the GL sign of a positive credit note.
