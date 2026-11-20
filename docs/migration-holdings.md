@@ -82,14 +82,26 @@ runtime SELECT only. Downgrade refuses while any row exists.
 * L3/L4/L6: TRUNCATE refused; a `migration_holdings` item cannot be resolved with an outstanding amount; resolved holding accounts are
   persisted (`erp_migration_holding_accounts`) and guarded even with no rows. L5: verify checks the prepayment account has not moved.
 
-## Straddle reproduction (W8, simplified)
+## Unit reproduction: straddle (E39) and sub-kobo (E15)
 
-`holding straddle plan|apply|verify` reproduces each legacy journal dated across the history cutoff as one balanced
-`migration_straddle` journal per ledger-line day, at the legacy account, amount and date (identity uuid5 over journal and day).
-It refuses any control or holding account line, non-zero net (total or per day), a line on or before the cutoff, a non-functional
-currency, an inactive account or a day whose period is not OPEN. It never touches suspense. Each journal gets one OPEN `E39`
-register item (source `migration_straddle`), a review item only. Input is the B-13 side file named in `receipts.straddle`
-(format in `holdings/straddle.py`).
+`holding straddle|subkobo plan|apply|verify` (module `holdings/units.py`) reproduces the legacy journals the importer
+refuses as UNITS. Input is #74's own side file, exactly as written (`<receipt>.straddlers.json`, `<receipt>.subkobo.json`;
+top level `{history_cutoff, class, reason, journals}`), bound in the run-spec as `receipts.straddle` / `receipts.subkobo`
+together with the import receipt `receipts.import_receipt`: the side-file sha must equal
+`history_cutoff_census.{straddlers|subkobo}.side_file_sha256`, the cutoff equals the receipt's and the posted opening's as-of
+date, the journal count (E39) or set (E15) equals the receipt's, `evidence_sha256` is recomputed through the shared evidence
+function, and nets, type, `s_j` are recomputed from the lines.
+
+* **straddle** (`migration_straddle`): one balanced journal per ledger-line day at the legacy account, amount and date, never
+  suspense. Refuses a legacy journal that is not POSTED, S1 or any line on or before the cutoff, a non-zero net (total or per
+  day), control, holding (persisted or run-spec), tax-role and prepaid-funding accounts, a non-functional currency, and a day
+  whose period is not OPEN. Item: E39 OPEN (review only).
+* **subkobo** (`migration_subkobo`): every legacy line re-posted exactly (6 dp) plus ONE residue line on
+  `migration.rounding_account` (run-spec param), on the legacy day. Refuses lines on more than one day, lines on or before
+  the cutoff, a net outside 0 < |net| < 0.01, `subkobo_control_line`, a closed period. Item: E15 RESOLVED with #74's evidence.
+* Window closure: `<mode>_already_applied` if any journal of the kind exists from a different plan.
+* The e2_0028 exceptions table carries a close-guard trigger from e2_0030 (a `migration_holdings` item with an outstanding
+  amount cannot be resolved).
 
 ## Not in this change
 

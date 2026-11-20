@@ -69,7 +69,7 @@ def run_plan(
     with read_only_session(engine) as db:
         snap = planning.read_snapshot(db, spec, billing, owner_readers=owner_readers)
         if receipts.census is not None:
-            planning.anchor_census(db, spec.tenant_id, receipts.census)  # F1
+            planning.anchor_census(db, spec.tenant_id, receipts.census, spec.window_id)  # F1
             planning.check_held_in_register(  # F6
                 db,
                 spec.tenant_id,
@@ -118,6 +118,9 @@ def applied_fingerprints(db: Session, tenant: UUID, window_id: str, functional: 
         )
         if journal is not None:
             out[code] = journal.source_fingerprint
+    # a flip whose every X was 0 leaves no journal: the persisted holding accounts also close the window
+    for row in db.scalars(sa.select(HoldingAccount).where(HoldingAccount.tenant_id == tenant)):
+        out[f"config:{row.control_code}"] = row.plan_sha256
     return out
 
 

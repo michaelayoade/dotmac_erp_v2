@@ -62,7 +62,7 @@ def run_t1_plan(
         posted_fingerprint = None if existing is None else existing.source_fingerprint
         already_posted = existing is not None
         # F1: the census must be the one #72 admitted from, and the billing window must carry the same manifest.
-        admitted_manifest = planning.anchor_census(db, tenant, census)
+        admitted_manifest = planning.anchor_census(db, tenant, census, spec.window_id)
         window_manifest = billing.window_manifest_fingerprint(db, spec.window_id)
         db.rollback()
     if window_manifest != admitted_manifest:

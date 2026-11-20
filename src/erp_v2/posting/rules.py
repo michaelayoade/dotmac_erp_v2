@@ -104,6 +104,8 @@ POLICIES: Final = MappingProxyType(
         # B-14 straddle reproduction (W8): a legacy journal dated across the history cutoff, re-posted balanced at its
         # legacy accounts and days; refuses control accounts, so no control door is used.
         ("erp.migration", "migration_straddle"): RefPolicy(),
+        # B-14 E15 sub-kobo units: legacy lines re-posted exactly (6 dp) plus one residue line on the rounding account.
+        ("erp.migration", "migration_subkobo"): RefPolicy(),
     }
 )
 
