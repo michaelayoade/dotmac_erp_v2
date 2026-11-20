@@ -486,3 +486,45 @@ def test_a_reversal_of_an_e15_or_e39_journal_lands_with_the_link_empty_and_is_no
             db.scalars(sa.select(JournalEntry.reverses_journal_id).where(JournalEntry.tenant_id == env.tenant_id))
         )
     assert links == [None, None]
+
+
+def test_the_unbalanced_journals_get_their_own_private_side_file_in_the_straddlers_shape(engine, legacy, tmp_path):
+    """E15: `<receipt>.subkobo.json` carries the full ledger lines (enough for B-14 to re-post them exactly); the
+    evidence sha is the SHARED `unit_evidence_sha`; the straddlers file keeps its shape."""
+    import hashlib
+    import json
+
+    env = world(engine)
+    s1, _s2 = seed_straddlers(engine, env)
+    jid = uuid4()
+    post_legacy(engine, env, jid, NEXT_DAY, [("1000", "10.000001", "0"), ("2000", "0", "10")], number="JE-subkobo")
+    args = type("A", (), {"history_cutoff": "2025-12-31", "receipt": str(tmp_path / "receipt.json")})()
+    _cutoff, section = cli._history_cutoff(args, journal_specs(engine), engine, ["gl"])
+    side = tmp_path / "receipt.json.subkobo.json"
+    assert (side.stat().st_mode & 0o777) == 0o600
+    assert hashlib.sha256(side.read_bytes()).hexdigest() == section["subkobo"]["side_file_sha256"]
+    body = json.loads(side.read_text())
+    assert set(body) == {"history_cutoff", "class", "reason", "journals"}
+    assert (body["history_cutoff"], body["class"], body["reason"]) == ("2025-12-31", "E15", "unbalanced_journal_unit")
+    (unit,) = body["journals"]
+    assert unit["journal"] == str(jid) and unit["type"] == "UNBALANCED" and unit["net"] == "0.000001"
+    assert set(unit) == {
+        "class", "reason", "journal", "type", "legacy_status", "journal_date", "source_module", "source_document_type",
+        "source_document_id", "currency", "post_net", "net", "evidence_sha256", "lines",
+    }  # fmt: skip
+    assert len(unit["lines"]) == 2 and {row["debit"] for row in unit["lines"]} == {"10.000001", "0"}
+    assert set(unit["lines"][0]) == {
+        "ledger_line_id", "journal_line_id", "account_id", "account_code", "posting_date", "debit", "credit",
+        "original_currency",
+    }  # fmt: skip
+    assert unit["evidence_sha256"] == history_cutoff.unit_evidence_sha(unit["lines"])
+    assert section["subkobo"]["journals"] == [str(jid)]
+    assert section["straddlers"]["journals"] == sorted(
+        j["journal"] for j in json.loads((tmp_path / "receipt.json.straddlers.json").read_text())["journals"]
+    )
+    assert section["subkobo"]["count"] == 1 and section["subkobo"]["sum_net"] == "0.000001"
+    # the straddlers file is untouched by the E15 work: only the straddlers, same keys, same shared sha
+    strad = json.loads((tmp_path / "receipt.json.straddlers.json").read_text())
+    assert len(strad["journals"]) == 2 and str(s1) in {j["journal"] for j in strad["journals"]}
+    assert all(j["evidence_sha256"] == history_cutoff.unit_evidence_sha(j["lines"]) for j in strad["journals"])
+    assert all("net" not in j for j in strad["journals"])

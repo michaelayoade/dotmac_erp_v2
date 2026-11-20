@@ -285,6 +285,29 @@ def _iso(value: object) -> str | None:
     return None if day is None else day.isoformat()
 
 
+def unit_evidence_sha(lines: Any) -> str:
+    """THE evidence sha256 of a unit's ledger lines: ``sha256(json.dumps(lines, sort_keys=True))`` over the line dicts
+    exactly as ``line_payload`` builds them. Shared by the straddler (E39) and unbalanced-unit (E15) side files and by
+    B-14 (#75), which recomputes it from the file and refuses a mismatch."""
+
+    return hashlib.sha256(json.dumps(list(lines), sort_keys=True).encode()).hexdigest()
+
+
+def line_payload(r: Any) -> dict[str, Any]:
+    """One ledger line as the side files carry it (the keys B-14 requires)."""
+
+    return {
+        "ledger_line_id": str(r["ledger_line_id"]),
+        "journal_line_id": None if r["journal_line_id"] is None else str(r["journal_line_id"]),
+        "account_id": str(r["account_id"]),
+        "account_code": r["account_code"],
+        "posting_date": _iso(r["posting_date"]),
+        "debit": format(Decimal(r["debit_amount"]), "f"),
+        "credit": format(Decimal(r["credit_amount"]), "f"),
+        "original_currency": r["original_currency_code"],
+    }
+
+
 def classify_straddlers(source: sa.Connection, cutoff: date) -> tuple[Straddler, ...]:
     """Every straddling journal with its type, nets and ledger lines. Raises ``HistoryCutoffRefused`` when the census
     cannot be read (an unreadable source is never an empty one) or when the classifier and the exclusion predicate
@@ -320,19 +343,8 @@ def classify_straddlers(source: sa.Connection, cutoff: date) -> tuple[Straddler,
                 day = _iso(r["posting_date"]) or ""
                 post.setdefault(day, {})
                 post[day][account] = post[day].get(account, zero) + net
-            payload.append(
-                {
-                    "ledger_line_id": str(r["ledger_line_id"]),
-                    "journal_line_id": None if r["journal_line_id"] is None else str(r["journal_line_id"]),
-                    "account_id": account,
-                    "account_code": r["account_code"],
-                    "posting_date": _iso(r["posting_date"]),
-                    "debit": format(Decimal(r["debit_amount"]), "f"),
-                    "credit": format(Decimal(r["credit_amount"]), "f"),
-                    "original_currency": r["original_currency_code"],
-                }
-            )
-        evidence = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            payload.append(line_payload(r))
+        evidence = unit_evidence_sha(payload)
         out.append(
             Straddler(
                 journal=journal,
@@ -348,6 +360,102 @@ def classify_straddlers(source: sa.Connection, cutoff: date) -> tuple[Straddler,
                 post_net={d: {a: format(v, "f") for a, v in sorted(m.items())} for d, m in sorted(post.items())},
                 s_j=format(sum(pre.values(), zero), "f"),
                 evidence_sha256=evidence,
+            )
+        )
+    return tuple(out)
+
+
+CLASS_SUBKOBO: Final = "E15"
+REASON_SUBKOBO: Final = REASON_UNBALANCED_UNIT
+
+_UNBALANCED_CLASSIFY_SQL: Final = (
+    "SELECT l.journal_entry_id, l.ledger_line_id, l.journal_line_id, l.account_id, l.account_code, l.posting_date, "  # noqa: S608
+    "l.debit_amount, l.credit_amount, l.original_currency_code, j.status, j.posting_date AS jpd, j.entry_date AS jed, "
+    "j.source_module, j.source_document_type, j.source_document_id, j.currency_code "
+    f"FROM posted_ledger_line l LEFT JOIN {_PARENT_TABLE} j ON j.{_PARENT_KEY} = l.journal_entry_id "
+    f"WHERE l.journal_entry_id IN {UNBALANCED_UNITS} "
+    f"AND l.journal_entry_id NOT IN ({STRADDLE_IDS_SQL}) "
+    "AND NOT COALESCE(COALESCE(j.posting_date, j.entry_date) <= :history_cutoff, FALSE) "
+    "ORDER BY l.journal_entry_id, l.ledger_line_id"
+)
+
+
+@dataclass(frozen=True)
+class UnbalancedUnit:
+    """One legacy journal whose posted ledger lines do not balance (P-5, the sub-kobo journals), refused as a unit
+    (E15). Same side-file shape as ``Straddler``: ``post_net`` per day and account, ``net`` = debit - credit."""
+
+    journal: str
+    status: str | None
+    journal_date: str | None
+    source_module: str | None
+    source_document_type: str | None
+    source_document_id: str | None
+    currency: str | None
+    lines: tuple[dict[str, Any], ...]
+    post_net: dict[str, dict[str, str]]
+    net: str
+    evidence_sha256: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "class": CLASS_SUBKOBO,
+            "reason": REASON_SUBKOBO,
+            "journal": self.journal,
+            "type": "UNBALANCED",
+            "legacy_status": self.status,
+            "journal_date": self.journal_date,
+            "source_module": self.source_module,
+            "source_document_type": self.source_document_type,
+            "source_document_id": self.source_document_id,
+            "currency": self.currency,
+            "post_net": self.post_net,
+            "net": self.net,
+            "evidence_sha256": self.evidence_sha256,
+            "lines": list(self.lines),
+        }
+
+
+def classify_unbalanced(source: sa.Connection, cutoff: date) -> tuple[UnbalancedUnit, ...]:
+    """The unbalanced journals the importer refuses as units (post-cutoff, not straddlers), with full ledger lines."""
+
+    try:
+        with source.begin_nested():
+            rows = source.execute(bind(_UNBALANCED_CLASSIFY_SQL, cutoff)).mappings().all()
+    except sa.exc.SQLAlchemyError as exc:
+        raise HistoryCutoffRefused(REFUSAL_UNREADABLE) from exc
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["journal_entry_id"]), []).append(row)
+    out: list[UnbalancedUnit] = []
+    zero = Decimal(0)
+    for journal, lines in sorted(grouped.items()):
+        first = lines[0]
+        jday = _day(first["jpd"]) or _day(first["jed"])
+        post: dict[str, dict[str, Decimal]] = {}
+        net = zero
+        payload = []
+        for r in lines:
+            value = Decimal(r["debit_amount"]) - Decimal(r["credit_amount"])
+            net += value
+            day = _iso(r["posting_date"]) or ""
+            account = str(r["account_id"])
+            post.setdefault(day, {})
+            post[day][account] = post[day].get(account, zero) + value
+            payload.append(line_payload(r))
+        out.append(
+            UnbalancedUnit(
+                journal=journal,
+                status=first["status"],
+                journal_date=None if jday is None else jday.isoformat(),
+                source_module=first["source_module"],
+                source_document_type=first["source_document_type"],
+                source_document_id=None if first["source_document_id"] is None else str(first["source_document_id"]),
+                currency=first["currency_code"],
+                lines=tuple(payload),
+                post_net={d: {a: format(v, "f") for a, v in sorted(m.items())} for d, m in sorted(post.items())},
+                net=format(net, "f"),
+                evidence_sha256=unit_evidence_sha(payload),
             )
         )
     return tuple(out)
@@ -372,12 +480,14 @@ def write_private_json(path: Any, body: dict[str, Any]) -> str:
 
 __all__ = [
     "CLASS_STRADDLE",
+    "CLASS_SUBKOBO",
     "KINDS",
     "KIND_JOURNAL",
     "KIND_JOURNAL_LINE",
     "KIND_LEDGER_LINE",
     "MISSING_COLUMN",
     "REASON_STRADDLE",
+    "REASON_SUBKOBO",
     "REASON_UNBALANCED_UNIT",
     "REFUSAL_INVALID",
     "REFUSAL_REQUIRED",
@@ -386,16 +496,20 @@ __all__ = [
     "UNBALANCED_AMOUNTS_SQL",
     "HistoryCutoffRefused",
     "Straddler",
+    "UnbalancedUnit",
     "bind",
     "c_collated",
     "classify_straddlers",
+    "classify_unbalanced",
     "exclusion_predicate",
     "keys_sha256",
+    "line_payload",
     "not_landed_predicate",
     "parse_cutoff",
     "required_source_columns",
     "straddle_predicate",
     "undated_predicate",
+    "unit_evidence_sha",
     "unit_refusal_predicate",
     "write_private_json",
 ]
