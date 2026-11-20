@@ -41,6 +41,7 @@ def _cust(tenant: UUID, name: str) -> UUID:
     return uuid5(tenant, name)  # customer account ids are global primary keys: derive them per tenant
 
 
+GL_SHA = "e" * 64  # sha of the census gl_attribution block (bound into the plan)
 REF = "dotmac-debt-register v1"
 FENCE = "fence-1"
 NOW = datetime(2026, 11, 20, tzinfo=UTC)
@@ -167,7 +168,14 @@ def _plan(engine, w, dual="on"):
     with Session(engine) as db, db.begin():
         db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
         plan = build_plan(
-            w.asm, db, scope=w.scope, migration_authority_ref=REF, occurred_at=NOW, params={}, dual_control=dual
+            w.asm,
+            db,
+            scope=w.scope,
+            migration_authority_ref=REF,
+            occurred_at=NOW,
+            params={},
+            dual_control=dual,
+            gl_attribution_sha256=GL_SHA,
         )
         return plan, role_oid(db)
 
@@ -708,7 +716,14 @@ def test_plan_refuses_a_non_functional_currency_before_anything_is_imported(engi
     with Session(engine) as db, db.begin():
         with pytest.raises(OperatorRefusal, match="ar_opening_fx_unsupported"):
             build_plan(
-                usd, db, scope=w.scope, migration_authority_ref=REF, occurred_at=NOW, params={}, dual_control="on"
+                usd,
+                db,
+                scope=w.scope,
+                migration_authority_ref=REF,
+                occurred_at=NOW,
+                params={},
+                dual_control="on",
+                gl_attribution_sha256=GL_SHA,
             )
 
 
@@ -806,3 +821,12 @@ def test_a_fresh_creator_row_is_tolerated_only_when_nobody_else_reaches_the_crea
     admin = _admin_engine()
     _drop(admin, probe)
     admin.dispose()
+
+
+def test_the_gl_attribution_sha_is_bound_into_the_plan_sha(engine):
+    w = _world(engine)
+    plan, oid = _plan(engine, w)
+    other = {**plan, "gl_attribution_sha256": "f" * 64}  # the per-party split edited after approval
+    with pytest.raises(OperatorRefusal, match="plan_sha_not_self_consistent"):
+        _apply(engine, w, other, oid, approved=plan["plan_sha256"])
+    assert plan["gl_attribution_sha256"] == GL_SHA

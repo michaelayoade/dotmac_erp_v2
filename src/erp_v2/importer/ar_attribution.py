@@ -20,6 +20,8 @@ Sign convention [I]: receivable debit positive; an unposted DRAFT/SUBMITTED docu
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
@@ -35,6 +37,14 @@ from erp_v2.importer.ar_census import (
 )
 
 PartyKey = tuple[str, str]  # (legacy customer key, currency)
+
+
+def attribution_sha256(block: Mapping[str, object]) -> str:
+    """Canonical sha of the `gl_attribution` block: bound into the plan and the receipt, so the per-party split
+    cannot be edited without detection."""
+
+    body = json.dumps(block, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(("erp.ar-gl-attribution.v1:" + body).encode()).hexdigest()
 
 
 def _minor(amount: object, journal: str, precision: int = 2) -> int:
@@ -190,15 +200,14 @@ def build_attribution(
     for journal, amount in per_journal.items():
         owners = {str(k) for _c, k in journal_owners.get(journal, ())}
         totals[owners.pop() if len(owners) == 1 else functional_currency] += amount
-    return {
-        "gl_attribution": {
-            "parties": entries,
-            "held": held_all,
-            "unattributed": [i for items in unattributed.values() for i in items],
-            "shared_ar_journal": shared,
-            "legacy_1400_minor_by_currency": dict(sorted(totals.items())),
-        }
+    block = {
+        "parties": entries,
+        "held": held_all,
+        "unattributed": [i for items in unattributed.values() for i in items],
+        "shared_ar_journal": shared,
+        "legacy_1400_minor_by_currency": dict(sorted(totals.items())),
     }
+    return {"gl_attribution": block, "gl_attribution_sha256": attribution_sha256(block)}
 
 
 # --- read-only loader (the caller sets the READ ONLY transaction posture) ----------------------------------------

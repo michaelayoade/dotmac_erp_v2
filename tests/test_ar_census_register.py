@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 from ar_opening_support import CUTOFF, SNAPSHOT, alloc, invoice, payment
 
+from erp_v2.importer.ar_attribution import attribution_sha256
 from erp_v2.importer.ar_census import build_census
 from erp_v2.migration_ledger import register
 from erp_v2.migration_ledger.common import LedgerRefused
@@ -40,7 +41,13 @@ def _receipt():
         "unattributed": [],
         "shared_ar_journal": [],
     }
+    body["gl_attribution_sha256"] = attribution_sha256(body["gl_attribution"])
     return census, body
+
+
+def _resha(body):
+    body["gl_attribution_sha256"] = attribution_sha256(body["gl_attribution"])
+    return body
 
 
 def test_receipt_becomes_open_work_items_by_class_and_key():
@@ -84,7 +91,7 @@ def test_gl_attribution_gaps_are_e36a_items():
             {"gljournal_id": "j-2", "amount_minor": 1, "shared": True},
         ],
     }
-    facts = [f for f in register.from_ar_census(body) if f.class_code == "E36a"]
+    facts = [f for f in register.from_ar_census(_resha(body)) if f.class_code == "E36a"]
     assert sorted(f.legacy_key for f in facts) == ["custgap:cust-9:NGN", "gljournal:j-1", "gljournal:j-2"]
     assert [f.detail["shared"] for f in facts if f.legacy_key.startswith("gljournal")] == [False, True]
     body["gl_attribution"] = "x"
@@ -106,7 +113,7 @@ def test_posted_after_cutoff_rows_become_e35_row_items():
         {"kind": "invoice", "key": "late-1", "partition": ["cust-1", "NGN"], "gross_minor": 4000}
     ]
     body["gl_attribution"]["held"].append({"reason": "row_after_cutoff", "legacy_key": "late-1", "amount_minor": 4000})
-    (fact,) = [f for f in register.from_ar_census(body) if f.legacy_key == "row:late-1"]
+    (fact,) = [f for f in register.from_ar_census(_resha(body)) if f.legacy_key == "row:late-1"]
     assert fact.class_code == "E35" and fact.detail["gl_signed_minor"] == 4000 and fact.detail["currency"] == "NGN"
 
 
@@ -123,3 +130,14 @@ def test_the_same_receipt_yields_the_same_fingerprints():
     assert [f.fingerprint for f in register.from_ar_census(body)] == [
         f.fingerprint for f in register.from_ar_census(body)
     ]
+
+
+def test_an_edited_attribution_block_is_refused_by_its_sha():
+    _, body = _receipt()
+    body["gl_attribution"]["held"][0]["amount_minor"] = 1  # edited after the census
+    with pytest.raises(LedgerRefused) as caught:
+        register.from_ar_census(body)
+    assert caught.value.code == "gl_attribution_sha_mismatch"
+    del body["gl_attribution_sha256"]
+    with pytest.raises(LedgerRefused):
+        register.from_ar_census(body)

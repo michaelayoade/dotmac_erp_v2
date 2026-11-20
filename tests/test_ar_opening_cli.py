@@ -92,3 +92,12 @@ def test_plan_sha_binds_the_manifest_and_every_command_digest() -> None:
     variance = [{"partition": "c", "source_key": "i", "basis": "stored_balance", "amount_minor": 5}]
     assert cli.plan_sha256("f" * 64, {"1": "a" * 64}, variance) != cli.plan_sha256("f" * 64, {"1": "a" * 64}, [])
     assert cli.plan_sha256("f" * 64, {}, [], "on") != cli.plan_sha256("f" * 64, {}, [], "off")  # dual_control is bound
+    assert cli.plan_sha256("f" * 64, {}, [], "on", "a" * 64) != cli.plan_sha256("f" * 64, {}, [], "on", "b" * 64)
+
+
+def test_attribution_sha_is_canonical_and_changes_with_any_edit():
+    from erp_v2.importer.ar_attribution import attribution_sha256
+
+    a = {"parties": [{"customer": "c", "gl_minor": 1}], "held": []}
+    assert attribution_sha256(a) == attribution_sha256({"held": [], "parties": [{"gl_minor": 1, "customer": "c"}]})
+    assert attribution_sha256(a) != attribution_sha256({"parties": [{"customer": "c", "gl_minor": 2}], "held": []})

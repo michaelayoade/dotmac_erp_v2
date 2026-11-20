@@ -176,3 +176,12 @@ Review af472276 hardening (architect findings):
   `createrole_self_grant` unset; no pre-existing writer role with SET/INHERIT members.
 - Before any plan/apply go: a read-only census + attribution dry run on g9 with a 0600 receipt, identical across two
   runs; confirm the distinct payment and invoice statuses per bucket and the GL sign of a positive credit note.
+- The sha of the census `gl_attribution` block (`gl_attribution_sha256`, also on the receipt) is bound into the plan sha
+  (plan.v4); `plan` and `apply` refuse without the attribution (`gl_attribution_required`) and the register refuses a
+  receipt whose block does not match its sha (`gl_attribution_sha_mismatch`). The per-party split cannot be edited
+  without detection. The census command therefore needs the destination chart (read only), like plan and apply.
+- Migrator (reader facts): the deploy pipeline runs NO alembic step. `mod_billing` and `public` tables, the `mod_billing`
+  schema and `alembic_version` are owned by `erp_owner`; the `public` schema is owned by `app_admin`. So `erp_owner` is the
+  migrator, and migrations (including `e2_0029`) are run by an operator as `erp_owner`, not by the pipeline.
+- R1 and W9 are approved by Michael (he pre-creates the writer as superuser, and creates the window-only operator login);
+  the PG tests model R1 (superuser pre-create, adopt) as the expected path.
