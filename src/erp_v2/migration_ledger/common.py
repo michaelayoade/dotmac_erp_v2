@@ -113,3 +113,10 @@ def keys_exactly(raw: object, keys: set[str], code: str) -> Mapping[str, Any]:
     if not isinstance(raw, dict) or set(raw) != keys:
         refuse(code)
     return raw
+
+
+def unit_evidence_sha(lines: Any) -> str:
+    """THE evidence sha256 of a refused unit's ledger lines (E39 straddlers, E15 sub-kobo): ``sha256(json.dumps(lines,
+    sort_keys=True))`` over the line dicts exactly as the B-13 importer writes them. Defined ONCE here; the importer
+    re-exports it (``importer.history_cutoff.unit_evidence_sha``) and B-14 imports it from there."""
+    return hashlib.sha256(json.dumps(list(lines), sort_keys=True).encode()).hexdigest()

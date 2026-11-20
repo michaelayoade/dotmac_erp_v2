@@ -1,0 +1,49 @@
+{
+ "class": "E15",
+ "history_cutoff": "2025-12-31",
+ "journals": [
+  {
+   "class": "E15",
+   "currency": "NGN",
+   "evidence_sha256": "e4e83a6a7f09b681fb0b6832ee608bb8572e36ae69d9bd837f37f96c1b6e4d12",
+   "journal": "75842837-297c-420f-b662-5611e69b4c79",
+   "journal_date": "2026-01-01",
+   "legacy_status": "POSTED",
+   "lines": [
+    {
+     "account_code": "2000",
+     "account_id": "03971f17-f2bf-418f-a3d2-f29b0da765fe",
+     "credit": "10",
+     "debit": "0",
+     "journal_line_id": "bd122878-e8cf-4ff7-89fd-1e82c5e8ea8a",
+     "ledger_line_id": "18559e02-0117-4496-b873-147237ab0b4d",
+     "original_currency": "NGN",
+     "posting_date": "2026-01-01"
+    },
+    {
+     "account_code": "1000",
+     "account_id": "3851bbb7-5196-4e61-876b-b24ca838c6c4",
+     "credit": "0",
+     "debit": "10.000001",
+     "journal_line_id": "b4fd962e-2959-48d3-9724-4a413f888004",
+     "ledger_line_id": "fb62f793-975f-4c9c-99a4-3eec7e6f4cee",
+     "original_currency": "NGN",
+     "posting_date": "2026-01-01"
+    }
+   ],
+   "net": "0.000001",
+   "post_net": {
+    "2026-01-01": {
+     "03971f17-f2bf-418f-a3d2-f29b0da765fe": "-10",
+     "3851bbb7-5196-4e61-876b-b24ca838c6c4": "10.000001"
+    }
+   },
+   "reason": "unbalanced_journal_unit",
+   "source_document_id": "75842837-297c-420f-b662-5611e69b4c79",
+   "source_document_type": "JOURNAL",
+   "source_module": "GL",
+   "type": "UNBALANCED"
+  }
+ ],
+ "reason": "unbalanced_journal_unit"
+}
