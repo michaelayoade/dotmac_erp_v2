@@ -89,7 +89,7 @@ refuses as UNITS. Input is #74's own side file, exactly as written (`<receipt>.s
 top level `{history_cutoff, class, reason, journals}`), bound in the run-spec as `receipts.straddle` / `receipts.subkobo`
 together with the import receipt `receipts.import_receipt`: the side-file sha must equal
 `history_cutoff_census.{straddlers|subkobo}.side_file_sha256`, the cutoff equals the receipt's and the posted opening's as-of
-date, the journal count (E39) or set (E15) equals the receipt's, `evidence_sha256` is recomputed through the shared evidence
+date, the full journal-id set and count equal the receipt's, `evidence_sha256` is recomputed through the shared evidence
 function, and nets, type, `s_j` are recomputed from the lines.
 
 * **straddle** (`migration_straddle`): one balanced journal per ledger-line day at the legacy account, amount and date, never
