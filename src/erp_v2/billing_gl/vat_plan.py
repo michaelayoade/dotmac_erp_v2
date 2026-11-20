@@ -14,7 +14,8 @@ from decimal import Decimal
 from uuid import UUID
 
 import sqlalchemy as sa
-from dotmac_accounting.models import PostedLedgerLine
+from dotmac_accounting.contracts import AccountKind
+from dotmac_accounting.models import Account, PostedLedgerLine
 from dotmac_billing import GetInvoiceDocumentFactV1, get_invoice_document_fact
 from dotmac_billing.models import BillingDocument
 from dotmac_kernel.cache import TenantScope
@@ -79,6 +80,7 @@ def load_doc(db: Session, tenant_id: UUID, document_id: UUID) -> vat.DocVat | No
             )
             for p in positions
         },
+        Decimal(positions[0].open_initial),
     )
     by_id = {p.id: p.treatment_code for p in positions}
     rows = list(
@@ -173,23 +175,42 @@ def line_accounts(db: Session, tenant_id: UUID, document_id: UUID) -> list[dict]
     ]
 
 
-def _check_lines(db, scope, tenant_id, document: BillingDocument, rows: list[dict]) -> str | None:
-    """Σ line_accounts must equal the document fact exactly, line by line. No rounding absorption."""
+def _revenue_accounts_valid(db: Session, tenant_id: UUID, rows: list[dict]) -> bool:
+    """``revenue_account_id`` is a plain id (no foreign key), so an unknown or inactive account must block here."""
+    ids = {UUID(r["account"]) for r in rows if r["pre_tax"]}
+    found = {
+        a.id: a for a in db.scalars(select(Account).where(Account.tenant_id == tenant_id, Account.id.in_(list(ids))))
+    }
+    return all(
+        i in found and found[i].is_active and found[i].posting_allowed and found[i].kind == AccountKind.POSTING
+        for i in ids
+    )
+
+
+def _check_lines(db, scope, tenant_id, document: BillingDocument, rows: list[dict], *, per_line: bool) -> str | None:
+    """Σ line_accounts must equal the document fact exactly. No rounding absorption.
+
+    An invoice is compared line by line. A credit note is compared by SUMS only: billing writes one line per credit
+    note while B-16 writes one row per credit-note line, so counts and per-line amounts are not comparable.
+    """
     if not rows:
         return "revenue_account_unmapped"
+    if not _revenue_accounts_valid(db, tenant_id, rows):
+        return "revenue_account_invalid"
     try:
         fact = get_invoice_document_fact(db, scope=scope, request=GetInvoiceDocumentFactV1(scope, document.id, 1)).fact
     except Exception:  # a billing read refusal blocks and retries
         return "invoice_document_unresolved"
-    if len(fact.lines) != len(rows):
-        return "line_accounts_mismatch"
-    for line, row in zip(sorted(fact.lines, key=lambda x: x.line_number), rows, strict=True):
-        if (
-            line.line_number != row["line_number"]
-            or line.pre_tax_amount.amount != row["pre_tax"]
-            or line.tax_amount.amount != row["tax"]
-        ):
+    if per_line:
+        if len(fact.lines) != len(rows):
             return "line_accounts_mismatch"
+        for line, row in zip(sorted(fact.lines, key=lambda x: x.line_number), rows, strict=True):
+            if (
+                line.line_number != row["line_number"]
+                or line.pre_tax_amount.amount != row["pre_tax"]
+                or line.tax_amount.amount != row["tax"]
+            ):
+                return "line_accounts_mismatch"
     if sum((r["pre_tax"] for r in rows), ZERO) != fact.subtotal.amount:
         return "line_accounts_mismatch"
     if sum((r["tax"] for r in rows), ZERO) != fact.tax_total.amount:
@@ -229,7 +250,7 @@ def issue_plan(db, scope: TenantScope, view, receivable: str, tax_accounts) -> P
     if document.grand_total != total:
         return _blocked("line_accounts_mismatch")
     rows = line_accounts(db, scope.tenant_id, document_id)
-    reason = _check_lines(db, scope, scope.tenant_id, document, rows)
+    reason = _check_lines(db, scope, scope.tenant_id, document, rows, per_line=True)
     if reason:
         return _blocked(reason)
     taxes = _taxes(rows, tax_accounts)
@@ -272,7 +293,7 @@ def credit_plan(db, scope: TenantScope, view, receivable: str, tax_accounts) -> 
     if document.grand_total != total:
         return _blocked("line_accounts_mismatch")
     rows = line_accounts(db, scope.tenant_id, document_id)
-    reason = _check_lines(db, scope, scope.tenant_id, document, rows)
+    reason = _check_lines(db, scope, scope.tenant_id, document, rows, per_line=False)
     if reason:
         return _blocked(reason)
     taxes = {}
@@ -321,8 +342,10 @@ def allocation_plan(db, scope: TenantScope, view) -> Plan:
             document = _document(db, scope.tenant_id, doc_id)
             if document is None:
                 return _blocked("invoice_document_unresolved")
-            if document.authoring_mode == "imported_open_item" or document.tax_total != 0:
-                return _blocked("vat_position_missing")
+            if document.authoring_mode == "imported_open_item":
+                return _blocked("vat_position_missing")  # a migrated invoice needs its loaded position (Q1)
+            if document.tax_total != 0:
+                return _blocked("waiting_document")  # a native taxed invoice whose issue fact is not posted yet
             continue
         try:
             if row.delta > 0:
@@ -338,6 +361,18 @@ def allocation_plan(db, scope: TenantScope, view) -> Plan:
             return _blocked(exc.code)
         all_moves += [(doc_id, m) for m in moves]
     return Plan(_vat_lines(all_moves, docs), Persist([], all_moves))
+
+
+def _net_closeout(doc: vat.DocVat, move: vat.Move) -> vat.Move:
+    """Void of a credit note: reverse only the close-out that is STILL in force.
+
+    A deallocation may already have run ``uncloseout`` for this tag; negating the original close-out again would
+    push R above D. The mirror of a close-out is therefore the net of closeout and uncloseout for its tag.
+    """
+    if not move.allocation_ref.startswith(vat.CLOSEOUT_PREFIX):
+        return move
+    active = doc.closeouts.get(move.allocation_ref, {}).get(move.treatment, ZERO)
+    return vat.Move(move.treatment, "reverse", active, -active, ZERO, False, move.allocation_ref)
 
 
 def _vat_lines(all_moves: list[tuple[UUID, vat.Move]], docs: dict[UUID, vat.DocVat | None]) -> tuple[Line, ...]:
@@ -366,6 +401,16 @@ def reversal_plan(db, scope: TenantScope, view, predecessor_kind: str | None, pr
         for doc_id, _ in mirrored:
             if doc_id not in docs:
                 docs[doc_id] = load_doc(db, scope.tenant_id, doc_id)
+        mirrored = [(doc_id, _net_closeout(docs[doc_id], move)) for doc_id, move in mirrored]
+        mirrored = [
+            (d, m)
+            for d, m in mirrored
+            if not (
+                m.kind == "reverse"
+                and m.deferral_delta == 0 == m.current_delta == m.open_delta
+                and m.allocation_ref.startswith(vat.CLOSEOUT_PREFIX)
+            )
+        ]
         for doc_id, move in mirrored:
             vat.apply(docs[doc_id], (move,))
     except vat.VatRefused as exc:

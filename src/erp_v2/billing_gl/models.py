@@ -30,6 +30,13 @@ WAITING: Final = "WAITING"
 DISPOSITIONS: Final = (POSTED, SKIP, NO_GL, REFUSED, BLOCKED, WAITING)
 TERMINAL: Final = (POSTED, SKIP, NO_GL)
 PENDING: Final = (BLOCKED, WAITING)
+# SKIP is only ever an opening import / unwind fact (V4/V5).
+OPENING_SKIP_KINDS: Final = (
+    "opening_cash_imported",
+    "opening_cash_import_reversed",
+    "opening_account_imported",
+    "opening_account_import_reversed",
+)
 
 
 class FactPosting(Base):

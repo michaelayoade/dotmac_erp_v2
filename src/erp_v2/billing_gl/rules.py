@@ -177,6 +177,8 @@ class Env:
     settlement_sources: tuple[str, ...] = ()
     # Kind of the reversed fact (reversal only), or None.
     reversed_kind: str | None = None
+    # Rev 2: the cash account of an erp_v2.ar receipt is structural; None unless its receipt row did not resolve.
+    cash_block: str | None = None
     # Rev 2: the mapper's VAT / document plan for this fact (None for kinds without one).
     plan: Plan | None = None
 
@@ -215,6 +217,8 @@ def _cash_source(rule: Rule, env: Env) -> str | Decision | None:
     """The cash-account key this fact needs, None when it needs no cash line, or a BLOCK."""
     if rule.cash is None:
         return None
+    if env.cash_block:
+        return _block(env.cash_block)
     if rule.cash == CASH_OPENING_REFUND:
         return "opening_refund"
     if rule.cash == CASH_REVERSAL and env.reversed_kind not in SETTLEMENT_FAMILY:

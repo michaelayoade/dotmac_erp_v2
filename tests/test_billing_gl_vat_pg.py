@@ -26,6 +26,7 @@ from dotmac_kernel.cache import TenantScope
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from test_billing_gl_pg import (  # noqa: F401  (hosted-Postgres fixtures and helpers)
+    RUN_AT,
     _registries,
     configure,
     dispositions,
@@ -207,15 +208,18 @@ def test_opening_position_releases_vat_on_payment(engine):
     inv = invoice(engine, env, acct, lines=False)
     # The mapper dispositions the issue fact SKIP (as for a carried opening document): record it as the mapper would.
     run(engine, env, enable_once=True)
-    with Session(engine) as db:
-        db.execute(
+    with engine.begin() as conn:
+        # The owner role plays the mapper here: SKIP of a V1 fact is not something the runtime role may write, so
+        # the guard trigger is lifted for this one fixture statement and restored immediately.
+        conn.execute(sa.text("ALTER TABLE erp_billing_fact_postings DISABLE TRIGGER erp_billing_fact_postings_guard"))
+        conn.execute(
             sa.text(
                 "UPDATE erp_billing_fact_postings SET disposition = 'SKIP', reason = 'opening_gl_carried' "
                 "WHERE tenant_id = :t AND effect_kind = 'invoice_issued'"
             ),
             {"t": env.tenant_id},
         )
-        db.commit()
+        conn.execute(sa.text("ALTER TABLE erp_billing_fact_postings ENABLE TRIGGER erp_billing_fact_postings_guard"))
     spec = {
         "version": 1,
         "tenant_id": str(env.tenant_id),
@@ -231,6 +235,7 @@ def test_opening_position_releases_vat_on_payment(engine):
                 "deferral_account": str(env.accounts["1455"]),
                 "current_account": str(env.accounts["1440"]),
                 "legacy_ref": "INV-OPEN-1",
+                "finance_override": None,
             }
         ],
     }
@@ -315,3 +320,256 @@ def test_downgrade_refuses_while_vat_rows_exist(engine):
         ):
             migration.downgrade()
         conn.rollback()
+
+
+# ------------------------------------------------ review findings (architect, 2026-11-19)
+
+
+def _raw_lines(engine, env, document_id, rows):
+    with Session(engine) as db:
+        for number, (account, pre_tax, tax) in enumerate(rows, 1):
+            db.execute(
+                sa.text(
+                    "INSERT INTO erp_ar_line_accounts (id, tenant_id, billing_document_id, line_number, "
+                    "revenue_account_id, pre_tax, tax, treatment_code) VALUES (:i, :t, :d, :n, :a, :p, :x, 'standard')"
+                ),
+                {"i": uuid4(), "t": env.tenant_id, "d": document_id, "n": number, "a": account, "p": pre_tax, "x": tax},
+            )
+        db.commit()
+
+
+def test_an_allocation_sorting_before_its_invoice_waits_and_does_not_block_the_account(engine):
+    """Finding 7: the allocation's occurred_at precedes the invoice's issue time, so it is processed first."""
+    env = world(engine)
+    acct = account_and_model(engine, env)
+    settlement = seed_billing(
+        engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, acct), "500.00", when=at(1))
+    )
+    inv = invoice(engine, env, acct, when=5)
+    seed_billing(engine, env, lambda db, sc: allocate(db, sc, settlement, inv, "50.00", when=at(2)))
+    first = run(engine, env)
+    assert first["blocked"] == 0, first["blocked_by_reason"]  # the account is NOT blocked; the invoice could post
+    assert first["blocked_by_reason"] == {"WAITING:waiting_document": 1}
+    second = run(engine, env)  # the retry now finds the invoice's position
+    assert second["waiting"] == 0 and dispositions(engine, env) == {"POSTED": 3}
+    tie_all(engine, env, [acct], inv.id)
+
+
+def test_an_erp_receipt_takes_its_cash_from_its_receipt_row_and_never_from_a_setting(engine):
+    env = world(engine)
+    configure(engine, env, cash_account={"erp_v2.ar": str(env.accounts["1010"])})  # a typed bank must NOT be used
+    acct = account_and_model(engine, env)
+    settlement = seed_billing(
+        engine,
+        env,
+        lambda db, sc: receipt(db, sc, db.get(BillingAccount, acct), "30.00", when=at(1), source="erp_v2.ar"),
+    )
+    assert run(engine, env)["blocked_by_reason"] == {"BLOCKED:receipt_cash_unresolved": 1}
+    assert gl(engine, env) == {}
+    with Session(engine) as db:
+        db.execute(
+            sa.text(
+                "INSERT INTO erp_ar_receipts (id, tenant_id, billing_settlement_id, cash_account_id) "
+                "VALUES (:i, :t, :s, :c)"
+            ),
+            {"i": uuid4(), "t": env.tenant_id, "s": settlement.id, "c": env.accounts["1010"]},
+        )
+        db.commit()
+    assert run(engine, env)["blocked"] == 0 and gl(engine, env)["1010"] == D("30.00")
+
+
+def test_a_credit_note_is_compared_by_sums_not_line_counts(engine):
+    """B-16 writes one row per credit-note line; billing writes one line per credit note (#78 review)."""
+    env = world(engine)
+    acct = account_and_model(engine, env)
+    inv = invoice(engine, env, acct)
+    note = seed_billing(engine, env, lambda db, sc: credit_note(db, sc, inv, pre_tax="50.00", tax="10.00", when=at(2)))
+    _raw_lines(engine, env, note.id, [(env.accounts["4000"], "30.00", "6.00"), (env.accounts["4000"], "20.00", "4.00")])
+    run(engine, env)
+    assert dispositions(engine, env) == {"POSTED": 2}
+    tie_all(engine, env, [acct], inv.id)
+    # Sums that disagree still block.
+    other = account_and_model(engine, env)
+    inv2 = invoice(engine, env, other, when=3)
+    note2 = seed_billing(
+        engine, env, lambda db, sc: credit_note(db, sc, inv2, pre_tax="50.00", tax="10.00", when=at(4))
+    )
+    _raw_lines(
+        engine, env, note2.id, [(env.accounts["4000"], "30.00", "6.00"), (env.accounts["4000"], "19.99", "4.00")]
+    )
+    assert run(engine, env)["blocked_by_reason"] == {"BLOCKED:line_accounts_mismatch": 1}
+
+
+def test_an_unknown_or_inactive_revenue_account_blocks(engine):
+    env = world(engine)
+    unknown, inactive = account_and_model(engine, env), account_and_model(engine, env)
+    seed_billing(engine, env, lambda db, sc: new_invoice(db, sc, db.get(BillingAccount, unknown), when=at(1)))
+    first = seed_billing(engine, env, lambda db, sc: new_invoice(db, sc, db.get(BillingAccount, inactive), when=at(2)))
+    # (fixture rows: the first invoice's document id is found through the posting-group read below)
+    with Session(engine) as db:
+        from dotmac_billing.models import BillingDocument
+
+        docs = {
+            d.billing_account_id: d.id
+            for d in db.scalars(sa.select(BillingDocument).where(BillingDocument.tenant_id == env.tenant_id))
+        }
+    _raw_lines(engine, env, docs[unknown], [(uuid4(), "100.00", "20.00")])  # an id that is no account
+    with Session(engine) as db:
+        db.execute(
+            sa.text("UPDATE mod_accounting.accounts SET is_active = false WHERE id = :a"), {"a": env.accounts["4000"]}
+        )
+        db.commit()
+    _raw_lines(engine, env, first.id, [(env.accounts["4000"], "100.00", "20.00")])
+    report = run(engine, env)
+    assert report["blocked_by_reason"] == {"BLOCKED:revenue_account_invalid": 2} and gl(engine, env) == {}
+
+
+def test_the_runtime_role_cannot_create_opening_positions_or_opening_movements(engine):
+    env = world(engine)
+    acct = account_and_model(engine, env)
+    inv = invoice(engine, env, acct)
+    run(engine, env)
+    with Session(engine) as db:
+        native = db.scalars(sa.select(VatPosition).where(VatPosition.tenant_id == env.tenant_id)).one()
+    with runtime_session(engine, env) as db:
+        with pytest.raises(DBAPIError, match="migration role"), db.begin_nested():
+            db.execute(
+                sa.text(
+                    "INSERT INTO erp_billing_vat_positions (id, tenant_id, document_id, treatment_code, origin, total, "
+                    "deferred, open_initial, source) VALUES (gen_random_uuid(), :t, gen_random_uuid(), 'standard', "
+                    "'opening', 10, 0, 10, 'x')"
+                ),
+                {"t": env.tenant_id},
+            )
+        with pytest.raises(DBAPIError, match="migration role"), db.begin_nested():
+            db.execute(
+                sa.text(
+                    "INSERT INTO erp_billing_vat_movements (id, tenant_id, position_id, fact_id, fact_version, kind, "
+                    "deferral_delta, current_delta) VALUES (gen_random_uuid(), :t, :p, gen_random_uuid(), 0, 'defer', "
+                    "0, 0)"
+                ),
+                {"t": env.tenant_id, "p": native.id},
+            )
+    assert inv is not None
+
+
+def test_a_vat_persist_failure_blocks_that_fact_only_and_rolls_its_journal_back(engine, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from erp_v2.billing_gl import vat_plan
+
+    env = world(engine)
+    bad, good = account_and_model(engine, env), account_and_model(engine, env)
+    invoice(engine, env, bad, when=1)
+    seed_billing(engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, good), "9.00", when=at(2)))
+    real = vat_plan.persist
+
+    def failing(db, tenant, fact_id, version, journal_id, spec):
+        if spec.new_positions:
+            raise IntegrityError("insert", {}, Exception("vat_invariant"))
+        return real(db, tenant, fact_id, version, journal_id, spec)
+
+    monkeypatch.setattr(vat_plan, "persist", failing)
+    report = run(engine, env)  # does not abort: the other account still posts
+    assert report["blocked_by_reason"] == {"BLOCKED:vat_invariant": 1}
+    assert dispositions(engine, env) == {"BLOCKED": 1, "POSTED": 1}
+    assert set(gl(engine, env)) == {"1010", "2100"}  # the invoice's journal rolled back with its savepoint
+
+
+def test_opening_lot_applications_release_and_unrelease_the_loaded_vat(engine):
+    """Spec 4.8 / finding 6: an application from an opening cash lot against a migrated invoice. The V4 fact is a
+    handcrafted stand-in (the opening-cash machinery is not driven here); the mapper path, plan and journal are real."""
+    from types import SimpleNamespace
+
+    from dotmac_billing import AccountingFactCursorV1, AccountingFactIndexEntryV1
+
+    from erp_v2.billing_gl import mapper as mapper_module
+    from erp_v2.billing_gl.mapper import Mapper
+
+    env = world(engine)
+    acct = account_and_model(engine, env)
+    inv = invoice(engine, env, acct, lines=False)  # a billing document standing in for the migrated invoice
+    item = {
+        "document_id": str(inv.id),
+        "treatment": "standard",
+        "total": "120.00",
+        "tax": "20.00",
+        "open_initial": "120.00",
+        "journal_1455_credit": "20.00",
+        "reclass": [],
+        "deferral_account": str(env.accounts["1455"]),
+        "current_account": str(env.accounts["1440"]),
+        "legacy_ref": "INV-OPEN-2",
+        "finance_override": None,
+    }
+    import json
+
+    planned = vat_opening.plan(
+        vat_opening.parse(json.dumps({"version": 1, "tenant_id": str(env.tenant_id), "items": [item]}).encode()),
+        "d" * 64,
+    )
+    with Session(engine) as db:
+        vat_opening.apply(db, env.tenant_id, planned)
+        db.commit()
+
+    def money(amount):
+        return SimpleNamespace(amount=D(amount), currency=SimpleNamespace(code="NGN", minor_units=2))
+
+    def v4(kind, lanes, effects):
+        return SimpleNamespace(
+            effect_kind=kind,
+            committed_at=RUN_AT,
+            source_ref="opening-lot-draw",
+            effects=tuple(SimpleNamespace(lane=lane, amount_delta=money(d)) for lane, d in lanes),
+            settlement_allocations=(),
+            opening_cash_effects=effects,
+        )
+
+    effect_id = uuid4()
+    application = SimpleNamespace(
+        effect_kind="application",
+        effect_id=effect_id,
+        document_id=inv.id,
+        amount=money("60.00"),
+        original_effect_id=None,
+    )
+    inverse = SimpleNamespace(
+        effect_kind="application_inverse",
+        effect_id=uuid4(),
+        document_id=inv.id,
+        amount=money("60.00"),
+        original_effect_id=effect_id,
+    )
+    facts = {
+        "opening_cash_applied": v4(
+            "opening_cash_applied", [("available_credit", "-60.00"), ("receivable", "-60.00")], (application,)
+        ),
+        "cash_credit_draw_reversed": v4(
+            "cash_credit_draw_reversed", [("available_credit", "60.00"), ("receivable", "60.00")], (inverse,)
+        ),
+    }
+    monkeypatch_target = mapper_module
+
+    def process(kind, hours):
+        entry = AccountingFactIndexEntryV1(
+            AccountingFactCursorV1(at(hours), acct, 1, 4, uuid4()), uuid4(), kind, "dotmac-billing", "x", "d" * 64
+        )
+        original = monkeypatch_target.get_accounting_fact_v4
+        monkeypatch_target.get_accounting_fact_v4 = lambda db, scope, posting_group_id: facts[kind]
+        try:
+            with Session(engine) as db:
+                db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(env.tenant_id)})
+                outcome = Mapper(db, env.tenant_id, now=RUN_AT, commit=lambda: None).process(entry)
+                db.commit()
+        finally:
+            monkeypatch_target.get_accounting_fact_v4 = original
+        return outcome
+
+    assert process("opening_cash_applied", 3) == "POSTED"
+    _, remaining = vat_state(engine, env, inv.id)
+    bal = gl(engine, env)
+    assert remaining == D("10.00") and bal["1455"] == D("10.00")  # the carried 1455 is debited by the release
+    assert -bal["1440"] == D("10.00")  # half of the remaining deferral on a half payment: released, not left on 1455
+    assert process("cash_credit_draw_reversed", 4) == "POSTED"
+    _, remaining = vat_state(engine, env, inv.id)
+    assert remaining == D("20.00") and gl(engine, env).get("1440", D(0)) == 0  # exactly un-released

@@ -42,6 +42,7 @@ from dotmac_billing.document_queries import fact_index_digest_seed, fact_index_l
 from dotmac_billing.models import AllocationEffect, ConfirmedSettlement
 from dotmac_kernel.cache import TenantScope
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from erp_v2.billing_gl import rules, settings, vat_plan
@@ -88,6 +89,7 @@ class Report:
     windows_closed: int = 0
     windows_mismatched: int = 0
     windows_remaining: int = 0
+    locked: bool = False
     integrity_alarms: int = 0
     # Counts only: labels carry reasons, never identifiers or amounts.
     blocked_by_reason: dict[str, int] = field(default_factory=dict)
@@ -137,6 +139,31 @@ def _fingerprint(source: _Source, posting_date: date, currency: str, lines) -> s
 
 def utc_day(day: date) -> datetime:
     return datetime.combine(day, time.min, tzinfo=UTC)
+
+
+def v4_alloc_rows(fact) -> tuple[AllocRow, ...]:
+    """Every settlement of a document by a V4 fact: settlement allocations AND opening-lot applications.
+
+    An advance drawn from an opening cash lot sits in ``opening_cash_effects`` (application / application_inverse),
+    not in ``settlement_allocations``; folding only the latter would leave such an application's VAT on 1455 forever.
+    """
+    rows = [
+        AllocRow(
+            a.allocation_effect_id,
+            a.allocation.document_id,
+            a.allocation.amount_delta.amount,
+            a.allocation.offsets_allocation_id,
+        )
+        for a in fact.settlement_allocations
+    ]
+    for effect in fact.opening_cash_effects:
+        if effect.effect_kind == "application":
+            rows.append(AllocRow(effect.effect_id, effect.document_id, effect.amount.amount, None))
+        elif effect.effect_kind == "application_inverse":
+            rows.append(
+                AllocRow(effect.effect_id, effect.document_id, -effect.amount.amount, effect.original_effect_id)
+            )
+    return tuple(rows)
 
 
 class Mapper:
@@ -263,15 +290,7 @@ class Mapper:
             moneys4 = [e.amount_delta for e in v4.effects]
             return FactView(
                 minor_units=moneys4[0].currency.minor_units if moneys4 else 2,
-                alloc_rows=tuple(
-                    AllocRow(
-                        a.allocation_effect_id,
-                        a.allocation.document_id,
-                        a.allocation.amount_delta.amount,
-                        a.allocation.offsets_allocation_id,
-                    )
-                    for a in v4.settlement_allocations
-                ),
+                alloc_rows=v4_alloc_rows(v4),
                 currency=moneys4[0].currency.code if moneys4 else None,
                 committed_at=v4.committed_at,
                 effects=tuple(Effect(e.lane, e.amount_delta.amount) for e in v4.effects),
@@ -384,17 +403,21 @@ class Mapper:
     def _env(self, view: FactView, rule: rules.Rule, entry=None, pred=None) -> rules.Env:
         sources: tuple[str, ...] = ()
         reversed_kind = None
-        cash_accounts = self.settings.cash_accounts
+        cash_accounts = dict(self.settings.cash_accounts)
+        cash_block = None
         if rule.cash in (rules.CASH_SETTLEMENT, rules.CASH_REVERSAL):
             ids = self._settlement_ids_for(view, rule)
             found = [self._settlement_source(i) for i in ids]
             sources = tuple(s for s in found if s)
             if AR_SOURCE in sources:
+                # The bank of an ERP receipt is STRUCTURE (its erp_ar_receipts row), never a typed setting: exactly
+                # one receipt row, else the fact blocks. There is no fallback to billing_gl.cash_account.
                 receipt_accounts = self._receipt_cash_account(ids)
+                cash_accounts = {k: v for k, v in cash_accounts.items() if k != AR_SOURCE}
                 if len(receipt_accounts) == 1:
-                    cash_accounts = {**cash_accounts, AR_SOURCE: next(iter(receipt_accounts))}
-                elif len(receipt_accounts) > 1:
-                    sources = (*sources, "ambiguous-receipt-cash")
+                    cash_accounts[AR_SOURCE] = next(iter(receipt_accounts))
+                else:
+                    cash_block = "receipt_cash_unresolved"
         if rule.cash == rules.CASH_REVERSAL and view.reverses_fact_id is not None:
             original = self._row(view.reverses_fact_id, 1)
             reversed_kind = None if original is None else original.effect_kind
@@ -404,6 +427,7 @@ class Mapper:
             prepayment_account=self.settings.prepayment_account,
             prepaid_funding_account=self.settings.prepaid_funding_account,
             cash_accounts=cash_accounts,
+            cash_block=cash_block,
             seal_at=self.seal_at,
             settlement_sources=sources,
             reversed_kind=reversed_kind,
@@ -453,9 +477,13 @@ class Mapper:
         if decision.disposition == Disp.POST:
             return self._post(entry, view, decision)
         if decision.disposition == Disp.BLOCKED:
-            state = WAITING if waiting else BLOCKED
+            # waiting_document: this fact sorted before its own invoice's issue fact. It waits for that fact but does
+            # NOT block the account (the invoice must post), and the next run's retry re-evaluates it.
+            ordering = decision.reason == "waiting_document"
+            state = WAITING if (waiting or ordering) else BLOCKED
             self._record(entry, view.currency, state, decision.reason)
-            self.blocked_accounts.add(account)
+            if not ordering:
+                self.blocked_accounts.add(account)
             return state
         self._record(entry, view.currency, decision.disposition.value, decision.reason)
         return decision.disposition.value
@@ -485,54 +513,67 @@ class Mapper:
             fingerprint=_fingerprint(source, posting_date, view.currency or "", decision.lines),
         )
         try:
-            result = bridge.post_consequence(
-                self.db,
-                scope=self.scope,
-                consequence=consequence,
-                approval_ref=f"billing_gl:{self.map_digest}",
-                actor=ACTOR,
-                now=self.now,
-            )
+            with self.db.begin_nested():
+                result = bridge.post_consequence(
+                    self.db,
+                    scope=self.scope,
+                    consequence=consequence,
+                    approval_ref=f"billing_gl:{self.map_digest}",
+                    actor=ACTOR,
+                    now=self.now,
+                )
+                if decision.persist is not None:
+                    vat_plan.persist(
+                        self.db,
+                        self.tenant_id,
+                        view.fact_id,
+                        entry.cursor.fact_version,
+                        result.journal_id,
+                        decision.persist,
+                    )
         except PostingRefused as exc:
             self._record(entry, view.currency, BLOCKED, exc.code)
             self.blocked_accounts.add(account)
             return BLOCKED
-        if decision.persist is not None:
-            vat_plan.persist(
-                self.db, self.tenant_id, view.fact_id, entry.cursor.fact_version, result.journal_id, decision.persist
-            )
+        except IntegrityError:
+            # The database invariant trigger refused the VAT movement: the journal rolled back with the savepoint, so
+            # this ONE fact blocks (integrity alarm) instead of aborting the run and stalling every account.
+            self._record(entry, view.currency, BLOCKED, "vat_invariant")
+            self.blocked_accounts.add(account)
+            return BLOCKED
         self._record(entry, view.currency, POSTED, None, result.journal_id)
         return POSTED
 
     # ------------------------------------------------------------- the loop
     def _retry_pending(self) -> None:
-        rows = list(
-            self.db.scalars(
-                select(FactPosting)
-                .where(FactPosting.tenant_id == self.tenant_id, FactPosting.disposition.in_(PENDING))
-                .order_by(
-                    FactPosting.occurred_at,
-                    FactPosting.billing_account_id,
-                    FactPosting.fact_version,
-                    FactPosting.fact_id,
+        """Retry every BLOCKED/WAITING fact, in billing index order, paging EVERY slice to the end.
+
+        Opening facts can share one timestamp (#72 stamps them with a single ``--occurred-at``), so a slice can hold
+        more than one page; a pending fact is matched in whichever page it is on, never dropped after the first.
+        """
+        pending = {
+            (row.fact_id, row.fact_version): row.occurred_at
+            for row in self.db.scalars(
+                select(FactPosting).where(FactPosting.tenant_id == self.tenant_id, FactPosting.disposition.in_(PENDING))
+            )
+        }
+        for stamp in sorted(set(pending.values())):
+            wanted = {key for key, at in pending.items() if at == stamp}
+            after = None
+            while wanted:
+                page = list_accounting_facts(
+                    self.db,
+                    scope=self.scope,
+                    request=ListAccountingFactsV1(self.scope, stamp, stamp + ONE_US, after, PAGE),
                 )
-            )
-        )
-        for pending in rows:
-            page = list_accounting_facts(
-                self.db,
-                scope=self.scope,
-                request=ListAccountingFactsV1(
-                    self.scope, pending.occurred_at, pending.occurred_at + ONE_US, None, PAGE
-                ),
-            )
-            match = [
-                e
-                for e in page.entries
-                if e.cursor.fact_id == pending.fact_id and e.cursor.fact_version == pending.fact_version
-            ]
-            if match:
-                self.process(match[0])
+                for entry in page.entries:
+                    key = (entry.cursor.fact_id, entry.cursor.fact_version)
+                    if key in wanted:
+                        wanted.discard(key)
+                        self.process(entry)
+                if page.next_cursor is None:
+                    break
+                after = page.next_cursor
 
     def _page_window(self, start: datetime, end: datetime) -> tuple[int, str]:
         digest = fact_index_digest_seed()
@@ -598,8 +639,22 @@ class Mapper:
         self.commit()
 
     def run(self) -> Report:
+        """One pass, under a per-tenant advisory lock so two overlapping runs can never process the same facts."""
         if not self.live and not self.enable_once:
             return self.report
+        bind = self.db.get_bind()
+        key = int.from_bytes(hashlib.sha256(f"billing_gl:{self.tenant_id}".encode()).digest()[:8], "big", signed=True)
+        # A dedicated connection: a session-level lock must outlive the per-page commits of the working session.
+        with bind.engine.connect() as lock:
+            if not lock.execute(sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar():
+                self.report.locked = True
+                return self.report
+            try:
+                return self._run()
+            finally:
+                lock.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+
+    def _run(self) -> Report:
         self.report.tenant_enabled = self.live
         self._retry_pending()
         self.commit()
@@ -622,6 +677,15 @@ class Mapper:
             elif utc_day(day) >= recheck_from:
                 todo.append((day, existing, True))
             day += timedelta(days=1)
+        # A rolling rescan of OLD closed windows: a fact backdated past resummarize_days is still found, on a cycle
+        # of rescan_days. ready() and the period guard refuse while any window is staler than that.
+        queued = {when for when, _, _ in todo}
+        stale = sorted(
+            (w for w in windows.values() if w.closed_at is not None and w.occurred_from.date() not in queued),
+            key=lambda w: w.rechecked_at or w.closed_at,
+        )
+        for window in stale[: self.settings.rescan_batch]:
+            todo.append((window.occurred_from.date(), window, True))
         for index, (when, existing, recheck) in enumerate(todo):
             if index >= self.max_windows:
                 self.report.windows_remaining = len(todo) - index

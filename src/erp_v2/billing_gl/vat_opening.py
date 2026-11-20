@@ -28,7 +28,16 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid5
 
-from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, fmt, money, refuse, strict_json, text
+from erp_v2.migration_ledger.common import (
+    LedgerRefused,
+    canonical_sha,
+    fmt,
+    money,
+    refuse,
+    sha_text,
+    strict_json,
+    text,
+)
 from erp_v2.migration_ledger.common import uuid_text as _uuid
 
 APPLY_ENV = "ERP_BILLING_GL_VAT_OPENING_APPLY"
@@ -44,11 +53,21 @@ ITEM_KEYS = {
     "deferral_account",
     "current_account",
     "legacy_ref",
+    "finance_override",
 }
 
 
 def derive(item: dict[str, Any]) -> tuple[Decimal | None, str | None]:
-    """(D_k, None) when loadable, else (None, E38 reason). Pure."""
+    """(D_k, None) when loadable, else (None, E38 reason). Pure.
+
+    A ``finance_override`` is the governed Finance resolution of an E38 item: a stated remaining deferral with its
+    evidence sha, bounded by the invoice's tax, replacing the legacy derivation for that one invoice.
+    """
+    override = item.get("finance_override")
+    if override is not None:
+        if override["deferred"] < 0 or override["deferred"] > item["tax"]:
+            return None, "override_out_of_range"
+        return override["deferred"], None
     if item["reclass"] is None:
         return None, "unattributable"
     remaining = item["journal_1455_credit"] - sum(item["reclass"], Decimal(0))
@@ -57,6 +76,18 @@ def derive(item: dict[str, Any]) -> tuple[Decimal | None, str | None]:
     if remaining > item["tax"]:
         return None, "remaining_above_tax"
     return remaining, None
+
+
+def _override(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"deferred", "evidence_sha256", "ref"}:
+        refuse("invalid_finance_override")
+    return {
+        "deferred": money(raw["deferred"]),
+        "evidence_sha256": sha_text(raw["evidence_sha256"], "invalid_finance_override"),
+        "ref": text(raw["ref"], "invalid_finance_override"),
+    }
 
 
 def parse(raw: bytes) -> dict[str, Any]:
@@ -78,10 +109,17 @@ def parse(raw: bytes) -> dict[str, Any]:
             "open_initial": money(raw_item["open_initial"]),
             "journal_1455_credit": money(raw_item["journal_1455_credit"]),
             "reclass": None if reclass is None else [money(x) for x in reclass],
-            "deferral_account": _uuid(raw_item["deferral_account"], "invalid_account"),
-            "current_account": _uuid(raw_item["current_account"], "invalid_account"),
+            "deferral_account": None
+            if raw_item["deferral_account"] is None
+            else _uuid(raw_item["deferral_account"], "invalid_account"),
+            "current_account": None
+            if raw_item["current_account"] is None
+            else _uuid(raw_item["current_account"], "invalid_account"),
             "legacy_ref": text(raw_item["legacy_ref"], "invalid_legacy_ref"),
+            "finance_override": _override(raw_item["finance_override"]),
         }
+        if item["tax"] != 0 and (item["deferral_account"] is None or item["current_account"] is None):
+            refuse("invalid_account")
         key = (item["document_id"], item["treatment"])
         if key in seen:
             refuse("duplicate_vat_opening_item")
@@ -92,10 +130,46 @@ def parse(raw: bytes) -> dict[str, Any]:
     return {"tenant_id": tenant, "items": items}
 
 
-def plan(parsed: dict[str, Any], input_sha: str) -> dict[str, Any]:
+def billing_check(db, tenant_id: UUID):
+    """A per-item cross-check of the input against billing: the document exists, is THIS tenant's imported open item,
+    its total equals the original grand total and its current exposure equals ``open_initial`` (the loader runs before
+    any live payment). A wrong ``open_initial`` would give a permanent ``vat_invariant`` or no close-out."""
+    from dotmac_billing import get_document_exposure
+    from dotmac_billing.models import BillingDocument
+    from dotmac_kernel.cache import TenantScope
+    from sqlalchemy import select
+
+    scope = TenantScope(tenant_id)
+
+    def check(item: dict[str, Any]) -> str | None:
+        document = db.scalar(
+            select(BillingDocument).where(
+                BillingDocument.tenant_id == tenant_id, BillingDocument.id == item["document_id"]
+            )
+        )
+        if document is None:
+            return "document_unresolved"
+        if document.authoring_mode != "imported_open_item" or document.document_kind != "invoice":
+            return "document_not_imported_open_item"
+        if Decimal(document.grand_total) != item["total"]:
+            return "total_mismatch"
+        try:
+            exposure = get_document_exposure(db, scope=scope, document_id=item["document_id"])
+        except Exception:  # an unreadable exposure is an item to resolve, not a crash
+            return "exposure_unreadable"
+        if Decimal(exposure.collectible_receivable.amount) != item["open_initial"]:
+            return "open_initial_mismatch"
+        return None
+
+    return check
+
+
+def plan(parsed: dict[str, Any], input_sha: str, check=None) -> dict[str, Any]:
     load, e38 = [], []
     for item in parsed["items"]:
         remaining, reason = derive(item)
+        if reason is None and check is not None:
+            reason = check(item)
         row = {
             "document_id": str(item["document_id"]),
             "treatment": item["treatment"],
@@ -110,8 +184,11 @@ def plan(parsed: dict[str, Any], input_sha: str) -> dict[str, Any]:
                 "deferred": fmt(remaining),
                 "total": fmt(item["total"]),
                 "open_initial": fmt(item["open_initial"]),
-                "deferral_account": str(item["deferral_account"]),
-                "current_account": str(item["current_account"]),
+                "deferral_account": None if item["deferral_account"] is None else str(item["deferral_account"]),
+                "current_account": None if item["current_account"] is None else str(item["current_account"]),
+                "override_evidence_sha256": None
+                if item["finance_override"] is None
+                else item["finance_override"]["evidence_sha256"],
             }
         )
     body = {"input_sha256": input_sha, "load": load, "e38": e38}
@@ -141,8 +218,8 @@ def apply(db, tenant_id: UUID, plan_body: dict[str, Any]) -> dict[str, int]:
             tenant_id=tenant_id,
             document_id=document_id,
             treatment_code=item["treatment"],
-            deferral_account_id=UUID(item["deferral_account"]),
-            current_account_id=UUID(item["current_account"]),
+            deferral_account_id=None if item["deferral_account"] is None else UUID(item["deferral_account"]),
+            current_account_id=None if item["current_account"] is None else UUID(item["current_account"]),
             origin=ORIGIN_OPENING,
             total=Decimal(item["total"]),
             deferred=Decimal(item["deferred"]),
@@ -186,18 +263,20 @@ def main(argv: list[str] | None = None) -> int:
     def body() -> dict[str, Any]:
         raw, sha = cli_common.read_bound(args.input)
         parsed = parse(raw)
-        planned = plan(parsed, sha)
-        if args.action == "plan":
-            return {"ready": True, "action": "plan", **planned}
-        if args.approved_plan_sha != planned["plan_sha256"]:
-            refuse("plan_sha_mismatch")
-        cli_common.operator(args.operator_ref)
         import sqlalchemy as sa
         from sqlalchemy.orm import Session
 
+        if args.action == "apply":
+            cli_common.operator(args.operator_ref)
         engine = cli_common.engine()
         with Session(engine) as db:
             db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(parsed["tenant_id"])})
+            planned = plan(parsed, sha, billing_check(db, parsed["tenant_id"]))
+            if args.action == "plan":
+                db.rollback()
+                return {"ready": True, "action": "plan", **planned}
+            if args.approved_plan_sha != planned["plan_sha256"]:
+                refuse("plan_sha_mismatch")
             result = apply(db, parsed["tenant_id"], planned)
             db.commit()
         return {"ready": True, "action": "apply", "plan_sha256": planned["plan_sha256"], **result}

@@ -72,10 +72,15 @@ def upgrade() -> None:
     _rls(VAT_POSITIONS_TABLE)
     op.execute(
         f"CREATE FUNCTION public.{VAT_POSITIONS_TABLE}_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "IF TG_OP = 'INSERT' THEN "
+        # The runtime role may only create native positions; an opening position is the loader's (migration role).
+        "IF current_user = 'app_user' AND NEW.origin <> 'native' THEN "
+        "RAISE EXCEPTION 'opening VAT positions are loaded by the migration role only' "
+        "USING ERRCODE = 'integrity_constraint_violation'; END IF; RETURN NEW; END IF; "
         "RAISE EXCEPTION 'VAT positions are append-only' USING ERRCODE = 'integrity_constraint_violation'; END $$"
     )
     op.execute(
-        f"CREATE TRIGGER {VAT_POSITIONS_TABLE}_guard BEFORE UPDATE OR DELETE ON public.{VAT_POSITIONS_TABLE} "
+        f"CREATE TRIGGER {VAT_POSITIONS_TABLE}_guard BEFORE INSERT OR UPDATE OR DELETE ON public.{VAT_POSITIONS_TABLE} "
         f"FOR EACH ROW EXECUTE FUNCTION public.{VAT_POSITIONS_TABLE}_guard()"
     )
 
@@ -118,6 +123,9 @@ def upgrade() -> None:
         "DECLARE d numeric; r numeric; o numeric; "
         "BEGIN "
         "IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'VAT movements are append-only' "
+        "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
+        "IF current_user = 'app_user' AND NEW.fact_version = 0 THEN "
+        "RAISE EXCEPTION 'opening VAT movements are loaded by the migration role only' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
         f"SELECT deferred, open_initial INTO d, o FROM public.{VAT_POSITIONS_TABLE} "
         "WHERE tenant_id = NEW.tenant_id AND id = NEW.position_id; "

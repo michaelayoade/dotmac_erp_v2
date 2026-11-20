@@ -267,6 +267,8 @@ def _settings(**kw) -> MapperSettings:
         "closed_period_policy": "next_open_period",
         "settle_seconds": 300,
         "resummarize_days": 45,
+        "rescan_days": 7,
+        "rescan_batch": 24,
         "history_floor": date(2000, 1, 1),
         "prepayment_account": PREPAY,
         "prepaid_funding_account": None,

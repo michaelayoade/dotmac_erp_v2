@@ -305,6 +305,7 @@ def _item(**kw):
         "deferral_account": DEF,
         "current_account": CUR,
         "legacy_ref": "INV-1",
+        "finance_override": None,
     }
     return {**base, **kw}
 
@@ -359,3 +360,110 @@ def test_vat_reasons_are_gate_inputs() -> None:
 
     assert checks.tax_accounts_mapped({"standard": {"current": CUR, "deferral": DEF}})
     assert not checks.tax_accounts_mapped({}) and not checks.tax_accounts_mapped({"standard": {"current": CUR}})
+
+
+# ------------------------------------------------ review findings (architect, 2026-11-19)
+
+
+def _opening_doc(*, total="120.00", open_initial="60.00", deferred="10.00"):
+    pos = vat.Position(None, "standard", DEF, CUR, D(deferred), D(deferred))
+    return vat.DocVat(uuid4(), D(total), D(open_initial), {"standard": pos}, D(open_initial))
+
+
+def test_part_paid_opening_invoice_releases_at_the_remaining_rate() -> None:
+    """Finding 9: a 50%-paid migrated invoice (D remaining 10 of 60 remaining gross) releases 5.00 on a 30.00 payment,
+    not the 2.50 the original-total denominator would give; the closing payment takes exactly what is left."""
+    doc = _opening_doc()
+    first = vat.release(doc, D("30.00"), "a1")
+    assert first[0].deferral_delta == D("-5.00")
+    vat.apply(doc, first)
+    last = vat.release(doc, D("30.00"), "a2")  # closes
+    vat.apply(doc, last)
+    assert last[0].deferral_delta == D("-5.00") and doc.positions["standard"].remaining == 0 and doc.open == 0
+
+
+def test_native_invoice_basis_equals_total() -> None:
+    doc, _ = issued()
+    assert doc.basis == doc.total == D("120.00")
+
+
+def test_voiding_a_credit_note_after_a_deallocation_reversed_its_closeout_does_not_negate_it_twice() -> None:
+    """Finding 11: the credit's close-out was already reversed by a later deallocation (uncloseout); the void must
+    mirror only what is still in force, or R would exceed D."""
+    from erp_v2.billing_gl import vat_plan
+
+    doc, _ = issued()
+    vat.apply(doc, vat.release(doc, D("90.00"), "a"))
+    credit = vat.credit(doc, {"standard": D("1.00")}, D("30.00"), "closeout:f")
+    vat.apply(doc, credit)
+    vat.apply(doc, vat.unrelease(doc, D("90.00"), "a"))  # runs uncloseout first
+    assert doc.closeouts["closeout:f"]["standard"] == 0  # nothing of the close-out remains in force
+    mirrored = [vat_plan._net_closeout(doc, m) for m in vat.negate(credit)]
+    close = [m for m in mirrored if m.allocation_ref == "closeout:f"]
+    assert close and all(m.deferral_delta == 0 for m in close)
+    for move in mirrored:
+        vat.apply(doc, (move,))  # no vat_invariant
+    assert doc.positions["standard"].remaining <= doc.positions["standard"].deferred
+
+
+def test_opening_lot_applications_are_settlements_of_the_document() -> None:
+    """Finding 6: an advance from an opening cash lot is an ``application`` effect, not a settlement allocation."""
+    from types import SimpleNamespace
+
+    from erp_v2.billing_gl.mapper import v4_alloc_rows
+
+    doc_id, effect_id, original = uuid4(), uuid4(), uuid4()
+
+    def effect(kind, amount, eid, orig=None):
+        return SimpleNamespace(
+            effect_kind=kind, effect_id=eid, document_id=doc_id, amount=SimpleNamespace(amount=D(amount)),
+            original_effect_id=orig,
+        )  # fmt: skip
+
+    fact = SimpleNamespace(
+        settlement_allocations=(),
+        opening_cash_effects=(
+            effect("application", "40.00", effect_id),
+            effect("application_inverse", "10.00", uuid4(), original),
+            SimpleNamespace(effect_kind="recognition", effect_id=uuid4(), document_id=None),
+        ),
+    )
+    rows = v4_alloc_rows(fact)
+    assert [(r.id, r.document_id, r.delta, r.offsets_id) for r in rows[:1]] == [(effect_id, doc_id, D("40.00"), None)]
+    assert rows[1].delta == D("-10.00") and rows[1].offsets_id == original and len(rows) == 2
+
+
+def test_an_erp_receipt_with_no_receipt_cash_row_blocks_never_a_typed_bank() -> None:
+    env = env_with(
+        None, cash_accounts={"erp_v2.ar": REV}, settlement_sources=("erp_v2.ar",), cash_block="receipt_cash_unresolved"
+    )
+    decision = rules.decide(
+        rules.rule_for(1, "settlement_accepted"), view("settlement_accepted", [("available_credit", "5")]), env
+    )
+    assert (decision.disposition, decision.reason) == (Disp.BLOCKED, "receipt_cash_unresolved")
+
+
+def test_opening_loader_accepts_zero_tax_positions_and_a_governed_override() -> None:
+    zero = _item(tax="0.00", journal_1455_credit="0.00", reclass=[], deferral_account=None, current_account=None)
+    override = _item(
+        reclass=["25.00"],  # would be negative_remaining
+        finance_override={"deferred": "4.00", "evidence_sha256": "e" * 64, "ref": "FIN-7"},
+    )
+    planned = vat_opening.plan(_parse([zero, override]), "a" * 64)
+    assert planned["counts"] == {"load": 2, "e38": 0}
+    assert planned["load"][0]["deferred"] == "0.000000" and planned["load"][0]["deferral_account"] is None
+    assert planned["load"][1]["deferred"] == "4.000000" and planned["load"][1]["override_evidence_sha256"] == "e" * 64
+    bad = _item(finance_override={"deferred": "21.00", "evidence_sha256": "e" * 64, "ref": "FIN-8"})
+    assert vat_opening.plan(_parse([bad]), "a" * 64)["e38"][0]["reason"] == "override_out_of_range"
+
+
+def test_opening_plan_applies_the_billing_cross_check() -> None:
+    parsed = _parse([_item(), _item()])
+    seen = []
+
+    def check(item):
+        seen.append(item["legacy_ref"])
+        return "open_initial_mismatch" if len(seen) == 1 else None
+
+    planned = vat_opening.plan(parsed, "a" * 64, check)
+    assert planned["counts"] == {"load": 1, "e38": 1} and planned["e38"][0]["reason"] == "open_initial_mismatch"

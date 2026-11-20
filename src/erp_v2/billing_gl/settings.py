@@ -153,8 +153,30 @@ SPECS: Final = [
         label="Re-summarise closed windows (days)",
         description="Closed windows this recent are re-checked every run; a mismatch re-pages the window.",
         inherits=False,
-        min_value=0,
+        min_value=1,
         max_value=3650,
+    ),
+    SettingSpec(
+        domain=DOMAIN,
+        key="rescan_days",
+        value_type=SettingValueType.integer,
+        default=7,
+        label="Window rescan horizon (days)",
+        description="Every closed window is re-summarised this often; the gate and period close refuse staler.",
+        inherits=False,
+        min_value=1,
+        max_value=365,
+    ),
+    SettingSpec(
+        domain=DOMAIN,
+        key="rescan_batch",
+        value_type=SettingValueType.integer,
+        default=24,
+        label="Old windows rescanned per run",
+        description="How many of the oldest-checked closed windows each run re-summarises (a rolling full rescan).",
+        inherits=False,
+        min_value=0,
+        max_value=1000,
     ),
     SettingSpec(
         domain=DOMAIN,
@@ -180,6 +202,8 @@ class MapperSettings:
     closed_period_policy: str
     settle_seconds: int
     resummarize_days: int
+    rescan_days: int
+    rescan_batch: int
     history_floor: date
     prepayment_account: str | None
     prepaid_funding_account: str | None
@@ -238,6 +262,8 @@ def load(db: Session, tenant_id: UUID) -> MapperSettings:
         closed_period_policy=str(read("closed_period_policy", NEXT_OPEN_PERIOD)),
         settle_seconds=int(read("settle_seconds", 300)),  # type: ignore[call-overload]
         resummarize_days=int(read("resummarize_days", 45)),  # type: ignore[call-overload]
+        rescan_days=int(read("rescan_days", 7)),  # type: ignore[call-overload]
+        rescan_batch=int(read("rescan_batch", 24)),  # type: ignore[call-overload]
         history_floor=date.fromisoformat(str(read("history_floor", "2000-01-01"))),
         prepayment_account=_account(db, tenant_id, read(PREPAYMENT_KEY, None, AR_DOMAIN)),
         prepaid_funding_account=_account(db, tenant_id, read(PREPAID_FUNDING_KEY, None, AR_DOMAIN)),

@@ -6,7 +6,7 @@ Hosted CI only (ERP_TEST_POSTGRES_URL), like the other hosted PG tests.
 """
 
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
@@ -29,6 +29,7 @@ from dotmac_accounting import service as accounting
 from dotmac_accounting.contracts import AccountClass, AccountKind, NormalBalance
 from dotmac_accounting.models import Account, AccountCategory, JournalEntry, PostedLedgerLine
 from dotmac_billing.contracts import SettlementFundingLane
+from dotmac_billing.models import BillingAccount
 from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.features import FeatureManifest
@@ -87,7 +88,7 @@ def _registries():
             )
 
 
-def world(engine, *, floor="2026-01-01", **config):
+def world(engine, *, floor="2025-12-01", **config):
     env = seed(engine, currency="NGN")
     with Session(engine) as db:
         cats = {
@@ -144,16 +145,20 @@ def configure(engine, env, **values):
 
 @contextmanager
 def runtime_session(engine, env):
-    """A session as the RUNTIME role with the tenant set, exactly how the scheduled mapper connects."""
-    with Session(engine) as db:
+    """A session as the RUNTIME role with the tenant set, exactly how the scheduled mapper connects.
+
+    Pinned to ONE connection: ``SET ROLE`` is session state, so a pool must never hand the role to another user.
+    The mapper's advisory lock takes its own connection from the engine, as in production.
+    """
+    with engine.connect() as conn, Session(bind=conn) as db:
         db.execute(sa.text("SET ROLE app_user"))
         db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(env.tenant_id)})
         try:
             yield db
         finally:
             db.rollback()
-            db.execute(sa.text("RESET ROLE"))
-            db.commit()
+            conn.execute(sa.text("RESET ROLE"))
+            conn.commit()
 
 
 def run(engine, env, *, now=RUN_AT, apply=True, enable_once=False):
@@ -588,3 +593,128 @@ def test_changed_fact_digest_is_an_integrity_alarm_and_downgrade_refuses_with_ro
         ):
             migration.downgrade()
         conn.rollback()
+
+
+# ------------------------------------------------ review findings 1-4 (architect, 2026-11-19)
+
+
+def test_retry_pages_every_blocked_fact_sharing_one_timestamp(engine, monkeypatch):
+    """#72 stamps every opening fact with one occurred_at; a slice can hold more than one page of pending facts."""
+    from erp_v2.billing_gl import mapper
+
+    monkeypatch.setattr(mapper, "PAGE", 2)
+    env = world(engine)
+    scope = TenantScope(env.tenant_id)
+    with Session(engine) as db:
+        ids = [new_account(db, scope).id for _ in range(5)]
+        db.commit()
+    for account_id in ids:
+        seed_billing(
+            engine,
+            env,
+            lambda db, sc, a=account_id: receipt(
+                db, sc, db.get(BillingAccount, a), "10.00", when=at(1), lane=SettlementFundingLane.PREPAID_FUNDING
+            ),
+        )
+    assert run(engine, env)["blocked"] == 5
+    configure(engine, env, ar={settings.PREPAID_FUNDING_KEY: str(env.accounts["2150"])})
+    healed = run(engine, env)
+    assert healed["blocked"] == 0 and dispositions(engine, env) == {"POSTED": 5}  # none stranded past page one
+
+
+def test_a_backdated_fact_is_found_by_the_rolling_rescan_and_staleness_refuses_period_close(engine):
+    env = world(engine)
+    scope = TenantScope(env.tenant_id)
+    with Session(engine) as db:
+        account_id = new_account(db, scope).id
+        db.commit()
+    configure(engine, env, resummarize_days=1, rescan_batch=0)  # no recent recheck and no rolling rescan
+    run(engine, env)
+    # A fact backdated into an already closed, long-since-unchecked window is invisible while the rescan is off ...
+    seed_billing(engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, account_id), "7.00", when=at(30)))
+    assert run(engine, env)["posted"] == 0 and gl(engine, env) == {}
+    # ... but the period cannot be closed on that basis: days not rescanned within rescan_days count as missing.
+    from erp_v2.billing_gl.checks import facts_incomplete
+
+    later = datetime(2026, 1, 30, 12, tzinfo=UTC)
+    with Session(engine) as db:
+        assert facts_incomplete(db, env.tenant_id, date(2026, 1, 1), date(2026, 1, 31), now=later) is True
+    # The rolling rescan (a batch per run) finds it, so nothing is silently never mapped.
+    configure(engine, env, rescan_batch=200)
+    found = run(engine, env, now=later)
+    assert found["posted"] == 1 and gl(engine, env)["1010"] == D("7.00")
+    with Session(engine) as db:
+        assert facts_incomplete(db, env.tenant_id, date(2026, 1, 1), date(2026, 1, 31), now=later) is False
+
+
+def test_days_without_a_window_row_block_period_close_and_the_gate(engine):
+    from erp_v2.billing_gl.checks import facts_incomplete, ready
+
+    env = world(engine)
+    with Session(engine) as db:
+        assert facts_incomplete(db, env.tenant_id, date(2026, 1, 1), date(2026, 1, 31), now=RUN_AT) is True
+        report = ready(db, env.tenant_id, now=RUN_AT, settle_seconds=300, seal_at=None, history_floor=date(2025, 12, 1))
+    assert report["missing_windows"] > 0 and report["ready"] is False
+    run(engine, env)
+    mapped = {"standard": {"current": str(env.accounts["1440"]), "deferral": str(env.accounts["1455"])}}
+    with Session(engine) as db:
+        done = ready(
+            db,
+            env.tenant_id,
+            now=RUN_AT,
+            settle_seconds=300,
+            seal_at=None,
+            history_floor=date(2025, 12, 1),
+            max_floor=date(2025, 12, 1),
+            tax_accounts=mapped,
+        )
+        late = ready(
+            db,
+            env.tenant_id,
+            now=RUN_AT,
+            settle_seconds=300,
+            seal_at=None,
+            history_floor=date(2026, 1, 1),
+            max_floor=date(2025, 12, 1),
+        )
+    assert done["missing_windows"] == 0 and done["ready"] is True, done
+    assert late["floor_too_late"] is True and late["ready"] is False  # a late floor cannot hide earlier days
+
+
+def test_runtime_role_cannot_insert_a_terminal_row_that_the_mapper_did_not_write(engine):
+    env = world(engine)
+    base = (
+        "INSERT INTO erp_billing_fact_postings (id, tenant_id, fact_id, fact_version, effect_kind, fact_digest, "
+        "billing_account_id, occurred_at, disposition, journal_id, attempts) VALUES "
+        "(gen_random_uuid(), :t, gen_random_uuid(), :v, :k, repeat('a', 64), gen_random_uuid(), now(), :d, :j, 1)"
+    )
+    cases = (
+        {"v": 1, "k": "settlement_accepted", "d": "POSTED", "j": uuid4()},  # fake journal
+        {"v": 1, "k": "settlement_accepted", "d": "SKIP", "j": None},  # SKIP only for opening kinds
+        {"v": 4, "k": "opening_cash_applied", "d": "SKIP", "j": None},  # V4 but not an import/unwind kind
+        {"v": 4, "k": "opening_cash_applied", "d": "NO_GL", "j": None},  # NO_GL only for V1
+    )
+    with runtime_session(engine, env) as db:
+        for case in cases:
+            with pytest.raises(DBAPIError, match=r"integrity|POSTED|SKIP|NO_GL"), db.begin_nested():
+                db.execute(sa.text(base), {"t": env.tenant_id, **case})
+        # A pending row (what a BLOCKED fact is) remains insertable.
+        db.execute(sa.text(base), {"t": env.tenant_id, "v": 1, "k": "allocation", "d": "BLOCKED", "j": None})
+
+
+def test_two_runs_cannot_overlap_the_second_exits_without_work(engine):
+    env = world(engine)
+    scope = TenantScope(env.tenant_id)
+    with Session(engine) as db:
+        account_id = new_account(db, scope).id
+        db.commit()
+    seed_billing(engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, account_id), "5.00", when=at(1)))
+    import hashlib
+
+    key = int.from_bytes(hashlib.sha256(f"billing_gl:{env.tenant_id}".encode()).digest()[:8], "big", signed=True)
+    with engine.connect() as holder:
+        assert holder.execute(sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar()
+        blocked = run(engine, env)
+        holder.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+    assert blocked["locked"] is True and blocked["posted"] == 0 and gl(engine, env) == {}
+    assert run(engine, env)["posted"] == 1  # the lock was released: the next run proceeds

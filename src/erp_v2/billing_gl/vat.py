@@ -69,6 +69,10 @@ class DocVat:
     total: Decimal  # T
     open: Decimal
     positions: dict[str, Position]
+    # The denominator of the release rate: the gross the deferral still covers. For a native invoice it is T; for a
+    # migrated, part-paid invoice it is the remaining gross at the opening (open_initial), because D is the remaining
+    # deferral (spec amendment to 4.3: rate = remaining deferral / remaining gross, not D / original total).
+    basis: Decimal = ZERO
     # allocation ref -> {treatment: net release}, and settled amount per allocation ref.
     net_release: dict[str, dict[str, Decimal]] = field(default_factory=lambda: defaultdict(dict))
     settled: dict[str, Decimal] = field(default_factory=lambda: defaultdict(Decimal))
@@ -100,7 +104,7 @@ def apply(doc: DocVat, moves: tuple[Move, ...]) -> None:
 
 
 def check(doc: DocVat) -> None:
-    if doc.open < 0 or doc.open > doc.total:
+    if doc.open < 0 or doc.open > doc.basis:
         raise VatRefused("vat_invariant")
     for pos in doc.positions.values():
         if pos.remaining < 0 or pos.remaining > pos.deferred:
@@ -122,7 +126,7 @@ def release(doc: DocVat, delta: Decimal, ref: str, minor_units: int = 2) -> tupl
     closes = doc.open - delta == 0
     moves = []
     for pos in doc.order():
-        share = pos.remaining if closes else min(pos.remaining, quantize(delta * pos.deferred / doc.total, minor_units))
+        share = pos.remaining if closes else min(pos.remaining, quantize(delta * pos.deferred / doc.basis, minor_units))
         carrier = _first(doc, pos.treatment)
         moves.append(Move(pos.treatment, "release", -share, share, -delta if carrier else ZERO, carrier, ref))
     return tuple(moves)
@@ -132,7 +136,7 @@ def unrelease(doc: DocVat, delta: Decimal, offsets_ref: str, minor_units: int = 
     """A deallocation of ``delta`` (> 0, the magnitude) against the allocation ``offsets_ref``."""
     if offsets_ref not in doc.net_release and offsets_ref not in doc.settled:
         raise VatRefused("vat_allocation_unresolved")
-    if delta <= 0 or delta > doc.settled[offsets_ref] or doc.open + delta > doc.total:
+    if delta <= 0 or delta > doc.settled[offsets_ref] or doc.open + delta > doc.basis:
         raise VatRefused("vat_invariant")
     moves: list[Move] = []
     # A close-out that made open = 0 is reversed first (exact), because the document is open again.
@@ -145,7 +149,7 @@ def unrelease(doc: DocVat, delta: Decimal, offsets_ref: str, minor_units: int = 
     full = delta == doc.settled[offsets_ref]
     for pos in doc.order():
         net = doc.net_release[offsets_ref].get(pos.treatment, ZERO)
-        share = net if full else min(net, quantize(delta * pos.deferred / doc.total, minor_units))
+        share = net if full else min(net, quantize(delta * pos.deferred / doc.basis, minor_units))
         carrier = _first(doc, pos.treatment)
         moves.append(Move(pos.treatment, "unrelease", share, -share, delta if carrier else ZERO, carrier, offsets_ref))
     return tuple(moves)
@@ -220,7 +224,7 @@ def issue(
         for treatment, (tax, deferral, current) in taxes.items()
         if tax != 0
     }
-    doc = DocVat(document_id, total, total, positions)
+    doc = DocVat(document_id, total, total, positions, total)
     moves = tuple(Move(t, "defer", p.deferred, ZERO) for t, p in sorted(positions.items()))
     apply(doc, moves)
     return doc, moves

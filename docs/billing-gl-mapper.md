@@ -61,9 +61,23 @@ summary (count + chained digest) equals the mapper's running `fact_index_line` d
 Posting date: `occurred_at` in `posting_timezone`. If that period is not OPEN: `next_open_period` (default) posts on the
 first open date after it with the original date in the description; `hold` BLOCKs `period_closed`.
 
+## Completeness, locking and terminal rows (architect review, 2026-11-19)
+
+- **One run at a time.** Each run takes a per-tenant session advisory lock on a dedicated connection; a second run exits
+  with `locked: true` and does nothing, so two overlapping runs can never process the same facts.
+- **Retry pages everything.** Pending facts are retried per timestamp slice, paging to the end (opening facts can share
+  one timestamp), in billing index order.
+- **Nothing is silently skipped.** Besides re-summarising recent windows, every run re-summarises the `rescan_batch`
+  oldest-checked closed windows, a rolling full rescan, so a backdated fact in an old window is found. Period close
+  (`soft_close_period` / `lock_period`) and the gate refuse while ANY UTC day up to the settle horizon has no closed window
+  checked within `rescan_days`, whether or not a window row exists for it. `history_floor` cannot hide early days: a period
+  starting before the floor is refused, and the gate refuses a floor later than 2000-01-01.
+- **Terminal rows are the mapper's only.** The runtime role can INSERT (W4), so the trigger also checks INSERT and UPDATE:
+  POSTED needs the posting bridge's own journal for that fact, SKIP is only for opening import/unwind kinds, NO_GL only for V1.
+
 ## Settings (domain `billing_gl`, entered in the UI)
 
-`enabled`, `cash_account` (JSON: source system -> account id; `opening_refund` for opening refunds), `posting_timezone`,
+`enabled`, `rescan_days` (7), `rescan_batch` (24), `cash_account` (JSON: source system -> account id; `opening_refund` for opening refunds), `posting_timezone`,
 `closed_period_policy`, `settle_seconds`, `resummarize_days`, `history_floor`. Read by key from B-14:
 `ar.prepayment_liability_account`, `ar.prepaid_funding_account` (account id, code or exact name).
 
@@ -112,3 +126,25 @@ advance. All of it is in the same one-journal-per-fact door; there is no new pos
   separate reader step.
 - **Gate.** `checks.ready` also requires `billing_gl.tax_accounts` to map every treatment to a current and a deferral
   account and 0 BLOCKED VAT facts.
+
+### Rev 2 review amendments (architect, 2026-11-19)
+
+- **Release rate (spec 4.3 amendment).** The release denominator is the gross the deferral still covers: `T` for a
+  native invoice, the remaining gross at the opening (`open_initial`) for a migrated, part-paid invoice, because the
+  loaded `D` is the remaining deferral. `r = min(R, HALF_EVEN(d x D / basis))`.
+- **Opening-lot advances.** A V4 fact's `opening_cash_effects` `application` / `application_inverse` rows are settlements
+  of their document, exactly like settlement allocations.
+- **Ordering.** An allocation that sorts before its native invoice's issue fact is WAITING `waiting_document`; it does
+  not block the account (the invoice must post) and the next run's retry re-evaluates it. `vat_position_missing` is for
+  imported documents only.
+- **Bank from structure.** An `erp_v2.ar` settlement needs exactly one `erp_ar_receipts` row for its cash account, else
+  BLOCK `receipt_cash_unresolved`; there is no fallback to `billing_gl.cash_account`.
+- **Line accounts.** A credit note is compared with the document by SUMS only (B-16 writes one row per credit-note line,
+  billing one line per credit note). An unknown, inactive or non-postable revenue account blocks `revenue_account_invalid`.
+- **Void of a credit note** mirrors only the close-out still in force (a later deallocation may already have reversed it).
+- **Persist.** Journal and VAT movements are written in one savepoint; a database `vat_invariant` refusal blocks that one
+  fact, it does not abort the run.
+- **Opening loader.** `plan` cross-checks each item against billing (document exists, this tenant's imported open item,
+  total = original grand total, exposure = `open_initial`); a zero-tax carried invoice loads a zero position;
+  an E38 item can be resolved by a `finance_override` (stated deferral, evidence sha, reference) in a new, sha-bound plan.
+  The runtime role cannot create `origin = opening` positions or `fact_version = 0` movements.
