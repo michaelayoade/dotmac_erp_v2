@@ -264,6 +264,24 @@ def bind_to_import_receipt(
         refuse("history_cutoff_mismatch", "the cutoff differs from the posted opening's as-of date")
 
 
+def bridge_rounding_code(db: Session, tenant: UUID) -> str | None:
+    """The rounding account the latest bridge version names (its T-SUBKOBO items post there); None before any bridge."""
+    body = db.scalar(
+        sa.select(m.BridgeVersion.body)
+        .where(m.BridgeVersion.tenant_id == tenant)
+        .order_by(m.BridgeVersion.version.desc())
+        .limit(1)
+    )
+    code = body.get("rounding_account_code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) and code else None
+
+
+def check_rounding_matches_bridge(db: Session, tenant: UUID, rounding_code: str) -> None:
+    bridge_code = bridge_rounding_code(db, tenant)
+    if bridge_code is not None and bridge_code != rounding_code:
+        refuse("rounding_account_differs_from_bridge", "the bridge's T-SUBKOBO items name another account")
+
+
 def evidence_of(journal: Journal) -> str:
     return journal.evidence_sha256
 
@@ -331,6 +349,7 @@ def build_plan(
         rounding = cfg.resolve_account(db, tenant, spec.params["migration.rounding_account"], what="rounding account")
         if rounding.id in barred:
             refuse("rounding_account_invalid", "a control, tax-role or holding account cannot be the rounding account")
+        check_rounding_matches_bridge(db, tenant, rounding.code)
     periods = list(db.scalars(sa.select(FiscalPeriod).where(FiscalPeriod.tenant_id == tenant)))
     out = []
     for j in journals:
@@ -438,6 +457,10 @@ def apply(
         refuse("dual_control_requires_distinct_operators")
     window_closed(db, tenant, mode, approved_sha)  # S1
     body = plan["plan"]
+    if mode is SUBKOBO:  # the residue account must still be the bridge's T-SUBKOBO account
+        residue_account = UUID(body["journals"][0]["days"][0]["lines"][-1]["account_id"])
+        code = db.scalar(sa.select(Account.code).where(Account.tenant_id == tenant, Account.id == residue_account))
+        check_rounding_matches_bridge(db, tenant, str(code))
     posted: dict[str, list[str]] = {}
     count = 0
     for j in body["journals"]:
@@ -540,4 +563,6 @@ def verify(db: Session, spec: planning.RunSpec, mode: Mode) -> dict[str, Any]:
             problems.append(f"{j.journal_id}:no_{mode.klass.lower()}_item")
         elif mode is SUBKOBO and (item.state != "resolved" or item.evidence_sha256 != j.evidence_sha256):
             problems.append(f"{j.journal_id}:e15_not_resolved_with_evidence")
+    if rounding is not None and bridge_rounding_code(db, tenant) not in (None, rounding.code):
+        problems.append("rounding_account_differs_from_bridge")
     return {"ready": not problems, "journals": len(journals), "problems": sorted(problems)}
