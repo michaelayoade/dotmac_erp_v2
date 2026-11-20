@@ -94,6 +94,18 @@ POLICIES: Final = MappingProxyType(
         # bank account's cash GL (advance) or a Finance-chosen non-control offset (adjustment, control
         # difference). Both refs are Account UUIDs, resolved from the tenant's records, never typed.
         ("erp", "staff_loan_entry"): RefPolicy(),
+        # B-14 migration holdings (W1: four new system doors onto control accounts). Lines are system-built from
+        # re-derived owner state, once-only uuid5 identities, Account UUIDs resolved from the tenant. ONLY
+        # erp_v2.holdings builds these kinds (a test greps).
+        ("erp.migration", "migration_holding"): RefPolicy(),
+        ("erp.migration", "holding_release"): RefPolicy(),
+        ("erp.migration", "holding_writeoff"): RefPolicy(),
+        ("erp.migration", "ar_opening_credit"): RefPolicy(),
+        # B-14 straddle reproduction (W8): a legacy journal dated across the history cutoff, re-posted balanced at its
+        # legacy accounts and days; refuses control accounts, so no control door is used.
+        ("erp.migration", "migration_straddle"): RefPolicy(),
+        # B-14 E15 sub-kobo units: legacy lines re-posted exactly (6 dp) plus one residue line on the rounding account.
+        ("erp.migration", "migration_subkobo"): RefPolicy(),
     }
 )
 

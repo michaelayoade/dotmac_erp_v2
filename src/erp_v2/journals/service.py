@@ -411,6 +411,28 @@ def _verify_rounding(db: Session, tenant_id: UUID, journal: JournalEntry) -> Non
         raise JournalRefused(exc.code, exc.detail) from exc
 
 
+def _holding_guard(db: Session, tenant_id: UUID, account_ids: set[UUID]) -> None:
+    """B-14 tightening: a holding account (one that carries an ``erp_migration_holdings`` row, or that a flip run
+    resolved as a holding account) moves only through the governed holding commands, never through a manual journal or a
+    held draft. A bare line would silently break the holding tie. No window, no setting and no override flag."""
+    if not account_ids:
+        return
+    from erp_v2.holdings.models import Holding, HoldingAccount
+
+    hit = db.scalar(
+        select(Holding.id).where(Holding.tenant_id == tenant_id, Holding.holding_account_id.in_(account_ids)).limit(1)
+    ) or db.scalar(  # a configured holding account is guarded even before it carries a row (L6)
+        select(HoldingAccount.id)
+        .where(HoldingAccount.tenant_id == tenant_id, HoldingAccount.holding_account_id.in_(account_ids))
+        .limit(1)
+    )
+    if hit is not None:
+        raise JournalRefused(
+            "holding_account_requires_holding_command",
+            "a migration holding account moves only through holding release or writeoff",
+        )
+
+
 def _control_guard(
     db: Session,
     tenant_id: UUID,
@@ -426,6 +448,7 @@ def _control_guard(
     simply re-creates the original fault). No window, no setting and no override flag.
     """
     ids = set(account_ids or ()) if journal is None else _journal_account_ids(db, tenant_id, journal.id)
+    _holding_guard(db, tenant_id, ids)
     codes = control_codes_among(db, tenant_id, ids)
     if not codes:
         return
