@@ -1249,3 +1249,43 @@ def test_a_manual_due_date_overrides_the_terms_and_is_recorded_as_manual(engine)
         assert queries.billing_document(db, env.tenant_id, plain).due_date_basis["derivation_policy"] == (
             "erp_v2.ar.net_days"
         )
+
+
+def test_guards_fire_for_a_login_member_of_app_user_not_only_app_user_itself(engine):
+    """Prod logs in as a LOGIN member of app_user (erp_v2_runtime): no e2_0032 guard may test current_user."""
+    import os
+
+    env = bridge_pg.seed(engine)
+    with engine.begin() as c:
+        draft = _raw_draft(c, env.tenant_id, status="issued", issued=uuid4())
+    role = f"ar_member_{uuid4().hex[:12]}"
+    admin = sa.create_engine(
+        sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
+    )
+    with admin.connect() as c:
+        c.exec_driver_sql(f'CREATE ROLE "{role}" LOGIN NOBYPASSRLS')
+        c.exec_driver_sql(f'GRANT app_user TO "{role}"')
+    rt = sa.create_engine(engine.url.set(username=role), hide_parameters=True)
+    try:
+        assert role != "app_user"
+        with Session(rt) as db:
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
+            with pytest.raises(sa.exc.DBAPIError):  # terminal-status trigger
+                db.execute(
+                    sa.text("UPDATE erp_ar_drafts SET status = 'draft', issued_by = NULL WHERE id = :i"), {"i": draft}
+                )
+            db.rollback()
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
+            with pytest.raises(sa.exc.DBAPIError):  # draft-line trigger (header is issued)
+                db.execute(
+                    sa.text(
+                        "INSERT INTO erp_ar_draft_lines (id, tenant_id, draft_id, n) "
+                        "VALUES (gen_random_uuid(), :t, :i, 1)"
+                    ),
+                    {"t": env.tenant_id, "i": draft},
+                )
+    finally:
+        rt.dispose()
+        with admin.connect() as c:
+            c.exec_driver_sql(f'DROP ROLE "{role}"')
+        admin.dispose()
