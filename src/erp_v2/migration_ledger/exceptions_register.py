@@ -14,8 +14,9 @@
 ``S.json`` is ``{"version": 1, "tenant_id": "<uuid>", "receipts": [{"kind": "held_drafts"|"import_itemised",
 "path": "<file>", "sha256": "<sha of the file>"}], "include_admission_reviews": true}``; every receipt is read
 through its sha and loaded by its adapter. Dry run is the default; every write needs ``--apply`` AND
-``ERP_MIGRATION_LEDGER_APPLY=1``. ``gate`` is read-only: exit 0 only when the open count is 0 AND the latest bridge
-version is signed; exit 3 otherwise (with the reasons).
+``ERP_MIGRATION_LEDGER_APPLY=1``. ``gate`` is read-only (profile ``as_is_v1``): exit 0 only when the latest bridge
+is signed and the ledger ties hold; the open count and class coverage are reported, not gated; exit 3 otherwise
+(with the reasons).
 """
 
 from __future__ import annotations
