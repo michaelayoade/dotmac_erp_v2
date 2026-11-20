@@ -152,3 +152,30 @@ advance. All of it is in the same one-journal-per-fact door; there is no new pos
   total = original grand total, exposure = `open_initial`); a zero-tax carried invoice loads a zero position;
   an E38 item can be resolved by a `finance_override` (stated deferral, evidence sha, reference) in a new, sha-bound plan.
   The runtime role cannot create `origin = opening` positions or `fact_version = 0` movements.
+
+### Q1 legacy VAT extraction (`vat-extract`, P-B16-e)
+
+    python -m erp_v2.billing_gl vat-extract --tenant-id T --organization-id O --cutoff D --snapshot-sha256 S \
+        --out ITEMS.json --receipt R.json [--overrides OVERRIDES.json] [--treatment-map MAP.json]
+
+Read-only on both sides (env-only `MIGRATION_DATABASE_URL` and `LEGACY_DATABASE_URL`, `SET TRANSACTION READ ONLY`, rehearsal
+snapshot only). Both output files are created exclusively with mode 0600 before any read. The items file is the exact
+`vat-opening` input in canonical JSON, so a re-run on the same snapshot gives the same sha; the receipt is counts and
+aggregate tie amounts only.
+
+- **Ledger truth** is `gl.posted_ledger_line` on the deferral accounts (the `deferral_pair_account_id` of each VAT/GST code's
+  collected account) up to the cutoff. Reversal journals keep their original's source key, so reversed and voided
+  invoices and bounced payments net out. Legacy account ids are the v2 account ids.
+- **Invoice credit** = the net of INVOICE, AR_INVOICE_VAT_DEFERRAL and AR_INVOICE_RESTORE lines per invoice (the snapshot
+  shows all three on 1455). It must equal the deferrable tax of the invoice's lines, else the invoice is unattributable (E38).
+- **Reclass** = legacy's own prorate (`(allocated x line tax / invoice total)` to 0.01, HALF_EVEN) per allocation, only for
+  payments with a net CUSTOMER_PAYMENT_VAT_RECLASS journal; a payment whose recomputed total differs from its journal makes
+  its invoices unattributable.
+- **Link** to billing is the #72 import receipt (`opening_receivable_bases` of the receipts in `erp_ar_opening_admissions`):
+  never an invoice number. The admissions' snapshot sha must equal `--snapshot-sha256`, and the bases must equal the
+  imported open items (`carried_count_mismatch`).
+- Every carried invoice appears exactly once per treatment (zero-tax invoices as a zero position `none`); NGN only.
+- **Tie (exact).** GL(deferral accounts) = per-invoice remainders + (derived reclass - journal reclass) + the lines no
+  invoice or payment owns (manual GL journals, AP), listed by source. Any difference refuses the run.
+- **Overrides** are a separate Finance-named input (`named_by`, evidence sha and reference per item), bound by sha in the
+  receipt; an override that matches no item refuses.
