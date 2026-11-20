@@ -26,7 +26,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from erp_v2.migration_ledger import bridge, bridge_inputs, legacy_ledger, rounding_verify, subkobo
+from erp_v2.migration_ledger import bridge, bridge_inputs, legacy_ledger, rounding_verify, units
 from erp_v2.migration_ledger import cli_common as cli
 from erp_v2.migration_ledger.common import keys_exactly, refuse, sha_text, strict_json, text, uuid_text
 
@@ -105,28 +105,40 @@ def _run(args) -> dict[str, Any]:
                             import_body, import_sha, raw.get("snapshot_sha256", ""), legacy, db, tenant
                         )
                         raw = {**raw, "items": [*raw.get("items", []), *raw_items["items"]]}
-                    subkobo_journals: tuple = ()
-                    if args.subkobo_side_file:
-                        if not args.import_receipt or opening_day is None:
-                            refuse("subkobo_binding_required", "the import receipt and a posted opening are required")
-                        if any(i.get("rule") == "T-SUBKOBO" for i in raw.get("items", [])):
-                            refuse("subkobo_items_come_from_the_side_file")
-                        side_bytes, side_sha = cli.read_bound(args.subkobo_side_file)
-                        receipt_bytes, _ = cli.read_bound(args.import_receipt)
-                        subkobo_journals = subkobo.bind_and_parse(
-                            strict_json(side_bytes, "invalid_subkobo_side_file"),
-                            side_sha,
-                            strict_json(receipt_bytes, "invalid_import_receipt"),
-                            opening_day,
+                    unit_list: tuple = ()
+                    side_binding: dict[str, str | None] = {}
+                    side_files = {"E15": args.subkobo_side_file, "E39": args.straddlers_side_file}
+                    if any(side_files.values()):
+                        if not args.import_receipt or not args.import_receipt_sha256 or opening_day is None:
+                            refuse(
+                                "unit_binding_required",
+                                "the import receipt, its --import-receipt-sha256 and a posted opening are required",
+                            )
+                        if any(i.get("rule") in ("T-SUBKOBO", "T-STRADDLE") for i in raw.get("items", [])):
+                            refuse("unit_items_come_from_the_side_files")
+                        receipt_bytes, receipt_sha = cli.read_bound(
+                            args.import_receipt, sha_text(args.import_receipt_sha256, "invalid_import_receipt_sha256")
                         )
+                        receipt_body = strict_json(receipt_bytes, "invalid_import_receipt")
+                        side_binding["import_receipt_sha256"] = receipt_sha
+                        codes = legacy_ledger.account_codes(db, tenant)
+                        for cls, path in side_files.items():
+                            if not path:
+                                continue
+                            side_bytes, side_sha = cli.read_bound(path)
+                            side_binding[
+                                "subkobo_side_file_sha256" if cls == "E15" else "straddlers_side_file_sha256"
+                            ] = side_sha
+                            unit_list += units.bind_and_parse(
+                                cls, strict_json(side_bytes, "invalid_unit_side_file"), side_sha, receipt_body,
+                                opening_day, codes,
+                            )  # fmt: skip
                         rounding = raw.get("rounding_account_code")
-                        raw = {
-                            **raw,
-                            "items": [
-                                *raw.get("items", []),
-                                *(i.as_dict() for i in subkobo.bridge_items(subkobo_journals, rounding)),
-                            ],
-                        }
+                        derived = [
+                            *units.bridge_items(tuple(u for u in unit_list if u.cls == "E39")),
+                            *units.bridge_items(tuple(u for u in unit_list if u.cls == "E15"), rounding),
+                        ]
+                        raw = {**raw, "items": [*raw.get("items", []), *(i.as_dict() for i in derived)]}
                     inputs = bridge.parse_inputs(raw, inputs_sha)
                     legacy_net, universe = legacy_ledger.recompute(legacy, db, tenant, opening_as_of=opening_day)
                 inputs = bridge.with_snapshot(inputs, legacy_net, universe)
@@ -138,7 +150,8 @@ def _run(args) -> dict[str, Any]:
                     ias8_sha=ias8_sha,
                     import_itemised=import_body,
                     import_sha=import_sha,
-                    subkobo=subkobo_journals,
+                    units=unit_list,
+                    side_binding=side_binding,
                 )
                 out = {
                     "mode": "build",
@@ -243,7 +256,9 @@ def main(argv=None) -> int:
     parser.add_argument("--import-itemised", type=Path, help="the #68 itemised file (rounding items are bound to it)")
     parser.add_argument("--import-itemised-sha256", help="the import receipt's itemised_sha256")
     parser.add_argument("--subkobo-side-file", type=Path, help="B-13 <receipt>.subkobo.json (E15; sha-bound)")
-    parser.add_argument("--import-receipt", type=Path, help="the importer execute receipt binding the side file")
+    parser.add_argument("--straddlers-side-file", type=Path, help="B-13 <receipt>.straddlers.json (E39; sha-bound)")
+    parser.add_argument("--import-receipt", type=Path, help="the importer execute receipt binding the side files")
+    parser.add_argument("--import-receipt-sha256", help="sha256 of the import receipt file (required with a side file)")
     parser.add_argument("--approved-sha256")
     parser.add_argument("--version", type=int)
     parser.add_argument("--expect-sha")

@@ -103,13 +103,18 @@ currencies), prepayment tie, holding ties, keyed accounts, control/tax codes exi
 writer role, `straddle_reproduced` (STRADDLE-SPEC W8: every E39 `journal_straddles_cutoff` journal has its B-14
 `migration_straddle` journals; B-14 wires it) and `e15_subkobo_posted` (B-13 review N1: every E15 sub-kobo key has its
 2-dp line on the rounding account; the posting itself is not built, see the PR). `migration_straddle` journals (owner
-`erp.migration`) are excluded from the bridge's native side. So are `migration_subkobo` journals (the 3 E15 sub-kobo journals, E15-AND-SIDEFILE-RULING): `bridge_report build
---subkobo-side-file F --import-receipt R` derives `T-SUBKOBO` items from the sha-bound B-13 side file (its sha must equal the
-receipt's `history_cutoff_census.subkobo.side_file_sha256`, its cutoff the receipt's and the opening's): per journal one
-residue item on (rounding account, journal period) plus one line item per (account, period) of its legacy lines (a ref
-may sit in one bucket only, so the inputs must carry no other item for these refs). The bridge refuses
-(`subkobo_items_forged`, `subkobo_items_differ_from_rounding_cell`) unless the items equal the derivation and the
-residues sum to the rounding-cell difference. Built: `post_flip_tools_unused` (the gate refuses `post_flip_tool_used_before_flip` if any B-1 review, any
+`erp.migration`) are excluded from the bridge's native side. So are `migration_subkobo` journals (the E15 sub-kobo journals,
+E15-AND-SIDEFILE-RULING as amended). `bridge_report build --subkobo-side-file F --straddlers-side-file G --import-receipt R
+--import-receipt-sha256 <sha>` derives `T-SUBKOBO` (E15) and `T-STRADDLE` (E39) items ONLY from #74's real side files
+(`migration_ledger/units.py`): the file's sha must equal the receipt's `history_cutoff_census.{subkobo|straddlers}.
+side_file_sha256`, the receipt's own sha is pinned by `--import-receipt-sha256`, the cutoffs must equal the receipt's and
+the opening's, and `post_net` (nested `{day: {account_id: net}}`), nets and evidence are rebuilt from the lines. Accounts
+are mapped from `account_id`. Per unit: one line item per (account, period), legacy = v2; E15 adds one residue item on
+(rounding account, journal period). An E39 unit must be type S2 with s_j 0 and balanced days (else
+`straddle_not_simple`). A ref sits in one bucket, so the inputs carry no other item for these refs. The bridge refuses
+(`unit_items_forged`, `subkobo_items_differ_from_rounding_cell`, `rounding_account_invalid`) unless the items equal the
+derivation and the residues sum to the rounding-cell difference. The signed body records `import_receipt_sha256`,
+`subkobo_side_file_sha256` and `straddlers_side_file_sha256`. Built: `post_flip_tools_unused` (the gate refuses `post_flip_tool_used_before_flip` if any B-1 review, any
 non-queued B-2 decision or any IAS 8 opening journal exists). Pending probe P-7: the opening posts functional currency
 only, so foreign-currency control positions at D need confirming before B-14. The lists are code constants in `ledger_roles`
 and recorded in each bridge body; the ledger and register state at signature is stored with the signature.
