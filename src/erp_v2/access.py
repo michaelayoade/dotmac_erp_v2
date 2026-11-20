@@ -21,7 +21,7 @@ from erp_v2.web.revenue_routes import WRITE_PERMISSION
 from erp_v2.web.routes import ACCESS_PERMISSION
 
 PROFILE_CODE: Final = "erp.web"
-PROFILE_VERSION: Final = 6
+PROFILE_VERSION: Final = 7
 
 # Roles that exist today and keep exactly their current grants.
 LEGACY_ROLES: Final = ("admin", "staff")
@@ -75,6 +75,11 @@ _NEW_PERMISSIONS: Final[dict[str, tuple[str, str]]] = {
     "erp.finance.receivables.post": (
         "Issue invoices and credit notes, post receipts, apply credit, deallocate, reverse and void.",
         "finance_approver",
+    ),
+    # Customer screen (F-F): master data, no two-person control (single-operator ruling). Reads use erp.web.access.
+    "erp.finance.customers.manage": (
+        "Create and edit customers: name, finance fields, notes, and status (close is permanent).",
+        "finance_preparer",
     ),
     "erp.banking.reconciliation.approve": ("Approve bank reconciliations.", "finance_approver"),
     # Cash GL split: re-point a bank account's cash GL. Same P0 role pair as journals
