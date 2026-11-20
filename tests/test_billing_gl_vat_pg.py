@@ -609,7 +609,7 @@ def test_voiding_a_credit_note_after_a_deallocation_keeps_gl_and_positions_tied(
 
 
 def test_a_login_member_of_app_user_without_bypassrls_is_refused_opening_rows(engine):
-    """R6: production logs in as a member of app_user (never current_user = app_user); the guard follows rolbypassrls."""
+    """R6: prod logs in as a member of app_user (never current_user = app_user); the guard follows rolbypassrls."""
     env = world(engine)
     acct = account_and_model(engine, env)
     invoice(engine, env, acct)
