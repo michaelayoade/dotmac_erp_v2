@@ -56,6 +56,7 @@ RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS)  # B-2 outcomes load from the
 IMPORT_CLASS: Final = {
     "expense_elsewhere_ambiguous": "E06",
     "wht_payment_fact_pending": "E06a",
+    "unposted_wht_line": "E04",  # AS-IS: an unposted invoice with a WHT line is not landed (H-DOC)
     "expense_account_is_control": "E21",
     "expense_account_is_tax_role": "E21",
     "tax_account_not_input_tax": "E09",

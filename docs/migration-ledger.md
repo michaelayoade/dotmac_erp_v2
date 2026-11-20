@@ -108,3 +108,57 @@ is 0 AND the latest bridge version is signed.
 * The recipes were written to the architect's column names and tested on synthetic snapshots; only the g9 pin test (skipped
   without a snapshot) proves them on real data.
 * Receipts of other builds (B-1 plan receipts, settled admission) enter through the admission-review rows only.
+
+## History cutoff (B-13) and the importer
+
+`python -m erp_v2.importer execute ... --history-cutoff 2025-12-31` is required whenever the journal pairings run (the
+cutover profile always includes them; the CLI refuses before touching either database without it, and the executor
+raises without it). The journal, journal-line and posted-ledger-line pairings do not read legacy rows dated on or before
+the cutoff: closed years arrive only through the opening journal above (its TB is the cumulative legacy balance to the
+cutoff, so copying the same lines too would count them twice). Journals are dated by `COALESCE(posting_date,
+entry_date)`, journal lines follow their parent journal, posted ledger lines use their own `posting_date` (the column
+the opening TB is computed from). An undated row is not provably closed, so it lands and is counted. A journal whose
+ledger lines straddle the cutoff refuses the run. The receipt's `history_cutoff` section is the census:
+`legacy = landed + excluded + refused` per pairing, with a sha256 over the excluded legacy keys (the legacy journal ids
+for the journal pairing). No destination document table references the journal tables (pinned by a test), so a
+pre-cutoff document keeps its legacy journal id as evidence in the retained snapshot and is neither excluded nor
+rewritten. PG test: `tests/test_importer_history_cutoff_pg.py` (v2 holds no legacy-owner line on or before the cutoff;
+opening + post-cutoff journals = the legacy TB at cutoff + 1 day).
+
+### P-5: the sub-kobo (unbalanced) journals
+
+Ruling: each journal whose posted ledger lines do not balance (the 3 sub-kobo journals, 0.000001) is refused as a UNIT
+(journal, journal lines, ledger lines): nothing of it lands. Landing it would leave a DRAFT carrying ledger lines (the
+owner trigger forbids posting it and forbids voiding it). It is not a row exception, so F2 does not exit incomplete: it
+is itemised (key, debit, credit) in the receipt's `history_cutoff_census` and in the side file under
+`E15_unbalanced_journal_unit`, for the E15 register item. Its 2-dp effect and the 6-dp residue go through the rounding
+path (B-9r). If such a journal were dated on or before the cutoff, the opening would refuse `opening_tb_not_zero_sum`.
+
+### Receipt and side file
+
+* `history_cutoff` (top level of the execute receipt): the ISO date or null. B-9r requires it and refuses a mismatch with
+  the opening as-of date.
+* `history_cutoff_census`: per pairing, source rows, excluded count, `excluded_keys_sha256` (keys ordered byte-wise,
+  `COLLATE "C"`), excluded by legacy status, undated refusals, unbalanced-unit counts, reversal-target count.
+* `<receipt>.history_cutoff.json` (mode 600, sha256 in `history_cutoff_census.side_file_sha256`): pre-cutoff
+  non-posted journal keys split by legacy status (`pre_cutoff_journal_draft`, ... for E16b), `E15_unbalanced_journal_unit`,
+  `reversal_target_before_cutoff` (post-cutoff reversals whose legacy target is pre-cutoff: they land as is, link empty,
+  info register rows, not counted against completeness) and `undated_*`.
+* Undated rows (no `posting_date`/`entry_date`) are named row refusals `history_cutoff_undated`;
+  `legacy_ledger.recompute` refuses a NULL-dated ledger line instead of omitting it.
+* Straddlers (STRADDLE-SPEC, W8): a journal crossing the cutoff is classified from its posted ledger lines (S1: lines on
+  both sides; S2: lines on one side, journal date on the other) and excluded as a UNIT (journal, lines, ledger lines) with
+  class E39 `journal_straddles_cutoff`, whenever any cutoff pairing runs. It is not a row exception, so F2 completes, and
+  it is not counted as a plain pre-cutoff exclusion. The mode-600 side file `<receipt>.straddlers.json` (sha256 in
+  `history_cutoff_census.straddlers`) lists, per journal: type, legacy status, journal date, source module/document,
+  currency, `pre_net` (already in the opening), `post_net` per day and account, `s_j`, the ledger lines and an evidence
+  sha256. The run refuses before any write if the side file cannot be written or if the classifier and the exclusion
+  predicate disagree. The reproduction journals (T-B) are B-14; the opening/bridge/gate share is B-9r (the observed straddlers all have
+  S_j = 0, so no opening suspense row is needed).
+* AP verifiers: a journal the cutoff excluded is proven on the snapshot (same predicate, the receipt cutoff carried in the
+  transform manifest binding as `history_cutoff`, all ledger lines on or before it), asserted ABSENT in v2, and a POSTED
+  `erp.opening` journal dated exactly the cutoff must exist in v2 (one read, every path).
+* A reversal whose target is a cutoff-excluded, E15 or E39 journal lands with the link empty (target kept as evidence).
+* A failed post-commit write of the side file is caught: the receipt is still written and the run is marked incomplete.
+* A transform manifest with no `import.unposted_wht` in its binding is a pre-B-13 manifest: `remove` is the only legal
+  default (the binding is under the manifest sha256).

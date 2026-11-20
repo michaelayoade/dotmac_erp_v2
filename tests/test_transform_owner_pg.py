@@ -94,7 +94,7 @@ def importer_manifest(scene) -> TransformManifest:
                 rows(INVOICE_HEADER_SQL),
                 rows(LINE_ITEM_SQL),
                 rows(ACCOUNT_SQL),
-                TransformParams(FALLBACK, str(scene.env.tenant_id)),
+                TransformParams(FALLBACK, str(scene.env.tenant_id), "remove"),  # the D-M2 WHT removal under test
                 chart,
                 {"snapshot_sha256": SNAP},
             )

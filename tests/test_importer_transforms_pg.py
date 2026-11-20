@@ -107,7 +107,7 @@ def test_null_expense_lines_land_wht_is_removed_and_the_partition_balances(engin
     try:
         with engine.connect() as source:
             source.exec_driver_sql(f"SET LOCAL search_path TO {schema}")
-            maps = EnrolmentMaps(source, source, transform_params=TransformParams(FALLBACK, TENANT))
+            maps = EnrolmentMaps(source, source, transform_params=TransformParams(FALLBACK, TENANT, "remove"))
             lines = maps.get("supplier_line_transforms")
             headers = maps.get("supplier_invoice_transforms")
             ledger = maps.transform_ledger()

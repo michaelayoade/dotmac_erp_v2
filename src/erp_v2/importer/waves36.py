@@ -113,6 +113,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
         constants={"status": "DRAFT"},
         computed={"source_document_id": "source_key"},
         deferred=("reverses_journal_id", "reversal_journal_id"),
+        history_cutoff="journal",
         null_fallbacks={"source_document_kind": "literal:JOURNAL"},
         note="lifecycle-staged: journals must be assembled DRAFT (lines "
         "immutable after); transitions step posts/voids/reverses after "
@@ -129,6 +130,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_accounting.journal_lines",
         "public.journal_entry_line",
+        history_cutoff="journal_line",
         renames={
             "journal_id": "journal_entry_id",
             "debit": "debit_amount",
@@ -141,6 +143,7 @@ WAVE3_PAIRINGS: Final[tuple[Pairing, ...]] = (
     Pairing(
         "mod_accounting.posted_ledger_lines",
         "public.posted_ledger_line",
+        history_cutoff="ledger_line",
         row_hash_columns=("source_fingerprint",),
         renames={
             "journal_id": "journal_entry_id",
@@ -1040,6 +1043,7 @@ def build_specs(
                 sub_customer_ref=pairing.sub_customer_ref,
                 source_row_refusal=pairing.source_row_refusal,
                 source_order=pairing.source_order,
+                history_cutoff=pairing.history_cutoff,
             )
         )
     return tuple(specs), tuple(generated)

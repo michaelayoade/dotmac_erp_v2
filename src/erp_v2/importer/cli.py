@@ -31,6 +31,17 @@ import sqlalchemy as sa
 
 from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBLIC_SECTOR_PAIRINGS
 from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
+from erp_v2.importer.history_cutoff import (
+    CLASS_STRADDLE,
+    REASON_STRADDLE,
+    REFUSAL_STRADDLE,
+    HistoryCutoffRefused,
+    classify_straddlers,
+    not_landed_predicate,
+    parse_cutoff,
+    write_private_json,
+)
+from erp_v2.importer.history_cutoff import bind as history_cutoff_bind
 from erp_v2.importer.minting import MintContext, MintResult
 from erp_v2.importer.pipeline import order_specs, partition_parent_blocked, run_import
 from erp_v2.importer.snapshot import ManifestError, SnapshotManifest
@@ -675,9 +686,10 @@ LEGACY_VOID_ACTOR_REFUSAL = "legacy_void_requires_migration_actor"
 LEGACY_VOID_COUNT_REFUSAL = "legacy_void_count_unavailable"
 
 
-def _legacy_void_journal_count(engine: sa.Engine, schemas, specs) -> int | None:
-    """Legacy VOID journals in the source; 0 only when there is no journal spec.
+def _legacy_void_journal_count(engine: sa.Engine, schemas, specs, history_cutoff=None) -> int | None:
+    """Legacy VOID journals that will land; 0 only when there is no journal spec.
 
+    Pre-cutoff journals (B-13) never land, so they do not need the migration actor.
     ``None`` means the count query failed: the caller must fail closed, never assume zero.
     """
 
@@ -687,11 +699,138 @@ def _legacy_void_journal_count(engine: sa.Engine, schemas, specs) -> int | None:
     try:
         with engine.connect() as conn:
             _set_search_path(conn, schemas)
+            if spec.history_cutoff is not None and history_cutoff is not None:
+                skipped = not_landed_predicate(
+                    spec.history_cutoff,
+                    spec.source_table,
+                    spec.column_map.get("id", ""),
+                    spec.column_map.get("journal_id"),
+                )
+                return int(
+                    conn.execute(
+                        history_cutoff_bind(
+                            f"SELECT count(*) FROM {spec.source_table} WHERE status = 'VOID' AND NOT {skipped}",  # noqa: S608
+                            history_cutoff,
+                        )
+                    ).scalar_one()
+                )
             return int(
                 conn.execute(sa.text(f"SELECT count(*) FROM {spec.source_table} WHERE status = 'VOID'")).scalar_one()  # noqa: S608
             )
     except sa.exc.SQLAlchemyError:
         return None
+
+
+HISTORY_CUTOFF_HINT = (
+    "pass --history-cutoff <ISO date> (the last closed day, e.g. 2025-12-31): closed years reach v2 only through "
+    "the B-9 opening journal, so a run that copies journal history without the cutoff would double count them"
+)
+
+
+def _history_cutoff(args: argparse.Namespace, executable, source_engine: sa.Engine, schemas):
+    """Resolve and verify the B-13 cutoff BEFORE any write.
+
+    Required whenever an executable spec declares one (the cutover profile always includes the journal pairings):
+    a missing or invalid flag refuses the whole run. Journals straddling the cutoff are classified and excluded as
+    units (E39), with a mode-600 side file.
+    Returns (cutoff date or None, receipt section).
+    """
+
+    needing = [s.destination_table for s in executable if s.history_cutoff is not None]
+    raw = getattr(args, "history_cutoff", None)
+    if not needing:
+        # Nothing here applies a cutoff (e.g. a master-data-only batch); a supplied flag is still validated and the
+        # receipt says it applied to no pairing.
+        if raw:
+            try:
+                return parse_cutoff(raw), {"history_cutoff": parse_cutoff(raw).isoformat(), "applies_to": []}
+            except HistoryCutoffRefused as exc:
+                raise CliRefusal(f"{exc.code}: {HISTORY_CUTOFF_HINT}; nothing written") from exc
+        return None, {"history_cutoff": None, "applies_to": []}
+    try:
+        cutoff = parse_cutoff(raw)
+    except HistoryCutoffRefused as exc:
+        raise CliRefusal(f"{exc.code}: {HISTORY_CUTOFF_HINT}; nothing written") from exc
+    # STRADDLE_SPEC (W8): a journal crossing the cutoff is classified (S1/S2) and excluded as a UNIT (journal, lines,
+    # ledger lines) with class E39, not refused. Whenever ANY cutoff pairing runs. The mode-600 side file is written
+    # BEFORE any database write; the run refuses if it cannot be written or if the classifier and the exclusion
+    # predicate disagree.
+    try:
+        with source_engine.connect() as conn:
+            _set_search_path(conn, schemas)
+            straddlers = classify_straddlers(conn, cutoff)
+    except HistoryCutoffRefused as exc:
+        raise CliRefusal(f"{exc.code}: the straddle census failed ({exc}); nothing written") from exc
+    straddle_section: dict[str, object] = {
+        "class": CLASS_STRADDLE,
+        "reason": REASON_STRADDLE,
+        "count": len(straddlers),
+        "s1": sum(1 for j in straddlers if j.kind == "S1"),
+        "s2": sum(1 for j in straddlers if j.kind == "S2"),
+        "sum_s_j": format(sum((_Decimal(j.s_j) for j in straddlers), _Decimal(0)), "f"),
+        "side_file": None,
+        "side_file_sha256": None,
+    }
+    receipt = getattr(args, "receipt", None)
+    if straddlers or receipt:
+        if not receipt:
+            raise CliRefusal(f"{REFUSAL_STRADDLE}: no receipt path to write the straddler side file; nothing written")
+        path = Path(receipt).with_name(Path(receipt).name + ".straddlers.json")
+        try:
+            straddle_section["side_file_sha256"] = write_private_json(
+                path,
+                {
+                    "history_cutoff": cutoff.isoformat(),
+                    "class": CLASS_STRADDLE,
+                    "reason": REASON_STRADDLE,
+                    "journals": [j.as_dict() for j in straddlers],
+                },
+            )
+        except OSError as exc:
+            raise CliRefusal(
+                f"{REFUSAL_STRADDLE}: the straddler side file could not be written ({type(exc).__name__}); "
+                "nothing written"
+            ) from exc
+        straddle_section["side_file"] = path.name
+    return cutoff, {
+        "history_cutoff": cutoff.isoformat(),
+        "applies_to": sorted(needing),
+        "straddlers": straddle_section,
+    }
+
+
+def _history_cutoff_side_file(reports, receipt_path: Path) -> str | None:
+    """Mode-600 side file for the register (B-9r loads it): the pre-cutoff NON-posted journal keys split by legacy
+    status (E16b), the unbalanced journals refused as a unit (E15, key and amounts), the post-cutoff reversals whose
+    target is pre-cutoff (``reversal_target_before_cutoff``, info) and any undated refusals. The sha256 of the file
+    is in the receipt. Returns None when no cutoff pairing ran."""
+
+    import hashlib
+
+    body: dict[str, list[str]] = {}
+    ran = False
+    for r in reports:
+        if r.history_cutoff is None:
+            continue
+        ran = True
+        for status, keys in r.history_cutoff_nonposted_keys.items():
+            body[f"pre_cutoff_journal_{status.lower() or 'unknown'}"] = list(keys)
+        if r.history_cutoff_unit_refused_journals:
+            body["E15_unbalanced_journal_unit"] = [
+                f"{j}|debit={d}|credit={c}" for j, d, c in r.history_cutoff_unit_refused_journals
+            ]
+        if r.history_cutoff_reversal_targets:
+            body["reversal_target_before_cutoff"] = [
+                f"{j}|legacy_target={t}" for j, t in r.history_cutoff_reversal_targets
+            ]
+        undated = [e.source_key for e in r.exceptions if e.reason == "history_cutoff_undated"]
+        if undated:
+            body[f"undated_{r.destination_table.rpartition('.')[2]}"] = undated
+    if not ran:
+        return None
+    path = receipt_path.with_name(receipt_path.name + ".history_cutoff.json")
+    write_side_file(path, body)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def cmd_execute(args: argparse.Namespace) -> int:
@@ -719,9 +858,10 @@ def cmd_execute(args: argparse.Namespace) -> int:
     executable = order_specs(kept, dest_tables)
     unsupplied = [s.destination_table for s in specs if s.executable and not set(s.run_supplied) <= set(run_constants)]
     non_executable = [s.destination_table for s in specs if s.source_row_refusal is None and not s.executable]
+    history_cutoff, cutoff_section = _history_cutoff(args, executable, source_engine, source_schemas)
     # Legacy VOID journals land through the owner's governed void; the approver is the
     # migration actor. Refuse before ANY write when it is missing (dry-run reports it).
-    void_journals = _legacy_void_journal_count(source_engine, source_schemas, specs)
+    void_journals = _legacy_void_journal_count(source_engine, source_schemas, specs, history_cutoff)
     actor_missing = _void_governance(manifest) is None
     if args.apply and void_journals is None:
         raise CliRefusal(f"{LEGACY_VOID_COUNT_REFUSAL}: the legacy VOID journal count query failed; nothing written")
@@ -754,6 +894,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             transform_binding={
                 "snapshot_sha256": manifest.snapshot_sha256,
                 "candidate_revision": manifest.candidate_revision,
+                **({"history_cutoff": history_cutoff.isoformat()} if history_cutoff is not None else {}),
             },
         )
         if needs_transforms:
@@ -774,6 +915,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             run_constants=run_constants,
             dry_run=not args.apply,
             commit_per_spec=bool(args.apply),
+            history_cutoff=history_cutoff,
         )
         tax_account_classes = enrolment.tax_account_classes()
         if mint_context is not None:
@@ -792,6 +934,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             dry_run=not args.apply,
             commit=bool(args.apply),
             void_governance=_void_governance(manifest),
+            history_cutoff=history_cutoff,
         )
         if args.apply:
             dest_conn.commit()  # post-mints; specs committed per spec
@@ -799,6 +942,12 @@ def cmd_execute(args: argparse.Namespace) -> int:
             dest_conn.rollback()
     transition_exceptions = [e for outcome in transitions for e in outcome.exceptions]
     transforms_section, transforms_incomplete = _transforms_receipt(enrolment, Path(args.receipt))
+    # Written after the apply commit: a failure here must not lose the receipt; it marks the run incomplete instead.
+    cutoff_side_error: str | None = None
+    try:
+        cutoff_side_sha = _history_cutoff_side_file(result.reports, Path(args.receipt))
+    except OSError as exc:
+        cutoff_side_sha, cutoff_side_error = None, type(exc).__name__
     sub_origin = _sub_origin_receipt(source_engine, source_schemas, result.reports, Path(args.receipt))
     complete = (
         result.complete
@@ -810,6 +959,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         and not transition_exceptions
         and not sub_origin["incomplete"]
         and not transforms_incomplete
+        and cutoff_side_error is None
         and not resolution.get("refusal_sources_incomplete")
     )
     payload: dict[str, object] = {
@@ -830,6 +980,33 @@ def cmd_execute(args: argparse.Namespace) -> int:
             for e in (*result.exceptions, *transition_exceptions)
         ],
         "sub_origin": sub_origin,
+        # Top level, an ISO date or null: B-9r requires it and refuses a mismatch with the opening as-of date.
+        "history_cutoff": cutoff_section.get("history_cutoff"),
+        "history_cutoff_census": {
+            **cutoff_section,
+            "side_file_sha256": cutoff_side_sha,
+            "side_file_error": cutoff_side_error,
+            "censuses": [
+                {
+                    "destination_table": r.destination_table,
+                    "source_rows": r.history_cutoff_source,
+                    "excluded_on_or_before_cutoff": r.history_cutoff_excluded,
+                    "excluded_keys_sha256": r.history_cutoff_excluded_sha256,
+                    "excluded_by_legacy_status": dict(sorted(r.history_cutoff_excluded_by_status.items())),
+                    "undated_refused": r.history_cutoff_undated,
+                    "unbalanced_unit_refused_rows": r.history_cutoff_unit_refused,
+                    "straddle_excluded_rows": r.history_cutoff_straddle_excluded,
+                    "unbalanced_unit_refused_journals": [
+                        {"journal": j, "debit": d, "credit": c} for j, d, c in r.history_cutoff_unit_refused_journals
+                    ],
+                    "reversal_target_before_cutoff": len(r.history_cutoff_reversal_targets),
+                    "read": r.read,
+                    "refused": r.refused,
+                }
+                for r in result.reports
+                if r.history_cutoff is not None
+            ],
+        },
         "legacy_void_governance": {
             "void_journals": void_journals,
             "migration_actor_missing": actor_missing,
@@ -916,6 +1093,12 @@ def build_parser() -> argparse.ArgumentParser:
             )
             cmd.add_argument("--apply", action="store_true", help="write (default dry-run)")
             cmd.add_argument(
+                "--history-cutoff",
+                help="ISO date (e.g. 2025-12-31): legacy journals, lines and posted ledger lines dated on or before it "
+                "are NOT imported (closed years arrive only through the B-9 opening journal). REQUIRED whenever the "
+                "journal pairings run; the run refuses without it",
+            )
+            cmd.add_argument(
                 "--mint",
                 action="store_true",
                 help="mint GENERATED enrolment rows (revisions, authorities, sourcing lines, "
@@ -924,7 +1107,9 @@ def build_parser() -> argparse.ArgumentParser:
             cmd.add_argument(
                 "--import-params-json",
                 help='declared import params, a JSON object: {"import.fallback_expense_account": "<account uuid>"} '
-                "(REQUIRED when supplier invoices are imported; the run refuses without it)",
+                "(REQUIRED when supplier invoices are imported; the run refuses without it); optional "
+                '"import.unposted_wht": "queue" (default: an unposted invoice with a WHT line is not landed, E04) '
+                'or "remove" (the old D-M2 WHT removal)',
             )
             cmd.add_argument("--tax-rule-policy-json", help="legacy tax_type -> ruled module codes")
             cmd.add_argument("--tax-band-binding-json", help="legacy tax band name -> legacy tax_code")
