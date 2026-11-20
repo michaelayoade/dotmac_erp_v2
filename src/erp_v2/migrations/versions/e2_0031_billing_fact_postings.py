@@ -1,3 +1,4 @@
+# ruff: noqa: S608  (the SQL interpolates module-constant names and kind lists only, never input)
 """B-15 live billing -> GL mapper: per-fact disposition rows and the fact-window ledger.
 
 Additive: two new tables, no change to any existing object. FORCE RLS with the tenant policy.
@@ -6,7 +7,8 @@ W4 (explicit widening, approved by Michael 2026-11-19): the mapper runs as the r
 SELECT, INSERT and a column-limited UPDATE on both tables, and no DELETE. These are the first runtime-writable
 migration-family tables; triggers hold the invariants even against the owner role:
 
-* postings: no DELETE; identity and ``fact_digest`` immutable (a digest change raises
+* postings: no DELETE; a terminal row must be what the mapper writes (POSTED needs the bridge journal for the fact,
+  SKIP only opening import/unwind kinds, NO_GL only V1); identity and ``fact_digest`` immutable (a digest change raises
   ``billing_fact_digest_changed``, an integrity alarm); POSTED, SKIP and NO_GL are terminal; BLOCKED and WAITING move
   only to a terminal state or to each other; REFUSED moves only to POSTED (after a reviewed dispatch change);
 * windows: no DELETE; the window bounds never change.
@@ -20,8 +22,9 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+from dotmac_accounting.models import SCHEMA
 
-from erp_v2.billing_gl.models import DISPOSITIONS, POSTINGS_TABLE, WINDOWS_TABLE
+from erp_v2.billing_gl.models import DISPOSITIONS, OPENING_SKIP_KINDS, POSTINGS_TABLE, WINDOWS_TABLE
 
 revision = "e2_0031_billing_fact_postings"
 down_revision = "e2_0030_migration_holdings"
@@ -41,10 +44,10 @@ def _rls(table: str) -> None:
     )
 
 
-def _guard(table: str, body: str) -> None:
+def _guard(table: str, body: str, events: str = "UPDATE OR DELETE") -> None:
     op.execute(f"CREATE FUNCTION public.{table}_guard() RETURNS trigger LANGUAGE plpgsql AS $$ {body} $$")
     op.execute(
-        f"CREATE TRIGGER {table}_guard BEFORE UPDATE OR DELETE ON public.{table} "
+        f"CREATE TRIGGER {table}_guard BEFORE {events} ON public.{table} "
         f"FOR EACH ROW EXECUTE FUNCTION public.{table}_guard()"
     )
 
@@ -82,11 +85,30 @@ def upgrade() -> None:
     op.create_index(f"ix_{POSTINGS_TABLE}_open", POSTINGS_TABLE, ["tenant_id", "disposition", "occurred_at"])
     op.create_index(f"ix_{POSTINGS_TABLE}_account", POSTINGS_TABLE, ["tenant_id", "billing_account_id", "occurred_at"])
     _rls(POSTINGS_TABLE)
+    skip_kinds = ", ".join(f"'{k}'" for k in OPENING_SKIP_KINDS)
+    journals = f"{SCHEMA}.journal_entries"
     _guard(
         POSTINGS_TABLE,
         "BEGIN "
         "IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'billing fact postings are never deleted' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
+        # The runtime role can INSERT (W4), so a terminal row is only valid when it is what the mapper writes:
+        # POSTED needs the bridge's own journal for this fact, SKIP is only an opening import/unwind kind,
+        # NO_GL only a V1 fact.
+        "IF NEW.disposition = 'POSTED' AND NOT EXISTS (SELECT 1 FROM "
+        + journals
+        + " j WHERE j.tenant_id = NEW.tenant_id AND j.id = NEW.journal_id AND j.source_owner = 'billing' "
+        "AND j.source_document_kind = 'accounting_fact' AND j.source_document_id = NEW.fact_id::text "
+        "AND j.source_version = NEW.fact_version::text) THEN "
+        "RAISE EXCEPTION 'a POSTED billing fact needs its posting-bridge journal' "
+        "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
+        "IF NEW.disposition = 'SKIP' AND NOT (NEW.fact_version IN (4, 5) AND NEW.effect_kind IN ("
+        + skip_kinds
+        + ")) THEN RAISE EXCEPTION 'SKIP is only for opening import and unwind facts' "
+        "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
+        "IF NEW.disposition = 'NO_GL' AND NEW.fact_version <> 1 THEN "
+        "RAISE EXCEPTION 'NO_GL is only for V1 facts' USING ERRCODE = 'integrity_constraint_violation'; END IF; "
+        "IF TG_OP = 'INSERT' THEN RETURN NEW; END IF; "
         "IF NEW.fact_digest <> OLD.fact_digest THEN RAISE EXCEPTION 'billing_fact_digest_changed' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
         "IF NEW.id <> OLD.id OR NEW.tenant_id <> OLD.tenant_id OR NEW.fact_id <> OLD.fact_id "
@@ -106,6 +128,7 @@ def upgrade() -> None:
         "RAISE EXCEPTION 'a REFUSED billing fact may only move to POSTED' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
         "RETURN NEW; END",
+        "INSERT OR UPDATE OR DELETE",
     )
     op.execute(f"GRANT SELECT, INSERT ON public.{POSTINGS_TABLE} TO app_user")
     op.execute(
@@ -148,7 +171,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     for table in (POSTINGS_TABLE, WINDOWS_TABLE):
-        if bind.execute(sa.text(f"SELECT EXISTS (SELECT 1 FROM public.{table})")).scalar():  # noqa: S608
+        if bind.execute(sa.text(f"SELECT EXISTS (SELECT 1 FROM public.{table})")).scalar():
             raise RuntimeError(f"refusing to drop {table}: billing mapper evidence exists")
     for table in (WINDOWS_TABLE, POSTINGS_TABLE):
         op.drop_table(table)

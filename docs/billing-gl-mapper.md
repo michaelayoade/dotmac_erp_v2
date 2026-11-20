@@ -60,9 +60,23 @@ summary (count + chained digest) equals the mapper's running `fact_index_line` d
 Posting date: `occurred_at` in `posting_timezone`. If that period is not OPEN: `next_open_period` (default) posts on the
 first open date after it with the original date in the description; `hold` BLOCKs `period_closed`.
 
+## Completeness, locking and terminal rows (architect review, 2026-11-19)
+
+- **One run at a time.** Each run takes a per-tenant session advisory lock on a dedicated connection; a second run exits
+  with `locked: true` and does nothing, so two overlapping runs can never process the same facts.
+- **Retry pages everything.** Pending facts are retried per timestamp slice, paging to the end (opening facts can share
+  one timestamp), in billing index order.
+- **Nothing is silently skipped.** Besides re-summarising recent windows, every run re-summarises the `rescan_batch`
+  oldest-checked closed windows, a rolling full rescan, so a backdated fact in an old window is found. Period close
+  (`soft_close_period` / `lock_period`) and the gate refuse while ANY UTC day up to the settle horizon has no closed window
+  checked within `rescan_days`, whether or not a window row exists for it. `history_floor` cannot hide early days: a period
+  starting before the floor is refused, and the gate refuses a floor later than 2000-01-01.
+- **Terminal rows are the mapper's only.** The runtime role can INSERT (W4), so the trigger also checks INSERT and UPDATE:
+  POSTED needs the posting bridge's own journal for that fact, SKIP is only for opening import/unwind kinds, NO_GL only for V1.
+
 ## Settings (domain `billing_gl`, entered in the UI)
 
-`enabled`, `cash_account` (JSON: source system -> account id; `opening_refund` for opening refunds), `posting_timezone`,
+`enabled`, `rescan_days` (7), `rescan_batch` (24), `cash_account` (JSON: source system -> account id; `opening_refund` for opening refunds), `posting_timezone`,
 `closed_period_policy`, `settle_seconds`, `resummarize_days`, `history_floor`. Read by key from B-14:
 `ar.prepayment_liability_account`, `ar.prepaid_funding_account` (account id, code or exact name).
 

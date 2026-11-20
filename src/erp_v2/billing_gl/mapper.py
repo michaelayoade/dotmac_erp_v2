@@ -24,6 +24,7 @@ from typing import Final
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import sqlalchemy as sa
 from dotmac_accounting.contracts import PeriodStatus
 from dotmac_accounting.models import Account, FiscalPeriod
 from dotmac_billing import (
@@ -86,6 +87,7 @@ class Report:
     windows_closed: int = 0
     windows_mismatched: int = 0
     windows_remaining: int = 0
+    locked: bool = False
     integrity_alarms: int = 0
     # Counts only: labels carry reasons, never identifiers or amounts.
     blocked_by_reason: dict[str, int] = field(default_factory=dict)
@@ -431,33 +433,34 @@ class Mapper:
 
     # ------------------------------------------------------------- the loop
     def _retry_pending(self) -> None:
-        rows = list(
-            self.db.scalars(
-                select(FactPosting)
-                .where(FactPosting.tenant_id == self.tenant_id, FactPosting.disposition.in_(PENDING))
-                .order_by(
-                    FactPosting.occurred_at,
-                    FactPosting.billing_account_id,
-                    FactPosting.fact_version,
-                    FactPosting.fact_id,
+        """Retry every BLOCKED/WAITING fact, in billing index order, paging EVERY slice to the end.
+
+        Opening facts can share one timestamp (#72 stamps them with a single ``--occurred-at``), so a slice can hold
+        more than one page; a pending fact is matched in whichever page it is on, never dropped after the first.
+        """
+        pending = {
+            (row.fact_id, row.fact_version): row.occurred_at
+            for row in self.db.scalars(
+                select(FactPosting).where(FactPosting.tenant_id == self.tenant_id, FactPosting.disposition.in_(PENDING))
+            )
+        }
+        for stamp in sorted(set(pending.values())):
+            wanted = {key for key, at in pending.items() if at == stamp}
+            after = None
+            while wanted:
+                page = list_accounting_facts(
+                    self.db,
+                    scope=self.scope,
+                    request=ListAccountingFactsV1(self.scope, stamp, stamp + ONE_US, after, PAGE),
                 )
-            )
-        )
-        for pending in rows:
-            page = list_accounting_facts(
-                self.db,
-                scope=self.scope,
-                request=ListAccountingFactsV1(
-                    self.scope, pending.occurred_at, pending.occurred_at + ONE_US, None, PAGE
-                ),
-            )
-            match = [
-                e
-                for e in page.entries
-                if e.cursor.fact_id == pending.fact_id and e.cursor.fact_version == pending.fact_version
-            ]
-            if match:
-                self.process(match[0])
+                for entry in page.entries:
+                    key = (entry.cursor.fact_id, entry.cursor.fact_version)
+                    if key in wanted:
+                        wanted.discard(key)
+                        self.process(entry)
+                if page.next_cursor is None:
+                    break
+                after = page.next_cursor
 
     def _page_window(self, start: datetime, end: datetime) -> tuple[int, str]:
         digest = fact_index_digest_seed()
@@ -523,8 +526,22 @@ class Mapper:
         self.commit()
 
     def run(self) -> Report:
+        """One pass, under a per-tenant advisory lock so two overlapping runs can never process the same facts."""
         if not self.live and not self.enable_once:
             return self.report
+        bind = self.db.get_bind()
+        key = int.from_bytes(hashlib.sha256(f"billing_gl:{self.tenant_id}".encode()).digest()[:8], "big", signed=True)
+        # A dedicated connection: a session-level lock must outlive the per-page commits of the working session.
+        with bind.engine.connect() as lock:
+            if not lock.execute(sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar():
+                self.report.locked = True
+                return self.report
+            try:
+                return self._run()
+            finally:
+                lock.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+
+    def _run(self) -> Report:
         self.report.tenant_enabled = self.live
         self._retry_pending()
         self.commit()
@@ -547,6 +564,15 @@ class Mapper:
             elif utc_day(day) >= recheck_from:
                 todo.append((day, existing, True))
             day += timedelta(days=1)
+        # A rolling rescan of OLD closed windows: a fact backdated past resummarize_days is still found, on a cycle
+        # of rescan_days. ready() and the period guard refuse while any window is staler than that.
+        queued = {when for when, _, _ in todo}
+        stale = sorted(
+            (w for w in windows.values() if w.closed_at is not None and w.occurred_from.date() not in queued),
+            key=lambda w: w.rechecked_at or w.closed_at,
+        )
+        for window in stale[: self.settings.rescan_batch]:
+            todo.append((window.occurred_from.date(), window, True))
         for index, (when, existing, recheck) in enumerate(todo):
             if index >= self.max_windows:
                 self.report.windows_remaining = len(todo) - index
