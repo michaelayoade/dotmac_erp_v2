@@ -314,3 +314,18 @@ def test_only_e38_items_may_be_overridden() -> None:
     with pytest.raises(LedgerRefused) as refused:
         vx.apply_overrides(body, json.dumps(override).encode())
     assert refused.value.code == "override_on_loadable_item"
+
+
+def test_the_residue_acknowledgement_gate_refuses_then_passes_with_the_sha_and_a_named_user() -> None:
+    inv = carried("i1", "60.00")
+    with_residue = derive(
+        [inv], legacy([line("INVOICE", "i1", "20.00"), line("MANUAL_FIX", None, "3.00")], {"i1": invoice()})
+    )[1]
+    sha = with_residue["residue_sha256"]
+    assert vx.residue_gate(with_residue, None, "finance.lead") == "residue_unacknowledged"
+    assert vx.residue_gate(with_residue, "0" * 64, "finance.lead") == "residue_unacknowledged"
+    assert vx.residue_gate(with_residue, sha, None) == "operator_ref_required"  # the acknowledgement names no one
+    assert vx.residue_gate(with_residue, sha, "  ") == "operator_ref_required"
+    assert vx.residue_gate(with_residue, sha, "finance.lead") is None
+    clean = derive([inv], legacy([line("INVOICE", "i1", "20.00")], {"i1": invoice()}))[1]
+    assert vx.residue_gate(clean, None, None) is None  # no residue: nothing to acknowledge

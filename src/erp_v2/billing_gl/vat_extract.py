@@ -42,6 +42,7 @@ from uuid import UUID
 
 from erp_v2.billing_gl import vat_opening
 from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, fmt, money, refuse, sha_text, strict_json, text
+from erp_v2.migration_ledger.ledger_check import OPENING_OWNERS
 
 CENT = Decimal("0.01")
 ZERO = Decimal(0)
@@ -394,7 +395,7 @@ def read_carried(db, tenant_id: UUID, snapshot_sha256: str) -> list[Carried]:
 
 
 def read_v2_opening(db, tenant_id: UUID, accounts: list[str]) -> Decimal:
-    """ERP v2's opening balance (B-9r journal, owner ``erp.opening``) of the deferral accounts: net credit."""
+    """ERP v2's opening balance (the B-9r opening and IAS 8 journals) of the deferral accounts: net credit."""
     import sqlalchemy as sa
     from dotmac_accounting.models import PostedLedgerLine
 
@@ -402,27 +403,32 @@ def read_v2_opening(db, tenant_id: UUID, accounts: list[str]) -> Decimal:
         sa.select(sa.func.coalesce(sa.func.sum(PostedLedgerLine.credit - PostedLedgerLine.debit), 0)).where(
             PostedLedgerLine.tenant_id == tenant_id,
             PostedLedgerLine.account_id.in_([UUID(a) for a in accounts]),
-            PostedLedgerLine.source_owner == "erp.opening",
+            PostedLedgerLine.source_owner.in_(OPENING_OWNERS),
         )
     )
     return Decimal(total)
 
 
-def read_ap_positions(db, accounts: list[str]) -> Decimal:
+def read_ap_positions(db, tenant_id: UUID, accounts: list[str]) -> Decimal:
     """Payables a6 remaining input deferral on the deferral accounts (``historical_tax_deferrals``), or 0 when the
-    payables release that carries it is not installed (the caller then also requires there to be no AP-module line)."""
+    payables release that carries it is not installed (the caller then also requires there to be no AP-module line).
+
+    The destination connection is the migration role, which BYPASSES row-level security, so the tenant filter is
+    explicit and the read refuses if more than one tenant would be summed."""
     import sqlalchemy as sa
 
     if not db.scalar(sa.text("SELECT to_regclass('mod_payables.historical_tax_deferrals') IS NOT NULL")):
         return ZERO
-    total = db.scalar(
+    rows = db.execute(
         sa.text(
-            "SELECT coalesce(sum(remaining), 0) FROM mod_payables.historical_tax_deferrals "
-            "WHERE deferral_account_ref = ANY(:a)"
+            "SELECT tenant_id, coalesce(sum(remaining), 0) FROM mod_payables.historical_tax_deferrals "
+            "WHERE tenant_id = :t AND deferral_account_ref = ANY(:a) GROUP BY tenant_id"
         ),
-        {"a": accounts},
-    )
-    return Decimal(total)
+        {"t": tenant_id, "a": accounts},
+    ).all()
+    if len(rows) > 1 or any(row[0] != tenant_id for row in rows):
+        refuse("ap_positions_multi_tenant")
+    return Decimal(rows[0][1]) if rows else ZERO
 
 
 def read_legacy(conn, organization_id: UUID, cutoff: date, carried_keys: list[str]) -> Legacy:
@@ -542,6 +548,19 @@ def read_legacy(conn, organization_id: UUID, cutoff: date, carried_keys: list[st
 # --------------------------------------------------------------------------- CLI
 
 
+def residue_gate(report: dict[str, Any], acknowledge: str | None, operator_ref: str | None) -> str | None:
+    """The residue-acknowledgement gate: None when the run may write its items file, else the refusal code.
+
+    A non-zero named residue needs Finance's acknowledgement: the exact residue sha and the acknowledging user."""
+    if not _has_residue(report["residue"]):
+        return None
+    if acknowledge != report["residue_sha256"]:
+        return "residue_unacknowledged"
+    if not operator_ref or not operator_ref.strip():
+        return "operator_ref_required"
+    return None
+
+
 class _Acknowledge(Exception):
     """Control flow: the residue needs Finance's acknowledgement before any items file is written."""
 
@@ -580,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         "--acknowledge-residue",
         help="the residue_sha256 of a previous receipt: Finance's acknowledgement of the named E38 residue",
     )
+    parser.add_argument("--operator-ref", help="the Finance user acknowledging the residue (recorded in the receipt)")
     args = parser.parse_args(argv)
     try:
         tenant, org = UUID(args.tenant_id), UUID(args.organization_id)
@@ -616,7 +636,7 @@ def main(argv: list[str] | None = None) -> int:
             db.execute(sa.text("SET TRANSACTION READ ONLY"))
             db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant)})
             v2_opening = read_v2_opening(db, tenant, data.deferral_accounts)
-            ap_positions = read_ap_positions(db, data.deferral_accounts)
+            ap_positions = read_ap_positions(db, tenant, data.deferral_accounts)
             db.rollback()
         body, report = derive(
             tenant, carried, data, mapping, v2_opening_net_credit=v2_opening, ap_positions=ap_positions
@@ -629,8 +649,9 @@ def main(argv: list[str] | None = None) -> int:
             "legacy_fingerprint_sha256": canonical_sha(data.fingerprint),
             **report,
         }
-        if _has_residue(report["residue"]) and args.acknowledge_residue != report["residue_sha256"]:
-            payload, code = {"ready": False, "refusal": "residue_unacknowledged", **base}, 2
+        refusal = residue_gate(report, args.acknowledge_residue, args.operator_ref)
+        if refusal:
+            payload, code = {"ready": False, "refusal": refusal, **base}, 2
             raise _Acknowledge
         overrides = None
         if args.overrides:
@@ -641,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
             "ready": True,
             **base,
             "residue_acknowledged": _has_residue(report["residue"]),
+            "acknowledged_by": args.operator_ref if _has_residue(report["residue"]) else None,
             "items_sha256": sha,
             "overrides": overrides,
             "plan_preview": vat_opening.plan(vat_opening.parse(data_bytes), sha)["counts"],

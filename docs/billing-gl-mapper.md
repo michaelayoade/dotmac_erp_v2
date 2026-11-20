@@ -181,8 +181,10 @@ aggregate tie amounts only.
   of those accounts (`tie_failed`), and the AP-module lines must equal minus the payables a6 remaining input deferral
   (`ap_positions_mismatch`). Everything no carried invoice owns is a NAMED residue in the receipt (AR lines with no carried
   owner by source, credit notes, non-carried invoice remainders, payments whose reclass does not re-derive, manual
-  non-AR/non-AP journals), with a `residue_sha256`. Finance acknowledges it by passing `--acknowledge-residue <sha>`; until
-  then the run writes no items file.
+  non-AR/non-AP journals), with a `residue_sha256`. Finance acknowledges it by passing `--acknowledge-residue <sha>` AND `--operator-ref <the acknowledging
+  user>` (recorded in the receipt as `acknowledged_by`); until then the run writes no items file. The AP positions read is
+  tenant-filtered explicitly (the migration role bypasses RLS) and refuses if more than one tenant would be summed; the v2
+  opening read covers both the opening and IAS 8 owners.
 - **Credit notes.** Legacy posts a credit note's 1455 under the credit note's OWN id and keeps no link to the invoice it
   reduces, so that amount is residue and every invoice touched by a payment that also allocates to a credit note is E38.
 - **Overrides** are a separate Finance-named input (`named_by`, evidence sha and reference per item), bound by sha in the

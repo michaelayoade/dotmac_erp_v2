@@ -171,4 +171,84 @@ def test_the_destination_reader_refuses_without_admissions_or_on_a_different_sna
 def test_the_v2_readers_return_zero_on_an_empty_estate(engine):
     with Session(engine) as db:
         assert vx.read_v2_opening(db, uuid4(), [str(uuid4())]) == D(0)
-        assert vx.read_ap_positions(db, [str(uuid4())]) == D(0)  # payables a6 positions are not installed here
+        assert vx.read_ap_positions(db, uuid4(), [str(uuid4())]) == D(0)  # payables a6 positions are not installed here
+
+
+def test_read_v2_opening_sums_only_the_opening_owners_on_the_named_accounts(engine):
+    from datetime import UTC, datetime
+
+    from dotmac_accounting import service as accounting
+    from dotmac_accounting.contracts import CreateJournal, JournalKind, JournalLineInput, SourceIdentity
+    from dotmac_kernel.cache import TenantScope
+    from test_journals_pg import seed
+
+    env = seed(engine, currency=None)
+    scope, now = TenantScope(env.tenant_id), datetime(2026, 1, 15, tzinfo=UTC)
+    deferral, other = env.accounts["2000"], env.accounts["2040"]
+
+    def post(owner, document, credit_account, amount):
+        with Session(engine) as db:
+            journal = accounting.create_journal(
+                db,
+                scope=scope,
+                command=CreateJournal(
+                    number=f"T-{document}",
+                    kind=JournalKind.STANDARD,
+                    entry_date=date(2026, 1, 10),
+                    posting_date=date(2026, 1, 10),
+                    currency_code="NGN",
+                    exchange_rate=D(1),
+                    description="test",
+                    reference=document,
+                    source=SourceIdentity(owner, "opening_balance", document, "1", "a" * 64),
+                    lines=(
+                        JournalLineInput(env.accounts["1000"], D(amount), D(0), None),
+                        JournalLineInput(credit_account, D(0), D(amount), None),
+                    ),
+                ),
+                idempotency_key=f"{document}:create",
+                idempotency_expires_at=None,
+                recorded_at=now,
+            )
+            accounting.post_journal(
+                db,
+                scope=scope,
+                journal_id=journal.id,
+                approval_reference="t",
+                posted_by="t",
+                idempotency_key=f"{document}:post",
+                idempotency_expires_at=None,
+                posted_at=now,
+            )
+            db.commit()
+
+    post("erp.opening", "o1", deferral, "150.00")
+    post("erp.ias8", "i1", deferral, "10.00")
+    post("billing", "b1", deferral, "999.00")  # not an opening owner: ignored
+    post("erp.opening", "o2", other, "77.00")  # an account not named: ignored
+    with Session(engine) as db:
+        assert vx.read_v2_opening(db, env.tenant_id, [str(deferral)]) == D("160.00")
+        assert vx.read_v2_opening(db, env.tenant_id, [str(deferral), str(other)]) == D("237.00")
+        assert vx.read_v2_opening(db, uuid4(), [str(deferral)]) == D(0)  # another tenant sees nothing
+
+
+def test_read_ap_positions_filters_the_tenant_explicitly(engine):
+    tenant, other, ref = uuid4(), uuid4(), str(uuid4())
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE mod_payables.historical_tax_deferrals "
+            "(tenant_id uuid, deferral_account_ref text, remaining numeric)"
+        )
+        for t, amount in ((tenant, "5.00"), (tenant, "2.50"), (other, "100.00")):
+            conn.execute(
+                sa.text("INSERT INTO mod_payables.historical_tax_deferrals VALUES (:t, :r, :a)"),
+                {"t": t, "r": ref, "a": amount},
+            )
+    try:
+        with Session(engine) as db:
+            assert vx.read_ap_positions(db, tenant, [ref]) == D("7.50")  # the other tenant's 100.00 is never summed
+            assert vx.read_ap_positions(db, other, [ref]) == D("100.00")
+            assert vx.read_ap_positions(db, tenant, [str(uuid4())]) == D(0)
+    finally:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE mod_payables.historical_tax_deferrals")
