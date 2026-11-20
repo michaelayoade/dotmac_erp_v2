@@ -725,6 +725,16 @@ def test_apply_credit_deallocate_and_reverse_a_receipt_as_bounced(engine):
         request_id=request,
     )  # same request id: the original
     assert outstanding(engine, env, document) == Decimal("40") and again.document_id == applied.document_id
+    assert again.replayed
+    with Session(engine) as db:  # the replay wrote no second success audit row
+        assert (
+            db.scalar(
+                sa.select(sa.func.count())
+                .select_from(AuditEvent)
+                .where(AuditEvent.tenant_id == env.tenant_id, AuditEvent.action == service.AUDIT_CREDIT_APPLIED)
+            )
+            == 1
+        )
     with Session(engine) as db:
         rows = queries.allocation_rows(db, env.tenant_id, document_id=document)
         assert len(rows) == 1
@@ -1038,3 +1048,161 @@ def test_gate_check_reports_setup_and_pre_flip_state(engine):
     assert "ar_producer_enabled_before_flip" in report.reasons
     assert "ar_rows_before_flip:erp_ar_drafts" in report.reasons
     assert "ar_rows_before_flip:erp_ar_line_accounts" in report.reasons
+
+
+@needs_a13
+def test_review_fixes_credit_note_shape_treatment_terms_periods_locks_and_replays(engine):
+    from erp_v2.migration_ledger.models import MigrationException
+
+    env = world(engine)
+    configure(engine, env, **{settings.KEY_TERMS: {"net_30": 30, "net_60": 60}})
+    plain = issue_invoice(engine, env, [line(unit="100", env=env)]).document_id  # no VAT on it
+    base = dict(
+        kind="credit_note",
+        customer_account_id=env.customers["C-1"],
+        document_date=DAY,
+        original_document_id=plain,
+        reason="r",
+    )
+    # 1. more than one credit line is refused for now
+    assert (
+        refused(
+            engine,
+            env,
+            "preparer",
+            service.create_draft,
+            request_id=uuid4(),
+            lines=[line("a", env=env), line("b", env=env)],
+            **base,
+        )
+        == "credit_note_single_line_only"
+    )
+    # 2. a taxed credit line whose treatment is not on the original is refused at issue
+    taxed = act(
+        engine, env, "preparer", service.create_draft, request_id=uuid4(), lines=[line("a", env=env, vat=True)], **base
+    )
+    assert refused(engine, env, "approver", service.issue_draft, draft_id=taxed.id) == "credit_tax_treatment_mismatch"
+    assert outstanding(engine, env, plain) == Decimal("100")
+    # 3. per-draft payment terms drive the due date; an unknown code is refused
+    sixty = act(
+        engine,
+        env,
+        "preparer",
+        service.create_draft,
+        request_id=uuid4(),
+        kind="invoice",
+        customer_account_id=env.customers["C-1"],
+        document_date=DAY,
+        lines=[line(env=env)],
+        payment_terms_code="net_60",
+    )
+    doc = act(engine, env, "approver", service.issue_draft, draft_id=sixty.id).document_id
+    with Session(engine) as db:
+        due = queries.billing_document(db, env.tenant_id, doc).due_at
+        assert due.astimezone(terms.LAGOS).date() == date(2026, 3, 13)
+        assert queries.draft(db, env.tenant_id, sixty.id).payment_terms_code == "net_60"
+    assert (
+        refused(
+            engine,
+            env,
+            "preparer",
+            service.create_draft,
+            request_id=uuid4(),
+            kind="invoice",
+            customer_account_id=env.customers["C-1"],
+            document_date=DAY,
+            lines=[line(env=env)],
+            payment_terms_code="net_999",
+        )
+        == "payment_terms_unknown"
+    )
+    # 5. every dated action needs an open period
+    with Session(engine) as db:
+        account = queries.billing_document(db, env.tenant_id, doc).billing_account_id
+    assert (
+        refused(
+            engine,
+            env,
+            "approver",
+            service.apply_credit,
+            billing_account_id=account,
+            document_id=doc,
+            amount=Decimal(1),
+            occurred_on=date(2025, 12, 20),
+            request_id=uuid4(),
+        )
+        == "period_missing"
+    )
+    assert (
+        refused(engine, env, "approver", service.void_document, document_id=doc, occurred_on=date(2025, 12, 20))
+        == "period_missing"
+    )
+    # 8. deallocations of different rows may share a request id; a replay is a no-op
+    one = issue_invoice(engine, env, [line(unit="50", env=env)], customer="C-2").document_id
+    two = issue_invoice(engine, env, [line(unit="50", env=env)], customer="C-2").document_id
+    _, posted = post_receipt(engine, env, "100", [(one, "50"), (two, "50")], customer="C-2", reference="BANK-REF-77")
+    with Session(engine) as db:
+        rows = queries.allocation_rows(db, env.tenant_id, settlement_id=posted.settlement_id)
+    shared = uuid4()
+    for row in rows:
+        act(engine, env, "approver", service.deallocate, allocation_id=row.id, occurred_on=DAY, request_id=shared)
+    assert outstanding(engine, env, one) == outstanding(engine, env, two) == Decimal("50")
+    replay = act(
+        engine, env, "approver", service.deallocate, allocation_id=rows[0].id, occurred_on=DAY, request_id=shared
+    )
+    assert replay.replayed
+    # 7. the F-D notice is a structural filter over every open E35 item (no truncation)
+    with Session(engine) as db:
+        for i in range(2105):
+            db.add(
+                MigrationException(
+                    tenant_id=env.tenant_id,
+                    class_code="E35",
+                    legacy_key=f"row:{i}",
+                    source_kind="t",
+                    state="open",
+                    fingerprint="b" * 64,
+                    source_receipt_sha256="a" * 64,
+                    detail={"party": ["other", "NGN"]},
+                )
+            )
+        db.add(
+            MigrationException(
+                tenant_id=env.tenant_id,
+                class_code="E35",
+                legacy_key="ar_unapplied_credit_note:CN-9",
+                source_kind="t",
+                state="open",
+                fingerprint="c" * 64,
+                source_receipt_sha256="a" * 64,
+                detail={"party": [str(env.customers["C-1"]), "NGN"]},
+            )
+        )
+        db.commit()
+    with Session(engine) as db:
+        assert queries.credit_note_notice(db, env.tenant_id, env.customers["C-1"]) == ["ar_unapplied_credit_note:CN-9"]
+        assert queries.credit_note_notice(db, env.tenant_id, env.customers["C-2"]) == []
+
+
+@needs_a13
+def test_d9_on_only_the_preparer_may_edit_or_discard_a_draft(engine):
+    env = world(engine, dual=True)
+    draft = draft_invoice(engine, env, [line(env=env)], who="preparer")
+    edit = dict(
+        draft_id=draft.id, customer_account_id=env.customers["C-1"], document_date=DAY, lines=[line(unit="5", env=env)]
+    )
+    assert refused(engine, env, "solo", service.update_draft, **edit) == "not_preparer"
+    assert refused(engine, env, "solo", service.discard_draft, draft_id=draft.id) == "not_preparer"
+    act(engine, env, "preparer", service.update_draft, **edit)
+    off = world(engine, dual=False)
+    other = draft_invoice(engine, off, [line(env=off)], who="preparer")
+    act(
+        engine,
+        off,
+        "solo",
+        service.update_draft,
+        draft_id=other.id,
+        customer_account_id=off.customers["C-1"],
+        document_date=DAY,
+        lines=[line(unit="5", env=off)],
+    )

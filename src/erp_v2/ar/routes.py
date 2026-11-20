@@ -30,13 +30,15 @@ from erp_v2.journals import policy as journal_policy
 ACCESS: Final = "erp.web.access"
 PREPARE: Final = "erp.finance.receivables.prepare"
 POST: Final = "erp.finance.receivables.post"
+READ: Final = "erp.finance.receivables.read"
 BASE: Final = "/finance/receivables"
 
 ROUTE_PERMISSIONS: Final = {
     "drafts_list": ACCESS,
     "invoice_new": PREPARE,
     "invoice_create": PREPARE,
-    "draft_detail": PREPARE,
+    "draft_detail": READ,
+    "draw_reverse": POST,
     "draft_save": PREPARE,
     "draft_discard": PREPARE,
     "draft_issue": POST,
@@ -203,6 +205,8 @@ def _form_context(
         default_revenue=cfg.default_revenue_account,
         notice=notice,
         enabled=settings.producer_enabled(db, tenant.id),
+        terms=cfg.terms,
+        default_terms=cfg.default_terms_code,
         currency=currency,
         currency_error=currency_error,
         request_id=str(uuid4()),
@@ -241,6 +245,7 @@ async def invoice_create(
             customer_account_id=_uuid(values.get("customer_account_id"), "The customer"),
             document_date=_date(values.get("document_date"), "the invoice date"),
             lines=lines,
+            payment_terms_code=values.get("payment_terms_code") or None,
         )
     except ArRefused as exc:
         return _page(
@@ -286,7 +291,7 @@ def draft_detail(
     request: Request,
     db: Session = Depends(get_db),
     tenant: Tenant = Depends(require_tenant),
-    party: Party = Depends(require_web_permission(PREPARE)),
+    party: Party = Depends(require_web_permission(READ)),
 ) -> HTMLResponse:
     return _draft_page(request, db, tenant, party, draft_id)
 
@@ -317,6 +322,7 @@ async def draft_save(
             bank_reference=values.get("bank_reference") or draft.bank_reference,
             amount=service.parse_decimal(values["amount"], label="amount") if values.get("amount") else draft.amount,
             reason=values.get("reason") or draft.reason,
+            payment_terms_code=(values.get("payment_terms_code") or None) if draft.kind == KIND_INVOICE else None,
         )
     except ArRefused as exc:
         return _draft_page(request, db, tenant, party, draft_id, error=_message(exc))
@@ -378,6 +384,7 @@ def _document_page(
             allocations=queries.allocation_rows(db, tenant.id, document_id=document.id),
             credit_notes=queries.credit_notes_for(db, tenant.id, document.id),
             voided=queries.is_voided(db, tenant.id, document.id),
+            draws=queries.opening_draws(db, tenant.id, document.id) if document.document_kind == "invoice" else [],
             gl_status=queries.gl_status(db, tenant.id, document.id),
             request_id=str(uuid4()),
             today=_today().isoformat(),
@@ -716,6 +723,32 @@ def _maybe_uuid(raw: str | None) -> UUID | None:
         return UUID((raw or "").strip())
     except ValueError:
         return None
+
+
+@router.post(BASE + "/draws/{group_id}/reverse", response_model=None)
+async def draw_reverse(
+    group_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(require_tenant),
+    party: Party = Depends(require_web_permission(POST)),
+) -> HTMLResponse | RedirectResponse:
+    values = dict(_form_items(await request.form()))
+    document_id = _maybe_uuid(values.get("document_id"))
+    try:
+        service.reverse_draw(
+            db,
+            tenant=tenant,
+            party=party,
+            group_id=group_id,
+            document_id=_uuid(values.get("document_id"), "The invoice"),
+            occurred_on=_date(values.get("occurred_on"), "the date"),
+        )
+    except ArRefused as exc:
+        if document_id is None:
+            raise HTTPException(status_code=400, detail=_message(exc)) from exc
+        return _document_page(request, db, tenant, party, document_id, error=_message(exc))
+    return _redirect(f"{BASE}/documents/{document_id}")
 
 
 @router.post(BASE + "/allocations/{allocation_id}/deallocate", response_model=None)

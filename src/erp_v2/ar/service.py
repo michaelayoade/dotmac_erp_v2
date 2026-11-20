@@ -197,8 +197,16 @@ def key_alloc(draft_id: UUID, n: int) -> str:
     return f"erp_v2.ar.alloc:{draft_id}:{n}"
 
 
-def key_dealloc(request_id: UUID) -> str:
-    return f"erp_v2.ar.dealloc:{request_id}"
+def key_dealloc(allocation_id: UUID, request_id: UUID) -> str:
+    return f"erp_v2.ar.dealloc:{allocation_id}:{request_id}"
+
+
+def key_draw_reverse(group_id: UUID) -> str:
+    return f"erp_v2.ar.drawrev:{group_id}"
+
+
+def key_reverse_draw(settlement_id: UUID, group_id: UUID) -> str:
+    return f"erp_v2.ar.rdraw:{settlement_id}:{group_id}"
 
 
 def key_reverse(settlement_id: UUID) -> str:
@@ -536,6 +544,7 @@ def _draft_payload(
     amount: Decimal | None,
     reason: str | None,
     allocations: Sequence[AllocationInput],
+    payment_terms_code: str | None = None,
 ) -> dict[str, object]:
     return {
         "kind": kind,
@@ -546,6 +555,7 @@ def _draft_payload(
         "bank_reference": bank_reference,
         "amount": str(amount) if amount is not None else None,
         "reason": reason,
+        "payment_terms_code": payment_terms_code,
         "lines": [
             [
                 ln.description,
@@ -572,6 +582,7 @@ def _check_draft_shape(
     original_document_id: UUID | None,
     amount: Decimal | None,
     now: datetime,
+    payment_terms_code: str | None = None,
 ) -> str:
     """Early validation at draft time (the issue re-validates against the then-current ledger). Returns the currency."""
     code = _functional(db, tenant.id)
@@ -580,16 +591,28 @@ def _check_draft_shape(
     if document_date > _lagos_today(now):
         raise ArRefused("date_future", "The date is in the future")
     if kind == KIND_INVOICE:
+        if payment_terms_code is not None and payment_terms_code not in settings.load(db, tenant.id).terms:
+            raise ArRefused("payment_terms_unknown", "Select one of the configured payment terms")
         _price_lines(db, tenant_id=tenant.id, lines=lines, code=code, on=document_date, source_prefix="draft")
     elif kind == KIND_CREDIT_NOTE:
         if original_document_id is None:
             raise ArRefused("credit_note_requires_invoice", "A credit note is issued against one named invoice")
+        _require_single_credit_line(lines)
         _price_lines(db, tenant_id=tenant.id, lines=lines, code=code, on=document_date, source_prefix="draft")
     elif kind == KIND_RECEIPT:
         _check_receipt_shape(amount, allocations)
     else:
         raise ArRefused("invalid_kind", "Unknown document kind")
     return code
+
+
+def _require_single_credit_line(lines: Sequence[object]) -> None:
+    """Billing writes ONE line per credit note and the B-15 mapper compares per-line rows until it compares sums
+    (#77): a multi-line credit note would BLOCK for good (the rows are append-only), so refuse it for now."""
+    if len(lines) > 1:
+        raise ArRefused(
+            "credit_note_single_line_only", "A credit note carries one line for now; issue one note per line"
+        )
 
 
 def _check_receipt_shape(amount: Decimal | None, allocations: Sequence[AllocationInput]) -> None:
@@ -659,6 +682,7 @@ def _create_draft(
     bank_reference: str | None,
     amount: Decimal | None,
     reason: str | None,
+    payment_terms_code: str | None,
     now: datetime,
 ) -> Outcome:
     code = _check_draft_shape(
@@ -671,6 +695,7 @@ def _create_draft(
         allocations=allocations,
         original_document_id=original_document_id,
         amount=amount,
+        payment_terms_code=payment_terms_code,
         now=now,
     )
 
@@ -686,6 +711,7 @@ def _create_draft(
             bank_reference=bank_reference,
             amount=amount,
             reason=reason,
+            payment_terms_code=payment_terms_code,
             status=STATUS_DRAFT,
             prepared_by=party.id,
             dual_control=governance.dual_control(session, tenant.id),
@@ -713,6 +739,7 @@ def _create_draft(
                 amount,
                 reason,
                 allocations,
+                payment_terms_code,
             )
         ),
         operation=operation,
@@ -747,6 +774,7 @@ def create_draft(
     bank_reference: str | None = None,
     amount: Decimal | None = None,
     reason: str | None = None,
+    payment_terms_code: str | None = None,
     now: datetime | None = None,
 ) -> Outcome:
     moment = now or datetime.now(UTC)
@@ -771,6 +799,7 @@ def create_draft(
             bank_reference=bank_reference,
             amount=amount,
             reason=reason,
+            payment_terms_code=payment_terms_code,
             now=moment,
         ),
     )
@@ -791,11 +820,13 @@ def _update_draft(
     bank_reference: str | None,
     amount: Decimal | None,
     reason: str | None,
+    payment_terms_code: str | None,
     now: datetime,
 ) -> Outcome:
     draft = _locked_draft(db, tenant.id, draft_id)
     if draft.status != STATUS_DRAFT:
         raise ArRefused("not_draft", "Only a draft can be edited")
+    _require_preparer_when_dual(draft, party)
     _check_draft_shape(
         db,
         tenant=tenant,
@@ -806,8 +837,10 @@ def _update_draft(
         allocations=allocations,
         original_document_id=original_document_id,
         amount=amount,
+        payment_terms_code=payment_terms_code,
         now=now,
     )
+    draft.payment_terms_code = payment_terms_code
     draft.customer_account_id = customer_account_id
     draft.document_date = document_date
     draft.original_document_id = original_document_id
@@ -845,6 +878,7 @@ def update_draft(
     bank_reference: str | None = None,
     amount: Decimal | None = None,
     reason: str | None = None,
+    payment_terms_code: str | None = None,
     now: datetime | None = None,
 ) -> Outcome:
     moment = now or datetime.now(UTC)
@@ -868,6 +902,7 @@ def update_draft(
             bank_reference=bank_reference,
             amount=amount,
             reason=reason,
+            payment_terms_code=payment_terms_code,
             now=moment,
         ),
     )
@@ -879,6 +914,7 @@ def _discard_draft(db: Session, *, tenant: Tenant, party: Party, draft_id: UUID,
         return Outcome(draft.id, True)
     if draft.status != STATUS_DRAFT:
         raise ArRefused("not_draft", "Only a draft can be deleted")
+    _require_preparer_when_dual(draft, party)
     draft.status = STATUS_DELETED
     draft.updated_at = now
     db.flush()
@@ -907,6 +943,12 @@ def _require_setup(cfg: settings.ArSettings, *keys: str) -> None:
     gaps = [k for k in cfg.missing() if k in keys]
     if gaps:
         raise ArRefused(f"ar_setup_incomplete:{gaps[0]}", f"Receivables setup is incomplete: {gaps[0]}")
+
+
+def _require_preparer_when_dual(draft: ArDraft, party: Party) -> None:
+    """D-9 ON: a draft is locked to its preparer, so a second person cannot rewrite it and then issue it."""
+    if draft.dual_control and draft.prepared_by != party.id:
+        raise ArRefused("not_preparer", "Only the person who prepared this draft can change it")
 
 
 def _require_dual_stamp(draft: ArDraft, party: Party) -> None:
@@ -992,13 +1034,16 @@ def _issue_invoice(db: Session, *, tenant: Tenant, party: Party, draft: ArDraft,
                 accepted_source_kinds=constants.ACCEPTED_SOURCE_KINDS,
             )
         )
+    terms_code = draft.payment_terms_code or cfg.default_terms_code or ""
+    if terms_code not in cfg.terms:
+        raise ArRefused("payment_terms_unknown", "The invoice's payment terms are not configured")
     basis = terms.net_days_basis(
         invoice_date=draft.document_date,
-        terms_code=cfg.default_terms_code or "",
+        terms_code=terms_code,
         terms_version=_terms_version(db, tenant.id),
         evidence_ref=f"erp_v2.ar.draft:{draft.id}",
     )
-    days = cfg.terms[cfg.default_terms_code or ""]
+    days = cfg.terms[terms_code]
     header = {
         "seller_snapshot": _seller_snapshot(cfg),
         "customer_snapshot": _customer_snapshot(customer.display_name),
@@ -1141,6 +1186,15 @@ def _issue_credit_note(db: Session, *, tenant: Tenant, party: Party, draft: ArDr
         on=draft.document_date,
         source_prefix=f"cn:{draft.id}",
     )
+    _require_single_credit_line(priced)
+    on_original = queries.original_treatments(db, tenant.id, original.id)
+    for item in priced:
+        if item.treatment_code is not None and item.treatment_code not in on_original:
+            # The mapper needs a VAT position of this treatment on the original: it would BLOCK after billing issued.
+            raise ArRefused(
+                "credit_tax_treatment_mismatch",
+                f"Line {item.n}: the VAT treatment is not one the original invoice carries",
+            )
     pre_tax = sum((p.pre_tax for p in priced), Decimal(0))
     tax = sum((p.tax for p in priced), Decimal(0))
     note = billing.issue_credit_note(
@@ -1390,8 +1444,7 @@ def _document_issuer(db: Session, tenant_id: UUID, document_id: UUID) -> UUID | 
 
 
 def _action_time(db: Session, tenant_id: UUID, occurred_on: date, now: datetime) -> datetime:
-    if occurred_on > _lagos_today(now):
-        raise ArRefused("date_future", "The date is in the future")
+    _require_postable_date(db, tenant_id, occurred_on, now)  # the mapper cannot post into a closed period
     return terms.midnight(occurred_on)
 
 
@@ -1409,6 +1462,8 @@ def _apply_credit(
 ) -> Outcome:
     scope = _scope(tenant)
     code = _functional(db, tenant.id)
+    if queries.posting_group_for_source(db, tenant.id, key_apply(request_id)) is not None:
+        return Outcome(document_id, True, document_id=document_id)  # a replay is a no-op, with no second audit row
     at = _action_time(db, tenant.id, occurred_on, now)
     document = queries.billing_document(db, tenant.id, document_id)
     if document is None or document.billing_account_id != billing_account_id:
@@ -1473,33 +1528,114 @@ def apply_credit(
 def _deallocate_row(
     db: Session, *, scope: TenantScope, tenant_id: UUID, row: Any, code: str, at: datetime, key: str
 ) -> Decimal:
-    """Reverse one allocation row's remaining amount; an opening-lot draw is restored through its own command."""
+    """Reverse exactly this allocation row's remaining amount (a row of an opening-bearing draw is never here)."""
     remaining = allocation_remaining(db, scope=scope, allocation_id=row.id)
     if remaining <= 0:
         return Decimal(0)
-    group = db.get(bm.PostingGroup, row.posting_group_id)
-    if group is not None and group.group_kind == "opening_cash_applied":
-        billing.reverse_cash_credit_draw(
-            db,
-            scope=scope,
-            command=ReverseCashCreditDrawV1(
-                scope=scope,
-                draw_posting_group_id=group.id,
-                amount=_money(remaining, code),
-                authorization_ref="erp_v2.ar.finance",
-                idempotency_key=key,
-                occurred_at=at,
-            ),
-        )
-    else:
-        billing.deallocate_settlement(
-            db,
-            scope=scope,
-            command=DeallocationCommand(
-                allocation_id=row.id, amount=_money(remaining, code), occurred_at=at, source_ref=key
-            ),
-        )
+    billing.deallocate_settlement(
+        db,
+        scope=scope,
+        command=DeallocationCommand(
+            allocation_id=row.id, amount=_money(remaining, code), occurred_at=at, source_ref=key
+        ),
+    )
     return remaining
+
+
+def _is_opening_draw(db: Session, group_id: UUID) -> bool:
+    group = db.get(bm.PostingGroup, group_id)
+    return group is not None and group.group_kind == "opening_cash_applied"
+
+
+def _reverse_draw_unit(
+    db: Session,
+    *,
+    scope: TenantScope,
+    tenant_id: UUID,
+    group_id: UUID,
+    document_id: UUID,
+    code: str,
+    at: datetime,
+    key: str,
+) -> Decimal:
+    """An opening-bearing draw is ONE unit: billing restores it in its own cash-source order, so its whole remaining
+    is reversed (a per-row amount would restore a different source)."""
+    remaining = queries.draw_remaining(db, tenant_id, group_id, document_id)
+    if remaining is None:
+        raise ArRefused("draw_unreadable", "The draw's remaining amount cannot be read")
+    if remaining <= 0:
+        return Decimal(0)
+    billing.reverse_cash_credit_draw(
+        db,
+        scope=scope,
+        command=ReverseCashCreditDrawV1(
+            scope=scope,
+            draw_posting_group_id=group_id,
+            amount=_money(remaining, code),
+            authorization_ref="erp_v2.ar.finance",
+            idempotency_key=key,
+            occurred_at=at,
+        ),
+    )
+    return remaining
+
+
+def _reverse_draw(
+    db: Session, *, tenant: Tenant, party: Party, group_id: UUID, document_id: UUID, occurred_on: date, now: datetime
+) -> Outcome:
+    scope = _scope(tenant)
+    code = _functional(db, tenant.id)
+    key = key_draw_reverse(group_id)
+    if queries.posting_group_for_source(db, tenant.id, key) is not None:
+        return Outcome(group_id, True, document_id=document_id)
+    at = _action_time(db, tenant.id, occurred_on, now)
+    if not _is_opening_draw(db, group_id):
+        raise ArRefused("not_found", "The draw was not found")
+    _require_other_person(db, tenant, party, _document_issuer(db, tenant.id, document_id))
+    amount = _reverse_draw_unit(
+        db, scope=scope, tenant_id=tenant.id, group_id=group_id, document_id=document_id, code=code, at=at, key=key
+    )
+    if amount == 0:
+        raise ArRefused("nothing_to_deallocate", "This draw has already been reversed")
+    _audit(
+        db,
+        tenant=tenant,
+        party=party,
+        entity_id=str(group_id),
+        action=AUDIT_DEALLOCATED,
+        success=True,
+        details={"amount": str(amount), "document_id": str(document_id), "draw": True},
+    )
+    return Outcome(group_id, False, document_id=document_id)
+
+
+def reverse_draw(
+    db: Session,
+    *,
+    tenant: Tenant,
+    party: Party,
+    group_id: UUID,
+    document_id: UUID,
+    occurred_on: date,
+    now: datetime | None = None,
+) -> Outcome:
+    moment = now or datetime.now(UTC)
+    return _guard(
+        db,
+        tenant=tenant,
+        party=party,
+        entity_id=str(group_id),
+        action="reverse_draw",
+        work=lambda: _reverse_draw(
+            db,
+            tenant=tenant,
+            party=party,
+            group_id=group_id,
+            document_id=document_id,
+            occurred_on=occurred_on,
+            now=moment,
+        ),
+    )
 
 
 def _deallocate(
@@ -1514,6 +1650,14 @@ def _deallocate(
 ) -> Outcome:
     scope = _scope(tenant)
     code = _functional(db, tenant.id)
+    key = key_dealloc(allocation_id, request_id)
+    if queries.posting_group_for_source(db, tenant.id, key) is not None:
+        row_doc = db.scalar(
+            select(bm.AllocationEffect.document_id).where(
+                bm.AllocationEffect.tenant_id == tenant.id, bm.AllocationEffect.id == allocation_id
+            )
+        )
+        return Outcome(allocation_id, True, document_id=row_doc)  # a replay is a no-op
     at = _action_time(db, tenant.id, occurred_on, now)
     row = db.scalar(
         select(bm.AllocationEffect).where(
@@ -1522,10 +1666,14 @@ def _deallocate(
     )
     if row is None or row.document_id is None or row.amount_delta <= 0:
         raise ArRefused("not_found", "The allocation was not found")
+    if _is_opening_draw(db, row.posting_group_id):
+        raise ArRefused(
+            "opening_draw_unit",
+            "This allocation is part of a draw that includes opening cash; reverse the whole draw from the invoice "
+            "page",
+        )
     _require_other_person(db, tenant, party, _document_issuer(db, tenant.id, row.document_id))
-    amount = _deallocate_row(
-        db, scope=scope, tenant_id=tenant.id, row=row, code=code, at=at, key=key_dealloc(request_id)
-    )
+    amount = _deallocate_row(db, scope=scope, tenant_id=tenant.id, row=row, code=code, at=at, key=key)
     if amount == 0:
         raise ArRefused("nothing_to_deallocate", "This allocation has already been reversed")
     _audit(
@@ -1584,7 +1732,6 @@ def _reverse_receipt(
     code = _functional(db, tenant.id)
     if reason not in REVERSAL_REASONS:
         raise ArRefused("reason_invalid", "The reason is void or bounced")
-    at = _action_time(db, tenant.id, occurred_on, now)
     draft = _locked_draft(db, tenant.id, receipt_draft_id)
     if draft.kind != KIND_RECEIPT or draft.billing_settlement_id is None:
         raise ArRefused("not_found", "The receipt was not found")
@@ -1604,8 +1751,13 @@ def _reverse_receipt(
     )
     if reversed_already is not None:
         return Outcome(draft.id, True, settlement_id=settlement_id)
+    at = _action_time(db, tenant.id, occurred_on, now)
     released = Decimal(0)
+    draws: dict[UUID, UUID] = {}
     for row in queries.allocation_rows(db, tenant.id, settlement_id=settlement_id):
+        if _is_opening_draw(db, row.posting_group_id):
+            draws[row.posting_group_id] = row.document_id  # restored once, as a unit, below
+            continue
         released += _deallocate_row(
             db,
             scope=scope,
@@ -1614,6 +1766,17 @@ def _reverse_receipt(
             code=code,
             at=at,
             key=key_reverse_dealloc(settlement_id, row.id),
+        )
+    for group_id, document_id in draws.items():
+        released += _reverse_draw_unit(
+            db,
+            scope=scope,
+            tenant_id=tenant.id,
+            group_id=group_id,
+            document_id=document_id,
+            code=code,
+            at=at,
+            key=key_reverse_draw(settlement_id, group_id),
         )
     billing.reverse_posting_group(
         db,
@@ -1665,12 +1828,12 @@ def reverse_receipt(
 
 def _void(db: Session, *, tenant: Tenant, party: Party, document_id: UUID, occurred_on: date, now: datetime) -> Outcome:
     scope = _scope(tenant)
-    at = _action_time(db, tenant.id, occurred_on, now)
     document = queries.billing_document(db, tenant.id, document_id)
     if document is None:
         raise ArRefused("not_found", "The document was not found")
     if queries.is_voided(db, tenant.id, document_id):
         return Outcome(document_id, True, document_id=document_id)  # a double POST is a no-op
+    at = _action_time(db, tenant.id, occurred_on, now)
     _require_other_person(db, tenant, party, _document_issuer(db, tenant.id, document_id))
     billing.void_document(
         db,

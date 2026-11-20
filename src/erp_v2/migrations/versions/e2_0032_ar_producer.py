@@ -70,6 +70,7 @@ def upgrade() -> None:
         sa.Column("bank_reference", sa.String(255), nullable=True),
         sa.Column("amount", _MONEY, nullable=True),
         sa.Column("reason", sa.Text(), nullable=True),
+        sa.Column("payment_terms_code", sa.String(80), nullable=True),
         sa.Column("status", sa.String(10), nullable=False),
         sa.Column("prepared_by", sa.Uuid(), nullable=False),
         sa.Column("issued_by", sa.Uuid(), nullable=True),
@@ -121,8 +122,8 @@ def upgrade() -> None:
     op.execute(f"GRANT SELECT, INSERT ON public.{DRAFTS_TABLE} TO app_user")
     op.execute(
         f"GRANT UPDATE (customer_account_id, currency, document_date, original_document_id, bank_account_id, "
-        f"bank_reference, amount, reason, status, issued_by, billing_document_id, billing_settlement_id, "
-        f"updated_at) ON public.{DRAFTS_TABLE} TO app_user"
+        f"bank_reference, amount, reason, payment_terms_code, status, issued_by, billing_document_id, "
+        f"billing_settlement_id, updated_at) ON public.{DRAFTS_TABLE} TO app_user"
     )
 
     op.create_table(

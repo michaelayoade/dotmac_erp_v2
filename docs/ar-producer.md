@@ -21,8 +21,9 @@ refuses `ar_producer_disabled` and writes nothing (not even an audit row); GETs 
 | Route | Permission |
 | --- | --- |
 | `GET /drafts` (open drafts), `GET /documents/{id}`, `GET /receipts/{id}` | `erp.web.access` |
+| `GET /drafts/{id}` | `erp.finance.receivables.read` (finance_preparer and finance_approver, so a poster can review a draft) |
 | `GET/POST /invoices/new`, `GET/POST /drafts/{id}`, `POST /drafts/{id}/discard`, `GET/POST /credit-notes/new?invoice=`, `GET/POST /receipts/new` | `erp.finance.receivables.prepare` (finance_preparer) |
-| `POST /drafts/{id}/issue`, `POST /documents/{id}/void`, `POST /receipts/{id}/post`, `POST /receipts/{id}/reverse`, `POST /accounts/{id}/apply-credit`, `POST /allocations/{id}/deallocate` | `erp.finance.receivables.post` (finance_approver) |
+| `POST /drafts/{id}/issue`, `POST /documents/{id}/void`, `POST /receipts/{id}/post`, `POST /receipts/{id}/reverse`, `POST /accounts/{id}/apply-credit`, `POST /allocations/{id}/deallocate`, `POST /draws/{group}/reverse` | `erp.finance.receivables.post` (finance_approver) |
 
 admin and staff hold neither permission. The billing `actor_ref` is always the authenticated party.
 
@@ -80,3 +81,18 @@ billing write commands.
 `erp_v2.ar.checks.ready(db, tenant_id)` reports: producer enabled or any row in the four tables before F10; every
 required setting key; each series enrolled in a collision domain (needs a numbering release with collision domains;
 at the a3 pin it reports `ar_setup_incomplete:<key>:not_enrolled`). Wiring it into the flip gate waits for B-9r.
+
+## Review changes (architect review of 423d8e8)
+
+- A credit note carries ONE line for now (`credit_note_single_line_only`): billing writes one line per note and the
+  mapper compares per-line rows until #77 compares sums. A taxed credit line must use a VAT treatment the original
+  invoice carries (`credit_tax_treatment_mismatch`; migrated originals: billing's own tax snapshots).
+- Payment terms are per draft (`erp_ar_drafts.payment_terms_code`, selected from `ar.payment_terms`, default
+  `ar.default_payment_terms_code`). Per-customer pre-fill needs customer terms data the customers module lacks (F-F).
+- A draw that includes opening cash is one unit: it is reversed whole from the invoice page (`/draws/{group}/reverse`);
+  deallocating one row of it is refused (`opening_draw_unit`). Proof on a real opening import is owed at S11.
+- Every dated action (apply, deallocate, void, reverse) needs an OPEN, non-adjustment period.
+- D-9 ON: only the preparer may edit or discard a draft (`not_preparer`).
+- The F-D notice is a structural SQL filter (`detail.party[0]` = customer account id) with no row cap.
+- Deallocate key is `dealloc:{allocation}:{request}`; deallocate and apply-credit replays return the original without a
+  second audit row. Role profile `erp.web` is version 6.

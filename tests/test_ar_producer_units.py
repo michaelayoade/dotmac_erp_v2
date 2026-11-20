@@ -53,7 +53,9 @@ def test_every_billing_key_is_stable_distinct_and_within_the_kernel_limit():
         service.key_autoapply(BIG),
         service.key_apply(BIG),
         service.key_alloc(BIG, 100),
-        service.key_dealloc(BIG),
+        service.key_dealloc(BIG, BIG),
+        service.key_draw_reverse(BIG),
+        service.key_reverse_draw(BIG, BIG),
         service.key_reverse(BIG),
         service.key_reverse_dealloc(BIG, BIG),
         service.key_void(BIG),
@@ -134,13 +136,15 @@ def test_before_r9_no_wht_or_non_cash_command_is_called_anywhere():
     assert not called, called
 
 
-def test_only_the_ar_package_and_the_importer_call_billing_write_commands():
+OPENING_IMPORTER_MODULES = ("importer/billing_opening.py", "importer/ar_")  # the opening commands (#72), when merged
+
+
+def test_only_the_ar_package_and_the_opening_importer_call_or_import_billing_write_commands():
+    """Any call, attribute use or import of a billing write command outside ``ar/`` and the opening importer."""
     offenders = []
-    for relative, text in _sources(exclude=("ar/", "importer/", "migrations/")):
+    for relative, text in _sources(exclude=("ar/", "migrations/", *OPENING_IMPORTER_MODULES)):
         for name in BILLING_WRITES:
-            if re.search(rf"\b(billing|service|billing_service)\.{name}\s*\(", text) or re.search(
-                rf"from dotmac_billing(\.service)? import[^\n]*\b{name}\b", text
-            ):
+            if re.search(rf"\b{name}\b", text):
                 offenders.append((relative, name))
     assert not offenders, offenders
 
@@ -433,6 +437,9 @@ def test_live_policy_governs_void_apply_deallocate_and_reverse(monkeypatch):
 
 def test_receivables_permissions_are_declared_for_the_finance_roles_only():
     declared = {spec.code: set(spec.default_roles) for spec in access.PERMISSION_SPECS}
+    assert declared[routes.READ] == {"finance_preparer", "finance_approver"}  # a poster can review a draft
+    assert not {"admin", "staff"} & declared[routes.READ]
+    assert access.PROFILE_VERSION == 6
     assert declared[routes.PREPARE] == {"finance_preparer"}
     assert declared[routes.POST] == {"finance_approver"}
     assert not {"admin", "staff"} & (declared[routes.PREPARE] | declared[routes.POST])
@@ -449,7 +456,7 @@ def test_every_route_is_in_the_permission_table_and_guarded_by_it():
         perms = set()
         for dep in route.dependant.dependencies:
             perms.update(c.cell_contents for c in (dep.call.__closure__ or []) if isinstance(c.cell_contents, str))
-        found[route.endpoint.__name__] = perms & {routes.ACCESS, routes.PREPARE, routes.POST}
+        found[route.endpoint.__name__] = perms & {routes.ACCESS, routes.PREPARE, routes.POST, routes.READ}
     assert set(found) == set(routes.ROUTE_PERMISSIONS)
     for name, permission in routes.ROUTE_PERMISSIONS.items():
         assert found[name] == {permission}, name
@@ -727,3 +734,70 @@ def test_migration_revision_chain_and_head():
 def test_the_gate_check_module_is_read_only():
     text = (SRC / "ar" / "checks.py").read_text()
     assert not re.search(r"\b(add|delete|execute|commit|flush)\(", text)
+
+
+# --- review fixes ------------------------------------------------------------------------------------------------
+
+
+def test_a_multi_line_credit_note_is_refused_until_the_mapper_compares_sums():
+    service._require_single_credit_line([1])
+    with pytest.raises(ArRefused) as info:
+        service._require_single_credit_line([1, 2])
+    assert info.value.code == "credit_note_single_line_only"
+
+
+def test_d9_on_locks_a_draft_to_its_preparer_off_does_not():
+    mine, other = SimpleNamespace(id=uuid4()), SimpleNamespace(id=uuid4())
+    on = SimpleNamespace(dual_control=True, prepared_by=mine.id)
+    off = SimpleNamespace(dual_control=False, prepared_by=mine.id)
+    service._require_preparer_when_dual(on, mine)
+    service._require_preparer_when_dual(off, other)
+    with pytest.raises(ArRefused) as info:
+        service._require_preparer_when_dual(on, other)
+    assert info.value.code == "not_preparer"
+
+
+def test_every_dated_action_requires_an_open_period(monkeypatch):
+    seen = []
+    monkeypatch.setattr(service, "_require_postable_date", lambda db, tenant, day, now: seen.append(day))
+    at = service._action_time(Mock(), uuid4(), date(2026, 1, 12), datetime(2026, 1, 15, tzinfo=UTC))
+    assert seen == [date(2026, 1, 12)] and at == terms.midnight(date(2026, 1, 12))
+    monkeypatch.undo()
+    with pytest.raises(ArRefused) as info:
+        service._action_time(
+            _periods(_period("SOFT_CLOSED")), uuid4(), date(2026, 1, 12), datetime(2026, 1, 15, tzinfo=UTC)
+        )
+    assert info.value.code == "period_closed"
+
+
+def test_a_row_of_an_opening_bearing_draw_cannot_be_deallocated_alone(monkeypatch):
+    monkeypatch.setattr(service, "_functional", lambda db, tenant: "NGN")
+    monkeypatch.setattr(service, "_action_time", lambda *a, **k: terms.midnight(date(2026, 1, 12)))
+    monkeypatch.setattr(service.queries, "posting_group_for_source", lambda *a: None)
+    monkeypatch.setattr(service, "_is_opening_draw", lambda db, group_id: True)
+    row = SimpleNamespace(document_id=uuid4(), amount_delta=Decimal(5), posting_group_id=uuid4())
+    db = Mock()
+    db.scalar.return_value = row
+    with pytest.raises(ArRefused) as info:
+        service._deallocate(
+            db,
+            tenant=SimpleNamespace(id=uuid4()),
+            party=Mock(),
+            allocation_id=uuid4(),
+            occurred_on=date(2026, 1, 12),
+            request_id=uuid4(),
+            now=datetime.now(UTC),
+        )
+    assert info.value.code == "opening_draw_unit"
+
+
+def test_the_f_d_notice_is_a_structural_sql_filter_with_no_truncation():
+    text = (SRC / "ar" / "queries.py").read_text()
+    body = text[text.index("def credit_note_notice") :]
+    assert "LIMIT" not in body.upper() and "limit(" not in body
+    assert "ar" in body and "detail::jsonb -> 'party' ->> 0" in body and "class_code = 'E35'" in body
+
+
+def test_the_deallocate_key_carries_the_allocation_and_the_request():
+    a, b, r = uuid4(), uuid4(), uuid4()
+    assert service.key_dealloc(a, r) != service.key_dealloc(b, r) != service.key_dealloc(a, uuid4())

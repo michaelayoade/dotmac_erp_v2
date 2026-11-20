@@ -352,8 +352,9 @@ this does not authorize adjusting balances or switching traffic.
   B-14 and `e2_0029` #72; the coordinator re-chains at merge): four tables, `erp_ar_drafts`, `erp_ar_draft_lines`,
   `erp_ar_line_accounts` and `erp_ar_receipts` (RLS forced; W5: runtime column-limited UPDATE on drafts, DML on draft
   lines bounded by a trigger, SELECT and INSERT only on the other two; append-only triggers; the downgrade refuses while
-  any row exists), and two permissions (`erp.finance.receivables.prepare` for finance_preparer, `...post` for
-  finance_approver; admin and staff hold neither). Needs the billing a13 command surface (unreleased; S9). Off by
+  any row exists), and three permissions (`erp.finance.receivables.prepare` for finance_preparer, `...post` for
+  finance_approver, `...read` for both so a poster can review a draft; admin and staff hold none) with the role
+  profile `erp.web` version 6. Needs the billing a13 command surface (unreleased; S9). Off by
   default: `ar.producer.enabled` is set in the UI at F10 together with `billing_gl.enabled`. No environment variable.
 - Statutory payees (PR-4b; `docs/payee-bank-instructions.md`) adds the head `e2_0024_statutory_payees` (after
   `e2_0023_staff_loan_entries`): one CHECK on `payee_bank_instructions` widened to allow kind `statutory`. The e2

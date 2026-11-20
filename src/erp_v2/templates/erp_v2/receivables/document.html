@@ -25,6 +25,10 @@
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="request_id" value="{{ request_id }}"><input type="hidden" name="document_id" value="{{ document.id }}"><input type="hidden" name="occurred_on" value="{{ today }}"><button type="submit">Deallocate</button></form>{% endif %}</td></tr>
 {% else %}<tr><td colspan="3">No allocations.</td></tr>{% endfor %}
 </tbody></table>
+<h2>Cash draws including opening cash</h2>
+<p>A draw that includes opening cash is reversed as a whole; it cannot be taken apart line by line.</p>
+<ul>{% for group_id, remaining in draws %}<li>Draw {{ group_id }}: remaining {{ remaining if remaining is not none else 'unavailable' }}
+{% if not voided and remaining %}<form method="post" action="{{ base }}/draws/{{ group_id }}/reverse"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="document_id" value="{{ document.id }}"><input type="hidden" name="occurred_on" value="{{ today }}"><button type="submit">Reverse whole draw</button></form>{% endif %}</li>{% else %}<li>None.</li>{% endfor %}</ul>
 <h2>Credit notes</h2>
 <ul>{% for c in credit_notes %}<li><a href="{{ base }}/documents/{{ c.id }}">{{ c.document_number }}</a>: {{ c.grand_total }}</li>{% else %}<li>None.</li>{% endfor %}</ul>
 {% if not voided %}

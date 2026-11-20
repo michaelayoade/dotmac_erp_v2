@@ -16,6 +16,9 @@
     <option value="">Select a customer</option>
     {% for c in customers %}<option value="{{ c.id }}" {% if customer_account_id and customer_account_id|string == c.id|string %}selected{% endif %}>{{ c.account_number }} — {{ c.display_name }}</option>{% endfor %}
   </select></label></p>
+  <p><label>Payment terms <select name="payment_terms_code">
+    {% for code, days in terms.items() %}<option value="{{ code }}" {% if (draft and draft.payment_terms_code == code) or (not (draft and draft.payment_terms_code) and default_terms == code) %}selected{% endif %}>{{ code }} ({{ days }} days)</option>{% endfor %}
+  </select></label></p>
   <p><label>Invoice date <input type="date" name="document_date" value="{{ draft.document_date if draft else today }}" required></label></p>
   {% include "erp_v2/receivables/_lines.html" %}
   <button type="submit">Save draft</button>

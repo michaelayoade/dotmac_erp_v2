@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final
@@ -29,7 +28,6 @@ from erp_v2.ar.models import (
     ArLineAccount,
     ArReceipt,
 )
-from erp_v2.migration_ledger.models import STATE_OPEN, MigrationException
 
 HOLDINGS_TABLE: Final = "erp_migration_holdings"
 POSTINGS_TABLE: Final = "erp_billing_fact_postings"
@@ -221,6 +219,19 @@ def allocation_rows(
     return list(db.scalars(statement.order_by(bm.AllocationEffect.created_at, bm.AllocationEffect.id)))
 
 
+def original_treatments(db: Session, tenant_id: UUID, document_id: UUID) -> set[str]:
+    """VAT treatments carried by an invoice: native = its line accounts; migrated = billing's own tax snapshots."""
+    rows = line_accounts(db, tenant_id, document_id)
+    if rows:
+        return {row.treatment_code for row in rows if row.treatment_code}
+    obligation_ids = [line.obligation_id for line in billing_lines(db, tenant_id, document_id) if line.obligation_id]
+    statement = select(bm.AppliedTaxSnapshot.treatment_code).where(
+        bm.AppliedTaxSnapshot.tenant_id == tenant_id,
+        (bm.AppliedTaxSnapshot.document_id == document_id) | (bm.AppliedTaxSnapshot.obligation_id.in_(obligation_ids)),
+    )
+    return set(db.scalars(statement))
+
+
 def credit_notes_for(db: Session, tenant_id: UUID, document_id: UUID) -> list[bm.BillingDocument]:
     return list(
         db.scalars(
@@ -239,6 +250,62 @@ def posting_group_for_source(db: Session, tenant_id: UUID, source_ref: str) -> b
     return db.scalar(
         select(bm.PostingGroup).where(bm.PostingGroup.tenant_id == tenant_id, bm.PostingGroup.source_ref == source_ref)
     )
+
+
+def draw_remaining(db: Session, tenant_id: UUID, group_id: UUID, document_id: UUID):
+    """Remaining amount of a pooled-cash draw (billing's own observation), or None when unreadable."""
+    group = db.get(bm.PostingGroup, group_id)
+    if group is None or group.tenant_id != tenant_id:
+        return None
+    original = -sum(
+        (
+            e.amount_delta
+            for e in db.scalars(
+                select(bm.PostingEffect).where(
+                    bm.PostingEffect.tenant_id == tenant_id,
+                    bm.PostingEffect.posting_group_id == group_id,
+                    bm.PostingEffect.lane == "receivable",
+                )
+            )
+        ),
+        Decimal(0),
+    )
+    if original <= 0:
+        return None
+    from dotmac_billing import GetCurrentCashCreditDrawV1, get_current_cash_credit_draw
+    from dotmac_kernel.money import Money, currency
+
+    try:
+        observed = get_current_cash_credit_draw(
+            db,
+            scope=TenantScope(tenant_id),
+            request=GetCurrentCashCreditDrawV1(
+                TenantScope(tenant_id),
+                group.billing_account_id,
+                group_id,
+                document_id,
+                Money.of(original, currency(group.currency)),
+                group.source_ref,
+            ),
+        )
+    except BillingError:
+        return None
+    return observed.remaining_amount.amount
+
+
+def opening_draws(db: Session, tenant_id: UUID, document_id: UUID) -> list[tuple[UUID, Decimal | None]]:
+    """Opening-bearing cash draws applied to an invoice (group id, remaining). Pure-opening draws have no allocation
+    row, so the document page is the only place they can be reversed from."""
+    groups = db.scalars(
+        select(bm.OpeningCashEffect.posting_group_id)
+        .where(
+            bm.OpeningCashEffect.tenant_id == tenant_id,
+            bm.OpeningCashEffect.document_id == document_id,
+            bm.OpeningCashEffect.effect_kind == "application",
+        )
+        .distinct()
+    )
+    return [(g, draw_remaining(db, tenant_id, g, document_id)) for g in groups]
 
 
 def group_reversed(db: Session, tenant_id: UUID, group_id: UUID) -> bool:
@@ -317,21 +384,19 @@ def gl_status(db: Session, tenant_id: UUID, document_id: UUID) -> str:
 
 
 def credit_note_notice(db: Session, tenant_id: UUID, customer_account_id: UUID) -> list[str]:
-    """Open E35 register items that mention this customer (F-D: a read-only safety notice, never a control).
+    """This customer's open legacy-credit-note items in the migration register (F-D: a read-only safety notice).
 
-    Legacy credit notes that were not carried are cleared by R8; issuing a new credit note for them would reverse
-    revenue twice. The register keys items by the legacy customer key, so an item is shown when the customer's
-    account id appears in its key or detail; the form also carries the standing warning regardless.
+    Legacy credit notes that were not carried are cleared by R8; issuing a new one here would reverse revenue twice.
+    A structural filter, no truncation: the E35 ``ar_unapplied_credit_note:*`` items carry the legacy customer key as
+    ``detail.party[0]`` (#72 register shape), and wave-4 keeps the legacy id as the customer account id.
     """
-    needle = str(customer_account_id)
-    rows = db.scalars(
-        select(MigrationException)
-        .where(
-            MigrationException.tenant_id == tenant_id,
-            MigrationException.class_code == "E35",
-            MigrationException.state == STATE_OPEN,
-        )
-        .order_by(MigrationException.legacy_key)
-        .limit(2000)
+    rows = db.execute(
+        text(
+            "SELECT legacy_key FROM public.erp_migration_exceptions "
+            "WHERE tenant_id = :t AND class_code = 'E35' AND state = 'open' "
+            "AND legacy_key LIKE 'ar\\_unapplied\\_credit\\_note:%' "
+            "AND (detail::jsonb -> 'party' ->> 0) = :c ORDER BY legacy_key"
+        ),
+        {"t": tenant_id, "c": str(customer_account_id)},
     )
-    return [row.legacy_key for row in rows if needle in row.legacy_key or needle in json.dumps(row.detail, default=str)]
+    return [row[0] for row in rows]
