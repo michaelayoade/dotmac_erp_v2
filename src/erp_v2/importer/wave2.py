@@ -45,6 +45,8 @@ class Pairing:
     sub_origin: SubOriginPolicy | None = None
     # Child rows pointing at a Sub-tagged customer become row exceptions (M11 pending)
     sub_customer_ref: SubCustomerRef | None = None
+    # B-13 history cutoff kind (history_cutoff.KINDS): rows dated on or before the run cutoff are not imported.
+    history_cutoff: str | None = None
     note: str = ""
     source_row_refusal: SourceRowRefusal | None = None
 

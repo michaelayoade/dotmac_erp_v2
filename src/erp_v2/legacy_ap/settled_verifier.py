@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import partial
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -42,6 +43,7 @@ from dotmac_payables import (
 )
 from sqlalchemy.orm import Session
 
+from erp_v2.importer.cutoff_evidence import journal_proof
 from erp_v2.importer.payables_history import (
     DESTINATION_JOURNAL,
     SOURCE_JOURNAL,
@@ -56,7 +58,7 @@ from erp_v2.importer.payables_history import (
     _id,
     _match,
     _one,
-    _pair,
+    _pairs,
     _project,
     _project_rows,
     _read,
@@ -286,7 +288,7 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
                 _tenant([other], tenant, "payment_allocation_invoice", "organization_id")
             if _equal(other["ap_control_account_id"], control):
                 expected_control = _sum([expected_control, item["allocated_amount"]])
-        journal, ledger, target, posted = self._payment_journal(tenant, header, payment, dest)
+        journal, ledger, target, posted, proof = self._payment_journal(tenant, header, payment, dest)
         debits = [r["debit_amount"] for r in ledger if _equal(r["account_id"], control)]
         credits = [r["credit_amount"] for r in ledger if _equal(r["account_id"], control)]
         _require(_sum(credits) == 0 and _sum(debits) == expected_control, "payment_gl_control_mismatch")
@@ -294,12 +296,13 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             payment_id=pid,
             payment=_project(payment, PAYMENT_FIELDS),
             source_journal=_project(journal, SOURCE_JOURNAL),
-            destination_journal=_project(target, DESTINATION_JOURNAL),
+            destination_journal=None if target is None else _project(target, DESTINATION_JOURNAL),
             source_ledger=_project_rows(ledger, SOURCE_LEDGER, "ledger_line_id"),
             destination_ledger=sorted(
                 [dict(id=_id(row["id"]), debit=row["debit"], credit=row["credit"]) for row in posted],
                 key=lambda row: row["id"],
             ),
+            **({"history_cutoff_proof": proof} if proof is not None else {}),
         )
         return dict(withholding=withholding, journal_ref=_id(payment["journal_entry_id"]), facts=facts)
 
@@ -343,52 +346,61 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             debit == _sum([r["credit_amount"] for r in ledger]) == journal["total_debit"] == journal["total_credit"],
             "payment_ledger_unbalanced",
         )
-        target = _one(
-            _read(dest, "journal_entries", schema="mod_accounting", key="id", value=jid),
-            "payment_destination_journal_missing",
+        proof = journal_proof(
+            journal, ledger, self.history_cutoff, _require, partial(self._opening_posted, dest, tenant)
         )
-        _tenant([target], tenant, "payment_destination_journal")
-        mapping = {
-            key: key
-            for key in (
-                "status",
-                "currency_code",
-                "exchange_rate",
-                "entry_date",
-                "posting_date",
-                "fiscal_period_id",
-                "description",
-                "reference",
-                "total_debit",
-                "total_credit",
-                "total_debit_functional",
-                "total_credit_functional",
-                "posted_at",
-                "created_at",
+        excluded = proof is not None
+        destination_rows = _read(dest, "journal_entries", schema="mod_accounting", key="id", value=jid)
+        if excluded:
+            # B-13: the payment journal is in the opening TB, not in v2: proven on the snapshot, asserted absent here.
+            _require(not destination_rows, "cutoff_payment_journal_present_in_destination")
+            target = None
+        else:
+            target = _one(destination_rows, "payment_destination_journal_missing")
+            _tenant([target], tenant, "payment_destination_journal")
+        if target is not None:
+            mapping = {
+                key: key
+                for key in (
+                    "status",
+                    "currency_code",
+                    "exchange_rate",
+                    "entry_date",
+                    "posting_date",
+                    "fiscal_period_id",
+                    "description",
+                    "reference",
+                    "total_debit",
+                    "total_credit",
+                    "total_debit_functional",
+                    "total_credit_functional",
+                    "posted_at",
+                    "created_at",
+                )
+            }
+            mapping.update(
+                number="journal_number",
+                kind="journal_type",
+                posted_by="posted_by_user_id",
+                reverses_journal_id="reversed_journal_id",
+                reversal_journal_id="reversal_journal_id",
+                source_document_kind="source_document_type",
             )
-        }
-        mapping.update(
-            number="journal_number",
-            kind="journal_type",
-            posted_by="posted_by_user_id",
-            reverses_journal_id="reversed_journal_id",
-            reversal_journal_id="reversal_journal_id",
-            source_document_kind="source_document_type",
-        )
-        _match(journal, target, mapping, "payment_journal")
-        _require(
-            target["source_document_id"] == f"{SOURCE_JOURNAL_REFERENCE}{journal['journal_entry_id']}",
-            "payment_journal_source_document_id",
-        )
-        self._provenance(target, "payment_journal")
-        # The same posting stamp the invoice journal proof requires.
-        stamp = (
-            f"{SOURCE_JOURNAL_REFERENCE}{target['id']}@{_day(journal['posting_date'], 'payment_journal_posting_date')}"
-        )
-        _require(target["approval_reference"] == stamp, "payment_journal_posting_stamp")
+            _match(journal, target, mapping, "payment_journal")
+            _require(
+                target["source_document_id"] == f"{SOURCE_JOURNAL_REFERENCE}{journal['journal_entry_id']}",
+                "payment_journal_source_document_id",
+            )
+            self._provenance(target, "payment_journal")
+            # The same posting stamp the invoice journal proof requires.
+            posted_on = _day(journal["posting_date"], "payment_journal_posting_date")
+            stamp = f"{SOURCE_JOURNAL_REFERENCE}{target['id']}@{posted_on}"
+            _require(target["approval_reference"] == stamp, "payment_journal_posting_stamp")
         originals = _read(src, "journal_entry_line", key="journal_entry_id", value=jid)
         imported = _read(dest, "journal_lines", schema="mod_accounting", key="journal_id", value=jid)
         _tenant(imported, tenant, "payment_journal_line")
+        if excluded:
+            _require(not imported, "cutoff_payment_journal_line_present_in_destination")
         line_map = {key: key for key in ("line_number", "account_id", "description", "created_at")}
         line_map.update(
             journal_id="journal_entry_id",
@@ -397,9 +409,10 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             debit_functional="debit_amount_functional",
             credit_functional="credit_amount_functional",
         )
-        for original, landed in _pair(originals, imported, "line_id", "payment_journal_line"):
+        for original, landed in _pairs(originals, imported, "line_id", "payment_journal_line", excluded):
             _require(_one_sided(original, ""), "payment_journal_line_amounts")
-            _match(original, landed, line_map, "payment_journal_line")
+            if landed is not None:
+                _match(original, landed, line_map, "payment_journal_line")
             _require(
                 original["currency_code"] in (None, header["currency_code"])
                 and original["exchange_rate"] in (None, Decimal(1))
@@ -417,6 +430,8 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
         _require(all(_one_sided(row, "") for row in ledger), "payment_ledger_line_amounts")
         posted = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=jid)
         _tenant(posted, tenant, "payment_destination_ledger")
+        if excluded:
+            _require(not posted, "cutoff_payment_ledger_present_in_destination")
         ledger_map = {key: key for key in ("account_id", "entry_date", "posting_date", "posted_at")}
         ledger_map.update(
             journal_id="journal_entry_id",
@@ -424,10 +439,11 @@ class SettledInvoiceVerifier(HistoricalPayablesVerifier):
             credit="credit_amount",
             posted_by="posted_by_user_id",
         )
-        for original, landed in _pair(ledger, posted, "ledger_line_id", "payment_ledger"):
-            _match(original, landed, ledger_map, "payment_ledger")
-            self._provenance(landed, "payment_ledger")
-        return journal, ledger, target, posted
+        for original, landed in _pairs(ledger, posted, "ledger_line_id", "payment_ledger", excluded):
+            if landed is not None:
+                _match(original, landed, ledger_map, "payment_ledger")
+                self._provenance(landed, "payment_ledger")
+        return journal, ledger, target, posted, proof
 
 
 __all__ = ["SettledInvoiceVerifier"]

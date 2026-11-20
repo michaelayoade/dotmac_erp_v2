@@ -23,6 +23,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from erp_v2.importer import history_cutoff as hc
 from erp_v2.importer.sub_origin import SUB_ORIGIN_COLUMN, SubCustomerRef, SubOriginPolicy
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -143,6 +144,10 @@ class TransformSpec:
     # calculation lines; the enrolment step builds the map from the
     # imported parent rows). A key with no map entry is an exception,
     # never a default.
+    history_cutoff: str | None = None
+    # B-13: closed-set kind (history_cutoff.KINDS). Rows provably dated on or before the run's
+    # `--history-cutoff` are not read (closed years arrive only through the B-9 opening journal);
+    # the executor raises without a cutoff and counts the excluded rows and their key digest.
     source_order: tuple[tuple[str, bool], ...] = ()
     # (source column, descending) pairs rendered as a deterministic
     # ORDER BY on the executor source scan. Declared only where
@@ -264,6 +269,7 @@ def build_spec(
     sub_customer_ref: SubCustomerRef | None = None,
     source_row_refusal: SourceRowRefusal | None = None,
     source_order: tuple[str, ...] = (),
+    history_cutoff: str | None = None,
 ) -> TransformSpec:
     """Intersect shapes into a spec; name every gap, never fill one."""
 
@@ -397,6 +403,13 @@ def build_spec(
         if dest_col not in column_map:
             raise ValueError(f"deferred column {dest_col!r} is not mapped from the source")
     missing.extend(_sub_origin_gaps(source_set, sub_origin))
+    if history_cutoff is not None:
+        if history_cutoff not in hc.KINDS:
+            raise ValueError(f"unknown history cutoff kind {history_cutoff!r}")
+        if any(c not in source_set for c in hc.required_source_columns(history_cutoff, column_map.get("journal_id"))):
+            missing.append(hc.MISSING_COLUMN)
+        if history_cutoff == hc.KIND_JOURNAL_LINE and "journal_id" not in column_map:
+            missing.append(hc.MISSING_COLUMN)
     consumed = set(column_map.values())
     residue = tuple(sorted(source_set - consumed))
     return TransformSpec(
@@ -417,6 +430,7 @@ def build_spec(
         sub_origin=sub_origin,
         sub_customer_ref=sub_customer_ref,
         source_order=tuple(parsed_order),
+        history_cutoff=history_cutoff,
     )
 
 
