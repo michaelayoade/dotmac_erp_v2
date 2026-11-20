@@ -1120,3 +1120,62 @@ def test_taxed_settled_invoice_whose_destination_tax_account_differs_is_refused(
     scene.build()
     plan = scene.run([iid], apply=False)
     assert plan["refusals_by_reason"] == {"legacy_evidence:invoice_line_tax_account": 1}
+
+
+def test_b13_a_cutoff_excluded_journal_that_is_present_in_the_destination_is_refused(engine, setup, monkeypatch):
+    """The scene's journals are dated 2026-01-10 and imported; with a receipt cutoff on or after that date the
+    verifier must see them as cutoff-excluded, so their presence in v2 is a named refusal (never silently accepted)."""
+    from datetime import date
+
+    from erp_v2.importer.payables_history import HistoricalPayablesVerifier
+
+    monkeypatch.setattr(HistoricalPayablesVerifier, "history_cutoff", property(lambda self: date(2026, 1, 10)))
+    _env, scene, iid = one(engine, setup)
+    # no posted opening dated the cutoff exists, so the absence of the journal could not be explained: refused
+    refused(scene, [iid], "legacy_evidence:cutoff_opening_not_posted")
+
+
+def test_b13_a_pre_cutoff_invoice_and_payment_journal_absent_from_v2_is_admitted_with_the_proof(
+    engine, setup, monkeypatch
+):
+    """Positive path: the scene's invoice and payment journals (legacy, dated 2026-01-10) are removed from v2 and a
+    posted ``erp.opening`` journal dated the cutoff stands in for them; with the receipt cutoff 2026-01-10 the settled
+    verifier proves them cutoff-excluded on the snapshot, asserts them absent, and admits the invoice."""
+    from datetime import date
+
+    from erp_v2.importer.payables_history import HistoricalPayablesVerifier
+
+    env, scene, iid = one(engine, setup)
+    opening, _lines, _ledger = seed_journal(
+        engine,
+        env,
+        number="OPEN-1",
+        document_type="OPENING",
+        document_id=uuid4(),
+        lines=[("2000", "1", "0"), ("2040", "0", "1")],
+    )
+    legacy_ids = [str(scene.journals[iid]), str(scene.rows["supplier_invoice"][0]["journal_entry_id"])]
+    with engine.begin() as c:
+        for table in ("posted_ledger_lines", "journal_lines", "journal_entries"):
+            c.exec_driver_sql(f"ALTER TABLE mod_accounting.{table} DISABLE TRIGGER USER")
+        try:
+            for table, column in (
+                ("posted_ledger_lines", "journal_id"),
+                ("journal_lines", "journal_id"),
+                ("journal_entries", "id"),
+            ):
+                c.execute(
+                    sa.text(f"DELETE FROM mod_accounting.{table} WHERE {column} = ANY(CAST(:ids AS uuid[]))"),  # noqa: S608
+                    {"ids": legacy_ids},
+                )
+            c.execute(
+                sa.text("UPDATE mod_accounting.journal_entries SET source_owner = 'erp.opening' WHERE id = :j"),
+                {"j": opening.id},
+            )
+        finally:
+            for table in ("posted_ledger_lines", "journal_lines", "journal_entries"):
+                c.exec_driver_sql(f"ALTER TABLE mod_accounting.{table} ENABLE TRIGGER USER")
+    monkeypatch.setattr(HistoricalPayablesVerifier, "history_cutoff", property(lambda self: date(2026, 1, 10)))
+    plan = scene.run([iid], apply=False)
+    assert plan["refusals_by_reason"] == {}, plan
+    assert plan["counts"]["eligible"] == 1, plan

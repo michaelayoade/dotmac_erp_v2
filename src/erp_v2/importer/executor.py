@@ -21,11 +21,25 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
 import sqlalchemy as sa
 
+from erp_v2.importer.history_cutoff import (
+    REFUSAL_REQUIRED,
+    REFUSAL_UNDATED,
+    UNBALANCED_AMOUNTS_SQL,
+    HistoryCutoffRefused,
+    bind,
+    c_collated,
+    exclusion_predicate,
+    keys_sha256,
+    straddle_predicate,
+    undated_predicate,
+    unit_refusal_predicate,
+)
 from erp_v2.importer.spec import TransformSpec
 from erp_v2.importer.sub_origin import (
     SUB_CUSTOMER_REFERENCE_REASON,
@@ -231,6 +245,26 @@ class TransformReport:
     sub_origin_excluded: int = 0
     sub_origin_excluded_keys: tuple[str, ...] = ()  # full, sorted
     sub_customer_ref_rows: tuple[str, ...] = ()  # keys refused: reference a Sub-tagged customer
+    # B-13 history cutoff census (None unless the spec declares one): rows provably dated on or before the cutoff
+    # are not read; they are counted, with a sha256 over their sorted source keys (the legacy journal ids for the
+    # journal pairing), and undated rows (not provably pre-cutoff, so they land) are counted too.
+    history_cutoff: str | None = None
+    history_cutoff_source: int | None = None
+    history_cutoff_excluded: int = 0
+    history_cutoff_excluded_sha256: str | None = None
+    history_cutoff_undated: int = 0  # named refusals (history_cutoff_undated), never landed
+    # Journal pairing only: pre-cutoff journals that were NOT posted in legacy, by legacy status (the E16b drafts and
+    # the like); the CLI writes their keys to a mode-600 side file so the register can itemise them.
+    history_cutoff_excluded_by_status: dict[str, int] = field(default_factory=dict)
+    history_cutoff_nonposted_keys: dict[str, list[str]] = field(default_factory=dict)
+    # Post-cutoff journals whose reversal target is a pre-cutoff journal: (journal key, legacy target id). They land as
+    # is with the link empty; evidence only, not an exception.
+    history_cutoff_reversal_targets: list[tuple[str, str]] = field(default_factory=list)
+    # P-5: rows of unbalanced journals refused as a unit (E15); journal pairing lists (key, debit, credit).
+    history_cutoff_unit_refused: int = 0
+    # STRADDLE_SPEC: rows of journals crossing the cutoff, excluded as a unit (E39); the CLI side file lists them.
+    history_cutoff_straddle_excluded: int = 0
+    history_cutoff_unit_refused_journals: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
     def refused(self) -> int:
@@ -332,8 +366,15 @@ def execute_transform(
     run_constants: dict[str, Any] | None = None,
     dry_run: bool = False,
     limit: int | None = None,
+    history_cutoff: date | None = None,
 ) -> TransformReport:
-    """Execute one table transform. Raises if the spec is not executable."""
+    """Execute one table transform. Raises if the spec is not executable.
+
+    A spec that declares a history cutoff (B-13) raises ``HistoryCutoffRefused`` without one: closed years must
+    never be copied by omission of a flag."""
+
+    if spec.history_cutoff is not None and history_cutoff is None:
+        raise HistoryCutoffRefused(REFUSAL_REQUIRED, spec.destination_table)
 
     if spec.source_row_refusal is not None:
         refusal = spec.source_row_refusal
@@ -400,7 +441,35 @@ def execute_transform(
     report = TransformReport(source_table=spec.source_table, destination_table=spec.destination_table)
     source_columns = list(dict.fromkeys(spec.column_map.values()))
     exclude_sub = spec.sub_origin is SubOriginPolicy.EXCLUDE
-    where_sub = f" WHERE {spec.source_table}.{SUB_ORIGIN_COLUMN} IS NULL" if exclude_sub else ""
+    conditions: list[str] = []
+    if exclude_sub:
+        conditions.append(f"{spec.source_table}.{SUB_ORIGIN_COLUMN} IS NULL")
+    cutoff_exclusion: str | None = None
+    if spec.history_cutoff is not None:
+        straddle = straddle_predicate(
+            spec.history_cutoff,
+            spec.source_table,
+            spec.column_map.get("id", ""),
+            spec.column_map.get("journal_id"),
+        )
+        # A straddling journal is excluded as a UNIT for its own reason (E39), never counted as a plain pre-cutoff row.
+        cutoff_exclusion = (
+            f"({exclusion_predicate(spec.history_cutoff, spec.source_table, spec.column_map.get('journal_id'))}"
+            f" AND NOT ({straddle}))"
+        )
+        conditions.append(f"NOT ({cutoff_exclusion})")
+        conditions.append(f"NOT ({straddle})")
+        unit_refusal = unit_refusal_predicate(
+            spec.history_cutoff,
+            spec.source_table,
+            spec.column_map.get("id", ""),
+            spec.column_map.get("journal_id"),
+        )
+        conditions.append(f"NOT ({unit_refusal})")
+        refused_undated = undated_predicate(spec.history_cutoff, spec.source_table, spec.column_map.get("journal_id"))
+        if refused_undated is not None:
+            conditions.append(f"NOT ({refused_undated})")
+    where_sub = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     ref = spec.sub_customer_ref
     select_columns = list(source_columns)
     if ref is not None and ref.column not in select_columns:
@@ -411,8 +480,9 @@ def execute_transform(
         order_sql = " ORDER BY " + ", ".join(
             f"{column} DESC" if descending else f"{column} ASC" for column, descending in spec.source_order
         )
-    select_sql = sa.text(
-        f"SELECT {', '.join(select_columns)} FROM {spec.source_table}{where_sub}{order_sql}"  # noqa: S608
+    select_text = f"SELECT {', '.join(select_columns)} FROM {spec.source_table}{where_sub}{order_sql}"  # noqa: S608
+    select_sql = (
+        bind(select_text, history_cutoff) if cutoff_exclusion is not None and history_cutoff else sa.text(select_text)
     )
     dest_columns = [
         c
@@ -435,6 +505,89 @@ def execute_transform(
     # feeding the destination `id`, else the first mapped column.
     guards = _fk_guards(destination_connection, spec, dest_columns) if not dry_run else ()
     key_source = spec.column_map.get("id", source_columns[0])
+    excluded_journal_keys: set[str] = set()
+    if cutoff_exclusion is not None and history_cutoff is not None:
+        # Excluded rows are never silent: counted, with a digest of their keys (legacy journal ids for the journal
+        # pairing), so legacy = landed + excluded-by-cutoff + refused is provable, and the closed years are known to
+        # arrive only through the opening.
+        report.history_cutoff = history_cutoff.isoformat()
+        report.history_cutoff_source = (
+            source_connection.execute(sa.text(f"SELECT count(*) FROM {spec.source_table}")).scalar() or 0  # noqa: S608
+        )
+        is_journal = spec.history_cutoff == "journal"
+        key_expr = f"{spec.source_table}.{key_source}"
+        status_col = f", {spec.source_table}.status" if is_journal else ""
+        excluded = source_connection.execute(
+            bind(
+                f"SELECT {key_expr}{status_col} FROM {spec.source_table} "  # noqa: S608
+                f"WHERE {cutoff_exclusion} ORDER BY {c_collated(source_connection, f'CAST({key_expr} AS TEXT)')}",
+                history_cutoff,
+            ),
+            execution_options={"stream_results": True, "yield_per": 5000},
+        )
+        count = 0
+
+        def _counted_keys():
+            nonlocal count
+            for row in excluded:
+                count += 1
+                key = str(row[0])
+                if is_journal:
+                    excluded_journal_keys.add(key)
+                    status = str(row[1] or "").upper()
+                    report.history_cutoff_excluded_by_status[status] = (
+                        report.history_cutoff_excluded_by_status.get(status, 0) + 1
+                    )
+                    if status != "POSTED":
+                        report.history_cutoff_nonposted_keys.setdefault(status, []).append(key)
+                yield key
+
+        report.history_cutoff_excluded_sha256 = keys_sha256(_counted_keys())
+        report.history_cutoff_excluded = count
+        report.history_cutoff_unit_refused = (
+            source_connection.execute(
+                bind(
+                    f"SELECT count(*) FROM {spec.source_table} "  # noqa: S608
+                    f"WHERE NOT ({cutoff_exclusion}) AND NOT ({straddle}) AND {unit_refusal}",
+                    history_cutoff,
+                )
+            ).scalar()
+            or 0
+        )
+        report.history_cutoff_straddle_excluded = (
+            source_connection.execute(
+                bind(f"SELECT count(*) FROM {spec.source_table} WHERE {straddle}", history_cutoff)  # noqa: S608
+            ).scalar()
+            or 0
+        )
+        if is_journal and report.history_cutoff_straddle_excluded:
+            # A reversal whose target is a straddler (E39) joins the excluded set too (it lands with the link empty).
+            excluded_journal_keys.update(
+                str(r[0])
+                for r in source_connection.execute(
+                    bind(f"SELECT {key_expr} FROM {spec.source_table} WHERE {straddle}", history_cutoff)  # noqa: S608
+                )
+            )
+        if is_journal and report.history_cutoff_unit_refused:
+            for jid, debit, credit in source_connection.execute(
+                bind(
+                    f"SELECT {key_expr}, a.d, a.c FROM {spec.source_table} "  # noqa: S608
+                    f"JOIN ({UNBALANCED_AMOUNTS_SQL}) a ON a.k = {key_expr} "
+                    f"WHERE NOT ({cutoff_exclusion}) AND NOT ({straddle})",
+                    history_cutoff,
+                )
+            ):
+                report.history_cutoff_unit_refused_journals.append((str(jid), format(debit, "f"), format(credit, "f")))
+            report.history_cutoff_unit_refused_journals.sort()
+            # ... and so does one whose target is an unbalanced-unit (E15) journal.
+            excluded_journal_keys.update(j for j, _d, _c in report.history_cutoff_unit_refused_journals)
+        undated = undated_predicate(spec.history_cutoff or "", spec.source_table, spec.column_map.get("journal_id"))
+        if undated is not None:
+            for row in source_connection.execute(
+                sa.text(f"SELECT {key_expr} FROM {spec.source_table} WHERE {undated}")  # noqa: S608
+            ):
+                report.history_cutoff_undated += 1
+                report.exceptions.append(RowException(spec.source_table, str(row[0]), "posting_date", REFUSAL_UNDATED))
     if exclude_sub:
         # Excluded rows are never silent: counted, with sorted keys, so
         # the census (source = imported + excluded + refused) reconciles.
@@ -640,6 +793,15 @@ def execute_transform(
             deferred_values = {c: params.pop(c) for c in spec.deferred if params.get(c) is not None}
             for c in spec.deferred:
                 params.pop(c, None)
+            if (
+                spec.history_cutoff == "journal"
+                and str(deferred_values.get("reverses_journal_id")) in excluded_journal_keys
+            ):
+                # B-13: the reversal target is a pre-cutoff journal (in the opening, not in v2). Land as is with the
+                # link empty; the legacy target id is census evidence, not an exception.
+                report.history_cutoff_reversal_targets.append(
+                    (str(row[key_source]), str(deferred_values.pop("reverses_journal_id")))
+                )
             if deferred_values:
                 deferred_updates.append((str(row[key_source]), params.get("id"), deferred_values))
             batch.append((str(row[key_source]), params))

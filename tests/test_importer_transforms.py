@@ -87,8 +87,11 @@ DEST_ROWS = [
 ]
 
 
-def params(account=None):
-    return TransformParams.from_mapping({"import.fallback_expense_account": account or FALLBACK}, TENANT)
+def params(account=None, wht="remove"):
+    # the pre-B-13 D-M2 behaviour (WHT removal) is the explicit ``remove`` mode; ``queue`` is the default
+    return TransformParams.from_mapping(
+        {"import.fallback_expense_account": account or FALLBACK, "import.unposted_wht": wht}, TENANT
+    )
 
 
 def vat(deferral=TAXACCT, paid=PAID, tax_type="VAT", org=ORG):
@@ -126,8 +129,8 @@ def invoice(
     return InvoiceFacts(uid(9000 + n), ORG, status, sub_, tax_, total_, tuple(lines), outcome, items or {})
 
 
-def run(inv):
-    return transform_invoice(inv, FALLBACK, ACCOUNTS)
+def run(inv, wht="remove"):
+    return transform_invoice(inv, FALLBACK, ACCOUNTS, wht)
 
 
 def rules(outcome):
@@ -371,6 +374,44 @@ def test_unposted_wht_line_has_the_wht_removed_so_the_total_is_the_gross():
     assert "total is the gross" in header_line.note
     line_line = next(b for b in out.bridge if b.scope == "line")
     assert "wht_removed 10" in line_line.note and "payment-time" in line_line.note
+
+
+def test_unposted_wht_defaults_to_queue_the_invoice_is_not_landed_and_nothing_is_removed():
+    wht = TaxCodeFacts(ORG, "WITHHOLDING", PAID, None)
+    inv = invoice(
+        [line(1, amount="100", tax="7.5", code=vat()), line(2, amount="200", tax="10", code=wht)],
+        status="SUBMITTED",
+        sub="300",
+        tax="17.5",
+        total="317.5",
+    )
+    default = transform_invoice(inv, FALLBACK, ACCOUNTS)  # no mode given: the default is queue
+    assert default.bucket == QUEUE and not default.lands
+    assert default.queue_reason == "unposted_wht_line" and default.queue_reasons == ("unposted_wht_line",)
+    assert default.bridge == () and default.legacy_total == D("317.5")  # no WHT removal is itemised
+    assert default == run(inv, "queue")
+    # the 1455 coding of the sibling VAT line is untouched, and the old behaviour is still one explicit switch away
+    assert run(inv, "remove").lands
+
+
+def test_the_wht_mode_only_gates_unposted_invoices_with_a_wht_line():
+    wht = TaxCodeFacts(ORG, "WITHHOLDING", PAID, None)
+    plain = invoice([line(1, amount="100", tax="7.5", code=vat())], status="DRAFT", sub="100", tax="7.5", total="107.5")
+    assert run(plain, "queue").lands and run(plain, "queue").bucket == run(plain, "remove").bucket
+    posted = invoice([line(1, tax="5", code=wht)], ledger={EXP: D(105)}, status="POSTED")
+    assert run(posted, "queue") == run(posted, "remove")
+
+
+def test_the_wht_mode_param_is_declared_validated_and_recorded():
+    assert params().unposted_wht == "remove"
+    assert TransformParams.from_mapping({"import.fallback_expense_account": FALLBACK}, TENANT).unposted_wht == "queue"
+    assert TransformParams.from_mapping({"import.unposted_wht": " REMOVE "}, TENANT).unposted_wht == "remove"
+    for bad in ("drop", "", "true", 1):
+        with pytest.raises(TransformParamsError) as exc:
+            TransformParams.from_mapping({"import.unposted_wht": bad}, TENANT)
+        assert exc.value.code == "unposted_wht_invalid"
+    with pytest.raises(ValueError):
+        transform_invoice(invoice([line(1)]), FALLBACK, ACCOUNTS, "silently")
 
 
 def test_unposted_taxed_line_without_a_valid_code_is_queued_not_folded():
@@ -998,6 +1039,18 @@ def test_landed_manifest_round_trips_into_the_verifier_view():
     source = {"line_id": lid(1), "expense_account_id": EXP, "line_amount": D(200), "tax_amount": D(10)}
     assert found.line_values(source)["tax_amount"] == D(0)
     assert found.landed_tax_ref(lid(1)) == (True, None) and found.landed_tax_ref(lid(9)) == (False, None)
+
+
+def test_the_manifest_carries_the_wht_mode_the_importer_ran_with_and_old_manifests_mean_remove():
+    from erp_v2.legacy_ap.transform_manifest import TransformManifest, TransformManifestError
+
+    body = TransformLedger((), FALLBACK, binding={"snapshot_sha256": "a" * 64}).itemised()
+    assert TransformManifest.from_itemised(body).unposted_wht == "remove"  # a pre-B-13 manifest: no mode recorded
+    queue = {**body, "binding": {"snapshot_sha256": "a" * 64, "import.unposted_wht": "queue"}}
+    assert TransformManifest.from_itemised(queue).unposted_wht == "queue"
+    bad = {**body, "binding": {"snapshot_sha256": "a" * 64, "import.unposted_wht": "other"}}
+    with pytest.raises(TransformManifestError):
+        TransformManifest.from_itemised(bad)
 
 
 def test_the_payment_schedule_follows_the_landed_total():

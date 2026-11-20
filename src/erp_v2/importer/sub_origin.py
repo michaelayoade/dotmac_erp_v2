@@ -30,6 +30,10 @@ class SubOriginPolicy(str, enum.Enum):
     EXCLUDE = "exclude"
     # The source table does not carry the column.
     NOT_APPLICABLE = "not_applicable"
+    # AS-IS ruling (2026-11-19): every legacy row migrates as legacy recorded it. The column is present and Sub-tagged
+    # rows are imported like any other (origin is provenance, never a rule). Replaces EXCLUDE on the wave-4 customer
+    # pairings, so the AR opening can reuse the imported wave-4 customer accounts.
+    INCLUDE = "include"
 
 
 # Legacy tables that carry a `dotmac_sub_id` column, by bare table name
