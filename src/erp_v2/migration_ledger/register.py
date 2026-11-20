@@ -187,6 +187,10 @@ def from_ar_census(body: Any) -> list[Fact]:
     attribution = body.get("gl_attribution")
     if not isinstance(attribution, dict):  # without the GL attribution the E36a items cannot be derived: refuse
         refuse("ar_census_without_gl_attribution", "run the census with the destination chart so 1400 is attributed")
+    from erp_v2.importer.ar_attribution import attribution_sha256
+
+    if body.get("gl_attribution_sha256") != attribution_sha256(attribution):  # the split was edited after the census
+        refuse("gl_attribution_sha_mismatch")
     facts: list[Fact] = []
 
     def add(class_code: str, key: str, detail: dict[str, Any]) -> None:

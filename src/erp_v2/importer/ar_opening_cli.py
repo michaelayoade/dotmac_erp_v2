@@ -87,16 +87,19 @@ def plan_sha256(
     command_digests: dict[str, str],
     variances: list[dict] | None = None,
     dual_control: str = "on",
+    gl_attribution_sha256: str = "",
 ) -> str:
-    """The plan sha binds the manifest, every command digest, every variance and the window's two-person policy."""
+    """The plan sha binds the manifest, every command digest, every variance, the window's two-person policy and the
+    sha of the census `gl_attribution` block (the per-party split B-14 itemises)."""
 
     body = json.dumps(
         {
-            "domain": "erp.ar-opening.plan.v3",
+            "domain": "erp.ar-opening.plan.v4",
             "manifest": manifest_fingerprint,
             "commands": command_digests,
             "variances": variances or [],
             "dual_control": dual_control,
+            "gl_attribution": gl_attribution_sha256,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -201,7 +204,15 @@ def existing_account_ids(db, *, scope, partitions) -> dict[tuple[str, str], UUID
 
 
 def build_plan(
-    assembly, db, *, scope, migration_authority_ref: str, occurred_at: datetime, params: dict, dual_control: str
+    assembly,
+    db,
+    *,
+    scope,
+    migration_authority_ref: str,
+    occurred_at: datetime,
+    params: dict,
+    dual_control: str,
+    gl_attribution_sha256: str,
 ) -> dict:
     """Pure over the assembly plus read-only target lookups. Writes nothing.
 
@@ -240,7 +251,8 @@ def build_plan(
         "census_sha256": assembly.census.sha256,
         "manifest_fingerprint": fingerprint,
         "dual_control": dual_control,
-        "plan_sha256": plan_sha256(fingerprint, digests, variances, dual_control),
+        "gl_attribution_sha256": gl_attribution_sha256,
+        "plan_sha256": plan_sha256(fingerprint, digests, variances, dual_control, gl_attribution_sha256),
         "command_digests": digests,
         "partitions": len(commands),
         "excluded_partitions": len(assembly.census.excluded),
@@ -349,7 +361,13 @@ def _apply_opening(
     _require(plan["variances"] == manifest_variances(assembly.manifest()), "variances_not_listed_in_plan")
     _require(
         plan["plan_sha256"]
-        == plan_sha256(plan["manifest_fingerprint"], plan["command_digests"], plan["variances"], plan["dual_control"]),
+        == plan_sha256(
+            plan["manifest_fingerprint"],
+            plan["command_digests"],
+            plan["variances"],
+            plan["dual_control"],
+            plan["gl_attribution_sha256"],
+        ),
         "plan_sha_not_self_consistent",
     )
     scope = assembly.scope
@@ -386,7 +404,6 @@ def _apply_opening(
             db.connection(),
             WRITER_ROLE,
             operator=db.scalar(sa.text("SELECT session_user")),
-            forbid_session_admin=True,
         )
         existing = get_opening_window(db, scope=scope)
         if existing is None:
@@ -627,34 +644,33 @@ def _run(args) -> dict:
         "serving_database_materials_forbidden",
     )
     ar_accounts = None
-    if args.command == "census" and destination_url:
+    if destination_url:
         from erp_v2.importer.identity_cli import _manifest as _read_manifest
 
         extent = _read_manifest(Path(args.manifest).read_bytes()).tenant_extent
         _require(len(extent) == 1, "single_tenant_extent_required")
         ar_accounts = _ar_control_account_ids(destination_url, UUID(extent[0]))
     manifest, rows, _customers, census, snapshot, seller, gl_rows = _load_inputs(args, source_url, ar_accounts)
+    attribution: dict = {}
+    if gl_rows is not None:  # B-14 input: per-customer legacy 1400 attribution (needs the destination chart)
+        from erp_v2.importer.ar_attribution import build_attribution
+
+        lines, owners = gl_rows
+        try:
+            attribution = build_attribution(
+                census,
+                gl_lines=lines,
+                journal_owners=owners,
+                invoice_types={str(i["invoice_id"]): str(i.get("invoice_type") or "") for i in rows["invoices"]},
+                functional_currency=args.functional_currency,
+            )
+        except CensusError as exc:
+            raise OperatorRefusal(str(exc).split(":")[0]) from exc
     if args.command == "census":
         receipt = census.receipt()
-        if gl_rows is not None:  # B-14 input: per-customer legacy 1400 attribution (needs the destination chart)
-            from erp_v2.importer.ar_attribution import build_attribution
-
-            lines, owners = gl_rows
-            try:
-                receipt.update(
-                    build_attribution(
-                        census,
-                        gl_lines=lines,
-                        journal_owners=owners,
-                        invoice_types={
-                            str(i["invoice_id"]): str(i.get("invoice_type") or "") for i in rows["invoices"]
-                        },
-                        functional_currency=args.functional_currency,
-                    )
-                )
-            except CensusError as exc:
-                raise OperatorRefusal(str(exc).split(":")[0]) from exc
+        receipt.update(attribution)  # gl_attribution and its sha
         return receipt
+    _require(bool(attribution), "gl_attribution_required")  # plan and apply are bound to the per-party split
     _require(bool(destination_url), "operator_database_materials_required")
     tenant = UUID(manifest.tenant_extent[0])
     scope = TenantScope(tenant)
@@ -707,6 +723,7 @@ def _run(args) -> dict:
                 occurred_at=occurred_at,
                 params=params,
                 dual_control="on" if policy_dual_control else "off",  # bound into the plan sha
+                gl_attribution_sha256=attribution["gl_attribution_sha256"],  # bound into the plan sha
             )
             oid = role_oid(db)
         if args.command == "plan":

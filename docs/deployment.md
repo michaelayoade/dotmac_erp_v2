@@ -355,7 +355,8 @@ this does not authorize adjusting balances or switching traffic.
   (not to the pipeline migrator): Michael grants the operator `WITH SET TRUE, INHERIT FALSE` for the window only and
   revokes it after the seal. It refuses an existing role with login, superuser, bypassrls, createrole, createdb,
   replication or any membership, and PostgreSQL below 15. The migration role needs CREATEROLE only if the role does
-  not exist yet. Membership is cluster-global: confirm the ERP cluster is not the CP cluster first.
+  not exist yet (migrations are run by an operator as `erp_owner`, never by the deploy pipeline); production and rehearsal use runbook R1 (a superuser pre-creates the role; `docs/mapping-billing.md`),
+  because `app_admin` reaches `erp_owner`'s would-be ADMIN row. Membership is cluster-global: confirm the ERP cluster is not the CP cluster first.
 - Statutory payees (PR-4b; `docs/payee-bank-instructions.md`) adds the head `e2_0024_statutory_payees` (after
   `e2_0023_staff_loan_entries`): one CHECK on `payee_bank_instructions` widened to allow kind `statutory`. The e2
   head in this section moves to it. Before the first statutory remittance Finance proposes and approves one

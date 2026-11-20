@@ -225,3 +225,13 @@ def test_a_posted_after_cutoff_row_of_a_refused_party_is_not_counted_twice():
     assert held["partition:cust-2:NGN"] == 15000 - 4000  # the whole GL minus the row held on its own
     (party,) = a["parties"]
     assert party["gl_minor"] == 15000 and sum(held.values()) == party["gl_minor"] and party["custgap_minor"] == 0
+
+
+def test_the_receipt_carries_the_sha_of_the_attribution_block():
+    from erp_v2.importer.ar_attribution import attribution_sha256
+
+    census, types = _census()
+    out = build_attribution(
+        census, gl_lines=LINES, journal_owners=OWNERS, invoice_types=types, functional_currency="NGN"
+    )
+    assert out["gl_attribution_sha256"] == attribution_sha256(out["gl_attribution"])

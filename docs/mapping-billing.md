@@ -131,8 +131,8 @@ Review af472276 hardening (architect findings):
 
 - PostgreSQL 16 or newer is required (`WITH SET TRUE, INHERIT FALSE` and `REVOKE ... OPTION FOR` are PG16). Any membership
   row on the writer with SET or INHERIT, held by any role, is refused by the migration and again by `apply` (only the
-  session operator may hold SET, never INHERIT). An ADMIN-only row is allowed: a non-superuser CREATEROLE migrator gets
-  one automatically on PG16; if `createrole_self_grant` also gave the creator SET or INHERIT on a role the migration
+  session operator may hold SET, never INHERIT). A creator's ADMIN-only row is tolerated by the migration only for a role it just created and only when no other role
+  reaches the creator (see R1 below); a non-superuser CREATEROLE migrator gets one automatically on PG16; if `createrole_self_grant` also gave the creator SET or INHERIT on a role the migration
   just created, those two options are revoked. A superuser migrator gets no row. An adopted role has every privilege
   stripped and exactly the R5 set re-granted, and the exact set is asserted from the ACLs; owned objects and default
   privileges are refused (`erp_v2.importer.ar_opening_role`).
@@ -151,10 +151,24 @@ Review af472276 hardening (architect findings):
 - Runbook: an aborted apply followed by a re-plan yields a new window id (the id derives from the plan sha), so the
   existing window is refused (`existing_window_differs`). The only way forward is a restore of the pre-F6 database and a
   fresh run; do not try to edit or reuse the half-provisioned window.
-- Runbook (post-migrate, Michael root): the migrator that created the writer holds an ADMIN-only membership row, which
-  would let it `GRANT` the writer to itself. After the migration run `REVOKE erp_billing_opening_writer FROM <migrator>`
-  (e.g. `erp_owner`), then grant the operator `WITH SET TRUE, INHERIT FALSE, ADMIN FALSE` for the window. The apply
-  preflight refuses while the session user holds ADMIN on the writer (`session_user_holds_admin_on_writer`).
+- Runbook R1 (Michael as root, BEFORE the deploy that carries `e2_0029`, rehearsal first, then production): a superuser
+  pre-creates the role so that nobody holds ADMIN on it and the migration takes the ADOPT path (revoke all, grant R5, assert
+  exact; it needs no CREATEROLE):
+  `CREATE ROLE erp_billing_opening_writer NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;`
+  Read back: all attributes false; `SELECT count(*) FROM pg_auth_members WHERE roleid = w.oid OR member = w.oid` is 0;
+  `pg_has_role('app_admin', 'erp_billing_opening_writer', 'MEMBER')` is false. Rollback: `DROP ROLE` (only before the
+  migration grants; after, REVOKE first; never once a window binds the oid). Why: on PG16 a non-superuser CREATEROLE creator
+  gets an ADMIN-only row, and in the probed graph `app_admin` is a member of `erp_owner` (admin, inherit, set), so
+  `app_admin` would reach ADMIN on the writer and could grant it to itself. Both the migration and the apply preflight now
+  refuse `writer_admin_reachable:<role>` for any non-superuser role that can reach (`pg_has_role(.., 'MEMBER')`, which
+  follows SET-only chains too) a role holding ADMIN on the writer. The migration tolerates only its own freshly created
+  creator row and only if no other role reaches the creator; apply tolerates nothing. Revoke-after-migrate is NOT a
+  substitute (the migration refuses first).
+- Operator (window-only login, a widening): Michael creates a dedicated login (for example `erp_ar_opening_operator`) that
+  is NOT `app_admin`, NOT `erp_owner` and not reachable from either (anything granted to `erp_owner` flows to `app_admin`).
+  `GRANT app_admin TO <op> WITH SET TRUE, INHERIT TRUE` (the CLI reads billing and inserts the admission rows as the
+  session user) and `GRANT erp_billing_opening_writer TO <op> WITH SET TRUE, INHERIT FALSE, ADMIN FALSE`. After the seal:
+  REVOKE both, plus the writer's INSERT grants (F9), then `ALTER ROLE <op> NOLOGIN` or DROP. The credential is Michael's.
 - Non-functional currency: `plan` refuses any partition whose currency is not NGN (`ar_opening_fx_unsupported`) before
   anything is imported or sealed, until the P-4/P-7 ruling.
 - Merge precondition (deploy): `e2_0029` runs the role guard on every target. Probe production and rehearsal read-only
@@ -162,3 +176,12 @@ Review af472276 hardening (architect findings):
   `createrole_self_grant` unset; no pre-existing writer role with SET/INHERIT members.
 - Before any plan/apply go: a read-only census + attribution dry run on g9 with a 0600 receipt, identical across two
   runs; confirm the distinct payment and invoice statuses per bucket and the GL sign of a positive credit note.
+- The sha of the census `gl_attribution` block (`gl_attribution_sha256`, also on the receipt) is bound into the plan sha
+  (plan.v4); `plan` and `apply` refuse without the attribution (`gl_attribution_required`) and the register refuses a
+  receipt whose block does not match its sha (`gl_attribution_sha_mismatch`). The per-party split cannot be edited
+  without detection. The census command therefore needs the destination chart (read only), like plan and apply.
+- Migrator (reader facts): the deploy pipeline runs NO alembic step. `mod_billing` and `public` tables, the `mod_billing`
+  schema and `alembic_version` are owned by `erp_owner`; the `public` schema is owned by `app_admin`. So `erp_owner` is the
+  migrator, and migrations (including `e2_0029`) are run by an operator as `erp_owner`, not by the pipeline.
+- R1 and W9 are approved by Michael (he pre-creates the writer as superuser, and creates the window-only operator login);
+  the PG tests model R1 (superuser pre-create, adopt) as the expected path.
