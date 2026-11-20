@@ -75,6 +75,8 @@ first open date after it with the original date in the description; `hold` BLOCK
   settle horizon (which have no window yet), must have a fresh closed window. The guard bites from F8 on (once any
   window or fact row exists for the tenant), so the runbook re-runs `--enable-once`, which rescans EVERY stale window
   (the rolling batch only runs while the mapper is live), just before the gate.
+- **Runbook.** Each `--enable-once` pass is capped at 1000 windows (`max_windows`), so loop `--enable-once --apply` until the report's
+  `windows_remaining` is 0 (about 10 passes over history from 2000), then once more just before the gate.
 - **Terminal rows are the mapper's only.** The runtime role can INSERT (W4), so the trigger also checks INSERT and UPDATE:
   POSTED needs the posting bridge's own journal for that fact, SKIP is only for opening import/unwind kinds, NO_GL only for V1.
 
