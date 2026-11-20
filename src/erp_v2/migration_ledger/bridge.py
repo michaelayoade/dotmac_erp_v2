@@ -50,6 +50,7 @@ from erp_v2.migration_ledger.common import (
 BUCKETS: Final = ("carry", "transform", "queue")
 ROUND_RULE: Final = "T-ROUND-2DP"
 AP_CONTROL: Final = "2000"
+CONTROL_ACCOUNTS_FOR_RESIDUE: Final = frozenset({"2000", "1400", "2040", "2045", "1410"})
 SCOPES: Final = ("header", "line")
 MAX_ITEMS: Final = 500_000
 
@@ -278,6 +279,12 @@ def control_lists() -> dict[str, list[str]]:
     return ledger_check.control_lists()
 
 
+def gate_profile() -> str:
+    from erp_v2.migration_ledger import ledger_check
+
+    return ledger_check.GATE_PROFILE
+
+
 def compute(
     inputs: Inputs,
     *,
@@ -287,6 +294,7 @@ def compute(
     ias8_sha: str | None,
     import_itemised: dict[str, Any] | None = None,
     import_sha: str | None = None,
+    subkobo: tuple[Any, ...] = (),
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The versioned body and the itemised (private) file. Pure.
 
@@ -294,6 +302,12 @@ def compute(
     IAS 8 journals' (account, movement) pairs; both are read from the ledger by the caller.
     """
     verify_rounding_items(inputs, import_itemised, import_sha)
+    from erp_v2.migration_ledger import subkobo as subkobo_mod
+
+    # T-SUBKOBO (E15 ruling): the items must equal the set derived from the sha-bound side file.
+    subkobo_mod.require_items_equal(inputs.items, subkobo_mod.bridge_items(subkobo, inputs.rounding_account_code))
+    if inputs.rounding_account_code in CONTROL_ACCOUNTS_FOR_RESIDUE and subkobo:
+        refuse("rounding_account_invalid")
     residue = rounding_residue(inputs)
     if residue and not inputs.rounding_account_code:
         refuse("rounding_account_required", "Finance must name the rounding account")
@@ -355,6 +369,20 @@ def compute(
                 "partition_gap": fmt(gap),
             }
         )
+    for period, sk_residue in subkobo_mod.residue_by_period(subkobo).items():
+        cell = [r for r in rows if r["account"] == inputs.rounding_account_code and r["period"] == period]
+        in_cell = sum(
+            (
+                i.v2 - i.legacy
+                for i in inputs.items
+                if i.rule == subkobo_mod.SUBKOBO_RULE
+                and i.item_id.endswith(f":{subkobo_mod.RESIDUE}")
+                and i.period == period
+            ),
+            ZERO,
+        )
+        if len(cell) != 1 or in_cell != sk_residue:
+            refuse("subkobo_items_differ_from_rounding_cell", "T-SUBKOBO items must sum to the residue in the cell")
     proof = partition_proof(inputs)
     itemised = {
         "items": [i.as_dict() for i in inputs.items],
@@ -372,8 +400,10 @@ def compute(
             "ias8_sha256": ias8_sha,
             "import_itemised_sha256": import_sha,
         },
+        "gate_profile": gate_profile(),
         "control_lists": control_lists(),
         "rounding_account_code": inputs.rounding_account_code,
+        "subkobo": subkobo_mod.summary(subkobo, inputs.rounding_account_code),
         "rounding_residue_by_period": {p: fmt(v) for p, v in residue.items()},
         "rows": rows,
         "partition": proof,
