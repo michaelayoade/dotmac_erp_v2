@@ -439,7 +439,7 @@ def test_receivables_permissions_are_declared_for_the_finance_roles_only():
     declared = {spec.code: set(spec.default_roles) for spec in access.PERMISSION_SPECS}
     assert declared[routes.READ] == {"finance_preparer", "finance_approver"}  # a poster can review a draft
     assert not {"admin", "staff"} & declared[routes.READ]
-    assert access.PROFILE_VERSION == 6
+    assert access.PROFILE_VERSION == 7
     assert declared[routes.PREPARE] == {"finance_preparer"}
     assert declared[routes.POST] == {"finance_approver"}
     assert not {"admin", "staff"} & (declared[routes.PREPARE] | declared[routes.POST])
@@ -727,8 +727,8 @@ def test_migration_revision_chain_and_head():
 
     assert migration.revision == "e2_0032_ar_producer"
     assert migration.down_revision == "e2_0031_billing_fact_postings"
-    assert "e2_0032_ar_producer" in EXPECTED_HEADS
-    assert not any(h.startswith("e2_003") and h != "e2_0032_ar_producer" for h in EXPECTED_HEADS)  # one e2 head
+    assert "e2_0035_customer_finance" in EXPECTED_HEADS  # stacked: the customer screen is the e2 head
+    assert not any(h.startswith("e2_003") and h != "e2_0035_customer_finance" for h in EXPECTED_HEADS)  # one e2 head
 
 
 def test_the_gate_check_module_is_read_only():
