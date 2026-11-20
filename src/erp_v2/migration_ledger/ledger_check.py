@@ -6,8 +6,12 @@
 * ``difference_rows``: recomputed v2 posted minus the expected v2 (the bridge's planned v2 plus every v2-native
   posting, i.e. every line whose owner is not the legacy import, the opening/IAS 8 owners or a rounding correction).
   It must be 0 for every row: no tolerance.
-* ``control_state``: for each code in ``ledger_roles.GATE_*`` the GL net against the live v2 owner subledger, read from
-  the owner tables. A subledger that does not exist yet REFUSES with a named reason; it is never skipped.
+* ``control_state``: for each code in ``ledger_roles.GATE_TIE_CODES`` the GL net against the live v2 owner subledger,
+  read from the owner tables. A subledger that does not exist yet REFUSES with a named reason; it is never skipped.
+* ``report_state``: the codes in ``REPORT_ZERO_CODES`` (2030) and ``REPORT_WHT_CODES`` (2110) are REPORTED, never
+  gated (flip-gate profile ``as_is_v1``, AS-IS-MIGRATION-REPLAN section 4).
+
+The profile id and every list are code constants: no runtime setting can relax the gate.
 """
 
 from __future__ import annotations
@@ -21,10 +25,14 @@ import sqlalchemy as sa
 from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
 from sqlalchemy.orm import Session
 
-from erp_v2.ledger_roles import GATE_TIE_CODES, GATE_WHT_CODES, GATE_ZERO_CODES
+from erp_v2.holdings.models import KIND_STRADDLE_POST as STRADDLE_KIND
+from erp_v2.holdings.models import KIND_SUBKOBO_POST as SUBKOBO_KIND
+from erp_v2.holdings.models import OWNER as STRADDLE_OWNER
+from erp_v2.ledger_roles import GATE_TIE_CODES, REPORT_WHT_CODES, REPORT_ZERO_CODES
 from erp_v2.migration_ledger.common import OPENING_PERIOD, ZERO, canonical_sha, fmt
 from erp_v2.migration_ledger.rounding_verify import ROUNDING_KIND
 
+GATE_PROFILE: Final = "as_is_v1"  # recorded in the bridge body, so Michael's signature covers it
 LEGACY_OWNER: Final = "legacy-erp"
 OPENING_OWNERS: Final = ("erp.opening", "erp.ias8")
 MANUAL_OWNER: Final = "erp.manual"
@@ -57,7 +65,11 @@ def v2_posted(db: Session, tenant: UUID) -> tuple[dict[tuple[str, str], Decimal]
     for code, day, owner, kind, net in _lines(db, tenant):
         period = OPENING_PERIOD if owner in OPENING_OWNERS else day.strftime("%Y-%m")
         total[(code, period)] += Decimal(net)
-        if owner not in (LEGACY_OWNER, *OPENING_OWNERS) and not (owner == MANUAL_OWNER and kind == ROUNDING_KIND):
+        if (
+            owner not in (LEGACY_OWNER, *OPENING_OWNERS)
+            and not (owner == MANUAL_OWNER and kind == ROUNDING_KIND)
+            and not (owner == STRADDLE_OWNER and kind in (STRADDLE_KIND, SUBKOBO_KIND))
+        ):
             native[(code, period)] += Decimal(net)
     return dict(total), dict(native)
 
@@ -132,13 +144,14 @@ def _sub_1410(db: Session, tenant: UUID) -> Decimal:
 
 _SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410}
 # NOT in ``_SUBLEDGERS`` because no owner subledger exists in v2 yet, so the gate REFUSES with a named reason (never
-# skips): 1400 (ruling D-B9-1 pending), 2045 (expenses a2 not pinned), 2110 (the a6 WHT table is not pinned; GL(2110)
-# must then equal the WHT ledger plus named exceptions).
+# skips): 1400 (billing a13 R1 not pinned), 2045 (expenses a2 not pinned). 2110 is report-only (``report_state``).
+# These ties net ALL currencies together; the per-currency tie is the pending check ``control_ties_per_currency``.
 
 
 def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
+    """The GATED ties (exact, GL against the owner subledger)."""
     state: dict[str, dict[str, Any]] = {}
-    for code in (*GATE_TIE_CODES, *GATE_WHT_CODES):
+    for code in GATE_TIE_CODES:
         gl = _gl_net(db, tenant, code)
         if code not in _SUBLEDGERS:
             state[code] = {
@@ -155,23 +168,36 @@ def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
             "ok": gl == sub,
             "reason": None if gl == sub else f"control_not_tied:{code}",
         }
-    for code in GATE_ZERO_CODES:
-        gl = _gl_net(db, tenant, code)
-        state[code] = {
-            "gl": fmt(gl),
-            "subledger": None,
-            "ok": gl == 0,
-            "reason": None if gl == 0 else f"zero_account_not_zero:{code}",
-        }
     return state
 
 
+def report_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
+    """Report-only balances (never a gate reason): 2030 (retired) and 2110 (real FIRS liability; the v2 WHT ledger
+    starts empty, so its balance is for statutory review)."""
+    out: dict[str, dict[str, Any]] = {}
+    for code in REPORT_ZERO_CODES:
+        gl = _gl_net(db, tenant, code)
+        out[code] = {"gl": fmt(gl), "kind": "retired_account_balance", "zero": gl == 0}
+    for code in REPORT_WHT_CODES:
+        out[code] = {"gl": fmt(_gl_net(db, tenant, code)), "kind": "wht_balance_for_statutory_review"}
+    return out
+
+
 def control_lists() -> dict[str, list[str]]:
-    return {"tie": list(GATE_TIE_CODES), "zero": list(GATE_ZERO_CODES), "wht": list(GATE_WHT_CODES)}
+    return {
+        "tie": list(GATE_TIE_CODES),
+        "report_zero": list(REPORT_ZERO_CODES),
+        "report_wht": list(REPORT_WHT_CODES),
+    }
 
 
 def ledger_state(db: Session, tenant: UUID) -> dict[str, Any]:
     total, _native = v2_posted(db, tenant)
     controls = control_state(db, tenant)
     rows = [[a, p, fmt(v)] for (a, p), v in sorted(total.items())]
-    return {"v2_posted_sha256": canonical_sha(rows), "controls": controls, "control_lists": control_lists()}
+    return {
+        "v2_posted_sha256": canonical_sha(rows),
+        "controls": controls,
+        "control_lists": control_lists(),
+        "reports": report_state(db, tenant),  # not part of the moved-since-signature comparison, never a gate
+    }

@@ -9,9 +9,18 @@
     ERP_MIGRATION_LEDGER_APPLY=1 python -m erp_v2.migration_ledger.opening_cli apply ... --plan-receipt P.json \
         --approved-plan-sha256 <plan_sha256 in P.json> --receipt A.json --operator-ref <who> --apply
 
-REFUSES unless the trial balance sums to zero and every control account (2000, 2040, 1410, 1400) equals its
-subledger opening once the itemised IAS 8 movements are applied (see ``opening``). Plan writes nothing; apply
-recomputes the plan and refuses on any drift. DSNs, environment only: ``MIGRATION_DATABASE_URL`` (destination) and
+    python -m erp_v2.migration_ledger.opening_cli gen-tb --tenant-id <uuid> --as-of YYYY-MM-DD \
+        --import-receipt IMPORT.json --receipt TB.json --operator-ref <who>
+
+``--import-receipt`` (plan, apply, gen-tb) is the applied, complete importer execute receipt (B-13): its
+``history_cutoff`` must equal the opening date (``opening_as_of_differs_from_history_cutoff``), and its sha is part of
+the plan sha.
+
+Flip-gate profile ``as_is_v1``: ``gen-tb`` WRITES the opening TB recomputed from the legacy snapshot (0600, exclusive);
+plan/apply REFUSE a declared TB that differs from the recomputed one, refuse a TB that does not sum to zero, and refuse
+any IAS 8 item (IAS 8 is empty before the flip). The control-account difference against the subledger opening is
+REPORT-ONLY (``proof.control_differences``, E37 info): it never refuses. Plan writes nothing; apply recomputes the plan
+and refuses on any drift. DSNs, environment only: ``MIGRATION_DATABASE_URL`` (destination) and
 ``LEGACY_DATABASE_URL`` (read-only legacy snapshot; the subledger opening is RECOMPUTED from it, never declared).
 Receipts are 0600, exclusive,
 and carry shas, counts and control-account tie-outs only. There is no undo: the only rollback is not to apply, and
@@ -32,6 +41,7 @@ from erp_v2.migration_ledger import legacy_subledger, opening
 from erp_v2.migration_ledger.common import (
     ZERO,
     canonical_sha,
+    day,
     fmt,
     keys_exactly,
     refuse,
@@ -96,7 +106,44 @@ def _recompute_subledger(eng, legacy_eng, tenant, as_of) -> dict[str, Any]:
         return legacy_subledger.recompute(legacy, as_of, family, functional)
 
 
+def _recompute_tb(eng, legacy_eng, tenant, as_of) -> dict[str, Any]:
+    """The opening TB from the legacy snapshot at the opening date (read only; same recompute as the bridge)."""
+    from erp_v2.migration_ledger import legacy_ledger
+
+    with Session(eng) as db, legacy_eng.connect() as legacy, legacy.begin():
+        legacy.execute(sa.text("SET TRANSACTION READ ONLY"))
+        legacy.execute(sa.text("SET LOCAL row_security = off"))
+        net, _universe = legacy_ledger.recompute(legacy, db, tenant, opening_as_of=as_of)
+    return opening.tb_from_legacy(net)
+
+
+def _gen_tb(args) -> dict[str, Any]:
+    if not args.tenant_id or not args.as_of or not args.import_receipt:
+        refuse("gen_tb_args_required")
+    tenant = uuid_text(args.tenant_id, "invalid_tenant_id")
+    as_of = day(args.as_of, "invalid_as_of")
+    receipt_data, _sha = cli.read_bound(args.import_receipt)
+    opening.require_as_of_matches_cutoff(
+        as_of, opening.parse_import_receipt(strict_json(receipt_data, "invalid_import_receipt"))
+    )
+    eng = cli.engine()
+    legacy_eng = cli.legacy_engine()
+    cli.install_registries()
+    try:
+        tb = _recompute_tb(eng, legacy_eng, tenant, as_of)
+    finally:
+        eng.dispose()
+        legacy_eng.dispose()
+    if sum(tb.values(), ZERO) != 0:
+        refuse("opening_tb_not_zero_sum")
+    return opening.tb_file_body(as_of, tb)  # exactly the parse_tb schema: the receipt IS the TB file
+
+
 def _run(args) -> dict[str, Any]:
+    if args.mode == "gen-tb":
+        return _gen_tb(args)
+    if not (args.spec and args.tb and args.ias8 and args.import_receipt):
+        refuse("plan_inputs_required")
     applying = args.mode == "apply"
     operator = cli.operator(args.operator_ref)
     given = load_inputs(args)
@@ -110,17 +157,25 @@ def _run(args) -> dict[str, Any]:
     if sum(given["tb"].values(), ZERO) != 0:
         out["refusal"] = "opening_tb_not_zero_sum"  # refused before any database access
         return out
+    receipt_data, import_sha = cli.read_bound(args.import_receipt)
+    opening.require_as_of_matches_cutoff(
+        given["as_of"], opening.parse_import_receipt(strict_json(receipt_data, "invalid_import_receipt"))
+    )  # refused before any database access, i.e. before the irreversible opening post
     eng = cli.engine()  # the DSNs leave the environment BEFORE the assembly is imported
     legacy_eng = cli.legacy_engine()
     cli.install_registries()
     from erp_v2.governance import policy as governance
 
     try:
+        generated = _recompute_tb(eng, legacy_eng, tenant, given["as_of"])
+        opening.require_declared_tb_matches(given["tb"], generated)
         sub = _recompute_subledger(eng, legacy_eng, tenant, given["as_of"])
         inputs = opening.OpeningInputs(
             given["as_of"], given["tb"], given["tb_sha"], sub,
             canonical_sha({k: fmt(v) for k, v in sorted(sub.items())}), given["ias8"], given["ias8_sha"],
+            opening.tb_canonical_sha(generated), import_sha,
         )  # fmt: skip
+        opening.require_no_ias8_before_flip(inputs)
         proof = opening.opening_proof(inputs)
         plan = opening.plan_sha256(inputs, proof)
         out.update(plan_sha256=plan, proof=proof, ready=bool(proof["ok"]))
@@ -143,8 +198,8 @@ def _run(args) -> dict[str, Any]:
                 refuse("plan_drift")
             planned_by = cli.operator(prior.get("prepared_by"))
         if not proof["ok"]:
-            out["refusal"] = "opening_control_not_subledger"
-            return out  # every GL - subledger difference must be covered EXACTLY by itemised IAS 8 items
+            out["refusal"] = "opening_tb_not_zero_sum"
+            return out  # control differences are report-only (E37 info in the proof); never a refusal
         with Session(eng) as db:
             if not applying:
                 db.execute(sa.text("SET TRANSACTION READ ONLY"))
@@ -180,9 +235,12 @@ def _run(args) -> dict[str, Any]:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m erp_v2.migration_ledger.opening_cli")
-    parser.add_argument("mode", choices=("plan", "apply"))
-    for name in ("spec", "tb", "ias8", "receipt"):
-        parser.add_argument(f"--{name}", required=True, type=Path)
+    parser.add_argument("mode", choices=("plan", "apply", "gen-tb"))
+    for name in ("spec", "tb", "ias8", "import_receipt"):
+        parser.add_argument(f"--{name.replace('_', '-')}", type=Path)
+    parser.add_argument("--receipt", required=True, type=Path)
+    parser.add_argument("--tenant-id")
+    parser.add_argument("--as-of")
     parser.add_argument("--plan-receipt", type=Path)
     parser.add_argument("--approved-plan-sha256")
     parser.add_argument("--operator-ref", required=True)

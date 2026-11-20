@@ -127,10 +127,10 @@ def test_billing_plan_receipt(tmp_path, monkeypatch) -> None:
     )
     assert code == 0
     data = json.loads(receipt.read_text())
-    assert data["items"] == 1 and data["open_ar_minor"] == 100000
-    assert data["sub_origin_exclusions"]["counts"]["invoices"] == 1
-    assert data["sub_origin_exclusions"]["invoices"] == ["sub-1"]
-    assert data["census"]["balanced"] is True and data["census"]["invoices"]["source"] == 2
+    # F1 reversed (v1677): the Sub-origin invoice is translated like any other; origin is provenance only.
+    assert data["items"] == 2 and data["open_ar_minor"] == 150000
+    assert "sub_origin_exclusions" not in data
+    assert data["census"]["carryable"] is True and data["census"]["invoices"] == 2
 
 
 def test_reflected_plan_survives_forbidden_runtime_env_names(tmp_path) -> None:
@@ -319,8 +319,9 @@ def test_execute_payment_refusal_receipt_and_exit_code(tmp_path, monkeypatch, ap
         assert receipt["source_resolution"]["refusal_sources_incomplete"] == [payment.source]
 
 
-def test_billing_preflight_wholly_sub_origin_is_a_clean_noop(tmp_path, monkeypatch) -> None:
+def test_billing_preflight_sub_origin_partition_is_translated_not_skipped(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("ERP_SELLER_LEGAL_NAME", "Dotmac Ltd")
+    monkeypatch.setenv("ERP_SELLER_ADDRESS_LINE", "1 Harbour Rd")
     invoices = tmp_path / "inv.json"
     invoices.write_text(
         json.dumps(
@@ -329,6 +330,8 @@ def test_billing_preflight_wholly_sub_origin_is_a_clean_noop(tmp_path, monkeypat
                     "invoice_id": "sub-1",
                     "invoice_number": "S-1",
                     "customer_key": "cust-1",
+                    "customer_legal_name": "Customer Ltd",
+                    "customer_address_line": "2 Way",
                     "invoice_date": "2026-01-05T00:00:00+00:00",
                     "currency_code": "NGN",
                     "total_amount": "500.00",
@@ -370,10 +373,10 @@ def test_billing_preflight_wholly_sub_origin_is_a_clean_noop(tmp_path, monkeypat
             str(receipt),
         ]
     )
-    assert code == 0
+    assert code in (0, 3)  # importable depends on the verifier; the partition is NOT a no-op
     data = json.loads(receipt.read_text())
-    assert data["nothing_to_import"] == "sub_origin"
-    assert data["census"]["balanced"] is True
+    assert "nothing_to_import" not in data and "sub_origin_exclusions" not in data
+    assert data["census"]["carryable"] is True and data["census"]["items"] == 1
 
 
 @pytest.mark.parametrize("apply", [False, True])

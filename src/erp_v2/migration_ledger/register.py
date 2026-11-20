@@ -9,6 +9,13 @@ Sources (each adapter is a pure function from a receipt or rows to ``Fact``s):
 * ``held_drafts``: the immutable ``erp_held_draft_decisions`` rows (no receipt adapter). A queued draft is open
   (E16a); a voided or posted draft is resolved; E17 findings derive from the ``duplicate_of_posted_fee_excess`` rows.
 * ``import_itemised``: the importer transform itemised file (#68: ``queue`` list); every queued invoice is open.
+* ``ar_census``: the AR opening census receipt (``importer/ar_census``; the AS-IS replan section 2 item 5), by sha:
+  E35 ``partition:<cust>:<ccy>`` (a partition billing cannot carry; its GL goes to the AR holding account),
+  E35 ``doc:<id>`` (the DRAFT / SUBMITTED AR invoices: an H-DOC work item, no GL), E35
+  ``ar_unapplied_credit_note:<id>`` (a credit note kept out of the billing manifest: party, document number,
+  amount; Finance applies or issues it after the flip), E36a ``custgap:<cust>:<ccy>`` / ``gljournal:<id>`` (GL that
+  has no billing counterpart, from the receipt's ``gl_attribution`` when the destination chart was supplied) and E36b
+  ``variance:<source key>`` (a stored-balance difference billing records at the seal; memo basis).
 * ``admission_reviews`` (database rows of B-1 decisions): a decision that waived a ``requires_correcting_journal``
   check (E08) or whose action is not executed here (void, supplier credit, reopen, ias8_post) is open; a plain
   admission is resolved ``admitted``.
@@ -18,13 +25,16 @@ resolved while its fingerprint is unchanged (fingerprinted decisions carry over,
 facts changed; an open item whose source was loaded but no longer lists it is reported as an orphan and stays open
 (never silently dropped). Finance resolves the rest with ``resolve`` and an evidence sha.
 
-Flip gate: passes only when the open count is 0 AND the latest bridge version is signed.
+Flip gate (profile ``as_is_v1``, AS-IS-MIGRATION-REPLAN section 4): the open work-queue count and the class coverage
+are REPORTS, not gates (Michael's as-is ruling: Finance works the queue after the flip). It passes only when the
+latest bridge version is signed (and was built under this profile), the recomputed ledger equals it and has not moved,
+and every gated control tie holds. The profile is a code constant; no setting can relax it.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -40,14 +50,16 @@ from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, refuse,
 SRC_HELD: Final = "held_drafts"
 SRC_IMPORT: Final = "import_itemised"
 SRC_REVIEWS: Final = "admission_reviews"
+SRC_AR_CENSUS: Final = "ar_census"
 SRC_MANUAL: Final = "manual"
 SRC_NA: Final = "not_applicable"
-RECEIPT_KINDS: Final = (SRC_IMPORT,)  # B-2 outcomes load from the database, never from a receipt file
+RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS)  # B-2 outcomes load from the database, never from a receipt file
 
 # class by importer queue reason (#68 Q_* constants); an unknown reason is refused, never guessed.
 IMPORT_CLASS: Final = {
     "expense_elsewhere_ambiguous": "E06",
     "wht_payment_fact_pending": "E06a",
+    "unposted_wht_line": "E04",  # AS-IS: an unposted invoice with a WHT line is not landed (H-DOC)
     "expense_account_is_control": "E21",
     "expense_account_is_tax_role": "E21",
     "tax_account_not_input_tax": "E09",
@@ -153,6 +165,125 @@ def from_import_itemised(body: Any) -> list[Fact]:
             "legacy_total": item.get("legacy_total"),
         }
         facts.append(Fact(sorted(classes)[0], f"invoice:{invoice}", SRC_IMPORT, None, None, detail))
+    return facts
+
+
+AR_CLASS_PARTITION: Final = "E35"
+AR_CLASS_GL_GAP: Final = "E36a"
+AR_CLASS_VARIANCE: Final = "E36b"
+
+
+def from_ar_census(body: Any) -> list[Fact]:
+    """The AR opening census receipt (counts, keys, amounts: no names) as open work items. Refuses anything else."""
+    if not isinstance(body, dict) or body.get("kind") != "ar-census" or not isinstance(body.get("census_sha256"), str):
+        refuse("invalid_ar_census")
+    census_sha = body["census_sha256"]
+    for name in (
+        "excluded_partitions",
+        "unapplied_credit_notes",
+        "unposted_documents",
+        "posted_after_cutoff",
+        "variances",
+    ):
+        if not isinstance(body.get(name, []), list):
+            refuse("invalid_ar_census")
+    attribution = body.get("gl_attribution")
+    if not isinstance(attribution, dict):  # without the GL attribution the E36a items cannot be derived: refuse
+        refuse("ar_census_without_gl_attribution", "run the census with the destination chart so 1400 is attributed")
+    from erp_v2.importer.ar_attribution import attribution_sha256
+
+    if body.get("gl_attribution_sha256") != attribution_sha256(attribution):  # the split was edited after the census
+        refuse("gl_attribution_sha_mismatch")
+    facts: list[Fact] = []
+
+    def add(class_code: str, key: str, detail: dict[str, Any]) -> None:
+        facts.append(Fact(class_code, key, SRC_AR_CENSUS, None, census_sha, detail))
+
+    signed = {str(h["legacy_key"]): int(h["amount_minor"]) for h in attribution.get("held", []) if isinstance(h, dict)}
+
+    for item in body.get("excluded_partitions", []):
+        cust, ccy = (str(x) for x in item["partition"])
+        add(
+            AR_CLASS_PARTITION,
+            f"partition:{cust}:{ccy}",
+            {
+                "holding": "H-SUB",
+                "blockers": sorted({str(b[1]) for b in item["blockers"]}),
+                "open_residual_minor": int(item["open_residual_minor"]),
+                "currency": ccy,
+            },
+        )
+    for item in body.get("unapplied_credit_notes", []):
+        add(
+            AR_CLASS_PARTITION,
+            f"ar_unapplied_credit_note:{text(item['key'], 'invalid_ar_census', 255)}",
+            {
+                "work_item": "ar_unapplied_credit_note",
+                "holding": "H-SUB",
+                "party": list(item["partition"]) if item.get("partition") else None,
+                "document_number": item.get("document_number"),
+                "amount_minor": item.get("gross_minor"),
+                "gl_signed_minor": signed.get(str(item["key"])),  # the amount B-14 itemises on 1400
+                "currency": item["partition"][1] if item.get("partition") else None,
+                "residual_minor": item.get("residual_minor"),
+                "reason": item.get("reason"),
+            },
+        )
+    for item in body.get("unposted_documents", []):
+        add(
+            AR_CLASS_PARTITION,
+            f"doc:{text(item['key'], 'invalid_ar_census', 255)}",
+            {"holding": "H-DOC", "status": item.get("status"), "amount_minor": item.get("gross_minor")},
+        )
+    for item in body.get("posted_after_cutoff", []):  # posted by D but dated after it: GL is in the ledger, held
+        key = text(item["key"], "invalid_ar_census", 255)
+        add(
+            AR_CLASS_PARTITION,
+            f"row:{key}",
+            {
+                "holding": "H-SUB",
+                "reason": "row_after_cutoff",
+                "kind": item.get("kind"),
+                "document_number": item.get("document_number"),
+                "amount_minor": item.get("gross_minor"),
+                "gl_signed_minor": signed.get(key),
+                "currency": item["partition"][1] if item.get("partition") else None,
+            },
+        )
+    for item in attribution.get("parties", []):
+        if int(item["custgap_minor"]) != 0:  # GL not explained by the carried or refused items of this party
+            cust, ccy = (
+                text(item["customer"], "invalid_ar_census", 255),
+                text(item["currency"], "invalid_ar_census", 3),
+            )
+            add(
+                AR_CLASS_GL_GAP,
+                f"custgap:{cust}:{ccy}",
+                {"amount_minor": int(item["custgap_minor"]), "holding": "H-SUB", "currency": ccy},
+            )
+    for item in attribution.get("unattributed", []):  # includes shared journals (flagged), never split
+        journal = text(item["gljournal_id"], "invalid_ar_census", 255)
+        add(
+            AR_CLASS_GL_GAP,
+            f"gljournal:{journal}",
+            {
+                "amount_minor": int(item["amount_minor"]),
+                "holding": "H-SUB",
+                "shared": bool(item.get("shared")),
+                "currency": item.get("currency"),
+            },
+        )
+    for item in body.get("variances", []):
+        add(
+            AR_CLASS_VARIANCE,
+            f"variance:{text(item['source_key'], 'invalid_ar_census', 255)}",
+            {
+                "partition": list(item["partition"]),
+                "reason": item.get("reason"),
+                "amount_minor": int(item["amount_minor"]),
+                "basis": "memo",
+            },
+        )
     return facts
 
 
@@ -428,10 +559,58 @@ def counts(db: Session, tenant: UUID) -> dict[str, Any]:
     }
 
 
+def _post_flip_tools_unused(db: Session, tenant: UUID) -> list[str]:
+    """Rule 0.2: B-1 reviews (#67), B-2 void/post decisions (#69) and IAS 8 opening journals are post-flip Finance
+    tools. Any record of their use before the flip means a journal the legacy never posted is in the v2 ledger (it
+    would count as v2-native in the bridge), so the gate refuses."""
+    from erp_v2.held_drafts.models import OUTCOME_QUEUED, HeldDraftDecision
+    from erp_v2.legacy_ap.models import AdmissionReview
+
+    used = (
+        db.scalar(sa.select(sa.func.count()).select_from(AdmissionReview).where(AdmissionReview.tenant_id == tenant))
+        or db.scalar(
+            sa.select(sa.func.count())
+            .select_from(HeldDraftDecision)
+            .where(HeldDraftDecision.tenant_id == tenant, HeldDraftDecision.outcome != OUTCOME_QUEUED)
+        )
+        or db.scalar(
+            sa.select(sa.func.count())
+            .select_from(m.OpeningJournal)
+            .where(m.OpeningJournal.tenant_id == tenant, m.OpeningJournal.kind == m.KIND_IAS8)
+        )
+    )
+    return ["post_flip_tool_used_before_flip"] if used else []
+
+
+# The section-4 checks of profile ``as_is_v1`` (AS-IS-MIGRATION-REPLAN, sections 4.1-4.5): name -> ``check(db, tenant)``
+# returning its refusal reasons, or None while the owner that wires it is not on main. EVERY None refuses the gate
+# (``profile_checks_unbuilt``), so the gate can never pass with an unbuilt check. An owner PR replaces its None with the
+# function; deleting a name fails the pinned test in tests/test_migration_ledger_pg.py (the set is pinned to the spec).
+# The exact ties of the signed bridge, the ledger comparison and the signature are checked inline in ``gate``.
+AS_IS_V1_CHECKS: Final[dict[str, Callable[[Session, UUID], list[str]] | None]] = {
+    "completeness_per_module_currency": None,  # 4.1: legacy = landed + held per module x currency (B-13/B-14/#72)
+    "control_ties_per_currency": None,  # 4.2: every control tie per currency (the inline ties net all currencies)
+    "prepayment_tie_r1": None,  # 4.2: prepayment == R1 available_credit + prepaid_funding (billing a13)
+    "holding_ties": None,  # 4.3: holding account == open register items; migration_holding posted once (B-14)
+    "setup_keyed_accounts": None,  # 4.5: every keyed account exists, active and postable (B-10-lite)
+    "setup_control_and_tax_codes_exist_once": None,  # 4.5
+    "setup_vat_deferral_pair": None,  # 4.5: the VAT codes have the deferral pair set
+    "setup_periods": None,  # 4.5: FY2025 holds the opening and is LOCKED; FY2026 and the cutover month OPEN
+    "setup_writer_role_m1": None,  # 4.5: the writer role passes the M1 checks (#72)
+    "straddle_reproduced": None,  # STRADDLE-SPEC (W8): every E39 journal has its migration_straddle journals (B-14)
+    "e15_subkobo_posted": None,  # E15: one migration_subkobo journal per key = legacy lines (6 dp) + ONE residue line
+    "post_flip_tools_unused": _post_flip_tools_unused,  # rule 0.2 (built)
+}
+
+
+def profile_checks_pending() -> list[str]:
+    return sorted(name for name, check in AS_IS_V1_CHECKS.items() if check is None)
+
+
 def gate(db: Session, tenant: UUID) -> dict[str, Any]:
-    """The flip gate: open count 0, every class covered, the latest bridge signed (body re-hashed), the recomputed v2
-    ledger equal to the bridge and unmoved since signature, and every control account tied (or named-unavailable,
-    which refuses)."""
+    """The flip gate, profile ``as_is_v1``: the latest bridge signed under this profile (body re-hashed), the
+    recomputed v2 ledger equal to the bridge and unmoved since signature, and every gated control account tied (or
+    named-unavailable, which refuses). The open count, class coverage, 2030, 2110 are reported only."""
     from erp_v2.migration_ledger import ledger_check
 
     c = counts(db, tenant)
@@ -440,10 +619,13 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
     signed = False
     version = sha = None
     reasons: list[str] = []
-    if c["open"] != 0:
-        reasons.append("open_exceptions")
-    if not cov["complete"]:
-        reasons.append("class_coverage_incomplete")
+    reports: dict[str, Any] = {}
+    pending = profile_checks_pending()
+    if pending:
+        reasons.append("profile_checks_unbuilt")
+    for check in AS_IS_V1_CHECKS.values():
+        if check is not None:
+            reasons.extend(check(db, tenant))
     if row is None:
         reasons.append("no_bridge_version")
     else:
@@ -456,6 +638,8 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
         if not signed:
             reasons.append("latest_bridge_not_signed")
         else:
+            if body.get("gate_profile") != ledger_check.GATE_PROFILE:
+                reasons.append("gate_profile_changed_since_signature")
             if ledger_check.difference_rows(db, tenant, body):
                 reasons.append("v2_ledger_differs_from_bridge")
             state = ledger_check.ledger_state(db, tenant)
@@ -465,9 +649,19 @@ def gate(db: Session, tenant: UUID) -> dict[str, Any]:
             if body.get("control_lists") != state["control_lists"]:
                 reasons.append("control_lists_changed_since_signature")
             reasons.extend(v["reason"] for v in state["controls"].values() if not v["ok"])
+            reports = state["reports"]
     return {
         "passed": not reasons,
+        "profile": ledger_check.GATE_PROFILE,
         "reasons": reasons,
+        "profile_checks_pending": pending,
+        "reports": {
+            "open_count": c["open"],
+            "resolved_count": c["resolved"],
+            "open_by_class": c["open_by_class"],
+            "classes_missing": cov["missing"],
+            "report_balances": reports,
+        },
         "open_count": c["open"],
         "resolved_count": c["resolved"],
         "open_by_class": c["open_by_class"],

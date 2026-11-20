@@ -21,8 +21,10 @@ Rules (Michael's rulings, each its own bridge line):
   (``import.fallback_expense_account``, a REQUIRED declared input: the import refuses without it).
 * ``T-UNPOSTED-CORRECT`` (D-M2): an invoice legacy never posted (DRAFT/SUBMITTED/APPROVED, no ledger lines) lands in
   its true state, coded for v2: VAT lines on the input-tax account (1455), a valid expense account (never a control or
-  tax-role account), no folded form. A WHT-type tax on a line is removed from the line and the header, so the total is
-  the gross (the WHT is a payment-time fact; the bridge line carries it). A taxed line without a valid code, an
+  tax-role account), no folded form. A WHT-type tax on a line: with ``import.unposted_wht`` = ``queue`` (the default,
+  AS-IS ruling 2026-11-19) the invoice is not landed and is queued as ``unposted_wht_line`` (H-DOC, class E04);
+  with ``remove`` (the old D-M2) the WHT is removed from the line and the header, so the total is the gross (the
+  WHT is a payment-time fact; the bridge line carries it). A taxed line without a valid code, an
   expense account that is a control or tax-role account, or a deferral journal already posted to the v2 ledger refuses
   the invoice to the queue.
 
@@ -61,6 +63,13 @@ from erp_v2.importer.tax_accounts import (
 )
 
 PARAM_FALLBACK_EXPENSE: Final = "import.fallback_expense_account"
+PARAM_UNPOSTED_WHT: Final = "import.unposted_wht"
+# AS-IS ruling (2026-11-19): an unposted invoice carrying a WHT line is not transformed. ``queue`` (default): the
+# invoice is not landed and becomes a work-queue item (H-DOC, E04, reason ``unposted_wht_line``). ``remove``: the
+# old D-M2 behaviour (WHT removed, invoice lands at the gross, queued as ``wht_payment_fact_pending``).
+UNPOSTED_WHT_QUEUE: Final = "queue"
+UNPOSTED_WHT_REMOVE: Final = "remove"
+UNPOSTED_WHT_MODES: Final = frozenset({UNPOSTED_WHT_QUEUE, UNPOSTED_WHT_REMOVE})
 
 T_EXP_LEGACY: Final = "T-EXP-LEGACY"
 T_ROUND_2DP: Final = "T-ROUND-2DP"
@@ -84,6 +93,7 @@ INPUT_VAT_RELEASE_CODES: Final = frozenset({"1440"})  # release target
 TAX_ROLE_CODES: Final = INVOICE_TAX_ACCOUNT_CODES | INPUT_VAT_RELEASE_CODES
 
 Q_REASON_AMBIGUOUS: Final = "expense_elsewhere_ambiguous"
+Q_UNPOSTED_WHT: Final = "unposted_wht_line"  # unposted invoice with a WHT line, ``import.unposted_wht`` = queue
 Q_WHT_PENDING: Final = "wht_payment_fact_pending"  # lands, but is queued until the a6 WHT table carries the fact
 Q_ACCOUNT_CONTROL: Final = "expense_account_is_control"
 Q_ACCOUNT_TAX_ROLE: Final = "expense_account_is_tax_role"
@@ -178,15 +188,20 @@ class TransformParams:
 
     fallback_expense_account: str | None = None
     tenant_id: str | None = None  # the run's single tenant extent: the fallback must be in this tenant's chart
+    unposted_wht: str = UNPOSTED_WHT_QUEUE  # ``import.unposted_wht``: queue (default) | remove
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, object] | None, tenant_id: object = None) -> TransformParams:
         tenant = None if tenant_id is None else canonical(tenant_id)
+        mode_raw = (values or {}).get(PARAM_UNPOSTED_WHT)
+        mode = UNPOSTED_WHT_QUEUE if mode_raw is None else str(mode_raw).strip().lower()
+        if mode not in UNPOSTED_WHT_MODES:
+            raise TransformParamsError("unposted_wht_invalid")
         raw = (values or {}).get(PARAM_FALLBACK_EXPENSE)
         if raw is None or str(raw).strip() == "":
-            return cls(None, tenant)
+            return cls(None, tenant, mode)
         try:
-            return cls(str(uuid.UUID(str(raw).strip())), tenant)
+            return cls(str(uuid.UUID(str(raw).strip())), tenant, mode)
         except ValueError as exc:
             raise TransformParamsError("fallback_expense_account_not_a_uuid") from exc
 
@@ -351,9 +366,18 @@ def _legacy_expense_mapping(invoice: InvoiceFacts) -> dict[str, str] | None:
 
 
 def transform_invoice(
-    invoice: InvoiceFacts, fallback_account: str, accounts: Mapping[str, AccountFacts]
+    invoice: InvoiceFacts,
+    fallback_account: str,
+    accounts: Mapping[str, AccountFacts],
+    unposted_wht: str = UNPOSTED_WHT_QUEUE,
 ) -> InvoiceOutcome:
-    """Apply every rule to one invoice; return its bucket, landing values and bridge lines. Pure."""
+    """Apply every rule to one invoice; return its bucket, landing values and bridge lines. Pure.
+
+    ``unposted_wht`` (``import.unposted_wht``) gates the WHT removal inside T-UNPOSTED-CORRECT: ``queue`` refuses an
+    unposted invoice with a WHT line (not landed, queue reason ``unposted_wht_line``); ``remove`` is the D-M2 rule."""
+
+    if unposted_wht not in UNPOSTED_WHT_MODES:
+        raise ValueError(f"unknown {PARAM_UNPOSTED_WHT} mode {unposted_wht!r}")
 
     iid = invoice.invoice_id
     status = invoice.status.strip().upper()
@@ -438,6 +462,9 @@ def transform_invoice(
                 continue
             code = line.tax_code
             tax_type = str(code.tax_type).strip().upper() if code is not None else ""
+            if code is not None and tax_type in WHT_TAX_TYPES and unposted_wht == UNPOSTED_WHT_QUEUE:
+                refuse(Q_UNPOSTED_WHT)
+                continue
             if code is not None and tax_type in WHT_TAX_TYPES:
                 wht_removed += line.tax_amount
                 tax_amount[k] = ZERO
@@ -990,7 +1017,7 @@ def build_transforms(
             classes[iid],
             {k: v for k, v in item_by_line.items() if k in {canonical(line.line_id) for line in lines}},
         )
-        outcome = transform_invoice(facts, fallback, accounts)
+        outcome = transform_invoice(facts, fallback, accounts, params.unposted_wht)
         outcomes.append(outcome)
         if outcome.lands:
             header_map[_key(h["invoice_id"])] = (
@@ -1012,7 +1039,13 @@ def build_transforms(
     return TransformBuild(
         line_map,
         header_map,
-        TransformLedger(tuple(outcomes), fallback, tuple(source_ids), len(rows), dict(binding or {})),
+        TransformLedger(
+            tuple(outcomes),
+            fallback,
+            tuple(source_ids),
+            len(rows),
+            {**dict(binding or {}), PARAM_UNPOSTED_WHT: params.unposted_wht},
+        ),
         class_counts(classes.values()),
     )
 
@@ -1059,8 +1092,12 @@ def read_and_build(
 
 __all__ = [
     "PARAM_FALLBACK_EXPENSE",
+    "PARAM_UNPOSTED_WHT",
     "REFUSAL_KEY",
     "RULES",
+    "UNPOSTED_WHT_MODES",
+    "UNPOSTED_WHT_QUEUE",
+    "UNPOSTED_WHT_REMOVE",
     "AccountFacts",
     "BridgeLine",
     "InvoiceFacts",
