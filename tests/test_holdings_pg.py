@@ -627,7 +627,7 @@ def test_rls_is_forced_the_runtime_role_reads_only_and_tenants_are_isolated(engi
         with engine.connect() as c:
             tx = c.begin()
             c.execute(sa.text("SET LOCAL ROLE app_user"))
-            c.execute(sa.text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(who.tenant_id)})
+            c.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(who.tenant_id)})
             try:
                 seen[who.tenant_id] = c.scalar(sa.text(f"SELECT count(*) FROM public.{HOLDINGS_TABLE}"))
             finally:
@@ -1329,16 +1329,15 @@ def legacy_schema(engine):
         c.exec_driver_sql("DROP SCHEMA gl CASCADE")
 
 
-def import_receipt_for(tmp_path, side_name, side_sha, section, count=None, subkobo_ids=None, cutoff="2025-12-31"):
-    body = {"history_cutoff": cutoff, "history_cutoff_census": {section: {"side_file_sha256": side_sha}}}
-    if section == "straddlers":
-        body["history_cutoff_census"][section]["count"] = count
-    else:
-        body["history_cutoff_census"]["censuses"] = [
-            {"unbalanced_unit_refused_journals": [{"journal": j, "debit": "0", "credit": "0"} for j in subkobo_ids]}
-        ]
-    path = write(tmp_path / "import-receipt.json", body)
-    return path
+def import_receipt_for(tmp_path, side_name, side_sha, section, journals, cutoff="2025-12-31", count=None):
+    """The import receipt skeleton #74 writes: the section carries the side-file sha, the count and the sorted ids."""
+    body = {
+        "history_cutoff": cutoff,
+        "history_cutoff_census": {
+            section: {"side_file_sha256": side_sha, "count": len(journals) if count is None else count, "journals": sorted(str(j) for j in journals)}
+        },
+    }  # fmt: skip
+    return write(tmp_path / "import-receipt.json", body)
 
 
 def real_straddle_files(engine, env, tmp_path, *, status="POSTED", lines=None):
@@ -1388,7 +1387,7 @@ def real_straddle_files(engine, env, tmp_path, *, status="POSTED", lines=None):
             "journals": [f.as_dict() for f in found],
         },
     )
-    receipt = import_receipt_for(tmp_path, side.name, sha, "straddlers", count=len(found))
+    receipt = import_receipt_for(tmp_path, side.name, sha, "straddlers", [f.journal for f in found])
     assert hashlib.sha256(side.read_bytes()).hexdigest() == sha
     return side, receipt, found
 
@@ -1497,12 +1496,9 @@ def test_a_tampered_line_refuses_evidence_sha_mismatch_and_binding_failures_refu
         units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
     assert e.value.code == "side_file_sha_mismatch"
     # a wrong cutoff / a wrong journal count in the receipt
-    bad = import_receipt_for(
-        tmp_path,
-        side.name,
-        json.loads(receipt.read_text())["history_cutoff_census"]["straddlers"]["side_file_sha256"],
-        "straddlers",
-        count=3,
+    good = json.loads(receipt.read_text())["history_cutoff_census"]["straddlers"]
+    bad = import_receipt_for(  # same count, one other id: the full id set is bound, not the count
+        tmp_path, side.name, good["side_file_sha256"], "straddlers", [*good["journals"][:-1], str(uuid4())]
     )
     env.spec = units_spec(env, tmp_path, straddle=side, receipt=bad)
     with pytest.raises(HoldingRefused) as e:
@@ -1516,7 +1512,7 @@ def test_a_tampered_line_refuses_evidence_sha_mismatch_and_binding_failures_refu
 
     retyped.write_text(json.dumps(body))
     rec = import_receipt_for(
-        tmp_path, retyped.name, hashlib.sha256(retyped.read_bytes()).hexdigest(), "straddlers", count=2
+        tmp_path, retyped.name, hashlib.sha256(retyped.read_bytes()).hexdigest(), "straddlers", good["journals"]
     )
     env.spec = units_spec(env, tmp_path, straddle=retyped, receipt=rec)
     with pytest.raises(HoldingRefused) as e:
@@ -1593,45 +1589,48 @@ def test_straddle_without_a_posted_opening_or_receipt_refuses(engine, legacy_sch
     assert e.value.code == "straddle_file_required"
 
 
-def subkobo_files(engine, env, tmp_path, *, lines=None, status="POSTED", extra_journal=None):
-    """The E15 side file in the ruling's shape (#74's emitter for it is the pending B-13 change): legacy lines carry
-    6 dp, the journal's net is a sub-kobo residue."""
-    import hashlib
+def subkobo_files(engine, env, tmp_path, *, lines=None, status="POSTED"):
+    """#74's REAL E15 output: ``classify_unbalanced`` and ``write_private_json`` over a seeded legacy schema."""
+    from erp_v2.importer import history_cutoff
 
-    from erp_v2.holdings import units as u
-
-    jid = str(uuid4())
+    jid = uuid4()
     lines = lines or [("1207", date(2026, 1, 13), "100.004000", "0"), ("1211", date(2026, 1, 13), "0", "100.000000")]
-    payload = [
-        {"ledger_line_id": str(uuid4()), "journal_line_id": str(uuid4()), "account_id": str(env.accounts[code]), "account_code": code,
-         "posting_date": day_.isoformat(), "debit": debit, "credit": credit, "original_currency": "NGN"}
-        for code, day_, debit, credit in lines
-    ]  # fmt: skip
-    net_ = sum(D(x["debit"]) - D(x["credit"]) for x in payload)
-    post_net: dict = {}
-    for x in (p for p in payload if p["posting_date"] > CUTOFF.isoformat()):
-        post_net.setdefault(x["posting_date"], {})
-        post_net[x["posting_date"]][x["account_id"]] = format(D(x["debit"]) - D(x["credit"]), "f")
-    journal = {"class": "E15", "reason": "unbalanced_journal_unit", "journal": jid, "type": "UNBALANCED", "legacy_status": status,
-               "journal_date": lines[0][1].isoformat(), "source_module": "GL", "source_document_type": "JOURNAL", "source_document_id": jid,
-               "currency": "NGN", "post_net": post_net, "net": format(net_, "f"), "evidence_sha256": u.unit_evidence_sha(payload), "lines": payload}  # fmt: skip
+    with engine.begin() as c:
+        c.exec_driver_sql("DELETE FROM gl.posted_ledger_line")
+        c.exec_driver_sql("DELETE FROM gl.journal_entry")
+    legacy_journal(engine, env, jid, lines[0][1], lines, number="JE-E15", status=status)
+    from datetime import timedelta
+
+    earliest = min(x[1] for x in lines)
+    with engine.connect() as source:
+        source.exec_driver_sql("SET search_path TO gl, public")
+        found = history_cutoff.classify_unbalanced(source, CUTOFF)
+        if not found:  # a case #74 would not classify at the real cutoff (lines on or before it): classify earlier
+            found = history_cutoff.classify_unbalanced(source, earliest - timedelta(days=1))
+    assert len(found) == 1 and found[0].journal == str(jid)
+    journal = found[0].as_dict()
+    post: dict = {}
+    for x in (ln for ln in journal["lines"] if ln["posting_date"] > CUTOFF.isoformat()):
+        post.setdefault(x["posting_date"], {})
+        post[x["posting_date"]][x["account_id"]] = format(D(x["debit"]) - D(x["credit"]), "f")
+    journal["post_net"] = post  # as at the real cutoff
     side = tmp_path / "receipt.json.subkobo.json"
-    body = json.dumps(
+    sha = history_cutoff.write_private_json(
+        side,
         {
             "history_cutoff": CUTOFF.isoformat(),
             "class": "E15",
             "reason": "unbalanced_journal_unit",
             "journals": [journal],
         },
-        indent=1,
-        sort_keys=True,
-    ).encode()
-    side.write_bytes(body)
-    receipt = import_receipt_for(tmp_path, side.name, hashlib.sha256(body).hexdigest(), "subkobo", subkobo_ids=[jid])
-    return side, receipt, jid, journal
+    )
+    receipt = import_receipt_for(tmp_path, side.name, sha, "subkobo", [str(jid)])
+    return side, receipt, str(jid), journal
 
 
-def test_subkobo_reposts_the_legacy_lines_exactly_plus_one_residue_line_and_resolves_e15(engine, tmp_path):
+def test_subkobo_reposts_the_legacy_lines_exactly_plus_one_residue_line_and_resolves_e15(
+    engine, legacy_schema, tmp_path
+):
     from erp_v2.holdings import units
 
     env = units_world(engine)
@@ -1675,7 +1674,7 @@ def test_subkobo_reposts_the_legacy_lines_exactly_plus_one_residue_line_and_reso
     assert net(engine, env, "6999") == D("-0.004")
 
 
-def test_subkobo_refusals(engine, tmp_path):
+def test_subkobo_refusals(engine, legacy_schema, tmp_path):
     from erp_v2.holdings import units
 
     day_ok = date(2026, 1, 13)
@@ -1804,3 +1803,48 @@ def test_n3_persisted_holding_config_closes_the_window_and_an_admission_of_anoth
     env2.spec = spec_bytes(env2, make_spec(tmp_path))
     seed_gl(engine, env2, "1400", D("1530"))
     t1(engine, env2)  # the extra admission row belongs to ANOTHER window and does not break the anchor
+
+
+def test_a_login_member_of_app_user_reads_but_never_writes_and_the_guards_hold_for_it(engine, tmp_path):
+    """Prod logs in as a LOGIN member of app_user, not as app_user: RLS and the grants must work through membership, and no
+    guard may key on ``current_user = 'app_user'``."""
+    env, *_ = flipped(engine, tmp_path)
+    other = world(engine)
+    role = f"erp_member_{uuid4().hex[:10]}"
+    with engine.begin() as c:
+        c.exec_driver_sql(f'CREATE ROLE "{role}" LOGIN')
+        c.exec_driver_sql(f'GRANT app_user TO "{role}"')
+        c.exec_driver_sql(f'GRANT "{role}" TO CURRENT_USER')  # so the test session may SET ROLE to it
+    try:
+        for who, expected in ((env, 9), (other, 0)):
+            with engine.connect() as c:
+                tx = c.begin()
+                c.execute(sa.text(f'SET LOCAL ROLE "{role}"'))
+                c.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(who.tenant_id)})
+                try:
+                    assert c.scalar(sa.text(f"SELECT count(*) FROM public.{HOLDINGS_TABLE}")) == expected
+                    assert c.scalar(sa.text("SELECT count(*) FROM public.erp_migration_holding_accounts")) == (
+                        6 if who is env else 0
+                    )
+                finally:
+                    tx.rollback()
+        gap = key_of(engine, env, "partygap:2000:NGN:A")
+        for statement in (
+            f"DELETE FROM public.{HOLDINGS_TABLE}",
+            f"UPDATE public.{HOLDINGS_TABLE} SET planned_by = 'x'",
+            f"TRUNCATE public.{HOLDINGS_TABLE}",
+            "UPDATE public.erp_migration_exceptions SET state = 'resolved' WHERE legacy_key = 'partygap:2000:NGN:A'",
+        ):
+            with engine.connect() as c:
+                tx = c.begin()
+                c.execute(sa.text(f'SET LOCAL ROLE "{role}"'))
+                c.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
+                with pytest.raises(DBAPIError):
+                    c.execute(sa.text(statement))
+                tx.rollback()
+        assert gap is not None
+    finally:
+        with engine.begin() as c:
+            c.exec_driver_sql(f'REVOKE app_user FROM "{role}"')
+            c.exec_driver_sql(f'REVOKE "{role}" FROM CURRENT_USER')
+            c.exec_driver_sql(f'DROP ROLE "{role}"')

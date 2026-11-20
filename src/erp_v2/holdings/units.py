@@ -13,7 +13,7 @@ Input is #74's own side file, exactly as ``importer/history_cutoff`` writes it (
 sets, with ``evidence_sha256`` recomputed here through the shared evidence function. The file must be bound to the import
 receipt (``receipts.import_receipt`` in the run-spec): its sha equals
 ``history_cutoff_census.{straddlers|subkobo}.side_file_sha256``, its ``history_cutoff`` equals the receipt's and the posted
-opening's as-of date, and the journal count (and, for E15, the journal set) equals the receipt's.
+opening's as-of date, and the full journal-id set and count equal the receipt's.
 
 Refusals (fail closed, nothing written): a legacy journal that is not POSTED; a non-functional currency; a control, holding,
 tax-role or prepaid-funding account line; an inactive or non-postable account; a day whose period is not OPEN (never
@@ -28,7 +28,6 @@ decides it), carrying #74's evidence sha and the reproduction journal ids.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -59,18 +58,11 @@ from erp_v2.holdings.models import (
     straddle_document_id,
     subkobo_document_id,
 )
+from erp_v2.importer.history_cutoff import unit_evidence_sha  # B-13 owns it (re-exports the shared function)
 from erp_v2.ledger_roles import tax_role_account_ids
 from erp_v2.migration_ledger import models as m
 from erp_v2.migration_ledger import register
 from erp_v2.migration_ledger.common import canonical_sha, day, fmt, money, sha_text, strict_json, text, uuid_text
-
-try:  # B-13 moves the evidence function to a shared place; import it from there once it lands
-    from erp_v2.importer.history_cutoff import unit_evidence_sha  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover - until #74 lands it
-
-    def unit_evidence_sha(lines: Any) -> str:
-        return hashlib.sha256(json.dumps(list(lines), sort_keys=True).encode()).hexdigest()
-
 
 TOP_KEYS: Final = {"history_cutoff", "class", "reason", "journals"}
 LINE_KEYS: Final = {
@@ -256,16 +248,11 @@ def bind_to_import_receipt(
         refuse("side_file_sha_mismatch", "the side file is not the one the import receipt names")
     if body.get("history_cutoff") != cutoff.isoformat():
         refuse("history_cutoff_mismatch", "the side file and the import receipt disagree on the cutoff")
-    if mode is STRADDLE and section.get("count") != len(journals):
+    listed = section.get("journals")
+    if not isinstance(listed, list) or sorted(str(x) for x in listed) != sorted(j.journal_id for j in journals):
+        refuse("unit_set_mismatch", "the journal set differs from the import receipt")
+    if section.get("count") != len(journals):
         refuse("unit_set_mismatch", "the journal count differs from the import receipt")
-    if mode is SUBKOBO:
-        listed = census.get("censuses") if isinstance(census, dict) else None
-        ids: set[str] = set()
-        for entry in listed if isinstance(listed, list) else []:
-            for item in entry.get("unbalanced_unit_refused_journals", []) if isinstance(entry, dict) else []:
-                ids.add(str(item["journal"]) if isinstance(item, dict) else str(item))
-        if ids != {j.journal_id for j in journals}:
-            refuse("unit_set_mismatch", "the journal set differs from the import receipt")
     opening = db.scalar(
         sa.select(sa.func.max(JournalEntry.posting_date)).where(
             JournalEntry.tenant_id == tenant, JournalEntry.source_owner == planning.OPENING_OWNER
