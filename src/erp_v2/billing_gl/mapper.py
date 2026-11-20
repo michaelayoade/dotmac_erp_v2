@@ -645,7 +645,9 @@ class Mapper:
         bind = self.db.get_bind()
         key = int.from_bytes(hashlib.sha256(f"billing_gl:{self.tenant_id}".encode()).digest()[:8], "big", signed=True)
         # A dedicated connection: a session-level lock must outlive the per-page commits of the working session.
-        with bind.engine.connect() as lock:
+        # AUTOCOMMIT: the lock connection must not sit idle-in-transaction for the whole run, or an
+        # idle_in_transaction_session_timeout would kill it and silently free the lock mid-run.
+        with bind.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as lock:
             if not lock.execute(sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar():
                 self.report.locked = True
                 return self.report
@@ -684,7 +686,10 @@ class Mapper:
             (w for w in windows.values() if w.closed_at is not None and w.occurred_from.date() not in queued),
             key=lambda w: w.rechecked_at or w.closed_at,
         )
-        for window in stale[: self.settings.rescan_batch]:
+        # --enable-once (the mapper idle) rescans EVERY stale window: the rolling batch only runs while live, so the
+        # runbook re-runs it just before the gate and the period guard (which bites from F8 on) can be healed.
+        batch = stale if not self.live else stale[: self.settings.rescan_batch]
+        for window in batch:
             todo.append((window.occurred_from.date(), window, True))
         for index, (when, existing, recheck) in enumerate(todo):
             if index >= self.max_windows:
