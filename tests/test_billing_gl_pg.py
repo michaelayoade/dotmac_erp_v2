@@ -715,3 +715,11 @@ def test_two_runs_cannot_overlap_the_second_exits_without_work(engine):
         holder.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
     assert blocked["locked"] is True and blocked["posted"] == 0 and gl(engine, env) == {}
     assert run(engine, env)["posted"] == 1  # the lock was released: the next run proceeds
+
+
+def test_the_period_guard_does_not_apply_to_a_tenant_whose_mapper_was_never_used(engine):
+    from erp_v2.billing_gl.checks import facts_incomplete
+
+    env = world(engine, enabled=False)
+    with Session(engine) as db:
+        assert facts_incomplete(db, env.tenant_id, date(2026, 1, 1), date(2026, 1, 31), now=RUN_AT) is False

@@ -128,6 +128,14 @@ def facts_incomplete(db: Session, tenant_id: UUID, start: date, end: date, *, no
     def read(key: str, default: object) -> object:
         return resolve_value(db, settings.DOMAIN, key, tenant_id=tenant_id, default=default)
 
+    # The guard only applies to a tenant whose mapper is in use (enabled, or it has ever recorded a window or a fact);
+    # a tenant that never turned it on has no billing facts to complete, so main stays deployable with the mapper idle.
+    in_use = read("enabled", False) is True or bool(
+        db.scalar(select(FactWindow.id).where(FactWindow.tenant_id == tenant_id).limit(1))
+        or db.scalar(select(FactPosting.id).where(FactPosting.tenant_id == tenant_id).limit(1))
+    )
+    if not in_use:
+        return False
     blockers = period_blockers(
         db,
         tenant_id,
