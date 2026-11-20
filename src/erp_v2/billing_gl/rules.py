@@ -147,6 +147,8 @@ class FactView:
     committed_at: datetime | None = None
     effects: tuple[Effect, ...] = ()
     minor_units: int = 2
+    # (treatment, tax) of the fact's applied tax snapshots, for the per-treatment cross-check of the line accounts.
+    tax_snapshots: tuple[tuple[str, Decimal], ...] = ()
     # Per-document settled amounts of an allocation-family fact (rev 2 VAT release).
     alloc_rows: tuple[AllocRow, ...] = ()
     # Evidence the mapper uses to find the cash account of settlement-family facts.

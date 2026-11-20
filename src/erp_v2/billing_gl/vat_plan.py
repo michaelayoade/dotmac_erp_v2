@@ -218,6 +218,21 @@ def _check_lines(db, scope, tenant_id, document: BillingDocument, rows: list[dic
     return None
 
 
+def _snapshots_agree(view, rows: list[dict]) -> bool:
+    """The per-treatment tax split is B-16's assertion; when the fact carries tax snapshots it must agree with them."""
+    if not view.tax_snapshots:
+        return True
+    by_row: dict[str, Decimal] = {}
+    for row in rows:
+        if row["tax"]:
+            by_row[row["treatment"]] = by_row.get(row["treatment"], ZERO) + row["tax"]
+    by_fact: dict[str, Decimal] = {}
+    for treatment, tax in view.tax_snapshots:
+        if tax:
+            by_fact[treatment] = by_fact.get(treatment, ZERO) + tax
+    return by_row == by_fact
+
+
 def _taxes(rows: list[dict], tax_accounts: dict[str, dict[str, str]]):
     """treatment -> (tax, deferral account, current account); or a block reason."""
     out: dict[str, tuple[Decimal, str, str]] = {}
@@ -253,6 +268,8 @@ def issue_plan(db, scope: TenantScope, view, receivable: str, tax_accounts) -> P
     reason = _check_lines(db, scope, scope.tenant_id, document, rows, per_line=True)
     if reason:
         return _blocked(reason)
+    if not _snapshots_agree(view, rows):
+        return _blocked("line_accounts_mismatch")
     taxes = _taxes(rows, tax_accounts)
     if isinstance(taxes, str):
         return _blocked(taxes)
@@ -296,6 +313,8 @@ def credit_plan(db, scope: TenantScope, view, receivable: str, tax_accounts) -> 
     reason = _check_lines(db, scope, scope.tenant_id, document, rows, per_line=False)
     if reason:
         return _blocked(reason)
+    if not _snapshots_agree(view, rows):
+        return _blocked("line_accounts_mismatch")
     taxes = {}
     for row in rows:
         if row["tax"]:
@@ -424,11 +443,23 @@ def reversal_plan(db, scope: TenantScope, view, predecessor_kind: str | None, pr
             .where(PostedLedgerLine.tenant_id == scope.tenant_id, PostedLedgerLine.journal_id == predecessor_journal)
             .order_by(PostedLedgerLine.journal_line_id)
         ).all()
-        # Exact negation of what was posted: swap each line's side. Never recomputed.
-        return Plan(
-            tuple(Line(str(a), Decimal(c), Decimal(d), "void of the posted line") for a, d, c in ledger),
-            persist,
+        # The non-VAT lines (revenue, receivable) are the exact negation of what was posted. The VAT-account lines are
+        # built from the movements STILL IN FORCE (the mirrored, netted movements): a later deallocation may already
+        # have reversed a close-out, and negating the old journal in full would then drift GL 1455/1440 from R_k.
+        vat_accounts = {
+            account
+            for doc in docs.values()
+            if doc is not None
+            for pos in doc.positions.values()
+            for account in (pos.deferral_account, pos.current_account)
+            if account
+        }
+        kept = tuple(
+            Line(str(a), Decimal(c), Decimal(d), "void of the posted line")
+            for a, d, c in ledger
+            if str(a) not in vat_accounts
         )
+        return Plan(kept + (_vat_lines(mirrored, docs) if mirrored else ()), persist)
     return Plan(_vat_lines(mirrored, docs), persist) if mirrored else Plan((), persist)
 
 

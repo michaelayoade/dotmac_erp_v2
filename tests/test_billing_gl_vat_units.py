@@ -332,7 +332,7 @@ def test_opening_remaining_is_the_legacy_credit_less_the_attributed_reclass() ->
 def test_unloadable_opening_items_become_e38_items_not_positions(override, reason) -> None:
     parsed = _parse([_item(**override), _item()])
     planned = vat_opening.plan(parsed, "a" * 64)
-    assert planned["counts"] == {"load": 1, "e38": 1} and planned["e38"][0]["reason"] == reason
+    assert planned["counts"] == {"load": 1, "e38": 1, "override": 0} and planned["e38"][0]["reason"] == reason
 
 
 def test_opening_plan_sha_is_stable_and_input_bound() -> None:
@@ -450,7 +450,7 @@ def test_opening_loader_accepts_zero_tax_positions_and_a_governed_override() -> 
         finance_override={"deferred": "4.00", "evidence_sha256": "e" * 64, "ref": "FIN-7"},
     )
     planned = vat_opening.plan(_parse([zero, override]), "a" * 64)
-    assert planned["counts"] == {"load": 2, "e38": 0}
+    assert planned["counts"] == {"load": 2, "e38": 0, "override": 1}
     assert planned["load"][0]["deferred"] == "0.000000" and planned["load"][0]["deferral_account"] is None
     assert planned["load"][1]["deferred"] == "4.000000" and planned["load"][1]["override_evidence_sha256"] == "e" * 64
     bad = _item(finance_override={"deferred": "21.00", "evidence_sha256": "e" * 64, "ref": "FIN-8"})
@@ -466,4 +466,5 @@ def test_opening_plan_applies_the_billing_cross_check() -> None:
         return "open_initial_mismatch" if len(seen) == 1 else None
 
     planned = vat_opening.plan(parsed, "a" * 64, check)
-    assert planned["counts"] == {"load": 1, "e38": 1} and planned["e38"][0]["reason"] == "open_initial_mismatch"
+    assert planned["counts"] == {"load": 1, "e38": 1, "override": 0}
+    assert planned["e38"][0]["reason"] == "open_initial_mismatch"

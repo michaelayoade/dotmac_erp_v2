@@ -5,7 +5,9 @@ Additive: two new tables. FORCE RLS with the tenant policy. Both are append-only
 triggers even against the owner role).
 
 W6 (explicit widening, approved by Michael 2026-11-19; extends W4): ``app_user`` gets SELECT and INSERT only. The
-opening loader (``python -m erp_v2.billing_gl vat-opening``) writes as the migration role.
+opening loader (``python -m erp_v2.billing_gl vat-opening``) writes as the migration role. The opening-row guards test
+the SESSION role's ``rolbypassrls`` (runtime login NOBYPASSRLS, migration owner BYPASSRLS), not the role name:
+the production runtime logs in as a member of ``app_user``, so ``current_user`` is never ``app_user``.
 
 Backstop trigger on movements: the position's deferral balance R_k must stay within 0..D_k and the document's open
 amount must stay >= 0 (``vat_invariant``), whatever wrote the row. The cross-position rule (open = 0 implies every
@@ -74,7 +76,8 @@ def upgrade() -> None:
         f"CREATE FUNCTION public.{VAT_POSITIONS_TABLE}_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
         "IF TG_OP = 'INSERT' THEN "
         # The runtime role may only create native positions; an opening position is the loader's (migration role).
-        "IF current_user = 'app_user' AND NEW.origin <> 'native' THEN "
+        "IF NOT COALESCE((SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user), false) "
+        "AND NEW.origin <> 'native' THEN "
         "RAISE EXCEPTION 'opening VAT positions are loaded by the migration role only' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; RETURN NEW; END IF; "
         "RAISE EXCEPTION 'VAT positions are append-only' USING ERRCODE = 'integrity_constraint_violation'; END $$"
@@ -124,7 +127,8 @@ def upgrade() -> None:
         "BEGIN "
         "IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'VAT movements are append-only' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
-        "IF current_user = 'app_user' AND NEW.fact_version = 0 THEN "
+        "IF NOT COALESCE((SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user), false) "
+        "AND NEW.fact_version = 0 THEN "
         "RAISE EXCEPTION 'opening VAT movements are loaded by the migration role only' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "
         f"SELECT deferred, open_initial INTO d, o FROM public.{VAT_POSITIONS_TABLE} "

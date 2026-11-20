@@ -192,14 +192,60 @@ def plan(parsed: dict[str, Any], input_sha: str, check=None) -> dict[str, Any]:
             }
         )
     body = {"input_sha256": input_sha, "load": load, "e38": e38}
-    return {**body, "counts": {"load": len(load), "e38": len(e38)}, "plan_sha256": canonical_sha(body)}
+    overridden = sum(1 for row in load if row["override_evidence_sha256"] is not None)
+    return {
+        **body,
+        "counts": {"load": len(load), "e38": len(e38), "override": overridden},
+        "plan_sha256": canonical_sha(body),
+    }
+
+
+def refuse_after_flip(db, tenant_id: UUID, document_ids: list[UUID]) -> None:
+    """The loader runs BEFORE any live payment (F7). ``open_initial`` is the exposure at the opening, so loading after
+    a payment would set it to the post-payment exposure and the blocked allocations would then release twice.
+
+    Refuses when the mapper is enabled (F10 has happened), when the tenant has any POSTED or pending mapper fact, or
+    when billing already holds an allocation or an opening-lot application against a listed document.
+    """
+    from dotmac_billing.models import AllocationEffect, OpeningCashEffect
+    from sqlalchemy import select
+
+    from erp_v2.billing_gl import settings
+    from erp_v2.billing_gl.models import PENDING, POSTED, FactPosting
+
+    if settings.load(db, tenant_id).enabled:
+        refuse("vat_opening_after_flip", "billing_gl.enabled is true")
+    if db.scalar(
+        select(FactPosting.id)
+        .where(FactPosting.tenant_id == tenant_id, FactPosting.disposition.in_((POSTED, *PENDING)))
+        .limit(1)
+    ):
+        refuse("vat_opening_after_flip", "the mapper has live or pending facts")
+    if document_ids and (
+        db.scalar(
+            select(AllocationEffect.id)
+            .where(AllocationEffect.tenant_id == tenant_id, AllocationEffect.document_id.in_(document_ids))
+            .limit(1)
+        )
+        or db.scalar(
+            select(OpeningCashEffect.id)
+            .where(OpeningCashEffect.tenant_id == tenant_id, OpeningCashEffect.document_id.in_(document_ids))
+            .limit(1)
+        )
+    ):
+        refuse("vat_opening_after_flip", "a listed document already has a payment")
 
 
 def apply(db, tenant_id: UUID, plan_body: dict[str, Any]) -> dict[str, int]:
-    """Insert positions and their opening ``defer`` movements as the migration role. A replay writes nothing."""
+    """Insert positions and their opening ``defer`` movements as the migration role. A replay writes nothing.
+
+    Refuses after the flip (see ``refuse_after_flip``).
+    """
     from sqlalchemy import select
 
     from erp_v2.billing_gl.models import ORIGIN_OPENING, VatMovement, VatPosition
+
+    refuse_after_flip(db, tenant_id, [UUID(item["document_id"]) for item in plan_body["load"]])
 
     written = skipped = 0
     for item in plan_body["load"]:

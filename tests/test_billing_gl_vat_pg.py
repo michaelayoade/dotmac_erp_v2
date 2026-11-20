@@ -203,7 +203,7 @@ def test_line_accounts_that_disagree_with_the_document_fact_block_without_absorb
 def test_opening_position_releases_vat_on_payment(engine):
     """A migrated invoice (carried by #72, so its issue fact is SKIP) gets its remaining deferral loaded by the
     opening loader (Q1); a payment then releases it 1455 -> 1440 from that position."""
-    env = world(engine)
+    env = world(engine, enabled=False)  # the loader runs at F7, before F10 enables the mapper
     acct = account_and_model(engine, env)
     inv = invoice(engine, env, acct, lines=False)
     # The mapper dispositions the issue fact SKIP (as for a carried opening document): record it as the mapper would.
@@ -253,6 +253,7 @@ def test_opening_position_releases_vat_on_payment(engine):
         engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, acct), "120.00", when=at(2))
     )
     seed_billing(engine, env, lambda db, sc: allocate(db, sc, settlement, inv, "120.00", when=at(3)))
+    configure(engine, env, enabled=True)  # F10
     run(engine, env)
     deferred, remaining = vat_state(engine, env, inv.id)
     assert (deferred, remaining) == (D("20.00"), D(0))
@@ -486,7 +487,7 @@ def test_opening_lot_applications_release_and_unrelease_the_loaded_vat(engine):
     from erp_v2.billing_gl import mapper as mapper_module
     from erp_v2.billing_gl.mapper import Mapper
 
-    env = world(engine)
+    env = world(engine, enabled=False)
     acct = account_and_model(engine, env)
     inv = invoice(engine, env, acct, lines=False)  # a billing document standing in for the migrated invoice
     item = {
@@ -511,6 +512,7 @@ def test_opening_lot_applications_release_and_unrelease_the_loaded_vat(engine):
     with Session(engine) as db:
         vat_opening.apply(db, env.tenant_id, planned)
         db.commit()
+    configure(engine, env, enabled=True)  # F10
 
     def money(amount):
         return SimpleNamespace(amount=D(amount), currency=SimpleNamespace(code="NGN", minor_units=2))
@@ -573,3 +575,137 @@ def test_opening_lot_applications_release_and_unrelease_the_loaded_vat(engine):
     assert process("cash_credit_draw_reversed", 4) == "POSTED"
     _, remaining = vat_state(engine, env, inv.id)
     assert remaining == D("20.00") and gl(engine, env).get("1440", D(0)) == 0  # exactly un-released
+
+
+# ------------------------------------------------ re-review R5-R9 (architect, 2026-11-20)
+
+
+def test_voiding_a_credit_note_after_a_deallocation_keeps_gl_and_positions_tied(engine):
+    """R5: issue, pay, credit with a close-out, deallocate (uncloseout), void the credit note. The void's VAT lines come
+    from the movements still in force; negating the old journal in full would drift GL 1455/1440 from R."""
+    env = world(engine)
+    acct = account_and_model(engine, env)
+    inv = invoice(engine, env, acct)
+    settlement = seed_billing(
+        engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, acct), "200.00", when=at(1))
+    )
+    first = seed_billing(engine, env, lambda db, sc: allocate(db, sc, settlement, inv, "90.00", when=at(2)))
+    note = seed_billing(engine, env, lambda db, sc: credit_note(db, sc, inv, pre_tax="29.00", tax="1.00", when=at(3)))
+    with_lines(engine, env, note, pre_tax="29.00", tax="1.00")
+    run(engine, env)
+    _, bal = tie_all(engine, env, [acct], inv.id)
+    assert bal.get("1455", D(0)) == 0  # the credit closed the invoice out
+    seed_billing(engine, env, lambda db, sc: deallocate(db, sc, first, "90.00", when=at(4)))
+    run(engine, env)
+    tie_all(engine, env, [acct], inv.id)
+    seed_billing(engine, env, lambda db, sc: void(db, sc, note, when=at(5)))
+    report = run(engine, env)
+    assert report["blocked"] == 0, report["blocked_by_reason"]
+    _, remaining = vat_state(engine, env, inv.id)
+    _, bal = tie_all(engine, env, [acct], inv.id)  # GL 1455 == -R exactly
+    assert -bal.get("1455", D(0)) == remaining and remaining == D(
+        "20.00"
+    )  # the invoice is as if never credited or paid
+
+
+def test_a_login_member_of_app_user_without_bypassrls_is_refused_opening_rows(engine):
+    """R6: production logs in as a member of app_user (never current_user = app_user); the guard follows rolbypassrls."""
+    env = world(engine)
+    acct = account_and_model(engine, env)
+    invoice(engine, env, acct)
+    run(engine, env)
+    with Session(engine) as db:
+        position = db.scalars(sa.select(VatPosition).where(VatPosition.tenant_id == env.tenant_id)).one()
+    role = f"erp_rt_{uuid4().hex[:10]}"
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f'CREATE ROLE "{role}" LOGIN NOBYPASSRLS IN ROLE app_user')
+        conn.exec_driver_sql(f'GRANT "{role}" TO CURRENT_USER WITH SET TRUE')
+    try:
+        with engine.connect() as conn, Session(bind=conn) as db:
+            db.execute(sa.text(f'SET ROLE "{role}"'))
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(env.tenant_id)})
+            assert db.scalar(sa.text("SELECT current_user")) == role  # NOT 'app_user'
+            with pytest.raises(DBAPIError, match="migration role"), db.begin_nested():
+                db.execute(
+                    sa.text(
+                        "INSERT INTO erp_billing_vat_positions (id, tenant_id, document_id, treatment_code, origin, "
+                        "total, deferred, open_initial, source) VALUES (gen_random_uuid(), :t, gen_random_uuid(), "
+                        "'standard', 'opening', 10, 0, 10, 'x')"
+                    ),
+                    {"t": env.tenant_id},
+                )
+            with pytest.raises(DBAPIError, match="migration role"), db.begin_nested():
+                db.execute(
+                    sa.text(
+                        "INSERT INTO erp_billing_vat_movements (id, tenant_id, position_id, fact_id, fact_version, "
+                        "kind, deferral_delta, current_delta) VALUES (gen_random_uuid(), :t, :p, gen_random_uuid(), "
+                        "0, 'defer', 0, 0)"
+                    ),
+                    {"t": env.tenant_id, "p": position.id},
+                )
+            db.rollback()
+            conn.execute(sa.text("RESET ROLE"))
+            conn.commit()
+    finally:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(f'DROP OWNED BY "{role}"')
+            conn.exec_driver_sql(f'DROP ROLE "{role}"')
+
+
+def test_the_opening_loader_refuses_after_the_flip(engine):
+    from erp_v2.migration_ledger.common import LedgerRefused
+
+    env = world(engine, enabled=False)
+    acct = account_and_model(engine, env)
+    inv = invoice(engine, env, acct, lines=False)
+    spec = {
+        "version": 1,
+        "tenant_id": str(env.tenant_id),
+        "items": [
+            {
+                "document_id": str(inv.id),
+                "treatment": "standard",
+                "total": "120.00",
+                "tax": "20.00",
+                "open_initial": "120.00",
+                "journal_1455_credit": "20.00",
+                "reclass": [],
+                "deferral_account": str(env.accounts["1455"]),
+                "current_account": str(env.accounts["1440"]),
+                "legacy_ref": "INV-LATE",
+                "finance_override": None,
+            }
+        ],
+    }
+    import json
+
+    planned = vat_opening.plan(vat_opening.parse(json.dumps(spec).encode()), "d" * 64)
+    # A payment already exists on the listed document: the exposure is no longer the opening exposure.
+    settlement = seed_billing(
+        engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, acct), "50.00", when=at(1))
+    )
+    seed_billing(engine, env, lambda db, sc: allocate(db, sc, settlement, inv, "50.00", when=at(2)))
+    with Session(engine) as db, pytest.raises(LedgerRefused) as paid:
+        vat_opening.apply(db, env.tenant_id, planned)
+    assert paid.value.code == "vat_opening_after_flip"
+    # The mapper being enabled (F10) refuses too.
+    configure(engine, env, enabled=True)
+    with Session(engine) as db, pytest.raises(LedgerRefused) as flipped:
+        vat_opening.apply(db, env.tenant_id, planned)
+    assert flipped.value.code == "vat_opening_after_flip"
+
+
+def test_only_the_vat_trigger_message_is_a_vat_invariant(engine, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from erp_v2.billing_gl import vat_plan
+
+    env = world(engine)
+    acct = account_and_model(engine, env)
+    invoice(engine, env, acct)
+
+    def failing(db, tenant, fact_id, version, journal_id, spec):
+        raise IntegrityError("insert", {}, Exception("some other constraint"))
+
+    monkeypatch.setattr(vat_plan, "persist", failing)
+    assert run(engine, env)["blocked_by_reason"] == {"BLOCKED:integrity_refused": 1}

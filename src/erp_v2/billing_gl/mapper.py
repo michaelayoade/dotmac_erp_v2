@@ -277,6 +277,7 @@ class Mapper:
             return FactView(
                 minor_units=moneys[0].currency.minor_units if moneys else 2,
                 alloc_rows=self._alloc_rows(entry) if rule.vat else (),
+                tax_snapshots=tuple((t.treatment_code, t.tax_amount.amount) for t in fact.tax_snapshots),
                 currency=moneys[0].currency.code if moneys else None,
                 committed_at=fact.committed_at,
                 effects=tuple(Effect(e.lane, e.amount_delta.amount) for e in fact.effects),
@@ -535,10 +536,11 @@ class Mapper:
             self._record(entry, view.currency, BLOCKED, exc.code)
             self.blocked_accounts.add(account)
             return BLOCKED
-        except IntegrityError:
-            # The database invariant trigger refused the VAT movement: the journal rolled back with the savepoint, so
-            # this ONE fact blocks (integrity alarm) instead of aborting the run and stalling every account.
-            self._record(entry, view.currency, BLOCKED, "vat_invariant")
+        except IntegrityError as exc:
+            # A database refusal: the journal rolled back with the savepoint, so this ONE fact blocks instead of
+            # aborting the run and stalling every account. Only the VAT trigger's own message is a vat_invariant.
+            reason = "vat_invariant" if "vat_invariant" in str(getattr(exc, "orig", exc)) else "integrity_refused"
+            self._record(entry, view.currency, BLOCKED, reason)
             self.blocked_accounts.add(account)
             return BLOCKED
         self._record(entry, view.currency, POSTED, None, result.journal_id)
