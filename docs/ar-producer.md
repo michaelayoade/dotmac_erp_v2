@@ -90,7 +90,8 @@ at the a3 pin it reports `ar_setup_incomplete:<key>:not_enrolled`). Wiring it in
 - Payment terms are per draft (`erp_ar_drafts.payment_terms_code`, selected from `ar.payment_terms`, default
   `ar.default_payment_terms_code`). Per-customer pre-fill needs customer terms data the customers module lacks (F-F).
 - A draw that includes opening cash is one unit: it is reversed whole from the invoice page (`/draws/{group}/reverse`);
-  deallocating one row of it is refused (`opening_draw_unit`). Proof on a real opening import is owed at S11.
+  deallocating one row of it is refused (`opening_draw_unit`). A receipt bounce un-applies the WHOLE draw, including
+  the opening cash and any other receipts in it, then reverses the settlement. Proof on a real opening import is owed at S11.
 - Every dated action (apply, deallocate, void, reverse) needs an OPEN, non-adjustment period.
 - D-9 ON: only the preparer may edit or discard a draft (`not_preparer`).
 - The F-D notice is a structural SQL filter (`detail.party[0]` = customer account id) with no row cap.
@@ -98,5 +99,5 @@ at the a3 pin it reports `ar_setup_incomplete:<key>:not_enrolled`). Wiring it in
   second audit row. Role profile `erp.web` is version 6.
 - Optional per-draft due date (`erp_ar_drafts.due_date`, not before the invoice date) overrides the terms-derived date;
   the due-date basis then names the policy `erp_v2.ar.manual_due_date` and records who set it.
-- Customer-screen seams (CUSTOMER-SCREEN-SPEC): `service.default_terms_for_customer` / `_draft_terms_code` (terms
-  pre-selection) and `_customer_document_snapshot` (snapshot fields); each is one hunk to replace, nothing else changes.
+- Customer-screen seams (CUSTOMER-SCREEN-SPEC): `service.default_terms_for_customer` / `resolve_terms_code` (terms
+  pre-selection, stored on the draft at create/update; issue reads only the stored code) and `_customer_document_snapshot` (snapshot fields); each is one hunk to replace, nothing else changes.

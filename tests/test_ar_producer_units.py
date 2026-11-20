@@ -811,12 +811,22 @@ def test_manual_basis_is_verified_and_names_the_manual_policy():
     assert basis.override_actor == "p" and basis.override_reason
 
 
-def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms():
+def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms(monkeypatch):
     cfg = _complete_settings()
     assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_30"
-    draft = SimpleNamespace(payment_terms_code=None, customer_account_id=uuid4())
-    assert service._draft_terms_code(Mock(), uuid4(), draft, cfg) == "net_30"
-    draft.payment_terms_code = "net_60"
-    assert service._draft_terms_code(Mock(), uuid4(), draft, cfg) == "net_60"
+    # resolved at create/update and stored; issue reads only the stored code
+    monkeypatch.setattr(service.settings, "load", lambda db_, tenant: cfg)
+    assert service.resolve_terms_code(Mock(), uuid4(), service.KIND_INVOICE, uuid4(), None) == "net_30"
+    assert service.resolve_terms_code(Mock(), uuid4(), service.KIND_INVOICE, uuid4(), "net_60") == "net_60"
+    assert service.resolve_terms_code(Mock(), uuid4(), "credit_note", uuid4(), None) is None
+    assert service._stored_terms_code(SimpleNamespace(payment_terms_code="net_30"), cfg) == "net_30"
+    for bad, refusal in (
+        (None, "payment_terms_missing"),
+        ("", "payment_terms_missing"),
+        ("x", "payment_terms_unknown"),
+    ):
+        with pytest.raises(service.ArRefused) as e:
+            service._stored_terms_code(SimpleNamespace(payment_terms_code=bad), cfg)
+        assert e.value.code == refusal
     snap = service._customer_document_snapshot(Mock(), uuid4(), SimpleNamespace(display_name="Acme"))
     assert snap.legal_name == "Acme"

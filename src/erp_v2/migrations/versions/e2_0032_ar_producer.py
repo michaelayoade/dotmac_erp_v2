@@ -20,7 +20,7 @@ tenant before use.
 
 The downgrade refuses while any row exists.
 
-Revision chain: e2_0031_billing_fact_postings (B-15) -> this. (The coordinator re-chains at merge.)
+Revision chain: e2_0031_billing_fact_postings (B-15) -> this.
 """
 
 from __future__ import annotations

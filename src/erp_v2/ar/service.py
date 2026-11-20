@@ -496,9 +496,24 @@ def _price_lines(
 # --- drafts -----------------------------------------------------------------------------------------------------
 
 
-def _draft_terms_code(db: Session, tenant_id: UUID, draft: ArDraft, cfg: settings.ArSettings) -> str:
-    """Seam (CUSTOMER-SCREEN-SPEC): the draft's own code, else the customer's finance row, else the tenant default."""
-    return draft.payment_terms_code or default_terms_for_customer(db, tenant_id, draft.customer_account_id, cfg) or ""
+def resolve_terms_code(
+    db: Session, tenant_id: UUID, kind: str, customer_account_id: UUID | None, explicit: str | None
+) -> str | None:
+    """Terms code stored on an invoice draft at create/update: the chosen one, else the customer's default (the seam
+    below). Issue reads only the stored code, so a later change of the customer's terms never moves a draft."""
+    if kind != KIND_INVOICE:
+        return explicit
+    return explicit or default_terms_for_customer(db, tenant_id, customer_account_id, settings.load(db, tenant_id))
+
+
+def _stored_terms_code(draft: ArDraft, cfg: settings.ArSettings) -> str:
+    """Issue reads only the draft's own code (resolved at create/update); an empty or unknown one refuses."""
+    code = draft.payment_terms_code
+    if not code:
+        raise ArRefused("payment_terms_missing", "The draft has no payment terms; edit it and select one")
+    if code not in cfg.terms:
+        raise ArRefused("payment_terms_unknown", "The invoice's payment terms are not configured")
+    return code
 
 
 def default_terms_for_customer(
@@ -737,7 +752,7 @@ def _create_draft(
             bank_reference=bank_reference,
             amount=amount,
             reason=reason,
-            payment_terms_code=payment_terms_code,
+            payment_terms_code=resolve_terms_code(session, tenant.id, kind, customer_account_id, payment_terms_code),
             due_date=due_date,
             status=STATUS_DRAFT,
             prepared_by=party.id,
@@ -872,7 +887,7 @@ def _update_draft(
         due_date=due_date,
         now=now,
     )
-    draft.payment_terms_code = payment_terms_code
+    draft.payment_terms_code = resolve_terms_code(db, tenant.id, draft.kind, customer_account_id, payment_terms_code)
     draft.due_date = due_date
     draft.customer_account_id = customer_account_id
     draft.document_date = document_date
@@ -1069,9 +1084,7 @@ def _issue_invoice(db: Session, *, tenant: Tenant, party: Party, draft: ArDraft,
                 accepted_source_kinds=constants.ACCEPTED_SOURCE_KINDS,
             )
         )
-    terms_code = _draft_terms_code(db, tenant.id, draft, cfg)
-    if terms_code not in cfg.terms:
-        raise ArRefused("payment_terms_unknown", "The invoice's payment terms are not configured")
+    terms_code = _stored_terms_code(draft, cfg)
     if draft.due_date is not None:
         if draft.due_date < draft.document_date:
             raise ArRefused("due_date_before_invoice", "The due date cannot be before the invoice date")
@@ -1080,7 +1093,7 @@ def _issue_invoice(db: Session, *, tenant: Tenant, party: Party, draft: ArDraft,
             terms_code=terms_code,
             terms_version=_terms_version(db, tenant.id),
             evidence_ref=f"erp_v2.ar.draft:{draft.id}",
-            actor_ref=str(party.id),
+            actor_ref=str(draft.prepared_by),  # the preparer typed the manual due date
         )
         due_at = terms.midnight(draft.due_date)
     else:

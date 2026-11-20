@@ -1270,13 +1270,17 @@ def test_guards_fire_for_a_login_member_of_app_user_not_only_app_user_itself(eng
         assert role != "app_user"
         with Session(rt) as db:
             db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
-            with pytest.raises(sa.exc.DBAPIError):  # terminal-status trigger
+            with pytest.raises(
+                sa.exc.DBAPIError, match="an issued or deleted AR draft is terminal"
+            ):  # terminal-status trigger
                 db.execute(
                     sa.text("UPDATE erp_ar_drafts SET status = 'draft', issued_by = NULL WHERE id = :i"), {"i": draft}
                 )
             db.rollback()
             db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
-            with pytest.raises(sa.exc.DBAPIError):  # draft-line trigger (header is issued)
+            with pytest.raises(
+                sa.exc.DBAPIError, match="AR draft lines change only while the draft is a draft"
+            ):  # draft-line trigger (header is issued)
                 db.execute(
                     sa.text(
                         "INSERT INTO erp_ar_draft_lines (id, tenant_id, draft_id, n) "
