@@ -25,6 +25,8 @@ import sqlalchemy as sa
 from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
 from sqlalchemy.orm import Session
 
+# STRADDLE_OWNER: B-14 kind ``migration_straddle``, explained by T-STRADDLE items, not native
+from erp_v2.holdings.models import OWNER as STRADDLE_OWNER
 from erp_v2.ledger_roles import GATE_TIE_CODES, REPORT_WHT_CODES, REPORT_ZERO_CODES
 from erp_v2.migration_ledger.common import OPENING_PERIOD, ZERO, canonical_sha, fmt
 from erp_v2.migration_ledger.rounding_verify import ROUNDING_KIND
@@ -32,7 +34,6 @@ from erp_v2.migration_ledger.rounding_verify import ROUNDING_KIND
 GATE_PROFILE: Final = "as_is_v1"  # recorded in the bridge body, so Michael's signature covers it
 LEGACY_OWNER: Final = "legacy-erp"
 OPENING_OWNERS: Final = ("erp.opening", "erp.ias8")
-STRADDLE_OWNER: Final = "erp.migration"  # B-14 kind ``migration_straddle``: explained by T-STRADDLE items, not native
 STRADDLE_KIND: Final = "migration_straddle"
 SUBKOBO_KIND: Final = "migration_subkobo"  # B-14 E15 reproduction: explained by T-SUBKOBO items, not native
 MANUAL_OWNER: Final = "erp.manual"
