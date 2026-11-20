@@ -33,10 +33,13 @@ from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBL
 from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
 from erp_v2.importer.history_cutoff import (
     CLASS_STRADDLE,
+    CLASS_SUBKOBO,
     REASON_STRADDLE,
+    REASON_SUBKOBO,
     REFUSAL_STRADDLE,
     HistoryCutoffRefused,
     classify_straddlers,
+    classify_unbalanced,
     not_landed_predicate,
     parse_cutoff,
     write_private_json,
@@ -810,10 +813,46 @@ def _history_cutoff(args: argparse.Namespace, executable, source_engine: sa.Engi
                 "nothing written"
             ) from exc
         straddle_section["side_file"] = path.name
+    # E15 (the sub-kobo journals): the SAME shape, in `<receipt>.subkobo.json`, so B-14 can re-post their lines exactly.
+    try:
+        with source_engine.connect() as conn:
+            _set_search_path(conn, schemas)
+            unbalanced = classify_unbalanced(conn, cutoff)
+    except HistoryCutoffRefused as exc:
+        raise CliRefusal(f"{exc.code}: the unbalanced-unit census failed ({exc}); nothing written") from exc
+    subkobo_section: dict[str, object] = {
+        "class": CLASS_SUBKOBO,
+        "reason": REASON_SUBKOBO,
+        "count": len(unbalanced),
+        "sum_net": format(sum((_Decimal(j.net) for j in unbalanced), _Decimal(0)), "f"),
+        "side_file": None,
+        "side_file_sha256": None,
+    }
+    if unbalanced or receipt:
+        if not receipt:
+            raise CliRefusal(f"{REFUSAL_STRADDLE}: no receipt path to write the sub-kobo side file; nothing written")
+        path = Path(receipt).with_name(Path(receipt).name + ".subkobo.json")
+        try:
+            subkobo_section["side_file_sha256"] = write_private_json(
+                path,
+                {
+                    "history_cutoff": cutoff.isoformat(),
+                    "class": CLASS_SUBKOBO,
+                    "reason": REASON_SUBKOBO,
+                    "journals": [j.as_dict() for j in unbalanced],
+                },
+            )
+        except OSError as exc:
+            raise CliRefusal(
+                f"{REFUSAL_STRADDLE}: the sub-kobo side file could not be written ({type(exc).__name__}); "
+                "nothing written"
+            ) from exc
+        subkobo_section["side_file"] = path.name
     return cutoff, {
         "history_cutoff": cutoff.isoformat(),
         "applies_to": sorted(needing),
         "straddlers": straddle_section,
+        "subkobo": subkobo_section,
     }
 
 

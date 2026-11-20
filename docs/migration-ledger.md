@@ -158,6 +158,10 @@ path (B-9r). If such a journal were dated on or before the cutoff, the opening w
 * AP verifiers: a journal the cutoff excluded is proven on the snapshot (same predicate, the receipt cutoff carried in the
   transform manifest binding as `history_cutoff`, all ledger lines on or before it), asserted ABSENT in v2, and a POSTED
   `erp.opening` journal dated exactly the cutoff must exist in v2 (one read, every path).
+* E15 side file `<receipt>.subkobo.json` (mode 600, sha in `history_cutoff_census.subkobo.side_file_sha256`): the
+  unbalanced journals in the straddlers shape (`{history_cutoff, class: E15, reason: unbalanced_journal_unit, journals}`),
+  with full ledger lines, `post_net`, `net`. `history_cutoff.unit_evidence_sha(lines)` is the one shared evidence sha
+  (E39 and E15; B-14 imports it).
 * A reversal whose target is a cutoff-excluded, E15 or E39 journal lands with the link empty (target kept as evidence).
 * A failed post-commit write of the side file is caught: the receipt is still written and the run is marked incomplete.
 * A transform manifest with no `import.unposted_wht` in its binding is a pre-B-13 manifest: `remove` is the only legal
