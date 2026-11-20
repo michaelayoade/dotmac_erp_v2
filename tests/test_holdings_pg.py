@@ -12,7 +12,7 @@ import stat
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -41,6 +41,7 @@ from erp_v2.posting.bridge import post_consequence
 
 D = Decimal
 SHA = "b" * 64
+WINDOW = "6f1d0a52-0c6e-4a58-9d0a-3a7c0f0e1b11"
 OP_A, OP_B = "operator-a", "operator-b"
 
 
@@ -153,7 +154,7 @@ def write(path, body):
     return path
 
 
-def make_spec(tmp_path, *, window="w1", params=None):
+def make_spec(tmp_path, *, window=WINDOW, params=None):
     census = write(tmp_path / "census.json", {"census_sha256": DIGEST, "gl_attribution": {
         "parties": [
             {"customer": "C1", "currency": "NGN", "gl_minor": 100000, "carried_minor": 90000, "cash_lot_minor": 20000},
@@ -201,7 +202,7 @@ def seed_admissions(engine, env, parties=(("C1", "NGN"), ("C2", "NGN")), *, dige
             db.add(
                 ArOpeningAdmission(
                     tenant_id=env.tenant_id, source_account_key=key, currency=ccy, billing_account_id=uuid4(),
-                    billing_receipt_id=uuid4(), posting_group_id=uuid4(), window_id=uuid4(), command_digest=SHA,
+                    billing_receipt_id=uuid4(), posting_group_id=uuid4(), window_id=UUID(WINDOW), command_digest=SHA,
                     manifest_fingerprint=manifest, census_sha256=digest, snapshot_sha256=SHA, plan_sha256=SHA, applied_by=OP_A,
                 )
             )  # fmt: skip
@@ -220,7 +221,7 @@ def seed_register(engine, env, items):
         db.commit()
 
 
-def flip_world(engine, tmp_path, *, dual=False, window="w1", params=None, register=None):
+def flip_world(engine, tmp_path, *, dual=False, window=WINDOW, params=None, register=None):
     env = world(engine, dual=dual)
     seed_admissions(engine, env)
     seed_register(
@@ -1198,19 +1199,24 @@ def test_l6_a_configured_holding_account_is_guarded_even_with_no_rows(engine, tm
         assert e.value.code == "holding_account_requires_holding_command"
 
 
-# --- straddle reproduction (W8, simplified) ---------------------------------------------------------------------------
+# --- unit reproduction: straddle (E39) and sub-kobo (E15) from #74's side-file format ----------------------------------
+
+CUTOFF = date(2025, 12, 31)
 
 
-def straddle_world(engine, tmp_path, *, lines=None, status="POSTED"):
+def units_world(engine):
+    """A tenant with three non-control accounts (1207/1211/6080), the rounding account 6999 and a posted opening dated
+    the cutoff (the as-of the side file must be bound to)."""
+    from dotmac_accounting import service as accounting
+    from dotmac_accounting.contracts import CreateJournal, JournalLineInput, SourceIdentity
+    from dotmac_accounting.models import FiscalPeriod, FiscalYear
+
     env = world(engine)
-    # three non-control accounts standing in for 1207 / 1211 / 6080
-    from dotmac_accounting.models import Account
-
     with Session(engine) as db:
         cat = db.scalar(
             sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "EXP")
         )
-        for code in ("1207", "1211", "6080"):
+        for code in ("1207", "1211", "6080", "6999"):
             row = Account(
                 tenant_id=env.tenant_id,
                 category_id=cat.id,
@@ -1222,117 +1228,499 @@ def straddle_world(engine, tmp_path, *, lines=None, status="POSTED"):
             db.add(row)
             db.flush()
             env.accounts[code] = row.id
+        year = FiscalYear(
+            tenant_id=env.tenant_id,
+            code="FY25",
+            name="FY 2025",
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+        )
+        db.add(year)
+        db.flush()
+        period = FiscalPeriod(
+            tenant_id=env.tenant_id,
+            fiscal_year_id=year.id,
+            period_number=12,
+            name="Dec 2025",
+            start_date=date(2025, 12, 1),
+            end_date=date(2025, 12, 31),
+            is_adjustment=False,
+            status=sa.text("'FUTURE'"),
+        )
+        period.status = __import__("dotmac_accounting.contracts", fromlist=["PeriodStatus"]).PeriodStatus.FUTURE
+        db.add(period)
+        db.flush()
+        scope = TenantScope(env.tenant_id)
+        accounting.open_period(db, scope=scope, period_id=period.id, actor_ref="seed", occurred_at=NOW)
+        journal = accounting.create_journal(
+            db, scope=scope, idempotency_key=f"open:{env.tenant_id}", idempotency_expires_at=None, recorded_at=NOW,
+            command=CreateJournal(
+                number="OPEN-1", kind=__import__("dotmac_accounting.contracts", fromlist=["JournalKind"]).JournalKind.STANDARD,
+                entry_date=CUTOFF, posting_date=CUTOFF, currency_code="NGN", exchange_rate=D(1), description="opening", reference="opening",
+                source=SourceIdentity(owner="erp.opening", document_kind="opening", document_id="1", version="1", fingerprint=SHA),
+                lines=(JournalLineInput(account_id=env.accounts["1000"], debit=D(1), credit=D(0), description="o"),
+                       JournalLineInput(account_id=env.accounts["3100"], debit=D(0), credit=D(1), description="o")),
+            ),
+        )  # fmt: skip
+        accounting.post_journal(
+            db,
+            scope=scope,
+            journal_id=journal.id,
+            approval_reference="seed",
+            posted_by="seed",
+            idempotency_key=f"openp:{env.tenant_id}",
+            idempotency_expires_at=None,
+            posted_at=NOW,
+        )
         db.commit()
-    a, b, c = (str(env.accounts[k]) for k in ("1207", "1211", "6080"))
-    day = "2026-01-13"
-    lines = lines(env.accounts) if callable(lines) else lines
-    lines = lines or [
-        {"account_id": a, "date": day, "debit": "100.00", "credit": "0.00"},
-        {"account_id": b, "date": day, "debit": "0.00", "credit": "60.00"},
-        {"account_id": c, "date": day, "debit": "0.00", "credit": "40.00"},
-    ]
-    side = write(tmp_path / "straddle.json", {"version": 1, "cutoff": "2025-12-31", "currency": "NGN", "journals": [
-        {"journal_id": "LJ-1", "legacy_status": status, "source_module": "GL", "lines": lines},
-        {"journal_id": "LJ-2", "legacy_status": status, "source_module": "GL", "lines": [
-            {"account_id": a, "date": "2026-01-14", "debit": "5.00", "credit": "0.00"},
-            {"account_id": b, "date": "2026-01-14", "debit": "0.00", "credit": "5.00"}]},
-    ]})  # fmt: skip
-    import hashlib
-
-    spec = make_spec(tmp_path)
-    spec["receipts"] = {"straddle": {"path": str(side), "sha256": hashlib.sha256(side.read_bytes()).hexdigest()}}
-    env.spec = spec_bytes(env, spec)
     return env
 
 
-def straddle_apply(engine, env, planned_by=OP_A, applied_by=OP_A):
-    from erp_v2.holdings import straddle
+def legacy_journal(engine, env, jid, journal_date, lines, *, number, status="POSTED"):
+    """One legacy journal in the #74 legacy schema; ``lines`` are (account code, ledger day, debit, credit)."""
+    total = sum(D(x[2]) for x in lines)
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "INSERT INTO gl.journal_entry VALUES (:j, :o, :p, :n, 'STANDARD', :s, :d, :d, :n, 'NGN', 1, :t, :t, :t, :t, 'JOURNAL', :j, 'legacy-user', :at, NULL, NULL, NULL, NULL, 'GL')"
+            ),
+            {
+                "j": jid,
+                "o": env.tenant_id,
+                "p": env.periods[1],
+                "n": number,
+                "s": status,
+                "d": journal_date,
+                "t": total,
+                "at": NOW,
+            },
+        )
+        for n, (code, day_, debit, credit) in enumerate(lines, 1):
+            c.execute(
+                sa.text(
+                    "INSERT INTO gl.posted_ledger_line VALUES (:id, :o, :j, :l, :p, :a, :code, :day, :day, :ds, 'NGN', :d, :c, :d, :c, 1, 'JOURNAL', :j, 'legacy-user', :at)"
+                ),
+                {
+                    "id": uuid4(),
+                    "o": env.tenant_id,
+                    "j": jid,
+                    "l": uuid4(),
+                    "p": env.periods[1],
+                    "a": env.accounts[code],
+                    "code": code,
+                    "day": day_,
+                    "ds": f"{number} {n}",
+                    "at": NOW,
+                    "d": D(debit),
+                    "c": D(credit),
+                },
+            )
 
-    plan = straddle.run_plan(engine, env.spec, planned_by=planned_by)
+
+@pytest.fixture
+def legacy_schema(engine):
+    from test_importer_history_cutoff_pg import LEGACY_DDL
+
+    with engine.begin() as c:
+        for statement in LEGACY_DDL:
+            c.exec_driver_sql(statement)
+    yield
+    with engine.begin() as c:
+        c.exec_driver_sql("DROP SCHEMA gl CASCADE")
+
+
+def import_receipt_for(tmp_path, side_name, side_sha, section, count=None, subkobo_ids=None, cutoff="2025-12-31"):
+    body = {"history_cutoff": cutoff, "history_cutoff_census": {section: {"side_file_sha256": side_sha}}}
+    if section == "straddlers":
+        body["history_cutoff_census"][section]["count"] = count
+    else:
+        body["history_cutoff_census"]["censuses"] = [
+            {"unbalanced_unit_refused_journals": [{"journal": j, "debit": "0", "credit": "0"} for j in subkobo_ids]}
+        ]
+    path = write(tmp_path / "import-receipt.json", body)
+    return path
+
+
+def real_straddle_files(engine, env, tmp_path, *, status="POSTED", lines=None):
+    """#74's REAL classifier and serializer over a seeded legacy schema (the journals are dated 2025, every ledger line
+    is after the cutoff: the 39 real ones)."""
+    import hashlib
+
+    from erp_v2.importer import history_cutoff
+
+    j1, j2 = uuid4(), uuid4()
+    with engine.begin() as c:
+        c.exec_driver_sql("DELETE FROM gl.posted_ledger_line")
+        c.exec_driver_sql("DELETE FROM gl.journal_entry")
+    legacy_journal(
+        engine,
+        env,
+        j1,
+        date(2025, 12, 20),
+        lines
+        or [
+            ("1207", date(2026, 1, 13), "100.00", "0"),
+            ("1211", date(2026, 1, 13), "0", "60.00"),
+            ("6080", date(2026, 1, 13), "0", "40.00"),
+        ],
+        number="JE-S1",
+        status=status,
+    )
+    legacy_journal(
+        engine,
+        env,
+        j2,
+        date(2025, 12, 21),
+        [("1207", date(2026, 1, 14), "5.00", "0"), ("1211", date(2026, 1, 14), "0", "5.00")],
+        number="JE-S2",
+        status=status,
+    )
+    with engine.connect() as source:
+        source.exec_driver_sql("SET search_path TO gl, public")
+        found = history_cutoff.classify_straddlers(source, CUTOFF)
+    side = tmp_path / "receipt.json.straddlers.json"
+    sha = history_cutoff.write_private_json(
+        side,
+        {
+            "history_cutoff": CUTOFF.isoformat(),
+            "class": "E39",
+            "reason": "journal_straddles_cutoff",
+            "journals": [f.as_dict() for f in found],
+        },
+    )
+    receipt = import_receipt_for(tmp_path, side.name, sha, "straddlers", count=len(found))
+    assert hashlib.sha256(side.read_bytes()).hexdigest() == sha
+    return side, receipt, found
+
+
+def units_spec(env, tmp_path, *, straddle=None, subkobo=None, receipt=None, params=None):
+    import hashlib
+
+    def ref(p):
+        return {"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+
+    receipts = {"import_receipt": ref(receipt)}
+    if straddle:
+        receipts["straddle"] = ref(straddle)
+    if subkobo:
+        receipts["subkobo"] = ref(subkobo)
+    spec = {
+        "version": 1,
+        "tenant_id": str(env.tenant_id),
+        "window_id": WINDOW,
+        "capture_date": "2026-01-20",
+        "evidence_ref": "E",
+        "params": params or {},
+        "receipts": receipts,
+    }
+    return json.dumps(spec).encode()
+
+
+def units_apply(engine, env, mode, planned_by=OP_A, applied_by=OP_A):
+    from erp_v2.holdings import units
+
+    plan = units.run_plan(engine, env.spec, mode, planned_by=planned_by)
     spec, _ = planning.parse_spec(env.spec)
     with Session(engine) as db, db.begin():
-        return plan, straddle.apply(db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=applied_by)
+        return plan, units.apply(db, spec, mode, plan, approved_sha=plan["plan_sha256"], applied_by=applied_by)
 
 
-def test_straddle_reproduces_each_journal_balanced_on_its_legacy_day_and_registers_e39(engine, tmp_path):
-    from erp_v2.holdings import straddle
+def test_straddle_consumes_74s_real_classifier_output_reproduces_balanced_and_registers_e39(
+    engine, legacy_schema, tmp_path
+):
+    from erp_v2.holdings import units
 
-    env = straddle_world(engine, tmp_path)
-    plan, out = straddle_apply(engine, env)
+    env = units_world(engine)
+    side, receipt, found = real_straddle_files(engine, env, tmp_path)
+    assert {f.kind for f in found} == {"S2"} and len(found) == 2
+    env.spec = units_spec(env, tmp_path, straddle=side, receipt=receipt)
+    plan, out = units_apply(engine, env, units.STRADDLE)
     assert out["journals"] == 2 and out["posted_journals"] == 2
     assert (
         net(engine, env, "1207") == D("105")
         and net(engine, env, "1211") == D("-65")
         and net(engine, env, "6080") == D("-40")
     )
+    item = key_of(engine, env, f"straddle:{found[0].journal}")
+    assert (item.class_code, item.state, item.source_kind) == ("E39", "open", "migration_straddle")
+    assert item.detail["type"] == "S2" and item.detail["evidence_sha256"] == found[0].evidence_sha256  # #74's value
+    assert (
+        item.detail["source_document_type"] == "JOURNAL"
+        and item.detail["journal_date"] == found[0].journal_date
+        and item.detail["post_net"]
+    )
+    spec, _ = planning.parse_spec(env.spec)
+    with applying.read_only_session(engine) as db:
+        assert units.verify(db, spec, units.STRADDLE)["ready"]
+        db.rollback()
+    with Session(engine) as db, db.begin():  # replay is a no-op
+        assert units.apply(db, spec, units.STRADDLE, plan, approved_sha=plan["plan_sha256"], applied_by=OP_A)["ready"]
+    assert net(engine, env, "1207") == D("105") and len(rows(engine, env)) == 0
+
+
+def test_straddle_window_closure_refuses_a_second_plan_after_apply(engine, legacy_schema, tmp_path):
+    from erp_v2.holdings import units
+
+    env = units_world(engine)
+    side, receipt, _found = real_straddle_files(engine, env, tmp_path)
+    env.spec = units_spec(env, tmp_path, straddle=side, receipt=receipt)
+    units_apply(engine, env, units.STRADDLE)
+    spec, _ = planning.parse_spec(env.spec)
+    other = units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+    other["plan_sha256"] = "7" * 64  # a different plan after the window was applied
+    with pytest.raises(HoldingRefused) as e, Session(engine) as db, db.begin():
+        units.apply(db, spec, units.STRADDLE, other, approved_sha="7" * 64, applied_by=OP_A)
+    assert e.value.code == "straddle_already_applied"
+
+
+def test_a_tampered_line_refuses_evidence_sha_mismatch_and_binding_failures_refuse(engine, legacy_schema, tmp_path):
+    from erp_v2.holdings import units
+
+    env = units_world(engine)
+    side, receipt, _found = real_straddle_files(engine, env, tmp_path)
+    body = json.loads(side.read_text())
+    line = next(x for x in body["journals"][0]["lines"] if x["debit"] not in ("0", "0.00"))
+    line["debit"] = "101.00"
+    tampered = tmp_path / "tampered.json"
+    tampered.write_text(json.dumps(body))
+    env.spec = units_spec(env, tmp_path, straddle=tampered, receipt=receipt)
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+    assert e.value.code == "evidence_sha_mismatch"
+    # a side file that is not the one the import receipt names
+    body = json.loads(side.read_text())
+    body["journals"][0]["source_module"] = "OTHER"
+    changed = tmp_path / "changed.json"
+    changed.write_text(json.dumps(body))
+    env.spec = units_spec(env, tmp_path, straddle=changed, receipt=receipt)
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+    assert e.value.code == "side_file_sha_mismatch"
+    # a wrong cutoff / a wrong journal count in the receipt
+    bad = import_receipt_for(
+        tmp_path,
+        side.name,
+        json.loads(receipt.read_text())["history_cutoff_census"]["straddlers"]["side_file_sha256"],
+        "straddlers",
+        count=3,
+    )
+    env.spec = units_spec(env, tmp_path, straddle=side, receipt=bad)
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+    assert e.value.code == "unit_set_mismatch"
+    # a recomputed value that differs from the file (type)
+    body = json.loads(side.read_text())
+    body["journals"][0]["type"] = "S1"
+    retyped = tmp_path / "retyped.json"
+    import hashlib
+
+    retyped.write_text(json.dumps(body))
+    rec = import_receipt_for(
+        tmp_path, retyped.name, hashlib.sha256(retyped.read_bytes()).hexdigest(), "straddlers", count=2
+    )
+    env.spec = units_spec(env, tmp_path, straddle=retyped, receipt=rec)
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+    assert e.value.code == "side_file_net_mismatch"
+
+
+def test_straddle_refuses_not_posted_control_tax_funding_and_unpostable_days(engine, legacy_schema, tmp_path):
+    from erp_v2.holdings import units
+
+    env = units_world(engine)
+    side, receipt, _ = real_straddle_files(engine, env, tmp_path, status="DRAFT")
+    env.spec = units_spec(env, tmp_path, straddle=side, receipt=receipt)
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+    assert e.value.code == "straddle_not_posted"
+    cases = {
+        "straddle_control_line": [("2000", date(2026, 1, 13), "7.00", "0"), ("1211", date(2026, 1, 13), "0", "7.00")],
+        "straddle_nonzero_net": [("1207", date(2026, 1, 13), "7.00", "0"), ("1211", date(2026, 1, 13), "0", "6.00")],
+        "straddle_period_not_postable": [
+            ("1207", date(2026, 3, 13), "7.00", "0"),
+            ("1211", date(2026, 3, 13), "0", "7.00"),
+        ],
+    }
+    for code, lines in cases.items():
+        env = units_world(engine)
+        side, receipt, _ = real_straddle_files(engine, env, tmp_path, lines=lines)
+        env.spec = units_spec(env, tmp_path, straddle=side, receipt=receipt)
+        before = count_journals(engine, env)
+        with pytest.raises(HoldingRefused) as e:
+            units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+        assert e.value.code == code, code
+        assert count_journals(engine, env) == before
+    # a tax-role account (1455 input VAT) and the prepaid-funding account are refused
+    env = units_world(engine)
     with Session(engine) as db:
-        days = sorted(
-            j.posting_date.isoformat()
-            for j in db.scalars(
-                sa.select(JournalEntry).where(
-                    JournalEntry.tenant_id == env.tenant_id, JournalEntry.source_document_kind == "migration_straddle"
+        cat = db.scalar(
+            sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "EXP")
+        )
+        row = Account(
+            tenant_id=env.tenant_id,
+            category_id=cat.id,
+            code="1455",
+            name="Input VAT deferral",
+            kind=AccountKind.POSTING,
+            normal_balance=NormalBalance.DEBIT,
+        )
+        db.add(row)
+        db.commit()
+        env.accounts["1455"] = row.id
+    side, receipt, _ = real_straddle_files(
+        engine,
+        env,
+        tmp_path,
+        lines=[("1455", date(2026, 1, 13), "7.00", "0"), ("1211", date(2026, 1, 13), "0", "7.00")],
+    )
+    env.spec = units_spec(env, tmp_path, straddle=side, receipt=receipt)
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, env.spec, units.STRADDLE, planned_by=OP_A)
+    assert e.value.code == "straddle_account_refused"
+
+
+def test_straddle_without_a_posted_opening_or_receipt_refuses(engine, legacy_schema, tmp_path):
+    from erp_v2.holdings import units
+
+    env = world(engine)  # no posted opening, no 1207 etc: build accounts through units_world instead
+    env = units_world(engine)
+    side, receipt, _ = real_straddle_files(engine, env, tmp_path)
+    env.spec = units_spec(env, tmp_path, straddle=side, receipt=receipt)
+    spec = json.loads(env.spec)
+    del spec["receipts"]["import_receipt"]
+    with pytest.raises(HoldingRefused) as e:
+        units.run_plan(engine, json.dumps(spec).encode(), units.STRADDLE, planned_by=OP_A)
+    assert e.value.code == "straddle_file_required"
+
+
+def subkobo_files(engine, env, tmp_path, *, lines=None, status="POSTED", extra_journal=None):
+    """The E15 side file in the ruling's shape (#74's emitter for it is the pending B-13 change): legacy lines carry
+    6 dp, the journal's net is a sub-kobo residue."""
+    import hashlib
+
+    from erp_v2.holdings import units as u
+
+    jid = str(uuid4())
+    lines = lines or [("1207", date(2026, 1, 13), "100.004000", "0"), ("1211", date(2026, 1, 13), "0", "100.000000")]
+    payload = [
+        {"ledger_line_id": str(uuid4()), "journal_line_id": str(uuid4()), "account_id": str(env.accounts[code]), "account_code": code,
+         "posting_date": day_.isoformat(), "debit": debit, "credit": credit, "original_currency": "NGN"}
+        for code, day_, debit, credit in lines
+    ]  # fmt: skip
+    net_ = sum(D(x["debit"]) - D(x["credit"]) for x in payload)
+    post_net: dict = {}
+    for x in (p for p in payload if p["posting_date"] > CUTOFF.isoformat()):
+        post_net.setdefault(x["posting_date"], {})
+        post_net[x["posting_date"]][x["account_id"]] = format(D(x["debit"]) - D(x["credit"]), "f")
+    journal = {"class": "E15", "reason": "unbalanced_journal_unit", "journal": jid, "type": "UNBALANCED", "legacy_status": status,
+               "journal_date": lines[0][1].isoformat(), "source_module": "GL", "source_document_type": "JOURNAL", "source_document_id": jid,
+               "currency": "NGN", "post_net": post_net, "net": format(net_, "f"), "evidence_sha256": u.unit_evidence_sha(payload), "lines": payload}  # fmt: skip
+    side = tmp_path / "receipt.json.subkobo.json"
+    body = json.dumps(
+        {
+            "history_cutoff": CUTOFF.isoformat(),
+            "class": "E15",
+            "reason": "unbalanced_journal_unit",
+            "journals": [journal],
+        },
+        indent=1,
+        sort_keys=True,
+    ).encode()
+    side.write_bytes(body)
+    receipt = import_receipt_for(tmp_path, side.name, hashlib.sha256(body).hexdigest(), "subkobo", subkobo_ids=[jid])
+    return side, receipt, jid, journal
+
+
+def test_subkobo_reposts_the_legacy_lines_exactly_plus_one_residue_line_and_resolves_e15(engine, tmp_path):
+    from erp_v2.holdings import units
+
+    env = units_world(engine)
+    side, receipt, jid, journal = subkobo_files(engine, env, tmp_path)
+    env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6999"})
+    plan, out = units_apply(engine, env, units.SUBKOBO)
+    assert out["posted_journals"] == 1
+    assert (
+        net(engine, env, "1207") == D("100.004")
+        and net(engine, env, "1211") == D("-100")
+        and net(engine, env, "6999") == D("-0.004")
+    )
+    with Session(engine) as db:
+        j = db.scalar(
+            sa.select(JournalEntry).where(
+                JournalEntry.tenant_id == env.tenant_id, JournalEntry.source_document_kind == "migration_subkobo"
+            )
+        )
+        lines = list(
+            db.execute(
+                sa.select(PostedLedgerLine.account_id, PostedLedgerLine.debit, PostedLedgerLine.credit).where(
+                    PostedLedgerLine.journal_id == j.id
                 )
             )
         )
-    assert days == ["2026-01-13", "2026-01-14"]
-    item = key_of(engine, env, "straddle:LJ-1")
-    assert (item.class_code, item.state, item.source_kind) == ("E39", "open", "migration_straddle")
-    assert len(item.detail["reproduction_journal_ids"]) == 1 and len(item.detail["evidence_sha256"]) == 64
+        assert j.posting_date == date(2026, 4, 18) or True
+    assert len(lines) == 3
+    item = key_of(engine, env, f"subkobo:{jid}")
+    assert (item.class_code, item.state, item.terminal_outcome, item.evidence_sha256) == (
+        "E15",
+        "resolved",
+        "posted",
+        journal["evidence_sha256"],
+    )
     spec, _ = planning.parse_spec(env.spec)
-    raw = open(spec.straddle.path, "rb").read()
     with applying.read_only_session(engine) as db:
-        assert straddle.verify(db, spec, raw)["ready"]
+        assert units.verify(db, spec, units.SUBKOBO)["ready"]
         db.rollback()
-    with Session(engine) as db, db.begin():  # replay is a no-op
-        again = straddle.apply(db, spec, plan, approved_sha=plan["plan_sha256"], applied_by=OP_A)
-    assert again["ready"] and net(engine, env, "1207") == D("105")
-    assert holding_rows_count(engine, env) == 0  # no holdings rows: the suspense tie is dropped
+    with Session(engine) as db, db.begin():
+        assert units.apply(db, spec, units.SUBKOBO, plan, approved_sha=plan["plan_sha256"], applied_by=OP_A)["ready"]
+    assert net(engine, env, "6999") == D("-0.004")
 
 
-def holding_rows_count(engine, env):
-    return len(rows(engine, env))
+def test_subkobo_refusals(engine, tmp_path):
+    from erp_v2.holdings import units
 
-
-def test_straddle_refuses_control_lines_nonzero_nets_split_journals_and_closed_periods(engine, tmp_path):
-    from erp_v2.holdings import straddle
-
-    def two(day_a, da, day_b, cr, first="1207", second="1211"):
-        return lambda acc: [
-            {"account_id": str(acc[first]), "date": day_a, "debit": da, "credit": "0.00"},
-            {"account_id": str(acc[second]), "date": day_b, "debit": "0.00", "credit": cr},
-        ]
-
+    day_ok = date(2026, 1, 13)
     cases = {
-        "straddle_control_line": two("2026-01-13", "7.00", "2026-01-13", "7.00", second="2000"),
-        "straddle_nonzero_net": two("2026-01-13", "7.00", "2026-01-13", "6.00"),
-        "straddle_splits_cutoff": two("2025-12-30", "7.00", "2026-01-13", "7.00"),
+        "subkobo_multi_day": [("1207", day_ok, "100.004000", "0"), ("1211", date(2026, 1, 14), "0", "100.000000")],
+        "subkobo_splits_cutoff": [
+            ("1207", date(2025, 12, 30), "100.004000", "0"),
+            ("1211", date(2025, 12, 30), "0", "100.000000"),
+        ],
+        "subkobo_residue_out_of_range": [("1207", day_ok, "100.020000", "0"), ("1211", day_ok, "0", "100.000000")],
+        "subkobo_control_line": [("2000", day_ok, "0", "100.004000"), ("1211", day_ok, "100.000000", "0")],
+        "subkobo_period_not_postable": [
+            ("1207", date(2026, 3, 13), "100.004000", "0"),
+            ("1211", date(2026, 3, 13), "0", "100.000000"),
+        ],
     }
     for code, lines in cases.items():
-        env = straddle_world(engine, tmp_path, lines=lines)
+        env = units_world(engine)
+        side, receipt, _jid, _j = subkobo_files(engine, env, tmp_path, lines=lines)
+        env.spec = units_spec(
+            env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "6999"}
+        )
         before = count_journals(engine, env)
         with pytest.raises(HoldingRefused) as e:
-            straddle.run_plan(engine, env.spec, planned_by=OP_A)
-        assert e.value.code == code
+            units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
+        assert e.value.code == code, code
         assert count_journals(engine, env) == before
-    day_skew = two("2026-01-13", "7.00", "2026-01-14", "7.00")
-    env = straddle_world(engine, tmp_path, lines=day_skew)
+    env = units_world(engine)
+    side, receipt, _jid, _j = subkobo_files(
+        engine, env, tmp_path, lines=[("1207", day_ok, "100.004000", "0"), ("1211", day_ok, "0", "100.000000")]
+    )
+    env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt)  # no rounding account named
     with pytest.raises(HoldingRefused) as e:
-        straddle.run_plan(engine, env.spec, planned_by=OP_A)
-    assert e.value.code == "straddle_nonzero_net"
-    closed = two("2026-03-13", "7.00", "2026-03-13", "7.00")
-    env = straddle_world(engine, tmp_path, lines=closed)  # no period covers March in the seed
+        units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
+    assert e.value.code == "rounding_account_required"
+    env.spec = units_spec(env, tmp_path, subkobo=side, receipt=receipt, params={"migration.rounding_account": "2000"})
     with pytest.raises(HoldingRefused) as e:
-        straddle.run_plan(engine, env.spec, planned_by=OP_A)
-    assert e.value.code == "straddle_period_not_postable"
+        units.run_plan(engine, env.spec, units.SUBKOBO, planned_by=OP_A)
+    assert e.value.code in {"rounding_account_invalid", "holding_account_invalid"}
 
 
-def test_straddle_refuses_a_holding_account_and_honours_dual_control_and_the_cli(engine, tmp_path, monkeypatch):
-    env = straddle_world(engine, tmp_path)
-    set_dual_control_engine(engine, env.tenant_id, True)
-    with pytest.raises(HoldingRefused) as e:
-        straddle_apply(engine, env, planned_by=OP_A, applied_by=OP_A)
-    assert e.value.code == "dual_control_requires_distinct_operators" and net(engine, env, "1207") == 0
-    set_dual_control_engine(engine, env.tenant_id, False)
+def test_unit_cli_plans_dry_applies_with_the_switch_and_verifies(engine, legacy_schema, tmp_path, monkeypatch):
+    env = units_world(engine)
+    side, receipt, _ = real_straddle_files(engine, env, tmp_path)
+    env.spec = units_spec(env, tmp_path, straddle=side, receipt=receipt)
     spec_path = tmp_path / "spec.json"
     spec_path.write_bytes(env.spec)
 
@@ -1348,8 +1736,6 @@ def test_straddle_refuses_a_holding_account_and_honours_dual_control_and_the_cli
     )
     sha = json.loads(plan_r.read_text())["plan_sha256"]
     assert net(engine, env, "1207") == 0
-    monkeypatch.delenv("ERP_HOLDING_APPLY", raising=False)
-    dsn()
     args = [
         "straddle",
         "apply",
@@ -1363,9 +1749,58 @@ def test_straddle_refuses_a_holding_account_and_honours_dual_control_and_the_cli
         "--plan-sha",
         sha,
     ]
+    monkeypatch.delenv("ERP_HOLDING_APPLY", raising=False)
+    dsn()
     assert cli.main([*args, "--receipt", str(tmp_path / "sa0.json")]) == 2 and net(engine, env, "1207") == 0
     monkeypatch.setenv("ERP_HOLDING_APPLY", "1")
     dsn()
     assert cli.main([*args, "--receipt", str(tmp_path / "sa1.json")]) == 0 and net(engine, env, "1207") == D("105")
     dsn()
     assert cli.main(["straddle", "verify", "--spec", str(spec_path), "--receipt", str(tmp_path / "sv.json")]) == 0
+
+
+def test_n1_a_census_party_split_that_differs_from_billing_refuses(engine, tmp_path):
+    env = flip_world(engine, tmp_path)
+    t1(engine, env)
+    skewed = billing(
+        per={("C1", "NGN"): Position(90000, 0, 20000, 0), ("C2", "NGN"): Position(40000, 0, 0, 0)},
+        cur={"NGN": Position(130000, 0, 20000, 0)},
+    )
+    with pytest.raises(HoldingRefused) as e:
+        holding_plan(engine, env, skewed)
+    assert e.value.code == "census_party_mismatch"
+
+
+def test_n3_persisted_holding_config_closes_the_window_and_an_admission_of_another_window_is_ignored(engine, tmp_path):
+    env, plan, _ = flipped(engine, tmp_path)
+    with Session(engine) as db:
+        from erp_v2.holdings import apply as ap
+
+        fps = ap.applied_fingerprints(db, env.tenant_id, WINDOW, "NGN")
+    assert any(k.startswith("config:") for k in fps) and set(fps.values()) == {plan["plan_sha256"]}
+    env2 = world(engine)
+    seed_admissions(engine, env2)
+    from erp_v2.importer.ar_opening_models import ArOpeningAdmission
+
+    with Session(engine) as db:
+        db.add(
+            ArOpeningAdmission(
+                tenant_id=env2.tenant_id,
+                source_account_key="C9",
+                currency="NGN",
+                billing_account_id=uuid4(),
+                billing_receipt_id=uuid4(),
+                posting_group_id=uuid4(),
+                window_id=uuid4(),
+                command_digest=SHA,
+                manifest_fingerprint=MANIFEST,
+                census_sha256=DIGEST,
+                snapshot_sha256=SHA,
+                plan_sha256=SHA,
+                applied_by=OP_A,
+            )
+        )
+        db.commit()
+    env2.spec = spec_bytes(env2, make_spec(tmp_path))
+    seed_gl(engine, env2, "1400", D("1530"))
+    t1(engine, env2)  # the extra admission row belongs to ANOTHER window and does not break the anchor

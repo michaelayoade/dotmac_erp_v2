@@ -158,34 +158,29 @@ def _do_t1_apply(args) -> dict[str, Any]:
         return t1_mod.apply_t1(db, spec, plan, approved_sha=args.plan_sha, applied_by=_operator(args.operator_ref))
 
 
-def _straddle_raw(spec: planning.RunSpec) -> bytes:
-    if spec.straddle is None:
-        refuse("straddle_file_required")
-    return _read_bound(spec.straddle)[0]
+def _do_units(args) -> dict[str, Any]:
+    from erp_v2.holdings import units
 
-
-def _do_straddle(args) -> dict[str, Any]:
-    from erp_v2.holdings import straddle
-
+    mode = units.MODES[args.cmd]
     spec_bytes = args.spec.read_bytes()
     spec, _ = planning.parse_spec(spec_bytes)
     engine = _engine()
     if args.mode == "plan":
-        return {
-            "ready": True,
-            "dry_run": True,
-            **straddle.run_plan(engine, spec_bytes, planned_by=_operator(args.operator_ref)),
-        }
+        out = units.run_plan(engine, spec_bytes, mode, planned_by=_operator(args.operator_ref))
+        return {"ready": True, "dry_run": True, **out}
     if args.mode == "verify":
         with applying.read_only_session(engine) as db:
-            out = straddle.verify(db, spec, _straddle_raw(spec))
+            out = units.verify(db, spec, mode)
             db.rollback()
         return out
     _require_apply(args.apply)
     approved = _plan_receipt(args.plan_receipt, args.plan_sha)
-    plan = straddle.run_plan(engine, spec_bytes, planned_by=approved["planned_by"])
+    with Session(engine) as db:
+        units.window_closed(db, spec.tenant_id, mode, args.plan_sha)  # S1, before any re-plan
+        db.rollback()
+    plan = units.run_plan(engine, spec_bytes, mode, planned_by=approved["planned_by"])
     with Session(engine) as db, db.begin():
-        return straddle.apply(db, spec, plan, approved_sha=args.plan_sha, applied_by=_operator(args.operator_ref))
+        return units.apply(db, spec, mode, plan, approved_sha=args.plan_sha, applied_by=_operator(args.operator_ref))
 
 
 def _command(args) -> dict[str, Any]:
@@ -251,10 +246,11 @@ def parser() -> argparse.ArgumentParser:
     t1 = sub.add_parser("t1").add_subparsers(dest="mode", required=True)
     common(t1.add_parser("plan"))
     common(t1.add_parser("apply"), apply=True, plan_bound=True)
-    st = sub.add_parser("straddle").add_subparsers(dest="mode", required=True)
-    common(st.add_parser("plan"))
-    common(st.add_parser("verify"))
-    common(st.add_parser("apply"), apply=True, plan_bound=True)
+    for unit_cmd in ("straddle", "subkobo"):
+        st = sub.add_parser(unit_cmd).add_subparsers(dest="mode", required=True)
+        common(st.add_parser("plan"))
+        common(st.add_parser("verify"))
+        common(st.add_parser("apply"), apply=True, plan_bound=True)
     rel = sub.add_parser("release")
     common(rel, apply=True)
     rel.add_argument("--exception", required=True)
@@ -278,9 +274,12 @@ _HANDLERS = {
     ("verify", None): _do_verify,
     ("t1", "plan"): _do_t1_plan,
     ("t1", "apply"): _do_t1_apply,
-    ("straddle", "plan"): _do_straddle,
-    ("straddle", "apply"): _do_straddle,
-    ("straddle", "verify"): _do_straddle,
+    ("straddle", "plan"): _do_units,
+    ("straddle", "apply"): _do_units,
+    ("straddle", "verify"): _do_units,
+    ("subkobo", "plan"): _do_units,
+    ("subkobo", "apply"): _do_units,
+    ("subkobo", "verify"): _do_units,
     ("release", None): _do_release,
     ("writeoff", "plan"): _do_writeoff,
     ("writeoff", "apply"): _do_writeoff,

@@ -42,7 +42,15 @@ KIND_RELEASE_POST: Final = "holding_release"
 KIND_WRITEOFF_POST: Final = "holding_writeoff"
 KIND_T1_POST: Final = "ar_opening_credit"
 KIND_STRADDLE_POST: Final = "migration_straddle"
-POSTING_KINDS: Final = (KIND_HOLDING_POST, KIND_RELEASE_POST, KIND_WRITEOFF_POST, KIND_T1_POST, KIND_STRADDLE_POST)
+KIND_SUBKOBO_POST: Final = "migration_subkobo"
+POSTING_KINDS: Final = (
+    KIND_HOLDING_POST,
+    KIND_RELEASE_POST,
+    KIND_WRITEOFF_POST,
+    KIND_T1_POST,
+    KIND_STRADDLE_POST,
+    KIND_SUBKOBO_POST,
+)
 
 # uuid5 namespaces (constants; never random) for the once-only document identities.
 HOLDING_NS: Final = UUID("5b0d1f0e-3f0a-5c7e-9b6a-0b14c0de0001")
@@ -69,6 +77,10 @@ def release_document_id(exception_id: UUID | str, n: int) -> str:
 
 def straddle_document_id(legacy_journal_id: str, day: str) -> str:
     return str(uuid5(STRADDLE_NS, f"{legacy_journal_id}:{day}"))
+
+
+def subkobo_document_id(legacy_journal_id: str, day: str) -> str:
+    return str(uuid5(STRADDLE_NS, f"subkobo:{legacy_journal_id}:{day}"))
 
 
 def writeoff_document_id(exception_id: UUID | str) -> str:

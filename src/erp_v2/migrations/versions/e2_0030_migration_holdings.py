@@ -174,7 +174,7 @@ def _exception_close_guard() -> None:
         f"CREATE FUNCTION public.{t}_close_guard() RETURNS trigger LANGUAGE plpgsql AS $$ "
         "DECLARE outstanding numeric; "
         "BEGIN "
-        "IF NEW.source_kind = 'migration_holdings' AND NEW.state = 'resolved' AND OLD.state <> 'resolved' THEN "
+        "IF (NEW.source_kind = 'migration_holdings' OR OLD.source_kind = 'migration_holdings') AND NEW.state = 'resolved' AND OLD.state <> 'resolved' THEN "
         f"SELECT coalesce(sum(amount), 0) INTO outstanding FROM public.{t} WHERE exception_id = NEW.id; "
         "IF outstanding <> 0 THEN RAISE EXCEPTION 'a migration holding item with an outstanding amount cannot be resolved' "
         "USING ERRCODE = 'integrity_constraint_violation'; END IF; "

@@ -59,6 +59,8 @@ class RunSpec:
     census: ReceiptRef | None
     gl_attribution: dict[str, ReceiptRef]
     straddle: ReceiptRef | None = None
+    subkobo: ReceiptRef | None = None
+    import_receipt: ReceiptRef | None = None
 
 
 def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
@@ -68,7 +70,13 @@ def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
     if not isinstance(body, dict) or set(body) != SPEC_KEYS or body["version"] != 1:
         refuse("invalid_spec_schema")
     receipts = body["receipts"]
-    if not isinstance(receipts, dict) or not set(receipts) <= {"census", "gl_attribution", "straddle"}:
+    if not isinstance(receipts, dict) or not set(receipts) <= {
+        "census",
+        "gl_attribution",
+        "straddle",
+        "subkobo",
+        "import_receipt",
+    }:
         refuse("invalid_spec_schema")
     params = body["params"]
     if not isinstance(params, dict):
@@ -87,13 +95,15 @@ def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
     return (
         RunSpec(
             uuid_text(body["tenant_id"], "invalid_tenant_id"),
-            text(body["window_id"], "invalid_spec_schema", 120),
+            str(uuid_text(body["window_id"], "invalid_window_id")),
             day(body["capture_date"], "invalid_capture_date"),
             text(body["evidence_ref"], "evidence_ref_required", 255),
             params,
             ref(receipts["census"]) if "census" in receipts else None,
             {c: ref(v) for c, v in attributions.items()},
             ref(receipts["straddle"]) if "straddle" in receipts else None,
+            ref(receipts["subkobo"]) if "subkobo" in receipts else None,
+            ref(receipts["import_receipt"]) if "import_receipt" in receipts else None,
         ),
         sha,
     )
@@ -130,7 +140,7 @@ def select_periods(tenant: UUID):
 # --- F1: the local anchor against the #72 admission rows ----------------------------------------------------------
 
 
-def anchor_census(db: Session, tenant: UUID, census: Census) -> str:
+def anchor_census(db: Session, tenant: UUID, census: Census, window_id: str) -> str:
     """Prove the census file is the one #72 admitted from. Every ``erp_ar_opening_admissions`` row of the tenant must
     carry the census receipt's own digest (its ``census_sha256`` field, which is not the file sha) and exactly one
     manifest fingerprint, and the admitted (source_account_key, currency) set must equal the census parties that carry
@@ -139,7 +149,13 @@ def anchor_census(db: Session, tenant: UUID, census: Census) -> str:
 
     if census.digest is None:
         refuse("census_digest_missing", "the census receipt carries no census_sha256")
-    rows = list(db.scalars(sa.select(ArOpeningAdmission).where(ArOpeningAdmission.tenant_id == tenant)))
+    rows = list(
+        db.scalars(
+            sa.select(ArOpeningAdmission).where(
+                ArOpeningAdmission.tenant_id == tenant, ArOpeningAdmission.window_id == UUID(window_id)
+            )
+        )
+    )
     if not rows:
         refuse("ar_admissions_missing", "no e2_0029 admission rows: the AR opening has not been applied")
     if {r.census_sha256 for r in rows} != {census.digest}:
@@ -279,6 +295,12 @@ def assemble(
     ):
         refuse("billing_positions_mismatch", "per-account positions without an R1 currency")
 
+    # N1: the census split per party must equal billing's per-account positions (exact inside the fence).
+    if receipts.census is not None:
+        for p in receipts.census.parties:
+            pos = acct_by_ccy.get(p.currency, {}).get(Party(attr.CENSUS_PARTY_KIND, p.customer), Position(0, 0, 0, 0))
+            if p.cash_lot_minor != pos.available_credit_minor or p.carried_minor != pos.receivable():
+                refuse("census_party_mismatch", "the census split differs from billing's position")
     codes: list[dict[str, Any]] = []
     for code in ORDER:
         control = snap.controls[code]
