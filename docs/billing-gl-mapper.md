@@ -177,7 +177,15 @@ aggregate tie amounts only.
   never an invoice number. The admissions' snapshot sha must equal `--snapshot-sha256`, and the bases must equal the
   imported open items (`carried_count_mismatch`).
 - Every carried invoice appears exactly once per treatment (zero-tax invoices as a zero position `none`); NGN only.
-- **Tie (exact).** GL(deferral accounts) = per-invoice remainders + (derived reclass - journal reclass) + the lines no
-  invoice or payment owns (manual GL journals, AP), listed by source. Any difference refuses the run.
+- **Tie (independent).** The legacy GL of the deferral accounts at the cutoff must equal ERP v2's own B-9r opening balance
+  of those accounts (`tie_failed`), and the AP-module lines must equal minus the payables a6 remaining input deferral
+  (`ap_positions_mismatch`). Everything no carried invoice owns is a NAMED residue in the receipt (AR lines with no carried
+  owner by source, credit notes, non-carried invoice remainders, payments whose reclass does not re-derive, manual
+  non-AR/non-AP journals), with a `residue_sha256`. Finance acknowledges it by passing `--acknowledge-residue <sha>`; until
+  then the run writes no items file.
+- **Credit notes.** Legacy posts a credit note's 1455 under the credit note's OWN id and keeps no link to the invoice it
+  reduces, so that amount is residue and every invoice touched by a payment that also allocates to a credit note is E38.
 - **Overrides** are a separate Finance-named input (`named_by`, evidence sha and reference per item), bound by sha in the
-  receipt; an override that matches no item refuses.
+  receipt. Only E38 items may be overridden (`override_on_loadable_item`); an override that matches no item refuses.
+- The receipt also carries the treatment-map sha and a legacy fingerprint (counts and max ids of `gl.posted_ledger_line`,
+  `ar.invoice`, `ar.payment_allocation`) so the output can be re-derived from it.

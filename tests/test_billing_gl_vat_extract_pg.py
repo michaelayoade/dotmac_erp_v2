@@ -43,7 +43,7 @@ def legacy(engine):
             "account_id uuid, posting_date date, debit_amount numeric, credit_amount numeric, source_module varchar, "
             "source_document_type varchar, source_document_id uuid);"
             "CREATE TABLE ar.invoice (invoice_id uuid PRIMARY KEY, organization_id uuid, invoice_number varchar, "
-            "total_amount numeric, currency_code varchar(3));"
+            "total_amount numeric, currency_code varchar(3), invoice_type varchar DEFAULT 'STANDARD');"
             "CREATE TABLE ar.invoice_line (line_id uuid PRIMARY KEY, invoice_id uuid, line_number int, "
             "tax_code_id uuid, "
             "tax_amount numeric);"
@@ -130,14 +130,15 @@ def test_the_legacy_reader_and_derivation_end_to_end(engine, legacy):
     }
     assert data.tax[str(tax_id)].deferrable and set(data.invoices) == {str(invoice), str(other_inv)}
     carried = [vx.Carried(str(invoice), uuid4(), D("60.00"), "NGN")]
-    body, report = vx.derive(uuid4(), carried, data)
+    body, report = vx.derive(uuid4(), carried, data, v2_opening_net_credit=D("74"), ap_positions=D(0))
     item = body["items"][0]
     assert item["reclass"] == ["10.000000"] and item["journal_1455_credit"] == "20.000000"
     assert report["tie"]["gl_net_credit"] == "74.000000" and report["tie"]["other_net"] == "57.000000"
+    assert data.fingerprint["ar_invoice"]["count"] == 2 and data.credit_note_ids == frozenset()
     assert report["items_loadable"] == 1
     with engine.connect() as conn:
         rerun = vx.read_legacy(conn, org, date(2026, 2, 1), [str(invoice)])
-    again = vx.derive(uuid4(), carried, rerun)
+    again = vx.derive(uuid4(), carried, rerun, v2_opening_net_credit=D("74"), ap_positions=D(0))
     assert vx.seal({**again[0], "tenant_id": body["tenant_id"]}) == vx.seal(body)  # deterministic re-run
 
 
@@ -165,3 +166,9 @@ def test_the_destination_reader_refuses_without_admissions_or_on_a_different_sna
     finally:
         with engine.begin() as conn:
             conn.exec_driver_sql("DROP TABLE public.erp_ar_opening_admissions")
+
+
+def test_the_v2_readers_return_zero_on_an_empty_estate(engine):
+    with Session(engine) as db:
+        assert vx.read_v2_opening(db, uuid4(), [str(uuid4())]) == D(0)
+        assert vx.read_ap_positions(db, [str(uuid4())]) == D(0)  # payables a6 positions are not installed here

@@ -41,7 +41,7 @@ from typing import Any
 from uuid import UUID
 
 from erp_v2.billing_gl import vat_opening
-from erp_v2.migration_ledger.common import LedgerRefused, fmt, money, refuse, sha_text, strict_json, text
+from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, fmt, money, refuse, sha_text, strict_json, text
 
 CENT = Decimal("0.01")
 ZERO = Decimal(0)
@@ -87,6 +87,9 @@ class Legacy:
     gl: list[GlLine]
     invoices: dict[str, Invoice]
     allocations: list[tuple[str, str, Decimal]]  # (payment_id, invoice_id, allocated_amount)
+    deferral_accounts: list[str] = field(default_factory=list)
+    credit_note_ids: frozenset[str] = frozenset()  # ar.invoice ids of invoice_type CREDIT_NOTE
+    fingerprint: dict[str, Any] = field(default_factory=dict)  # counts and max ids of the three legacy tables
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +108,20 @@ def prorate(allocated: Decimal, component: Decimal, total: Decimal) -> Decimal:
 
 
 def derive(
-    tenant_id: UUID, carried: list[Carried], data: Legacy, treatment_map: dict[str, str] | None = None
+    tenant_id: UUID,
+    carried: list[Carried],
+    data: Legacy,
+    treatment_map: dict[str, str] | None = None,
+    *,
+    v2_opening_net_credit: Decimal,
+    ap_positions: Decimal,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The sealed input body and the counts-only report. Pure: refuses rather than guesses."""
+    """The sealed input body and the counts-only report. Pure: refuses rather than guesses.
+
+    ``v2_opening_net_credit`` is ERP v2's own opening balance (B-9r, owner ``erp.opening``) of the deferral accounts at
+    the cutoff; the legacy GL must equal it. ``ap_positions`` is the payables a6 remaining input deferral on those
+    accounts; the AP-module lines must equal minus that. Both are INDEPENDENT of this derivation, so the tie can fail.
+    """
     treatment_map = treatment_map or {}
     if any(c.currency != FUNCTIONAL for c in carried) or any(g.currency != FUNCTIONAL for g in data.gl):
         refuse("non_ngn_unsupported")
@@ -122,15 +136,30 @@ def derive(
     invoice_credit: dict[str, Decimal] = defaultdict(Decimal)
     reclass_net: dict[str, Decimal] = defaultdict(Decimal)  # payment id -> net debit (positive = recognised)
     other: dict[str, Decimal] = defaultdict(Decimal)
+    credit_note_lines: dict[str, Decimal] = defaultdict(Decimal)  # legacy posts a credit note's 1455 under its OWN id
+    ar_other: dict[str, Decimal] = defaultdict(Decimal)  # AR lines no carried invoice or payment owns
+    ar_other_count: dict[str, int] = defaultdict(int)
+    ap_net = ZERO
+    manual: dict[str, Decimal] = defaultdict(Decimal)
     gl_total = ZERO
     for line in data.gl:
         gl_total += line.net_credit
-        if line.source_module == "AR" and line.source_type in INVOICE_SOURCES and line.source_id:
+        if line.source_module == "AR" and line.source_id in data.credit_note_ids:
+            credit_note_lines[line.source_id] += line.net_credit
+        elif line.source_module == "AR" and line.source_type in INVOICE_SOURCES and line.source_id:
             invoice_credit[line.source_id] += line.net_credit
         elif line.source_module == "AR" and line.source_type == RECLASS_SOURCE and line.source_id:
             reclass_net[line.source_id] += -line.net_credit
         else:
-            other[f"{line.source_module}/{line.source_type}"] += line.net_credit
+            key = f"{line.source_module}/{line.source_type}"
+            other[key] += line.net_credit
+            if line.source_module == "AR":
+                ar_other[key] += line.net_credit
+                ar_other_count[key] += 1
+            elif line.source_module == "AP":
+                ap_net += line.net_credit
+            else:
+                manual[key] += line.net_credit
 
     # 2. legacy's own prorate over each counted payment's allocations
     derived_by: dict[tuple[str, str], list[Decimal]] = defaultdict(list)  # (invoice, treatment) -> amounts
@@ -155,6 +184,19 @@ def derive(
             derived_payment[payment] += part
     bad_payments = {p for p in counted if derived_payment[p] != reclass_net[p]}
     unattributable = {inv for p in bad_payments for inv in touched[p]}
+    # A credit note applied through a payment reduces SOME invoice, and legacy keeps no structural link to which one:
+    # every invoice such a payment touches is unattributable (E38), never guessed.
+    by_payment: dict[str, set[str]] = defaultdict(set)
+    for payment, invoice_id, _ in data.allocations:
+        by_payment[payment].add(invoice_id)
+    credit_applied = {
+        inv
+        for invoices in by_payment.values()
+        if invoices & data.credit_note_ids
+        for inv in invoices
+        if inv not in data.credit_note_ids
+    }
+    unattributable |= credit_applied
 
     # 3. one item set per carried invoice (zero-tax ones as a zero position)
     items: list[dict[str, Any]] = []
@@ -197,7 +239,8 @@ def derive(
                 }
             )
 
-    # 4. the exact tie, from the raw lines, against the per-invoice remainders
+    # 4. the tie. The legacy GL must equal ERP v2's OWN opening balance of these accounts (an independent figure),
+    #    the AP lines must equal the payables a6 positions, and everything no carried invoice owns is a NAMED residue.
     invoice_ids = set(invoice_credit) | {c.invoice_key for c in carried}
     derived_inv: dict[str, Decimal] = defaultdict(Decimal)
     for (invoice_id, _), parts in derived_by.items():
@@ -205,11 +248,33 @@ def derive(
     remaining = {i: invoice_credit.get(i, ZERO) - derived_inv.get(i, ZERO) for i in invoice_ids | set(derived_inv)}
     carried_keys = {c.invoice_key for c in carried}
     carried_remaining = sum((v for k, v in remaining.items() if k in carried_keys), ZERO)
-    other_invoice_remaining = sum((v for k, v in remaining.items() if k not in carried_keys), ZERO)
+    non_carried = {k: v for k, v in remaining.items() if k not in carried_keys and v != 0}
+    other_invoice_remaining = sum(non_carried.values(), ZERO)
     reclass_diff = sum(derived_payment.values(), ZERO) - sum(reclass_net.values(), ZERO)
+    credit_note_net = sum(credit_note_lines.values(), ZERO)
     other_net = sum(other.values(), ZERO)
-    if carried_remaining + other_invoice_remaining + reclass_diff + other_net != gl_total:
-        refuse("tie_failed")
+    if gl_total != v2_opening_net_credit:
+        refuse("tie_failed")  # legacy GL at the cutoff vs ERP v2's opening balance of the deferral accounts
+    if ap_net != -ap_positions:
+        refuse("ap_positions_mismatch")  # AP-module lines vs the payables a6 remaining input deferral
+    if carried_remaining + other_invoice_remaining + reclass_diff + credit_note_net + other_net != gl_total:
+        refuse("tie_failed")  # internal consistency of the classification (kept as a guard)
+    residue = {
+        "ar_lines_without_carried_owner": {
+            "count": sum(ar_other_count.values()),
+            "amount": fmt(sum(ar_other.values(), ZERO)),
+            "by_source": {k: fmt(v) for k, v in sorted(ar_other.items())},
+        },
+        "credit_notes": {"count": len(credit_note_lines), "amount": fmt(credit_note_net)},
+        "non_carried_invoice_remainders": {"count": len(non_carried), "amount": fmt(other_invoice_remaining)},
+        "reclass_mismatch": {"payments": len(bad_payments), "amount": fmt(reclass_diff)},
+        "manual_non_ar_non_ap": {
+            "amount": fmt(sum(manual.values(), ZERO)),
+            "by_source": {k: fmt(v) for k, v in sorted(manual.items())},
+        },
+        "credit_note_applied_invoices": len(credit_applied & carried_keys),
+    }
+    residue_sha = canonical_sha(residue)
 
     body = {"version": 1, "tenant_id": str(tenant_id), "items": items}
     loadable = sum(1 for i in items if _loadable(i))
@@ -227,9 +292,13 @@ def derive(
             "carried_remaining": fmt(carried_remaining),
             "other_invoice_remaining": fmt(other_invoice_remaining),
             "reclass_diff": fmt(reclass_diff),
+            "credit_note_net": fmt(credit_note_net),
             "other_net": fmt(other_net),
-            "other_by_source": {k: fmt(v) for k, v in sorted(other.items())},
+            "v2_opening_net_credit": fmt(v2_opening_net_credit),
+            "ap_positions": fmt(ap_positions),
         },
+        "residue": residue,
+        "residue_sha256": residue_sha,
     }
     return body, report
 
@@ -265,6 +334,8 @@ def apply_overrides(body: dict[str, Any], raw: bytes) -> tuple[dict[str, Any], d
         key = (str(UUID(str(entry["document_id"]))), text(entry["treatment"], "invalid_overrides", 80))
         if key in seen or key not in index:
             refuse("override_unmatched")
+        if _loadable(index[key]):
+            refuse("override_on_loadable_item")
         seen.add(key)
         index[key]["finance_override"] = {
             "deferred": fmt(money(entry["deferred"])),
@@ -322,6 +393,38 @@ def read_carried(db, tenant_id: UUID, snapshot_sha256: str) -> list[Carried]:
     return [Carried(b.source_invoice_key, b.document_id, Decimal(b.initial_receivable), b.currency) for b in bases]
 
 
+def read_v2_opening(db, tenant_id: UUID, accounts: list[str]) -> Decimal:
+    """ERP v2's opening balance (B-9r journal, owner ``erp.opening``) of the deferral accounts: net credit."""
+    import sqlalchemy as sa
+    from dotmac_accounting.models import PostedLedgerLine
+
+    total = db.scalar(
+        sa.select(sa.func.coalesce(sa.func.sum(PostedLedgerLine.credit - PostedLedgerLine.debit), 0)).where(
+            PostedLedgerLine.tenant_id == tenant_id,
+            PostedLedgerLine.account_id.in_([UUID(a) for a in accounts]),
+            PostedLedgerLine.source_owner == "erp.opening",
+        )
+    )
+    return Decimal(total)
+
+
+def read_ap_positions(db, accounts: list[str]) -> Decimal:
+    """Payables a6 remaining input deferral on the deferral accounts (``historical_tax_deferrals``), or 0 when the
+    payables release that carries it is not installed (the caller then also requires there to be no AP-module line)."""
+    import sqlalchemy as sa
+
+    if not db.scalar(sa.text("SELECT to_regclass('mod_payables.historical_tax_deferrals') IS NOT NULL")):
+        return ZERO
+    total = db.scalar(
+        sa.text(
+            "SELECT coalesce(sum(remaining), 0) FROM mod_payables.historical_tax_deferrals "
+            "WHERE deferral_account_ref = ANY(:a)"
+        ),
+        {"a": accounts},
+    )
+    return Decimal(total)
+
+
 def read_legacy(conn, organization_id: UUID, cutoff: date, carried_keys: list[str]) -> Legacy:
     """Legacy reads on a read-only snapshot connection (the caller sets READ ONLY and ``row_security = off``)."""
     import sqlalchemy as sa
@@ -351,8 +454,28 @@ def read_legacy(conn, organization_id: UUID, cutoff: date, carried_keys: list[st
             {"o": org, "a": accounts, "c": cutoff},
         )
     ]
+    credit_note_ids = frozenset(
+        r[0]
+        for r in conn.execute(
+            sa.text(
+                "SELECT invoice_id::text FROM ar.invoice "
+                "WHERE organization_id = :o AND invoice_type::text = 'CREDIT_NOTE'"
+            ),
+            {"o": org},
+        )
+    )
     reclass_payments = sorted(
         {g.source_id for g in gl if g.source_module == "AR" and g.source_type == RECLASS_SOURCE and g.source_id}
+        | {
+            r[0]
+            for r in conn.execute(
+                sa.text(
+                    "SELECT DISTINCT payment_id::text FROM ar.payment_allocation "
+                    "WHERE invoice_id = ANY(CAST(:c AS uuid[]))"
+                ),
+                {"c": sorted(credit_note_ids)},
+            )
+        }
     )
     allocations = [
         (p, i, Decimal(a))
@@ -368,6 +491,7 @@ def read_legacy(conn, organization_id: UUID, cutoff: date, carried_keys: list[st
         set(carried_keys)
         | {g.source_id for g in gl if g.source_module == "AR" and g.source_type in INVOICE_SOURCES and g.source_id}
         | {i for _, i, _ in allocations}
+        | credit_note_ids
     )
     invoices: dict[str, Invoice] = {}
     for inv_id, number, total, currency in conn.execute(
@@ -397,10 +521,43 @@ def read_legacy(conn, organization_id: UUID, cutoff: date, carried_keys: list[st
     ):
         if inv_id in invoices:
             invoices[inv_id].line_taxes.append((tax_id, Decimal(tax_amount)))
-    return Legacy(tax, gl, invoices, allocations)
+    fingerprint: dict[str, Any] = {}
+    for name, sql in (
+        (
+            "gl_posted_ledger_line",
+            "SELECT count(*), max(line_id::text) FROM gl.posted_ledger_line WHERE organization_id = :o",
+        ),
+        ("ar_invoice", "SELECT count(*), max(invoice_id::text) FROM ar.invoice WHERE organization_id = :o"),
+        (
+            "ar_payment_allocation",
+            "SELECT count(*), max(allocation_id::text) FROM ar.payment_allocation a WHERE EXISTS "
+            "(SELECT 1 FROM ar.invoice i WHERE i.invoice_id = a.invoice_id AND i.organization_id = :o)",
+        ),
+    ):
+        count, max_id = conn.execute(sa.text(sql), {"o": org}).one()
+        fingerprint[name] = {"count": int(count), "max_id": max_id}
+    return Legacy(tax, gl, invoices, allocations, accounts, credit_note_ids, fingerprint)
 
 
 # --------------------------------------------------------------------------- CLI
+
+
+class _Acknowledge(Exception):
+    """Control flow: the residue needs Finance's acknowledgement before any items file is written."""
+
+
+def _has_residue(residue: dict[str, Any]) -> bool:
+    def nonzero(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(nonzero(v) for v in value.values())
+        if isinstance(value, str):
+            try:
+                return Decimal(value) != 0
+            except Exception:
+                return False
+        return bool(value)
+
+    return nonzero(residue)
 
 
 def _create(path: Path) -> int:
@@ -419,6 +576,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--overrides", type=Path)
     parser.add_argument("--treatment-map", type=Path)
+    parser.add_argument(
+        "--acknowledge-residue",
+        help="the residue_sha256 of a previous receipt: Finance's acknowledgement of the named E38 residue",
+    )
     args = parser.parse_args(argv)
     try:
         tenant, org = UUID(args.tenant_id), UUID(args.organization_id)
@@ -445,10 +606,32 @@ def main(argv: list[str] | None = None) -> int:
             conn.execute(sa.text("SET LOCAL row_security = off"))
             data = read_legacy(conn, org, cutoff, [c.invoice_key for c in carried])
             conn.rollback()
-        mapping = {}
+        mapping: dict[str, str] = {}
+        map_sha = None
         if args.treatment_map:
-            mapping = {str(k): str(v) for k, v in strict_json(args.treatment_map.read_bytes()).items()}
-        body, report = derive(tenant, carried, data, mapping)
+            raw_map = args.treatment_map.read_bytes()
+            map_sha = hashlib.sha256(raw_map).hexdigest()
+            mapping = {str(k): str(v) for k, v in strict_json(raw_map).items()}
+        with Session(dest) as db:
+            db.execute(sa.text("SET TRANSACTION READ ONLY"))
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant)})
+            v2_opening = read_v2_opening(db, tenant, data.deferral_accounts)
+            ap_positions = read_ap_positions(db, data.deferral_accounts)
+            db.rollback()
+        body, report = derive(
+            tenant, carried, data, mapping, v2_opening_net_credit=v2_opening, ap_positions=ap_positions
+        )
+        base = {
+            "cutoff": cutoff.isoformat(),
+            "snapshot_sha256": args.snapshot_sha256,
+            "treatment_map_sha256": map_sha,
+            "legacy_fingerprint": data.fingerprint,
+            "legacy_fingerprint_sha256": canonical_sha(data.fingerprint),
+            **report,
+        }
+        if _has_residue(report["residue"]) and args.acknowledge_residue != report["residue_sha256"]:
+            payload, code = {"ready": False, "refusal": "residue_unacknowledged", **base}, 2
+            raise _Acknowledge
         overrides = None
         if args.overrides:
             body, overrides = apply_overrides(body, args.overrides.read_bytes())
@@ -456,13 +639,14 @@ def main(argv: list[str] | None = None) -> int:
         os.write(fd_out, data_bytes)
         payload = {
             "ready": True,
-            "cutoff": cutoff.isoformat(),
-            "snapshot_sha256": args.snapshot_sha256,
+            **base,
+            "residue_acknowledged": _has_residue(report["residue"]),
             "items_sha256": sha,
             "overrides": overrides,
-            **report,
             "plan_preview": vat_opening.plan(vat_opening.parse(data_bytes), sha)["counts"],
         }
+    except _Acknowledge:
+        pass  # the receipt (with the residue and its sha) is already set; no items file is written
     except LedgerRefused as exc:
         payload, code = {"ready": False, "refusal": exc.code}, 2
     except Exception as exc:
