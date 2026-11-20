@@ -33,6 +33,7 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES, GATE_TIE_CODES
 from erp_v2.migration_ledger import models as m
 from erp_v2.migration_ledger.common import (
     OPENING_PERIOD,
@@ -50,6 +51,10 @@ from erp_v2.migration_ledger.common import (
 BUCKETS: Final = ("carry", "transform", "queue")
 ROUND_RULE: Final = "T-ROUND-2DP"
 AP_CONTROL: Final = "2000"
+# The rounding account must never be a control account (the residue line would be a GL-only control entry). Taken from
+# ledger_roles (the posting guard's list and the gate's tie list); config-keyed holding/prepayment accounts are checked
+# where the config is read.
+CONTROL_ACCOUNTS_FOR_RESIDUE: Final = frozenset(CONTROL_ACCOUNT_CODES) | frozenset(GATE_TIE_CODES)
 SCOPES: Final = ("header", "line")
 MAX_ITEMS: Final = 500_000
 
@@ -278,6 +283,12 @@ def control_lists() -> dict[str, list[str]]:
     return ledger_check.control_lists()
 
 
+def gate_profile() -> str:
+    from erp_v2.migration_ledger import ledger_check
+
+    return ledger_check.GATE_PROFILE
+
+
 def compute(
     inputs: Inputs,
     *,
@@ -287,6 +298,8 @@ def compute(
     ias8_sha: str | None,
     import_itemised: dict[str, Any] | None = None,
     import_sha: str | None = None,
+    units: tuple[Any, ...] = (),
+    side_binding: dict[str, str | None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The versioned body and the itemised (private) file. Pure.
 
@@ -294,6 +307,17 @@ def compute(
     IAS 8 journals' (account, movement) pairs; both are read from the ledger by the caller.
     """
     verify_rounding_items(inputs, import_itemised, import_sha)
+    from erp_v2.migration_ledger import units as units_mod
+
+    # T-STRADDLE (E39) and T-SUBKOBO (E15): the items must equal the set derived from the receipt-bound side files.
+    e15 = tuple(u for u in units if u.cls == units_mod.E15)
+    e39 = tuple(u for u in units if u.cls == units_mod.E39)
+    units_mod.require_items_equal(units_mod.STRADDLE_RULE, inputs.items, units_mod.bridge_items(e39))
+    units_mod.require_items_equal(
+        units_mod.SUBKOBO_RULE, inputs.items, units_mod.bridge_items(e15, inputs.rounding_account_code)
+    )
+    if inputs.rounding_account_code in CONTROL_ACCOUNTS_FOR_RESIDUE and e15:
+        refuse("rounding_account_invalid")
     residue = rounding_residue(inputs)
     if residue and not inputs.rounding_account_code:
         refuse("rounding_account_required", "Finance must name the rounding account")
@@ -355,6 +379,20 @@ def compute(
                 "partition_gap": fmt(gap),
             }
         )
+    for period, sk_residue in units_mod.residue_by_period(e15).items():
+        cell = [r for r in rows if r["account"] == inputs.rounding_account_code and r["period"] == period]
+        in_cell = sum(
+            (
+                i.v2 - i.legacy
+                for i in inputs.items
+                if i.rule == units_mod.SUBKOBO_RULE
+                and i.item_id.endswith(f":{units_mod.RESIDUE}")
+                and i.period == period
+            ),
+            ZERO,
+        )
+        if len(cell) != 1 or in_cell != sk_residue:
+            refuse("subkobo_items_differ_from_rounding_cell", "T-SUBKOBO items must sum to the residue in the cell")
     proof = partition_proof(inputs)
     itemised = {
         "items": [i.as_dict() for i in inputs.items],
@@ -371,9 +409,18 @@ def compute(
             "opening_tb_sha256": opening_tb_sha,
             "ias8_sha256": ias8_sha,
             "import_itemised_sha256": import_sha,
+            # the receipt and the side files the T-STRADDLE / T-SUBKOBO items were derived from: signed with the body
+            "import_receipt_sha256": (side_binding or {}).get("import_receipt_sha256"),
+            "subkobo_side_file_sha256": (side_binding or {}).get("subkobo_side_file_sha256"),
+            "straddlers_side_file_sha256": (side_binding or {}).get("straddlers_side_file_sha256"),
         },
+        "gate_profile": gate_profile(),
         "control_lists": control_lists(),
         "rounding_account_code": inputs.rounding_account_code,
+        "units": {
+            "E15": units_mod.summary(e15, inputs.rounding_account_code),
+            "E39": units_mod.summary(e39),
+        },
         "rounding_residue_by_period": {p: fmt(v) for p, v in residue.items()},
         "rows": rows,
         "partition": proof,
