@@ -22,7 +22,7 @@ from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (host
 
 from erp_v2.claims_opening import cli, core, extract, reclass
 from erp_v2.claims_opening.reasons import ClaimsRefusal
-from erp_v2.claims_opening.verifier import ClaimOpeningVerifier
+from erp_v2.claims_opening.verifier import BACKFILL_PREFIX, ClaimOpeningVerifier
 from erp_v2.holdings import attribution as attr
 from erp_v2.holdings import positions
 from erp_v2.importer.payables_history import READ_FIELDS
@@ -40,9 +40,19 @@ POSTED_AT = datetime(2026, 1, 10, tzinfo=UTC)
 BOOLEANS = {"is_reversal"}
 SOURCE_TABLES = {
     "expense_claim": extract.CLAIM_FIELDS,
-    "journal_entry": READ_FIELDS["journal_entry"],
+    "journal_entry": [*READ_FIELDS["journal_entry"], "correlation_id"],
     "posted_ledger_line": READ_FIELDS["posted_ledger_line"],
 }
+
+
+@pytest.fixture(scope="module", autouse=True)
+def audit_registry():
+    from dotmac_kernel.audit_actions import AuditActionRegistry, install_audit_actions
+
+    from erp_v2.assembly import assembly
+    from erp_v2.claims_opening.audit import claims_opening_feature
+
+    install_audit_actions(AuditActionRegistry.from_manifests([*assembly.modules, claims_opening_feature]))
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +74,7 @@ def world(engine) -> SimpleNamespace:
                 AccountCategory.tenant_id == env.tenant_id, AccountCategory.account_class == AccountClass.LIABILITY
             )
         )
-        for code in ("2045", "2030", "2110"):
+        for code in ("2045", "2030", "2110", "6000"):
             row = Account(
                 tenant_id=env.tenant_id, category_id=cat.id, code=code, name=f"A{code}",
                 kind=AccountKind.POSTING, normal_balance=NormalBalance.CREDIT,
@@ -81,7 +91,10 @@ def post_opening(engine, env, day=CUTOFF):
     insert_journal(engine, env, uuid4(), owner="erp.opening", day=day)
 
 
-def insert_journal(engine, env, jid, *, owner="legacy-erp", day=date(2026, 1, 10)):
+def insert_journal(engine, env, jid, *, owner="legacy-erp", day=date(2026, 1, 10), lines=None):
+    """A POSTED destination journal; ``lines`` (code, debit, credit) mirror the legacy lines (default: a dummy pair)."""
+    lines = [(c, D(d), D(cr)) for c, d, cr in (lines or (("1000", 1, 0), ("4000", 0, 1)))]
+    total = sum(d for _c, d, _cr in lines)
     with Session(engine) as db:
         db.add(
             JournalEntry(
@@ -96,10 +109,10 @@ def insert_journal(engine, env, jid, *, owner="legacy-erp", day=date(2026, 1, 10
                 description="Legacy journal",
                 currency_code="NGN",
                 exchange_rate=D(1),
-                total_debit=D(1),
-                total_credit=D(1),
-                total_debit_functional=D(1),
-                total_credit_functional=D(1),
+                total_debit=total,
+                total_credit=total,
+                total_debit_functional=total,
+                total_credit_functional=total,
                 source_owner=owner,
                 source_document_kind="EXPENSE_CLAIM",
                 source_document_id=f"legacy:gl.journal_entry:{jid}",
@@ -112,7 +125,7 @@ def insert_journal(engine, env, jid, *, owner="legacy-erp", day=date(2026, 1, 10
             )
         )
         db.flush()
-        for n, (code, debit, credit) in enumerate((("1000", D(1), D(0)), ("4000", D(0), D(1))), 1):
+        for n, (code, debit, credit) in enumerate(lines, 1):
             db.add(
                 JournalLine(
                     tenant_id=env.tenant_id,
@@ -128,7 +141,7 @@ def insert_journal(engine, env, jid, *, owner="legacy-erp", day=date(2026, 1, 10
             )
         db.flush()
         for line in db.scalars(sa.select(JournalLine).where(JournalLine.journal_id == jid)):
-            code = "1000" if line.debit else "4000"
+            code = lines[line.line_number - 1][0]
             db.add(
                 PostedLedgerLine(
                     tenant_id=env.tenant_id,
@@ -187,11 +200,12 @@ class Scene:
         return eid
 
     def journal(self, lines, *, doc_type="EXPENSE_CLAIM", doc_id=None, day="2026-01-10", dest=True, ledger_day=None,
-                undated=False, tenant=None):  # fmt: skip
+                undated=False, tenant=None, correlation=None, dest_lines=None):  # fmt: skip
         """lines: (account code, debit, credit). Returns the legacy journal id (also the destination id)."""
         jid, tenant = uuid4(), tenant or self.env.tenant_id
         total = sum(D(d) for _c, d, _cr in lines)
-        row = dict.fromkeys(READ_FIELDS["journal_entry"])
+        row = dict.fromkeys([*READ_FIELDS["journal_entry"], "correlation_id"])
+        row["correlation_id"] = correlation
         row.update(
             journal_entry_id=str(jid), organization_id=str(tenant), journal_number=f"J-{jid.hex[:8]}",
             journal_type="STANDARD", status="POSTED", source_module="EXP", source_document_type=doc_type,
@@ -211,13 +225,13 @@ class Scene:
             )  # fmt: skip
             self.rows["posted_ledger_line"].append(line)
         if dest and tenant == self.env.tenant_id:
-            insert_journal(self.engine, self.env, jid)
+            insert_journal(self.engine, self.env, jid, lines=dest_lines or [(c, d, cr) for c, d, cr in lines])
         return jid
 
     def claim(self, *, net="100.00", carried="2110", reclass_to=None, posted=True, status="APPROVED", paid="0",
               dest=True, dest_journal=True, net_null=False, balance=None, currency="NGN", advance="0", employee="new",
               journal_day="2026-01-10", ledger_day=None, undated=False, credit_lines=None, reimb=None,
-              tenant=None, claim_id=None):  # fmt: skip
+              tenant=None, claim_id=None, backfill=0, reclass_backfill=False, dest_lines=None):  # fmt: skip
         """One legacy claim. ``carried``: the family account its claim journal credits; ``reclass_to``: a claim-linked
         RECLASS line pair moving the credit from ``carried`` to that account."""
         cid = claim_id or uuid4()
@@ -227,9 +241,17 @@ class Scene:
         if posted:
             lines = credit_lines or [("6000", net, "0"), (carried, "0", net)]
             jid = self.journal(lines, doc_id=cid, day=journal_day, dest=dest_journal, ledger_day=ledger_day,
-                               undated=undated, tenant=tenant)  # fmt: skip
-        if reclass_to:
-            self.journal([(carried, net, "0"), (reclass_to, "0", net)], doc_type="RECLASS", doc_id=cid)
+                               undated=undated, tenant=tenant, dest_lines=dest_lines)  # fmt: skip
+        link = BACKFILL_PREFIX + str(jid)
+        if reclass_to:  # a claim-linked RECLASS journal (optionally ALSO the backfill journal of the claim journal)
+            self.journal(
+                [(carried, net, "0"), (reclass_to, "0", net)], doc_type="RECLASS", doc_id=cid,
+                correlation=link if reclass_backfill else None,
+            )  # fmt: skip
+        for _ in range(backfill):  # legacy backfill reclass journal(s): no source_document_id, only the correlation
+            self.journal(
+                [(carried, net, "0"), ("2030", "0", net)], doc_type="EXPENSE_RECLASS_BACKFILL", correlation=link
+            )  # fmt: skip
         reimb_id = None
         if reimb is not None:
             reimb_id = self.journal(reimb, doc_type="EXPENSE_REIMBURSEMENT", doc_id=cid)
@@ -412,12 +434,14 @@ def test_p3_replay_is_a_no_op_and_a_different_plan_after_the_reclass_is_refused(
     plan = scene.plan()
     first = scene.apply(plan)
     before = counts(engine, env.tenant_id)
+    assert scene.plan()["window_closed"] is False  # the same set re-planned after the reclass
     again = scene.run(apply=True, digest=plan["digest"])  # the same reviewed plan
     assert again["replayed"] and again["journal_id"] == first["journal_id"] and again["admitted"] == 0
     assert counts(engine, env.tenant_id) == before
     scene.claim(net="40.00", carried="2110")  # a different plan: one more admissible claim
     scene.build()
     new_plan = scene.plan()
+    assert new_plan["window_closed"] is True and core.public_receipt(new_plan, mode="plan")["window_closed"] is True
     with pytest.raises(ClaimsRefusal) as e:
         scene.run(apply=True, digest=new_plan["digest"])
     assert e.value.reason == "historical_claim_window_closed"
@@ -490,7 +514,9 @@ def refusal_scene(engine, tmp_path, accepted=True):
     ids["journal_straddles_history_cutoff"] = scene.claim(net="100.00", ledger_day="2025-12-20")
     ids["destination_journal_missing"] = scene.claim(net="100.00", dest_journal=False)
     ids["owner_refused:claim_already_accepted"] = scene.claim(net="100.00")
-    ids["held2040"] = scene.claim(net="100.00", credit_lines=[("6000", "100.00", "0"), ("2040", "0", "90.00")])
+    ids["held2040"] = scene.claim(
+        net="100.00", credit_lines=[("6000", "100.00", "0"), ("2040", "0", "90.00"), ("1000", "0", "10.00")]
+    )
     scene.build()
     if not accepted:
         return env, scene, ids
@@ -772,3 +798,92 @@ def test_p14_the_verifier_cannot_write(engine, tmp_path):
         scene.run(apply=True, digest=plan["digest"], verifier_cls=Writer)
     assert isinstance(e.value.__cause__, InvalidCommand) and "must not write" in str(e.value.__cause__)
     assert counts(engine, env.tenant_id) == dict(claim_liabilities=0, historical_claim_receipts=0, reclass_journals=0)
+
+
+# --- review fixes: F1 (backfill reclass), F2 (N refusals carry the real net), F5 (audit), F7, F8 ------------------------
+
+
+def test_f1_a_backfill_only_reclass_moves_the_carried_account_and_a_linked_and_backfill_journal_counts_once(
+    engine, tmp_path
+):
+    env = world(engine)
+    scene = Scene(engine, env, tmp_path)
+    only = scene.claim(net="300.00", carried="2040", backfill=1)  # credited 2040, moved by the backfill journal only
+    both = scene.claim(net="200.00", carried="2040", reclass_to="2030", reclass_backfill=True)  # linked AND backfill
+    amb = scene.claim(net="50.00", carried="2040", backfill=2)  # two backfill journals: ambiguous
+    scene.build()
+    plan = scene.plan()
+    by = {d["legacy_claim_id"]: d for d in plan["detail"]}
+    assert by[str(only)]["outcome"] == "eligible" and by[str(only)]["carried_code"] == "2030"
+    assert by[str(both)]["outcome"] == "eligible" and by[str(both)]["carried_code"] == "2030"  # counted ONCE
+    assert by[str(amb)]["reason"] == "claim_reclass_ambiguous"
+    scene.apply(plan)
+    with Session(engine) as db:
+        journal = reclass.posted_reclass(db, env.tenant_id)
+        assert core.journal_dr(db, env.tenant_id, journal.id, env.accounts["2030"]) == D("500.00")
+        assert core.journal_dr(db, env.tenant_id, journal.id, env.accounts["2040"]) == D(0)
+
+
+def test_f2_the_no_net_payable_refusal_carries_its_real_net_and_a_2040_carrier_is_held(engine, tmp_path):
+    _env, scene = census_scene(engine, tmp_path)
+    plan = scene.plan()
+    (n,) = [d for d in plan["detail"] if d.get("reason") == "claim_net_payable_missing"]
+    assert (n["amount"], n["carried_code"]) == ("100.00", "2110") and n["amount"] != "0.00"
+    # a 2040-carried one reaches held_2040 at its GL-signed amount, keyed by the legacy employee id
+    env2 = world(engine)
+    (tmp_path / "b").mkdir()
+    scene2 = Scene(engine, env2, tmp_path / "b")
+    ok = scene2.claim(net="10.00")
+    nn = scene2.claim(net="75.00", carried="2040", net_null=True, dest=False)
+    scene2.build()
+    result = scene2.apply()
+    items = {i["key"]: i for i in result["items"]}
+    assert items[f"claim:{nn}"]["amount"] == "75.00" and items[f"claim:{nn}"]["gl_signed_minor"] == -7500
+    fragment = core.fragment_2040(result["admitted_items"], result["items"], D(0))
+    employee = next(r["employee_id"] for r in scene2.rows["expense_claim"] if r["claim_id"] == str(nn))
+    assert fragment["held_2040"][0]["key"] == employee and fragment["held_2040"][0]["amount"] == "-75.00"
+    assert str(ok) in {i.legacy_claim_id for i in result["admitted_items"]}
+
+
+def audit_events(engine, tenant):
+    from dotmac_kernel.audit import AuditEvent
+
+    with Session(engine) as db:
+        return list(
+            db.scalars(
+                sa.select(AuditEvent).where(
+                    AuditEvent.tenant_id == tenant, AuditEvent.action.like("erp.claims_opening.%")
+                )
+            )
+        )
+
+
+def test_f5_one_audit_event_per_apply_none_on_a_refused_apply_and_no_names(engine, tmp_path):
+    env = world(engine)
+    scene = Scene(engine, env, tmp_path)
+    scene.claim(net="100.00")
+    scene.build()
+    plan = scene.plan()
+    with pytest.raises(ClaimsRefusal):  # refused: wrong reviewed digest
+        scene.run(apply=True, digest="0" * 64)
+    assert audit_events(engine, env.tenant_id) == []
+    first = scene.apply(plan)
+    (event,) = audit_events(engine, env.tenant_id)
+    assert event.action == "erp.claims_opening.applied" and event.entity_id == first["journal_id"]
+    assert event.actor_id == OP and event.entity_type == "journal_entry"
+    blob = json.dumps(event.details)
+    assert plan["digest"] in blob and scene.claims[0] not in blob and "Zed Claimant" not in blob
+    assert str(next(iter(scene.employees.values()))) not in blob
+    scene.run(apply=True, digest=plan["digest"])  # replay
+    actions = sorted(e.action for e in audit_events(engine, env.tenant_id))
+    assert actions == ["erp.claims_opening.applied", "erp.claims_opening.replayed"]
+
+
+def test_f7_a_destination_journal_that_differs_from_the_legacy_family_lines_aborts(engine, tmp_path):
+    env = world(engine)
+    scene = Scene(engine, env, tmp_path)
+    scene.claim(net="100.00", dest_lines=[("6000", "100.00", "0"), ("2110", "0", "99.00"), ("1000", "0", "1.00")])
+    scene.build()
+    with pytest.raises(ClaimsRefusal) as e:
+        scene.plan()
+    assert e.value.reason == "claims_evidence_failure:destination_journal_differs"

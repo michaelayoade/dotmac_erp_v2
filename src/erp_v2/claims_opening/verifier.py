@@ -41,6 +41,8 @@ from erp_v2.importer.snapshot import SnapshotManifest
 SOURCE_OWNER = "erp.legacy"
 IMPORT_OWNER = "legacy-erp"  # the importer's journal owner in v2
 RECLASS_TYPE = "RECLASS"
+BACKFILL_PREFIX = "EXPENSE-RECLASS-BACKFILL-JE-"
+BACKFILL_FIELDS = ["journal_entry_id", "organization_id", "status", "correlation_id"]
 JOURNAL_DOMAIN = "erp.claims-opening.accounting.v1"
 FACTS_DOMAIN = "erp.claims-opening.facts.v1"
 SETTLEMENT_DOMAIN = "erp.claims-opening.reimbursement.v1"
@@ -170,7 +172,123 @@ class ClaimOpeningVerifier(HistoricalClaimLiabilityVerifier):
                 and found[0]["source_owner"] == IMPORT_OWNER,
                 "destination_journal_missing",
             )
+            landed = _read(dest, "posted_ledger_lines", schema="mod_accounting", key="journal_id", value=journal_id)
+
+            def family(rows, debit, credit):
+                return sorted(
+                    (str(r["account_code"]), Decimal(r[debit]), Decimal(r[credit]))
+                    for r in rows
+                    if str(r["account_code"]) in FAMILY
+                )
+
+            _require(
+                family(ledger, "debit_amount", "credit_amount") == family(landed, "debit", "credit"),
+                "destination_journal_differs",
+            )
         return journal, ledger, proof
+
+    def _backfill(self, tenant: UUID, journal_id: str, residual: Decimal | None) -> str | None:
+        """The legacy backfill reclass journal of ``journal_id`` (``correlation_id`` = prefix + the journal id, exact
+        match, tenant-filtered, POSTED), or None. More than one is ``claim_reclass_ambiguous``."""
+        rows = [
+            r
+            for r in _read(
+                self.source,
+                "journal_entry",
+                key="correlation_id",
+                value=BACKFILL_PREFIX + journal_id,
+                fields=BACKFILL_FIELDS,
+            )
+            if _equal(r["organization_id"], tenant) and str(r["status"]).strip().upper() == "POSTED"
+        ]
+        if len(rows) > 1:
+            raise ClaimEvidenceError("claim_reclass_ambiguous", None, residual)
+        return _id(rows[0]["journal_entry_id"]) if rows else None
+
+    def _gather(
+        self, tenant: UUID, claim: extract.ClaimRow, claim_id: UUID, dest: sa.Connection, *, strict: bool,
+        residual: Decimal | None,
+    ):  # fmt: skip
+        """The claim's legacy GL over the family: claim journal, reimbursement journal, the backfill reclass journal of
+        each of those, then the RECLASS lines citing the claim (a journal already counted is never counted twice).
+        -> (journals, credit-positive net per family account, settlements, claim journal posted_at)."""
+        src = self.source
+        journals: dict[str, tuple[dict, list[dict], dict | None]] = {}
+        settlements: list[HistoricalClaimSettlement] = []
+        nets: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
+
+        def add(net: dict[str, Decimal]) -> None:
+            for code, value in net.items():
+                nets[code] += value
+
+        def take(jid: str) -> None:
+            journals[jid] = self._journal(tenant, jid, dest)
+            add(_net(journals[jid][1]))
+
+        take(claim.journal_id)
+        posted_at = journals[claim.journal_id][0]["posted_at"]
+        _require(posted_at is not None, "journal_undated")
+        reimbursed = claim.reimbursement_journal_id
+        if reimbursed is not None and extract.journal_posted(src, reimbursed):
+            take(reimbursed)
+            if strict:
+                paid_gl = -sum(_net(journals[reimbursed][1]).values(), Decimal(0))
+                _require(paid_gl == claim.paid, "settlements_sum_mismatch")
+                if claim.paid > 0:
+                    settlements.append(
+                        HistoricalClaimSettlement(
+                            evidence_ref=f"journal:{reimbursed}",
+                            amount=claim.paid,
+                            evidence_fingerprint=_fingerprint(
+                                SETTLEMENT_DOMAIN, dict(journal=reimbursed, amount=format(claim.paid, "f"))
+                            ),
+                        )
+                    )
+        elif strict:
+            _require(claim.paid == 0, "reimbursement_not_posted")
+        for base in [j for j in (claim.journal_id, reimbursed) if j is not None and j in journals]:
+            backfill = self._backfill(tenant, base, residual)
+            if backfill is not None and backfill not in journals:
+                take(backfill)
+        cited = [
+            r
+            for r in _read(src, "posted_ledger_line", key="source_document_id", value=str(claim_id))
+            if str(r["source_document_type"]) == RECLASS_TYPE and _equal(r["organization_id"], tenant)
+        ]
+        by_journal: dict[str, list[dict]] = defaultdict(list)
+        for r in cited:
+            if _id(r["journal_entry_id"]) not in journals:
+                by_journal[_id(r["journal_entry_id"])].append(r)
+        for jid, lines in sorted(by_journal.items()):
+            journals[jid] = self._journal(tenant, jid, dest)
+            add(_net(lines))
+        return journals, dict(nets), settlements, posted_at
+
+    @staticmethod
+    def _facts_lines(journals) -> list[dict]:
+        return [
+            dict(
+                journal=jid,
+                lines=sorted(
+                    [str(r["account_code"]), format(r["debit_amount"], "f"), format(r["credit_amount"], "f")]
+                    for r in ledger
+                    if str(r["account_code"]) in FAMILY
+                ),
+            )
+            for jid, (_j, ledger, _p) in sorted(journals.items())
+        ]
+
+    def family_net(self, tenant: UUID, claim: extract.ClaimRow, db: Session) -> tuple[str | None, Decimal]:
+        """(carried code | None, credit-positive net) of a claim over the family, with NO residual check (the N
+        refusals). A net on several accounts gives (None, Σ)."""
+        with db.no_autoflush:
+            _journals, nets, _s, _p = self._gather(
+                tenant, claim, UUID(claim.claim_id), db.connection(), strict=False, residual=None
+            )
+        nonzero = {c: v for c, v in nets.items() if v != 0}
+        if len(nonzero) == 1:
+            return next(iter(nonzero.items()))
+        return None, sum(nonzero.values(), Decimal(0))
 
     def _evidence(self, tenant: UUID, claim_id: UUID, db: Session) -> HistoricalClaimLiabilityEvidence:
         src, dest = self.source, db.connection()
@@ -201,67 +319,10 @@ class ClaimOpeningVerifier(HistoricalClaimLiabilityVerifier):
         _require(target.currency_code == claim.currency, "destination_claim_missing")
         claimant: UUID = target.claimant_party_id
 
-        # legacy GL for the claim
-        journals: dict[str, tuple[dict, list[dict], dict | None]] = {}
-        settlements: list[HistoricalClaimSettlement] = []
-        nets: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
-        facts_lines: list[dict] = []
-
-        def add(net: dict[str, Decimal]) -> None:
-            for code, value in net.items():
-                nets[code] += value
-
-        journals[claim.journal_id] = self._journal(tenant, claim.journal_id, dest)
-        add(_net(journals[claim.journal_id][1]))
-        posted_at = journals[claim.journal_id][0]["posted_at"]
-        _require(posted_at is not None, "journal_undated")
-
-        if claim.reimbursement_journal_id is not None:
-            if extract.journal_posted(src, claim.reimbursement_journal_id):
-                rid = claim.reimbursement_journal_id
-                journals[rid] = self._journal(tenant, rid, dest)
-                reimb_net = _net(journals[rid][1])
-                add(reimb_net)
-                paid_gl = -sum(reimb_net.values(), Decimal(0))
-                _require(paid_gl == claim.paid, "settlements_sum_mismatch")
-                if claim.paid > 0:
-                    settlements.append(
-                        HistoricalClaimSettlement(
-                            evidence_ref=f"journal:{rid}",
-                            amount=claim.paid,
-                            evidence_fingerprint=_fingerprint(
-                                SETTLEMENT_DOMAIN, dict(journal=rid, amount=format(claim.paid, "f"))
-                            ),
-                        )
-                    )
-            else:
-                _require(claim.paid == 0, "reimbursement_not_posted")
-        else:
-            _require(claim.paid == 0, "reimbursement_not_posted")
-
-        cited = [
-            r
-            for r in _read(src, "posted_ledger_line", key="source_document_id", value=str(claim_id))
-            if str(r["source_document_type"]) == RECLASS_TYPE and _equal(r["organization_id"], tenant)
-        ]
-        by_journal: dict[str, list[dict]] = defaultdict(list)
-        for r in cited:
-            if _id(r["journal_entry_id"]) not in journals:
-                by_journal[_id(r["journal_entry_id"])].append(r)
-        for jid, lines in sorted(by_journal.items()):
-            journals[jid] = self._journal(tenant, jid, dest)
-            add(_net(lines))
-        for jid, (_j, ledger, _p) in sorted(journals.items()):
-            facts_lines.append(
-                dict(
-                    journal=jid,
-                    lines=sorted(
-                        [str(r["account_code"]), format(r["debit_amount"], "f"), format(r["credit_amount"], "f")]
-                        for r in ledger
-                        if str(r["account_code"]) in FAMILY
-                    ),
-                )
-            )
+        journals, nets, settlements, posted_at = self._gather(
+            tenant, claim, claim_id, dest, strict=True, residual=residual
+        )
+        facts_lines = self._facts_lines(journals)
 
         nonzero = {c: v for c, v in nets.items() if v != 0}
         if len(nonzero) > 1:

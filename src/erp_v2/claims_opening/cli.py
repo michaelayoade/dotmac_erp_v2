@@ -117,6 +117,10 @@ def _run(args) -> dict:
         operator_ref=operator,
         expenses_version=REQUIRED_EXPENSES_VERSION,
     )
+    if args.mode == "apply":
+        from erp_v2.claims_opening import audit as vocabulary
+
+        vocabulary.install()
     dest_engine = _safe_engine(destination_url)
     try:
         if args.mode == "verify":

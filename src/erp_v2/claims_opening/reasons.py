@@ -15,6 +15,7 @@ VERIFIER_REASONS: Final = (
     "legacy_claim_gl_unattributable",
     "claim_carried_split",
     "claim_carried_outside_family",
+    "claim_reclass_ambiguous",
     "reimbursement_not_posted",
     "settlements_sum_mismatch",
     "claim_advance_unproven",
@@ -27,6 +28,18 @@ VERIFIER_REASONS: Final = (
     "cutoff_opening_not_posted",
     "destination_journal_missing",
 )
+# Run or integrity faults (never a per-claim business refusal): they ABORT the plan, nothing is written, and a
+# rerun after the fix self-heals. ``account_missing:<code>`` is the one prefixed member. Closed and test-enforced.
+ABORT_REASONS: Final = frozenset(
+    {
+        "command_source_owner", "command_snapshot", "command_source_claim", "command_fingerprint",
+        "source_connection_required", "destination_session_required", "destination_dirty_session",
+        "scope_tenant_required", "tenant_extent", "claim_journal_tenant", "source_claim_missing",
+        "cutoff_journal_present_in_destination", "destination_journal_differs", "claim_amount_invalid",
+        "census_partition_incomplete", "source_table_resolution",
+    }
+)  # fmt: skip
+ABORT_PREFIXES: Final = ("account_missing:",)
 OWNER_CODES: Final = (
     "historical_claim_not_open",
     "legacy_gl_does_not_hold_claim",

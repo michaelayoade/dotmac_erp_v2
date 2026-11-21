@@ -23,7 +23,15 @@ from dotmac_expenses.models import (
 from sqlalchemy.orm import Session
 
 from erp_v2.claims_opening import extract, reclass
-from erp_v2.claims_opening.reasons import FAMILY, FUNCTIONAL, OWNER_CODES, REASONS, ClaimsRefusal
+from erp_v2.claims_opening.reasons import (
+    ABORT_PREFIXES,
+    ABORT_REASONS,
+    FAMILY,
+    FUNCTIONAL,
+    OWNER_CODES,
+    REASONS,
+    ClaimsRefusal,
+)
 from erp_v2.claims_opening.verifier import ClaimEvidenceError, ClaimOpeningVerifier, carried_code_of
 from erp_v2.holdings import plan as holdings_plan
 from erp_v2.migration_ledger.common import canonical_sha, fmt
@@ -71,7 +79,9 @@ def _claimant_of(db: Session, tenant: UUID, claim_id: str) -> str | None:
 
 def _refusal(db, tenant, row: extract.ClaimRow, reason: str, carried: str | None, amount: Decimal | None) -> dict:
     if reason not in REASONS:
-        raise ClaimsRefusal(f"claims_evidence_failure:{reason}")
+        if reason in ABORT_REASONS or reason.startswith(ABORT_PREFIXES):
+            raise ClaimsRefusal(f"claims_evidence_failure:{reason}")  # a run or integrity fault: abort, write nothing
+        raise ClaimsRefusal(f"claims_reason_unmapped:{reason}")  # a code bug: the reason is in no closed set
     value = amount if amount is not None else extract.owed(row)
     return dict(
         outcome="refused",
@@ -86,7 +96,6 @@ def _refusal(db, tenant, row: extract.ClaimRow, reason: str, carried: str | None
 
 def classify(db: Session, scope, verifier: ClaimOpeningVerifier, row: extract.ClaimRow, admitted_at: datetime) -> dict:
     """eligible / already_done / refused for one bucket A claim. Read only: nothing is written."""
-    from dotmac_expenses.contracts import HistoricalClaimLiabilityCommand  # noqa: F401
     from dotmac_expenses.liability import _check_historical_evidence
 
     tenant = scope.tenant_id
@@ -148,7 +157,11 @@ def build_plan(
     detail = [classify(db, scope, verifier, r, admitted_at) for r in rows]
     for claim_id in census.n_posted:  # N with a POSTED journal: refused, never guessed
         row = next(r for r in census.buckets[extract.BUCKET_N] if r.claim_id == claim_id)
-        detail.append(_refusal(db, tenant, row, "claim_net_payable_missing", None, Decimal(0)))
+        try:  # the claim's REAL family net and carried account (no residual check): E37 amount, held_2040
+            carried, net = verifier.family_net(tenant, row, db)
+        except ClaimEvidenceError as exc:
+            carried, net = exc.carried_code, exc.amount if exc.amount is not None else Decimal(0)
+        detail.append(_refusal(db, tenant, row, "claim_net_payable_missing", carried, net))
     detail.sort(key=lambda d: d["legacy_claim_id"])
     eligible = [d for d in detail if d["outcome"] == "eligible"]
     done = [d for d in detail if d["outcome"] == "already_done"]
@@ -165,7 +178,9 @@ def build_plan(
     totals = {}
     for code in FAMILY:
         subset = [
-            Decimal(d.get("residual") or d["amount"]) for d in (*admitted_rows, *refused) if d["carried_code"] == code
+            Decimal(d.get("residual") or d["amount"])
+            for d in (*admitted_rows, *refused)
+            if d["carried_code"] == code and d.get("reason") != "claim_net_payable_missing"
         ]
         totals[code] = dict(count=len(subset), sum=_money(sum(subset, Decimal(0))))
     a_count, a_sum, _ = census.totals(extract.BUCKET_A)
@@ -177,9 +192,17 @@ def build_plan(
     refused_sum = sum((Decimal(d["amount"]) for d in refused if d["reason"] != "claim_net_payable_missing"), Decimal(0))
     refused_a = [d for d in refused if d["reason"] != "claim_net_payable_missing"]
     employees_a = len({r.employee_id for r in rows if r.employee_id})
+    existing = reclass.posted_reclass(db, tenant)
+    plan_fp = (
+        reclass.set_fingerprint(items, currency=FUNCTIONAL, snapshot_sha256=verifier.snapshot_sha256)
+        if items and not eligible
+        else None
+    )
     body = dict(
         version=1,
         kind="claims-opening-plan",
+        # the reclass is posted and this plan is not that set: apply would refuse historical_claim_window_closed
+        window_closed=existing is not None and not (plan_fp is not None and existing.source_fingerprint == plan_fp),
         bindings=bindings,
         window_id=window_id,
         capture_date=capture_date.isoformat(),
@@ -206,9 +229,7 @@ def build_plan(
         ),
         refusals_by_reason=dict(sorted(Counter(d["reason"] for d in refused).items())),
         # Only known when every admission already exists (liability ids are owner-generated): the replay case.
-        set_fingerprint=reclass.set_fingerprint(items, currency=FUNCTIONAL, snapshot_sha256=verifier.snapshot_sha256)
-        if items and not eligible
-        else None,
+        set_fingerprint=plan_fp,
         detail=detail,
     )
     body["digest"] = plan_digest(body)
@@ -223,7 +244,9 @@ def plan_digest(body: dict) -> str:
         row = {k: v for k, v in d.items() if k not in ("outcome", "liability_id")}
         row["admitted"] = d["outcome"] != "refused"
         detail.append(row)
-    view = {k: v for k, v in body.items() if k not in ("digest", "detail", "counts", "set_fingerprint")}
+    view = {
+        k: v for k, v in body.items() if k not in ("digest", "detail", "counts", "set_fingerprint", "window_closed")
+    }
     view["detail"] = detail
     view["admitted_count"] = sum(1 for d in detail if d["admitted"])
     return canonical_sha(view)
@@ -237,6 +260,7 @@ def public_receipt(plan: dict, *, mode: str) -> dict:
         production_ready=False,
         bindings=plan["bindings"],
         plan_digest=plan["digest"],
+        window_closed=plan["window_closed"],
         buckets=plan["buckets"],
         carried_split=plan["carried_split"],
         completeness=plan["completeness"],
@@ -296,10 +320,12 @@ def apply_plan(
                 for d in plan["detail"]
                 if d["outcome"] == "already_done"
             ]  # fmt: skip
-            return dict(
+            out = dict(
                 plan=plan, replayed=True, journal_id=str(existing.id), items=_items(plan), admitted=0,
                 admitted_items=replay_items, accounts=reclass.account_ids(db, tenant),
             )  # fmt: skip
+            audit(db, tenant, out, operator=verifier.operator_ref)
+            return out
         raise ClaimsRefusal("historical_claim_window_closed")
     accounts = reclass.account_ids(db, tenant)
     liability_ref = str(accounts["2045"])
@@ -360,10 +386,44 @@ def apply_plan(
         now=now,
     )
     reclass.postcondition(db, tenant, result.journal_id, accounts)
-    return dict(
+    out = dict(
         plan=plan, replayed=False, journal_id=str(result.journal_id), items=_items(plan), admitted=admitted,
-        admitted_items=items, accounts=accounts,
+        admitted_items=items, accounts=accounts, set_fingerprint=consequence.fingerprint,
     )  # fmt: skip
+    audit(db, tenant, out, operator=verifier.operator_ref)
+    return out
+
+
+def audit(db: Session, tenant: UUID, result: dict, *, operator: str) -> None:
+    """ONE audit event per apply (inside the transaction): entity = the reclass journal, actor = the operator,
+    metadata = digests and counts only (no claim, employee or party ids, no names)."""
+    from dotmac_kernel.audit import write_audit_event
+
+    from erp_v2.claims_opening import audit as vocabulary
+
+    plan = result["plan"]
+    admitted = [d for d in plan["detail"] if d["outcome"] != "refused"]
+    write_audit_event(
+        db,
+        tenant_id=tenant,
+        actor_type="service",
+        actor_id=operator,
+        actor_label=operator,
+        source_application=vocabulary.SOURCE_APPLICATION,
+        action=vocabulary.AUDIT_REPLAYED if result["replayed"] else vocabulary.AUDIT_APPLIED,
+        entity_type="journal_entry",
+        entity_id=result["journal_id"],
+        is_success=True,
+        details=dict(
+            plan_digest=plan["digest"],
+            window_id=plan["window_id"],
+            admitted=len(admitted),
+            refused=plan["counts"]["refused"],
+            sum=_money(sum((Decimal(d["residual"]) for d in admitted), Decimal(0))),
+            set_fingerprint=result.get("set_fingerprint") or plan["set_fingerprint"],
+            replayed=result["replayed"],
+        ),
+    )
 
 
 def journal_dr(db: Session, tenant: UUID, journal_id: UUID | str, account_id: UUID) -> Decimal:

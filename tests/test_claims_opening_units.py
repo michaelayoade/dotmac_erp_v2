@@ -9,7 +9,15 @@ from uuid import uuid4
 import pytest
 
 from erp_v2.claims_opening import core, extract, reclass
-from erp_v2.claims_opening.reasons import EXTRACT_REASONS, OWNER_REASONS, REASONS, VERIFIER_REASONS, ClaimsRefusal
+from erp_v2.claims_opening.reasons import (
+    ABORT_PREFIXES,
+    ABORT_REASONS,
+    EXTRACT_REASONS,
+    OWNER_REASONS,
+    REASONS,
+    VERIFIER_REASONS,
+    ClaimsRefusal,
+)
 from erp_v2.holdings.attribution import parse_gl_attribution
 from erp_v2.migration_ledger import register
 from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha
@@ -118,19 +126,61 @@ def test_u5_every_refusal_reason_is_an_e37_row_and_an_unknown_one_is_refused():
     with pytest.raises(LedgerRefused) as e:
         register.from_claims_opening(stale)
     assert e.value.code == "claims_opening_sha_mismatch"
-    # every reason the extract and the verifier can raise is in the closed table (a new one is a test failure)
+    # F3: every reason a claim can raise is in a CLOSED set (row-level REASONS or the ABORT run faults), the two are
+    # disjoint, and an unmapped one is a code bug (claims_reason_unmapped), never an E37 row
     src = Path(__file__).resolve().parent.parent / "src" / "erp_v2" / "claims_opening"
+    import ast
+
+    def literal(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr) and node.values and isinstance(node.values[0], ast.Constant):
+            return node.values[0].value  # f"account_missing:{code}" -> the prefix
+        return None
+
     raised = set()
-    for name in ("verifier.py", "core.py", "extract.py"):
-        raised |= set(
-            re.findall(
-                r'(?:_require\([^"]*?|ClaimEvidenceError\(|_refusal\([^"]*?)"([a-z_:]+)"', (src / name).read_text()
-            )
-        )
-    row_level = {r for r in raised if r in REASONS or r.startswith("owner_refused")}
-    assert {"claim_net_payable_missing", "claim_carried_split", "owner_refused:historical_claim_not_open"} <= row_level
+    for name in ("verifier.py", "extract.py", "core.py"):
+        for node in ast.walk(ast.parse((src / name).read_text())):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name | ast.Attribute):
+                continue
+            fn = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+            if fn in ("_require", "_cutoff_require") and len(node.args) == 2:
+                found = literal(node.args[1])
+            elif fn in ("ClaimEvidenceError", "ExtractRefused") and node.args:
+                found = literal(node.args[0])
+            elif fn == "_refusal" and len(node.args) >= 4:
+                found = literal(node.args[3])
+            else:
+                continue
+            if found is not None:
+                raised.add(found)
+    assert len(raised) > 25
+    assert raised <= REASONS | ABORT_REASONS | {r for r in raised if r.startswith(ABORT_PREFIXES)}, sorted(
+        raised - REASONS - ABORT_REASONS
+    )
+    assert not REASONS & ABORT_REASONS
     assert set(EXTRACT_REASONS + VERIFIER_REASONS + OWNER_REASONS) == REASONS
+    row = extract.ClaimRow("c", "e", "APPROVED", "NGN", D("1"), D("0"), D("1"), D("0"), "j", None)
+    with pytest.raises(ClaimsRefusal) as e:
+        core._refusal(None, None, row, "made_up_reason", None, None)
+    assert e.value.reason == "claims_reason_unmapped:made_up_reason"
+    with pytest.raises(ClaimsRefusal) as e:
+        core._refusal(None, None, row, "tenant_extent", None, None)
+    assert e.value.reason == "claims_evidence_failure:tenant_extent"
     assert canonical_sha({"a": 1}) == canonical_sha({"a": 1})
+
+
+def test_f6_the_expenses_version_and_the_private_owner_check_are_pinned():
+    import inspect
+    from importlib.metadata import version
+
+    from dotmac_expenses.liability import _check_historical_evidence
+
+    # plan time previews the owner's checks through a private function: a bump must fail HERE, not at runtime
+    assert version("dotmac-expenses") == "0.1.0a2"
+    params = inspect.signature(_check_historical_evidence).parameters
+    assert list(params) == ["evidence", "tenant_id", "command", "admitted_at"]
+    assert all(p.kind is p.KEYWORD_ONLY for n, p in params.items() if n != "evidence")
 
 
 def test_only_claims_opening_reclass_builds_the_claim_family_kind():

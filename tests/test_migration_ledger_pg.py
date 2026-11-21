@@ -549,12 +549,11 @@ def gate(engine, env):
 
 @pytest.fixture
 def owners_available(monkeypatch):
-    """The owner subledger not built in v2 yet (1400) stands in as zero; the gate REFUSES without it (2045 is real)."""
+    """The owner subledger not built in v2 yet (1400) stands in as zero; the gate REFUSES without it."""
     from erp_v2.migration_ledger import ledger_check
 
     zero = lambda db, tenant: Decimal(0)  # noqa: E731
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "1400", zero)
-    monkeypatch.setitem(ledger_check._SUBLEDGERS, "2045", zero)
     # tests of the other reasons: the unbuilt checks (None) become no-ops; the built ones stay (see the unbuilt tests)
     monkeypatch.setattr(
         register, "AS_IS_V1_CHECKS", {k: v or (lambda db, tenant: []) for k, v in register.AS_IS_V1_CHECKS.items()}
