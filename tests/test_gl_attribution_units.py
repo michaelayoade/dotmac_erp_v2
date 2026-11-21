@@ -422,3 +422,15 @@ def test_f1_sources_require_declaration_unit():
         with pytest.raises(LedgerRefused) as e:
             acli.Sources(**kwargs).require()
         assert e.value.code == code
+
+
+def test_only_claims_opening_builds_or_posts_the_reclass_journal():
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "erp_v2"
+    offenders = [
+        str(p.relative_to(src))
+        for p in src.rglob("*.py")
+        if "claims_opening" not in p.parts and ("reclass.build(" in p.read_text() or "reclass.post(" in p.read_text())
+    ]
+    assert offenders == []

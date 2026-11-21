@@ -33,9 +33,9 @@ from dotmac_accounting.contracts import JournalStatus
 from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
 from sqlalchemy.orm import Session
 
+from erp_v2.claims_opening import reclass
 from erp_v2.holdings.attribution import Party
 from erp_v2.holdings.models import (
-    KIND_CLAIM_RECLASS,
     KIND_HOLDING_POST,
     KIND_RELEASE_POST,
     KIND_STRADDLE_POST,
@@ -78,7 +78,7 @@ def classify_v2(code: str, owner: str, kind: str | None) -> str:
             return refuse(f"straddle_on_control:{code}")
         if kind in rules.SUBKOBO_KINDS:
             return "legacy"
-        if kind == KIND_CLAIM_RECLASS:
+        if reclass.is_reclass_journal(owner, kind):
             return "claim_reclass"
     if owner == MANUAL_OWNER and kind == ROUNDING_KIND:
         return "rounding"
@@ -214,16 +214,7 @@ class Sources:
 
 def _s8_journals(db: Session, tenant: UUID) -> list[str]:
     """Every claim-family reclass journal of the tenant (any control code it touches)."""
-    return sorted(
-        str(i)
-        for i in db.scalars(
-            sa.select(JournalEntry.id).where(
-                JournalEntry.tenant_id == tenant,
-                JournalEntry.source_owner == OWNER,
-                JournalEntry.source_document_kind == KIND_CLAIM_RECLASS,
-            )
-        )
-    )
+    return reclass.reclass_journal_ids(db, tenant)
 
 
 def _check_s8_receipt(raw: bytes, fragment_sha: str | None, *, tenant: UUID, snapshot_sha: str, v2_journals: list[str]):

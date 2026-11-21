@@ -194,5 +194,4 @@ def test_only_claims_opening_reclass_builds_the_claim_family_kind():
         "holdings/models.py",  # the constant and POSTING_KINDS
         "posting/rules.py",  # the reviewed RefPolicy entry
         "claims_opening/reclass.py",  # the one builder (queries read it back by the same constant)
-        "migration_ledger/attribution_cli.py",  # READS the journal (classifies it, looks up its id); never builds it
     }
