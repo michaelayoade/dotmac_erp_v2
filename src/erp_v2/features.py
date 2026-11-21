@@ -15,6 +15,7 @@ from erp_v2.banking.routes import banking_web_feature
 from erp_v2.banking.statement_routes import banking_statements_feature
 from erp_v2.billing_gl.feature import billing_gl_feature
 from erp_v2.cash_gl.routes import cash_gl_feature
+from erp_v2.customers_web.routes import customers_web_feature
 from erp_v2.governance.policy import governance_feature
 from erp_v2.journals.routes import journals_web_feature
 from erp_v2.payees.routes import payee_bank_feature
@@ -36,6 +37,7 @@ ERP_FEATURES: tuple[FeatureManifest, ...] = (
     erp_web_feature,
     revenue_web_feature,
     receivables_producer_feature,
+    customers_web_feature,
     revenue_approval_feature,
     credit_note_feature,
     legacy_reentry_feature,

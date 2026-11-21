@@ -452,7 +452,7 @@ def test_receivables_permissions_are_declared_for_the_finance_roles_only():
     declared = {spec.code: set(spec.default_roles) for spec in access.PERMISSION_SPECS}
     assert declared[routes.READ] == {"finance_preparer", "finance_approver"}  # a poster can review a draft
     assert not {"admin", "staff"} & declared[routes.READ]
-    assert access.PROFILE_VERSION == 6
+    assert access.PROFILE_VERSION == 7
     assert declared[routes.PREPARE] == {"finance_preparer"}
     assert declared[routes.POST] == {"finance_approver"}
     assert not {"admin", "staff"} & (declared[routes.PREPARE] | declared[routes.POST])
@@ -741,8 +741,8 @@ def test_migration_revision_chain_and_head():
     assert migration.revision == "e2_0032_ar_producer"
     assert migration.down_revision == "e2_0031_billing_fact_postings"
     assert "e2_0032_ar_producer" not in EXPECTED_HEADS  # e2_0033 (B-15 rev 2 VAT) chains after it
-    assert "e2_0033_billing_gl_vat" in EXPECTED_HEADS
-    assert not any(h.startswith("e2_003") and h != "e2_0033_billing_gl_vat" for h in EXPECTED_HEADS)  # one e2 head
+    assert "e2_0035_customer_finance" in EXPECTED_HEADS  # the customer screen is the one e2 head
+    assert not any(h.startswith("e2_003") and h != "e2_0035_customer_finance" for h in EXPECTED_HEADS)  # one e2 head
 
 
 def test_the_gate_check_module_is_read_only():
@@ -825,9 +825,18 @@ def test_manual_basis_is_verified_and_names_the_manual_policy():
     assert basis.override_actor == "p" and basis.override_reason
 
 
-def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms(monkeypatch):
-    cfg = _complete_settings()
+def test_the_customer_screen_seams_fall_back_to_the_tenant_terms_and_the_name_snapshot(monkeypatch):
+    from erp_v2.customers_web import queries as customer_queries
+    from erp_v2.customers_web import terms as customer_terms
+
+    cfg = replace(_complete_settings(), terms={"net_30": 30, "net_14": 14})
+    monkeypatch.setattr(customer_terms, "code_for", lambda db_, tenant, customer: None)  # no customer code recorded
+    monkeypatch.setattr(customer_queries, "finance", lambda db_, tenant, customer: None)  # no finance row recorded
     assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_30"
+    monkeypatch.setattr(customer_terms, "code_for", lambda db_, tenant, customer: "net_14")
+    assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_14"  # a configured customer code
+    monkeypatch.setattr(customer_terms, "code_for", lambda db_, tenant, customer: "gone")
+    assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_30"  # no longer configured
     # resolved at create/update and stored; issue reads only the stored code
     monkeypatch.setattr(service.settings, "load", lambda db_, tenant: cfg)
     assert service.resolve_terms_code(Mock(), uuid4(), service.KIND_INVOICE, uuid4(), None) == "net_30"
@@ -842,5 +851,5 @@ def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms(monkeyp
         with pytest.raises(service.ArRefused) as e:
             service._stored_terms_code(SimpleNamespace(payment_terms_code=bad), cfg)
         assert e.value.code == refusal
-    snap = service._customer_document_snapshot(Mock(), uuid4(), SimpleNamespace(display_name="Acme"))
+    snap = service._customer_document_snapshot(Mock(), uuid4(), SimpleNamespace(id=uuid4(), display_name="Acme"))
     assert snap.legal_name == "Acme"

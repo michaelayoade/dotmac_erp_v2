@@ -495,7 +495,9 @@ def test_downgrade_refuses_while_rows_exist(engine):
     with pytest.raises(RuntimeError, match="refusing to drop"):
         command.downgrade(cfg, "e2_0031_billing_fact_postings")
     with engine.connect() as c:
-        assert "e2_0033_billing_gl_vat" in {r[0] for r in c.execute(sa.text("SELECT version_num FROM alembic_version"))}
+        assert "e2_0035_customer_finance" in {
+            r[0] for r in c.execute(sa.text("SELECT version_num FROM alembic_version"))
+        }
 
 
 # --- the producer --------------------------------------------------------------
