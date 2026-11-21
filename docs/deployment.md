@@ -348,6 +348,22 @@ this does not authorize adjusting balances or switching traffic.
   Written only by the operator CLIs `opening_cli`, `bridge_report` and `exceptions_register`. No new permission,
   role profile bump or environment variable for the serving runtime. The operator switch
   `ERP_MIGRATION_LEDGER_APPLY=1` is read by the CLIs only.
+- AR opening admissions (`docs/mapping-billing.md`) adds the head `e2_0029_ar_opening_admissions` (chained after
+  `e2_0028_migration_ledger`; `e2_0030` is reserved for B-14 holdings): `erp_ar_opening_admissions` (RLS forced,
+  runtime SELECT only, immutable rows, downgrade refuses with rows) and the NOLOGIN role
+  `erp_billing_opening_writer` with exactly the billing R5 grants. The migration grants NO membership of that role
+  (not to the pipeline migrator): Michael grants the operator `WITH SET TRUE, INHERIT FALSE` for the window only and
+  revokes it after the seal. It refuses an existing role with login, superuser, bypassrls, createrole, createdb,
+  replication or any membership, and PostgreSQL below 15. The migration role needs CREATEROLE only if the role does
+  not exist yet (migrations are run by an operator as `erp_owner`, never by the deploy pipeline); production and rehearsal use runbook R1 (a superuser pre-creates the role; `docs/mapping-billing.md`),
+  because `app_admin` reaches `erp_owner`'s would-be ADMIN row. Membership is cluster-global: confirm the ERP cluster is not the CP cluster first.
+- AR producer (B-16; `docs/ar-producer.md`) adds the head `e2_0032_ar_producer` (follows `e2_0031`): four tables, `erp_ar_drafts`, `erp_ar_draft_lines`,
+  `erp_ar_line_accounts` and `erp_ar_receipts` (RLS forced; W5: runtime column-limited UPDATE on drafts, DML on draft
+  lines bounded by a trigger, SELECT and INSERT only on the other two; append-only triggers; the downgrade refuses while
+  any row exists), and three permissions (`erp.finance.receivables.prepare` for finance_preparer, `...post` for
+  finance_approver, `...read` for both so a poster can review a draft; admin and staff hold none) with the role
+  profile `erp.web` version 6. Needs the billing a13 command surface (unreleased; S9). Off by
+  default: `ar.producer.enabled` is set in the UI at F10 together with `billing_gl.enabled`. No environment variable.
 - Statutory payees (PR-4b; `docs/payee-bank-instructions.md`) adds the head `e2_0024_statutory_payees` (after
   `e2_0023_staff_loan_entries`): one CHECK on `payee_bank_instructions` widened to allow kind `statutory`. The e2
   head in this section moves to it. Before the first statutory remittance Finance proposes and approves one

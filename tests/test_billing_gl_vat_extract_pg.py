@@ -142,30 +142,43 @@ def test_the_legacy_reader_and_derivation_end_to_end(engine, legacy):
     assert vx.seal({**again[0], "tenant_id": body["tenant_id"]}) == vx.seal(body)  # deterministic re-run
 
 
+def _superuser_engine(engine):
+    """The same database as a superuser (the fixture's owner role cannot relax FK triggers); disposed by the caller."""
+    import os
+
+    url = sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]).set(database=engine.url.database)
+    return sa.create_engine(url, hide_parameters=True)
+
+
 def test_the_destination_reader_refuses_without_admissions_or_on_a_different_snapshot(engine):
     tenant = uuid4()
-    with Session(engine) as db:
-        assert db.scalar(sa.text("SELECT to_regclass('public.erp_ar_opening_admissions') IS NOT NULL")) is False
-        with pytest.raises(LedgerRefused) as unavailable:
-            vx.read_carried(db, tenant, "a" * 64)
+    # The real e2_0029 table exists at the head; every statement below runs in a transaction that is rolled back.
+    with _superuser_engine(engine).connect() as conn:
+        conn.exec_driver_sql("DROP TABLE public.erp_ar_opening_admissions")  # DDL is transactional: rolled back below
+        with Session(bind=conn) as db:
+            assert db.scalar(sa.text("SELECT to_regclass('public.erp_ar_opening_admissions') IS NOT NULL")) is False
+            with pytest.raises(LedgerRefused) as unavailable:
+                vx.read_carried(db, tenant, "a" * 64)
+        conn.rollback()
     assert unavailable.value.code == "ar_admissions_unavailable"
-    with engine.begin() as conn:
-        conn.exec_driver_sql(
-            "CREATE TABLE public.erp_ar_opening_admissions "
-            "(tenant_id uuid, billing_receipt_id uuid, snapshot_sha256 text)"
-        )
+    digest = "b" * 64
+    with _superuser_engine(engine).connect() as conn:
+        conn.exec_driver_sql("SET LOCAL session_replication_role = replica")  # the tenant FK is not under test
         conn.execute(
-            sa.text("INSERT INTO public.erp_ar_opening_admissions VALUES (:t, gen_random_uuid(), :s)"),
-            {"t": tenant, "s": "b" * 64},
+            sa.text(
+                "INSERT INTO public.erp_ar_opening_admissions (id, tenant_id, source_account_key, currency, "
+                "billing_account_id, billing_receipt_id, posting_group_id, window_id, command_digest, "
+                "manifest_fingerprint, census_sha256, snapshot_sha256, plan_sha256, applied_by) "
+                "VALUES (gen_random_uuid(), :t, 'k', 'NGN', gen_random_uuid(), gen_random_uuid(), "
+                "gen_random_uuid(), gen_random_uuid(), :d, :d, :d, :d, :d, 'tester')"
+            ),
+            {"t": tenant, "d": digest},
         )
-    try:
-        with Session(engine) as db:
+        with Session(bind=conn) as db:
             with pytest.raises(LedgerRefused) as mismatch:
                 vx.read_carried(db, tenant, "a" * 64)
             assert mismatch.value.code == "snapshot_mismatch"
-    finally:
-        with engine.begin() as conn:
-            conn.exec_driver_sql("DROP TABLE public.erp_ar_opening_admissions")
+        conn.rollback()
 
 
 def test_the_v2_readers_return_zero_on_an_empty_estate(engine):
@@ -234,21 +247,24 @@ def test_read_v2_opening_sums_only_the_opening_owners_on_the_named_accounts(engi
 
 def test_read_ap_positions_filters_the_tenant_explicitly(engine):
     tenant, other, ref = uuid4(), uuid4(), str(uuid4())
-    with engine.begin() as conn:
-        conn.exec_driver_sql(
-            "CREATE TABLE mod_payables.historical_tax_deferrals "
-            "(tenant_id uuid, deferral_account_ref text, remaining numeric)"
-        )
+    # The real payables a6 table exists; its supplier-invoice and tenant FKs are not under test, so the rows go in
+    # under replica role inside a transaction that is rolled back.
+    with _superuser_engine(engine).connect() as conn:
+        conn.exec_driver_sql("SET LOCAL session_replication_role = replica")
         for t, amount in ((tenant, "5.00"), (tenant, "2.50"), (other, "100.00")):
             conn.execute(
-                sa.text("INSERT INTO mod_payables.historical_tax_deferrals VALUES (:t, :r, :a)"),
+                sa.text(
+                    "INSERT INTO mod_payables.historical_tax_deferrals (id, tenant_id, invoice_id, "
+                    "deferral_account_ref, source_owner, source_invoice_id, source_snapshot_sha256, "
+                    "evidence_fingerprint, facts_fingerprint, accounting_evidence_fingerprint, deferred_tax_total, "
+                    "released_before_admission, remaining, evidence, admitted_at) "
+                    "VALUES (gen_random_uuid(), :t, gen_random_uuid(), :r, 'o', 'i', 's', 'e', 'f', 'a', :a, 0, :a, "
+                    "'{}', now())"
+                ),
                 {"t": t, "r": ref, "a": amount},
             )
-    try:
-        with Session(engine) as db:
+        with Session(bind=conn) as db:
             assert vx.read_ap_positions(db, tenant, [ref]) == D("7.50")  # the other tenant's 100.00 is never summed
             assert vx.read_ap_positions(db, other, [ref]) == D("100.00")
             assert vx.read_ap_positions(db, tenant, [str(uuid4())]) == D(0)
-    finally:
-        with engine.begin() as conn:
-            conn.exec_driver_sql("DROP TABLE mod_payables.historical_tax_deferrals")
+        conn.rollback()

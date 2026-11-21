@@ -32,6 +32,8 @@ from dotmac_billing import (
     ListAccountingFactsV1,
     SummarizeAccountingFactWindowV1,
     get_accounting_fact_v1,
+    get_accounting_fact_v2,
+    get_accounting_fact_v3,
     get_accounting_fact_v4,
     get_accounting_fact_v5,
     get_opening_window_seal,
@@ -284,6 +286,30 @@ class Mapper:
                 settlement_ids=tuple(dict.fromkeys(a.settlement_id for a in fact.allocations)),
                 reverses_fact_id=fact.reverses_fact_id,
                 source_ref=fact.source_ref,
+                **base,
+            )
+        if version == 2:
+            v2 = get_accounting_fact_v2(self.db, scope=self.scope, fact_id=cursor.fact_id)
+            moneys2 = [e.amount_delta for e in v2.effects]
+            return FactView(
+                currency=moneys2[0].currency.code if moneys2 else None,
+                committed_at=v2.committed_at,
+                effects=tuple(Effect(e.lane, e.amount_delta.amount) for e in v2.effects),
+                settlement_ids=tuple(
+                    dict.fromkeys(d.settlement_id for d in v2.withholding_discharges if d.settlement_id is not None)
+                ),
+                reverses_fact_id=v2.reverses_fact_id,
+                source_ref=v2.source_ref,
+                **base,
+            )
+        if version == 3:
+            v3 = get_accounting_fact_v3(self.db, scope=self.scope, fact_id=cursor.fact_id)
+            moneys3 = [e.amount_delta for e in v3.effects]
+            return FactView(
+                currency=moneys3[0].currency.code if moneys3 else None,
+                committed_at=v3.committed_at,
+                effects=tuple(Effect(e.lane, e.amount_delta.amount) for e in v3.effects),
+                source_ref=v3.source_ref,
                 **base,
             )
         if version == 4:

@@ -59,7 +59,8 @@ def gather(db: Session, tenant, spec) -> tuple[list[register.Fact], set[str], st
             Path(text(e["path"], "invalid_spec_schema", 1024)), sha_text(e["sha256"], "invalid_spec_schema")
         )
         body = strict_json(data, "invalid_receipt_json")
-        facts += register.from_import_itemised(body)
+        adapter = register.from_ar_census if e["kind"] == register.SRC_AR_CENSUS else register.from_import_itemised
+        facts += adapter(body)
         sources.add(e["kind"])
         shas.append(sha)
     facts += register.from_held_decisions(db, tenant)  # B-2 outcomes: the immutable table, never a receipt file

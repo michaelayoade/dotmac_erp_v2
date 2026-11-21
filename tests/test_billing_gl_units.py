@@ -102,10 +102,12 @@ def test_invoice_kinds_block_until_rev2(kind) -> None:
         (3, "non_cash_credit_reduced"),
     ],
 )
-def test_v2_v3_blocked_unreadable_and_never_read(version, kind) -> None:
+def test_v2_v3_are_read_through_the_public_getters_and_blocked_by_name(version, kind) -> None:
     rule = rules.rule_for(version, kind)
-    assert rule.needs_fact is False
-    assert rules.decide(rule, view(version, kind), env()).reason == "fact_contract_unreadable"
+    assert rule.needs_fact is True  # R9 (billing a13): get_accounting_fact_v2 / _v3
+    expected = "wht_mapping_not_built" if version == 2 else "non_cash_credit_mapping_not_built"
+    decision = rules.decide(rule, view(version, kind), env())
+    assert (decision.disposition, decision.reason) == (Disp.BLOCKED, expected)
 
 
 # --------------------------------------------------------------------- lane math
@@ -242,7 +244,7 @@ def test_opening_facts_skip_only_when_committed_at_or_before_the_seal() -> None:
 
 @pytest.mark.parametrize("kind", sorted(k for v, k in rules.DISPATCH if v == 6))
 def test_v6_is_refused_without_reading_approval_fields(kind) -> None:
-    """Both the a12 two-person shape and the a13/R4b OFF shape (null request id, no approvers) get the same
+    """Both the two-person shape and the a13/R4b OFF shape (null request id, no approvers) get the same
     disposition because the mapper never decodes a V6 fact: the rule says needs_fact False and the decision uses
     nothing but (version, kind)."""
     rule = rules.rule_for(6, kind)
@@ -309,3 +311,24 @@ def test_cli_refuses_operator_dsns_a_bad_tenant_and_apply_without_the_switch(mon
     for code in ("invalid_tenant_id", "operator_database_materials_forbidden", "explicit_billing_gl_apply_required"):
         assert code in out
     assert "documentation.invalid" not in out and tenant not in out
+
+
+def test_v2_v3_mapper_reads_match_the_real_a13_fact_contracts() -> None:
+    """The mapper's V2/V3 decode touches these attributes of billing's public fact types (R9); a rename in billing
+    fails here instead of degrading a fact to ``fact_read_failed`` at run time."""
+    from dataclasses import fields
+
+    from dotmac_billing import get_accounting_fact_v2, get_accounting_fact_v3
+    from dotmac_billing.contracts import (
+        AccountingEffectV1,
+        AccountingFactV2,
+        AccountingFactV3,
+        WithholdingDischargeEffectV1,
+    )
+
+    assert callable(get_accounting_fact_v2) and callable(get_accounting_fact_v3)
+    common = {"committed_at", "effects", "source_ref"}
+    assert common | {"withholding_discharges", "reverses_fact_id"} <= {f.name for f in fields(AccountingFactV2)}
+    assert common <= {f.name for f in fields(AccountingFactV3)}
+    assert {"lane", "amount_delta"} <= {f.name for f in fields(AccountingEffectV1)}
+    assert "settlement_id" in {f.name for f in fields(WithholdingDischargeEffectV1)}

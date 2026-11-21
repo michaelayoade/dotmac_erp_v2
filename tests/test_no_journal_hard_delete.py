@@ -23,7 +23,9 @@ SQL_DELETE = re.compile(
 )
 # Reviewed ORM/Core delete call sites: path relative to src/erp_v2 -> permitted call count.
 # auth_service deletes an AuthSession row (sign-out); it never touches accounting models.
-ALLOWED_DELETE_CALLS = {"web/auth_service.py": 1}
+# ar/service.py replaces the lines of an AR draft that is still a draft (erp_ar_draft_lines, B-16): a workflow row,
+# never a ledger or journal row; the table trigger refuses any line change once the draft is issued or discarded.
+ALLOWED_DELETE_CALLS = {"web/auth_service.py": 1, "ar/service.py": 1}
 JOURNAL_MODELS = {
     "JournalEntry",
     "JournalLine",
@@ -70,9 +72,10 @@ def test_orm_and_core_delete_calls_are_exactly_the_reviewed_allowlist():
             found[str(path.relative_to(SRC))] = count
     assert found == ALLOWED_DELETE_CALLS
     # the one allowed site must not be fed a ledger model
-    allowed = SRC / "web" / "auth_service.py"
-    names = {n.id for n in ast.walk(ast.parse(allowed.read_text())) if isinstance(n, ast.Name)}
-    assert not names & JOURNAL_MODELS
+    for relative in ("web/auth_service.py", "ar/service.py"):
+        allowed = SRC / relative
+        names = {n.id for n in ast.walk(ast.parse(allowed.read_text())) if isinstance(n, ast.Name)}
+        assert not names & JOURNAL_MODELS, relative
 
 
 def test_no_cascading_foreign_key_or_relationship_deletes_ledger_rows():

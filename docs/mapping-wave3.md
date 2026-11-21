@@ -128,8 +128,10 @@ is dest6 plus the declared NET deltas in the receipt, which can be negative:
 that a queued, not-landed invoice no longer lands; `declared_written_delta_headers` = minus the newly not-landed
 headers. `changed_header_values` counts landed headers whose values change (WHT removal, rounding), itemised in the
 side file. The partition universe is every source header id (line-less invoices included) and the source line count.
-An unposted invoice whose WHT was removed to gross lands but is also queued (`wht_payment_fact_pending`) until the a6
-WHT table carries the fact; rounding rounds the tax first and derives the subtotal from the 2-dp total, and
+Since B-13 the default is `import.unposted_wht` = `queue`: an unposted invoice with a WHT line is NOT landed and is
+queued as `unposted_wht_line` (register class E04, H-DOC). Only with `import.unposted_wht` = `remove` (the old D-M2
+rule, recorded in the manifest binding that the verifiers re-derive from) is the WHT removed to gross, the invoice
+landed and also queued (`wht_payment_fact_pending`) until the a6 WHT table carries the fact; rounding rounds the tax first and derives the subtotal from the 2-dp total, and
 `total_mismatch_after_transform` is counted in the queue. The itemised bridge is the
 mode-600 side file `<receipt>.transforms.json` (sha256 in the receipt).
 

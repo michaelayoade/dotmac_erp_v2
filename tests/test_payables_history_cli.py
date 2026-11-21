@@ -357,8 +357,8 @@ def operator(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(cli, "_dependencies", dependencies)
-    monkeypatch.setattr(cli, "_installed_payables_version", lambda: "0.1.0a5")
-    monkeypatch.setattr(cli, "_expected_schema_heads", lambda: {"pa_0005_reversal_settled_history", "assembly_head"})
+    monkeypatch.setattr(cli, "_installed_payables_version", lambda: "0.1.0a6")
+    monkeypatch.setattr(cli, "_expected_schema_heads", lambda: {"pa_0006_tax_release_hist_credit", "assembly_head"})
     monkeypatch.setattr(cli, "_safe_engine", lambda url: Engine())
     monkeypatch.setattr(cli, "Session", FakeSession)
     for name in ("DATABASE_URL", "PLATFORM_DATABASE_URL"):
@@ -404,7 +404,7 @@ def test_operator_plan_no_owner_calls_and_only_read_queries(operator):
     assert all(flag in posture for flag in ("rolsuper", "rolbypassrls", "rolcreaterole", "rolreplication"))
 
 
-@pytest.mark.parametrize("installed", ["0.1.0a2", "0.1.0a3", "0.1.0a4", "0.1.0a5+local", "0.1.0a6"])
+@pytest.mark.parametrize("installed", ["0.1.0a2", "0.1.0a3", "0.1.0a4", "0.1.0a5", "0.1.0a6+local", "0.1.0a7"])
 def test_unqualified_payables_runtime_refuses_before_database_access(operator, monkeypatch, installed):
     args, state, _ = operator
     monkeypatch.setattr(cli, "_installed_payables_version", lambda: installed)
@@ -443,9 +443,9 @@ def test_unsafe_destination_role_refuses_before_plan_or_owner(operator, tmp_path
         ["pa_0002_optional_supplier_doc", "assembly_head"],
         ["pa_0003_historical_invoice", "assembly_head"],  # stale a3 head
         ["pa_0004_supplier_payments", "assembly_head"],  # stale a4 head
-        ["pa_0005_reversal_settled_history"],
-        ["pa_0005_reversal_settled_history", "assembly_head", "unknown_head"],
-        ["pa_0005_reversal_settled_history", "assembly_head", "assembly_head"],
+        ["pa_0006_tax_release_hist_credit"],
+        ["pa_0006_tax_release_hist_credit", "assembly_head", "unknown_head"],
+        ["pa_0006_tax_release_hist_credit", "assembly_head", "assembly_head"],
     ],
 )
 def test_destination_requires_complete_exact_schema_before_planning(operator, heads):
@@ -457,11 +457,11 @@ def test_destination_requires_complete_exact_schema_before_planning(operator, he
     assert state["transaction_tenant"] is None
 
 
-def test_pins_are_a5_and_head_is_an_expected_stamped_head():
+def test_pins_are_a6_and_head_is_an_expected_stamped_head():
     from erp_v2.migrate import EXPECTED_HEADS, EXPECTED_STAMPED_HEADS
 
-    assert cli.REQUIRED_PAYABLES_VERSION == "0.1.0a5"
-    assert cli.REQUIRED_PAYABLES_HEAD == "pa_0005_reversal_settled_history"
+    assert cli.REQUIRED_PAYABLES_VERSION == "0.1.0a6"
+    assert cli.REQUIRED_PAYABLES_HEAD == "pa_0006_tax_release_hist_credit"
     assert cli.REQUIRED_PAYABLES_HEAD in EXPECTED_STAMPED_HEADS
     stale = {"pa_0003_historical_invoice", "pa_0004_supplier_payments"}
     assert not stale & set(EXPECTED_HEADS) and not stale & set(EXPECTED_STAMPED_HEADS)
@@ -488,6 +488,8 @@ def test_zero_row_assertion_covers_the_ruled_tables():
         "supplier_payment_withholdings",
         "historical_settlements",
         "settlement_observations",
+        "historical_credit_receipts",
+        "historical_credit_settlements",
     }
 
 
@@ -776,7 +778,7 @@ def test_hosted_postgres_refuses_unqualified_schema_heads(hosted_postgres, chang
                 connection.execute(
                     sa.text(
                         "UPDATE public.alembic_version SET version_num='pa_0002_optional_supplier_doc' "
-                        "WHERE version_num='pa_0005_reversal_settled_history'"
+                        "WHERE version_num='pa_0006_tax_release_hist_credit'"
                     )
                 )
         with Session(engines["operator"]) as session, session.begin():

@@ -13,6 +13,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
+import account_maintenance_support as accounts_gov
 import pytest
 import sqlalchemy as sa
 from dotmac_accounting import service as accounting
@@ -258,7 +259,7 @@ def refuse_closed_period(engine, env):
 
 def refuse_inactive_account(engine, env):
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == env.accounts["2000"]).values(is_active=False))
+        accounts_gov.retire(db, env.accounts["2000"])
         db.commit()
     return consequence(env), "account_not_postable"
 
@@ -279,6 +280,9 @@ def refuse_unbalanced(engine, env):
 def test_refusal_leaves_no_bridge_rows_and_the_callers_prior_write_survives(engine, scenario):
     env = seed(engine)
     c, code = scenario(engine, env)
+    # a governed account change (accounting a3) leaves its own idempotency record; the refused posting must add none
+    before = counts(engine, env)
+    assert {k: v for k, v in before.items() if k != "idempotency"} == {k: 0 for k in ("journals", "lines", "ledger")}
     with Session(engine) as db:
         db.add(
             AccountCategory(
@@ -290,7 +294,7 @@ def test_refusal_leaves_no_bridge_rows_and_the_callers_prior_write_survives(engi
             bridge.post_consequence(db, scope=env.scope, consequence=c, approval_ref="appr-1", actor="p-1", now=NOW)
         assert exc.value.code == code
         db.commit()  # the caller catches the refusal and still commits
-    assert counts(engine, env) == EMPTY
+    assert counts(engine, env) == before
     with Session(engine) as db:
         assert db.scalar(
             sa.select(AccountCategory.id).where(

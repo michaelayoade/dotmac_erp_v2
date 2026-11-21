@@ -370,10 +370,19 @@ def test_an_erp_receipt_takes_its_cash_from_its_receipt_row_and_never_from_a_set
     with Session(engine) as db:
         db.execute(
             sa.text(
-                "INSERT INTO erp_ar_receipts (id, tenant_id, billing_settlement_id, cash_account_id) "
-                "VALUES (:i, :t, :s, :c)"
+                "INSERT INTO erp_ar_receipts (id, tenant_id, billing_settlement_id, draft_id, bank_account_id, "
+                "cash_account_id, bank_reference, receipt_number, received_on, recorded_by) "
+                "VALUES (:i, :t, :s, :d, :b, :c, 'ref-1', 'RCT-1', current_date, :u)"
             ),
-            {"i": uuid4(), "t": env.tenant_id, "s": settlement.id, "c": env.accounts["1010"]},
+            {
+                "i": uuid4(),
+                "t": env.tenant_id,
+                "s": settlement.id,
+                "d": uuid4(),
+                "b": uuid4(),
+                "c": env.accounts["1010"],
+                "u": uuid4(),
+            },
         )
         db.commit()
     assert run(engine, env)["blocked"] == 0 and gl(engine, env)["1010"] == D("30.00")
@@ -416,6 +425,18 @@ def test_an_unknown_or_inactive_revenue_account_blocks(engine):
         }
     _raw_lines(engine, env, docs[unknown], [(uuid4(), "100.00", "20.00")])  # an id that is no account
     with Session(engine) as db:
+        # accounting a3 requires a recorded account change in the same transaction for a flag change
+        db.execute(
+            sa.text(
+                "INSERT INTO mod_accounting.account_changes (id, tenant_id, account_id, change_kind, old_code, "
+                "new_code, old_kind, new_kind, old_posting_allowed, new_posting_allowed, old_is_active, "
+                "new_is_active, reason, actor_ref, evidence, occurred_at) "
+                "SELECT gen_random_uuid(), tenant_id, id, 'RETIRE', code, code, kind, kind, posting_allowed, "
+                "posting_allowed, is_active, false, 'test retire', 'test', '{}'::jsonb, now() "
+                "FROM mod_accounting.accounts WHERE id = :a"
+            ),
+            {"a": env.accounts["4000"]},
+        )
         db.execute(
             sa.text("UPDATE mod_accounting.accounts SET is_active = false WHERE id = :a"), {"a": env.accounts["4000"]}
         )

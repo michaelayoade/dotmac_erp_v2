@@ -38,7 +38,8 @@ the residual line on the settlement source system's cash account.
 | V1 reversal | POST L, + cash when the reversed fact is settlement-family; predecessor must be POSTED. A void of an invoice or credit note is the exact negation of the predecessor's posted journal and VAT movements (rev 2) |
 | V1 invoice_issued | POST: Dr 1400 grand total / Cr revenue per line / Cr deferral per treatment (rev 2) |
 | V1 credit_note_issued | POST: Dr revenue / Dr deferral min(t, R) / Dr current the rest / Cr 1400; closes out the deferral when open reaches 0 (rev 2) |
-| V2, V3 | BLOCK `fact_contract_unreadable` (no public getter) |
+| V2 (withholding) | read via `get_accounting_fact_v2` (billing a13, R9), then BLOCK `wht_mapping_not_built` |
+| V3 (non-cash credit) | read via `get_accounting_fact_v3` (a13, R9), then BLOCK `non_cash_credit_mapping_not_built` |
 | V4/V5 imported | SKIP `opening_gl_carried` if committed at or before the seal, else BLOCK `opening_fact_after_seal` |
 | V4/V5 import reversed | SKIP before the seal, BLOCK `opening_unwind_post_seal` after |
 | V4 applied, draw reversed | POST L |

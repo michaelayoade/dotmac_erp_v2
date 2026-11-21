@@ -21,7 +21,7 @@ from erp_v2.web.revenue_routes import WRITE_PERMISSION
 from erp_v2.web.routes import ACCESS_PERMISSION
 
 PROFILE_CODE: Final = "erp.web"
-PROFILE_VERSION: Final = 5
+PROFILE_VERSION: Final = 6
 
 # Roles that exist today and keep exactly their current grants.
 LEGACY_ROLES: Final = ("admin", "staff")
@@ -68,6 +68,14 @@ _NEW_PERMISSIONS: Final[dict[str, tuple[str, str]]] = {
         "finance_approver",
     ),
     "erp.finance.supplier_payments.approve": ("Approve supplier payment proposals.", "finance_approver"),
+    "erp.finance.receivables.prepare": (
+        "Prepare customer invoices, credit notes and receipts (drafts).",
+        "finance_preparer",
+    ),
+    "erp.finance.receivables.post": (
+        "Issue invoices and credit notes, post receipts, apply credit, deallocate, reverse and void.",
+        "finance_approver",
+    ),
     "erp.banking.reconciliation.approve": ("Approve bank reconciliations.", "finance_approver"),
     # Cash GL split: re-point a bank account's cash GL. Same P0 role pair as journals
     # (finance_preparer proposes, finance_approver approves; SoD keeps them two people).
@@ -113,11 +121,22 @@ _CASH_GL_PERMISSIONS: Final[dict[str, tuple[str, tuple[str, ...]]]] = {
     ),
 }
 
+# Receivables draft review: both roles of the pair may read a draft (a poster reviews it before issuing; one guard
+# takes one code, so the cash GL re-point precedent above).
+RECEIVABLES_READ: Final = "erp.finance.receivables.read"
+_RECEIVABLES_PERMISSIONS: Final[dict[str, tuple[str, tuple[str, ...]]]] = {
+    RECEIVABLES_READ: (
+        "View receivables drafts before they are issued or posted.",
+        ("finance_preparer", "finance_approver"),
+    ),
+}
+
 # Every new permission as (code, description, roles).
 _ALL_NEW: Final = (
     *((code, description, (role,)) for code, (description, role) in _NEW_PERMISSIONS.items()),
     *((code, description, roles) for code, (description, roles) in _PAYEE_PERMISSIONS.items()),
     *((code, description, roles) for code, (description, roles) in _CASH_GL_PERMISSIONS.items()),
+    *((code, description, roles) for code, (description, roles) in _RECEIVABLES_PERMISSIONS.items()),
 )
 
 NEW_PERMISSION_CODES: Final = frozenset(code for code, _, _ in _ALL_NEW)

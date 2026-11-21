@@ -18,8 +18,8 @@ def grants(role):
     return {g.permission_code for g in profile().grants if g.role_code == role}
 
 
-def test_profile_is_erp_web_v5():
-    assert (profile().code, profile().version) == ("erp.web", 5)
+def test_profile_is_erp_web_v6():
+    assert (profile().code, profile().version) == ("erp.web", 6)
 
 
 def test_admin_and_staff_get_nothing_new():

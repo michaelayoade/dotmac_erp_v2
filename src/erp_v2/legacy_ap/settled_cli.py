@@ -68,7 +68,7 @@ from erp_v2.legacy_ap.recognize_cli import (
     parse_list,
 )
 
-REQUIRED_PAYABLES_VERSION = "0.1.0a5"
+REQUIRED_PAYABLES_VERSION = "0.1.0a6"
 SOURCE_OWNER = "legacy-erp"
 DOCUMENT_KIND = "supplier_invoice"
 _REASON = re.compile(r"[a-z][a-z0-9_:.-]*")

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}{{ document.document_kind|replace('_', ' ')|title }} {{ document.document_number or '' }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>{{ document.document_kind|replace('_', ' ')|title }} {{ document.document_number or '(draft)' }}</h1>
+<p><a href="{{ base }}">Receivables</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>Customer</dt><dd>{{ account.external_account_ref if account else document.billing_account_id }}</dd>
+  <dt>Status</dt><dd>{{ 'voided' if voided else document.lifecycle }}</dd>
+  <dt>Issued</dt><dd>{{ document.issued_at or '—' }}</dd>
+  <dt>Due</dt><dd>{{ document.due_at or '—' }}</dd>
+  <dt>Totals</dt><dd>{{ document.currency }} {{ document.subtotal }} + {{ document.tax_total }} tax = {{ document.grand_total }}</dd>
+  {% if exposure %}<dt>Outstanding</dt><dd>{{ exposure.outstanding if exposure.outstanding is not none else 'unavailable' }} ({{ exposure.state or 'unknown' }})</dd>{% endif %}
+  <dt>GL posting</dt><dd>{{ gl_status }}</dd>
+</dl>
+<h2>Lines</h2>
+<table><thead><tr><th>#</th><th>Description</th><th>Qty</th><th>Pre-tax</th><th>Tax</th><th>Total</th><th>Revenue account</th></tr></thead><tbody>
+{% for l in lines %}{% set la = line_accounts.get(l.line_number) %}<tr><td>{{ l.line_number }}</td><td>{{ l.description }}</td><td>{{ l.quantity }}</td><td>{{ l.pre_tax_amount }}</td><td>{{ l.tax_amount }}</td><td>{{ l.total_amount }}</td><td>{{ la.revenue_account_id if la else 'not recorded' }}</td></tr>{% endfor %}
+</tbody></table>
+{% if document.document_kind == 'invoice' %}
+<h2>Allocations</h2>
+<table><thead><tr><th>Settlement</th><th>Amount</th><th></th></tr></thead><tbody>
+{% for a in allocations %}<tr><td>{{ a.settlement_id }}</td><td>{{ a.amount_delta }}</td>
+<td>{% if not voided %}<form method="post" action="{{ base }}/allocations/{{ a.id }}/deallocate">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="request_id" value="{{ request_id }}"><input type="hidden" name="document_id" value="{{ document.id }}"><input type="hidden" name="occurred_on" value="{{ today }}"><button type="submit">Deallocate</button></form>{% endif %}</td></tr>
+{% else %}<tr><td colspan="3">No allocations.</td></tr>{% endfor %}
+</tbody></table>
+<h2>Cash draws including opening cash</h2>
+<p>A draw that includes opening cash is reversed as a whole; it cannot be taken apart line by line.</p>
+<ul>{% for group_id, remaining in draws %}<li>Draw {{ group_id }}: remaining {{ remaining if remaining is not none else 'unavailable' }}
+{% if not voided and remaining %}<form method="post" action="{{ base }}/draws/{{ group_id }}/reverse"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="document_id" value="{{ document.id }}"><input type="hidden" name="occurred_on" value="{{ today }}"><button type="submit">Reverse whole draw</button></form>{% endif %}</li>{% else %}<li>None.</li>{% endfor %}</ul>
+<h2>Credit notes</h2>
+<ul>{% for c in credit_notes %}<li><a href="{{ base }}/documents/{{ c.id }}">{{ c.document_number }}</a>: {{ c.grand_total }}</li>{% else %}<li>None.</li>{% endfor %}</ul>
+{% if not voided %}
+<p><a href="{{ base }}/credit-notes/new?invoice={{ document.id }}">Credit this invoice</a></p>
+<h2>Apply customer credit</h2>
+<form method="post" action="{{ base }}/accounts/{{ document.billing_account_id }}/apply-credit">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="request_id" value="{{ request_id }}"><input type="hidden" name="document_id" value="{{ document.id }}">
+  <p><label>Amount <input name="amount" inputmode="decimal" required></label> <label>Date <input type="date" name="occurred_on" value="{{ today }}" required></label> <button type="submit">Apply credit</button></p>
+</form>
+{% endif %}
+{% endif %}
+{% if not voided and document.issued_at %}
+<h2>Void</h2>
+<p>A document with allocations or credit notes cannot be voided; a migrated invoice is corrected by a credit note instead.</p>
+<form method="post" action="{{ base }}/documents/{{ document.id }}/void">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><label>Date <input type="date" name="occurred_on" value="{{ today }}" required></label> <button type="submit">Void document</button></p>
+</form>
+{% endif %}
+{% endblock %}

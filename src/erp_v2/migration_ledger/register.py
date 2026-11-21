@@ -9,6 +9,13 @@ Sources (each adapter is a pure function from a receipt or rows to ``Fact``s):
 * ``held_drafts``: the immutable ``erp_held_draft_decisions`` rows (no receipt adapter). A queued draft is open
   (E16a); a voided or posted draft is resolved; E17 findings derive from the ``duplicate_of_posted_fee_excess`` rows.
 * ``import_itemised``: the importer transform itemised file (#68: ``queue`` list); every queued invoice is open.
+* ``ar_census``: the AR opening census receipt (``importer/ar_census``; the AS-IS replan section 2 item 5), by sha:
+  E35 ``partition:<cust>:<ccy>`` (a partition billing cannot carry; its GL goes to the AR holding account),
+  E35 ``doc:<id>`` (the DRAFT / SUBMITTED AR invoices: an H-DOC work item, no GL), E35
+  ``ar_unapplied_credit_note:<id>`` (a credit note kept out of the billing manifest: party, document number,
+  amount; Finance applies or issues it after the flip), E36a ``custgap:<cust>:<ccy>`` / ``gljournal:<id>`` (GL that
+  has no billing counterpart, from the receipt's ``gl_attribution`` when the destination chart was supplied) and E36b
+  ``variance:<source key>`` (a stored-balance difference billing records at the seal; memo basis).
 * ``admission_reviews`` (database rows of B-1 decisions): a decision that waived a ``requires_correcting_journal``
   check (E08) or whose action is not executed here (void, supplier credit, reopen, ias8_post) is open; a plain
   admission is resolved ``admitted``.
@@ -43,14 +50,16 @@ from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha, refuse,
 SRC_HELD: Final = "held_drafts"
 SRC_IMPORT: Final = "import_itemised"
 SRC_REVIEWS: Final = "admission_reviews"
+SRC_AR_CENSUS: Final = "ar_census"
 SRC_MANUAL: Final = "manual"
 SRC_NA: Final = "not_applicable"
-RECEIPT_KINDS: Final = (SRC_IMPORT,)  # B-2 outcomes load from the database, never from a receipt file
+RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS)  # B-2 outcomes load from the database, never from a receipt file
 
 # class by importer queue reason (#68 Q_* constants); an unknown reason is refused, never guessed.
 IMPORT_CLASS: Final = {
     "expense_elsewhere_ambiguous": "E06",
     "wht_payment_fact_pending": "E06a",
+    "unposted_wht_line": "E04",  # AS-IS: an unposted invoice with a WHT line is not landed (H-DOC)
     "expense_account_is_control": "E21",
     "expense_account_is_tax_role": "E21",
     "tax_account_not_input_tax": "E09",
@@ -156,6 +165,125 @@ def from_import_itemised(body: Any) -> list[Fact]:
             "legacy_total": item.get("legacy_total"),
         }
         facts.append(Fact(sorted(classes)[0], f"invoice:{invoice}", SRC_IMPORT, None, None, detail))
+    return facts
+
+
+AR_CLASS_PARTITION: Final = "E35"
+AR_CLASS_GL_GAP: Final = "E36a"
+AR_CLASS_VARIANCE: Final = "E36b"
+
+
+def from_ar_census(body: Any) -> list[Fact]:
+    """The AR opening census receipt (counts, keys, amounts: no names) as open work items. Refuses anything else."""
+    if not isinstance(body, dict) or body.get("kind") != "ar-census" or not isinstance(body.get("census_sha256"), str):
+        refuse("invalid_ar_census")
+    census_sha = body["census_sha256"]
+    for name in (
+        "excluded_partitions",
+        "unapplied_credit_notes",
+        "unposted_documents",
+        "posted_after_cutoff",
+        "variances",
+    ):
+        if not isinstance(body.get(name, []), list):
+            refuse("invalid_ar_census")
+    attribution = body.get("gl_attribution")
+    if not isinstance(attribution, dict):  # without the GL attribution the E36a items cannot be derived: refuse
+        refuse("ar_census_without_gl_attribution", "run the census with the destination chart so 1400 is attributed")
+    from erp_v2.importer.ar_attribution import attribution_sha256
+
+    if body.get("gl_attribution_sha256") != attribution_sha256(attribution):  # the split was edited after the census
+        refuse("gl_attribution_sha_mismatch")
+    facts: list[Fact] = []
+
+    def add(class_code: str, key: str, detail: dict[str, Any]) -> None:
+        facts.append(Fact(class_code, key, SRC_AR_CENSUS, None, census_sha, detail))
+
+    signed = {str(h["legacy_key"]): int(h["amount_minor"]) for h in attribution.get("held", []) if isinstance(h, dict)}
+
+    for item in body.get("excluded_partitions", []):
+        cust, ccy = (str(x) for x in item["partition"])
+        add(
+            AR_CLASS_PARTITION,
+            f"partition:{cust}:{ccy}",
+            {
+                "holding": "H-SUB",
+                "blockers": sorted({str(b[1]) for b in item["blockers"]}),
+                "open_residual_minor": int(item["open_residual_minor"]),
+                "currency": ccy,
+            },
+        )
+    for item in body.get("unapplied_credit_notes", []):
+        add(
+            AR_CLASS_PARTITION,
+            f"ar_unapplied_credit_note:{text(item['key'], 'invalid_ar_census', 255)}",
+            {
+                "work_item": "ar_unapplied_credit_note",
+                "holding": "H-SUB",
+                "party": list(item["partition"]) if item.get("partition") else None,
+                "document_number": item.get("document_number"),
+                "amount_minor": item.get("gross_minor"),
+                "gl_signed_minor": signed.get(str(item["key"])),  # the amount B-14 itemises on 1400
+                "currency": item["partition"][1] if item.get("partition") else None,
+                "residual_minor": item.get("residual_minor"),
+                "reason": item.get("reason"),
+            },
+        )
+    for item in body.get("unposted_documents", []):
+        add(
+            AR_CLASS_PARTITION,
+            f"doc:{text(item['key'], 'invalid_ar_census', 255)}",
+            {"holding": "H-DOC", "status": item.get("status"), "amount_minor": item.get("gross_minor")},
+        )
+    for item in body.get("posted_after_cutoff", []):  # posted by D but dated after it: GL is in the ledger, held
+        key = text(item["key"], "invalid_ar_census", 255)
+        add(
+            AR_CLASS_PARTITION,
+            f"row:{key}",
+            {
+                "holding": "H-SUB",
+                "reason": "row_after_cutoff",
+                "kind": item.get("kind"),
+                "document_number": item.get("document_number"),
+                "amount_minor": item.get("gross_minor"),
+                "gl_signed_minor": signed.get(key),
+                "currency": item["partition"][1] if item.get("partition") else None,
+            },
+        )
+    for item in attribution.get("parties", []):
+        if int(item["custgap_minor"]) != 0:  # GL not explained by the carried or refused items of this party
+            cust, ccy = (
+                text(item["customer"], "invalid_ar_census", 255),
+                text(item["currency"], "invalid_ar_census", 3),
+            )
+            add(
+                AR_CLASS_GL_GAP,
+                f"custgap:{cust}:{ccy}",
+                {"amount_minor": int(item["custgap_minor"]), "holding": "H-SUB", "currency": ccy},
+            )
+    for item in attribution.get("unattributed", []):  # includes shared journals (flagged), never split
+        journal = text(item["gljournal_id"], "invalid_ar_census", 255)
+        add(
+            AR_CLASS_GL_GAP,
+            f"gljournal:{journal}",
+            {
+                "amount_minor": int(item["amount_minor"]),
+                "holding": "H-SUB",
+                "shared": bool(item.get("shared")),
+                "currency": item.get("currency"),
+            },
+        )
+    for item in body.get("variances", []):
+        add(
+            AR_CLASS_VARIANCE,
+            f"variance:{text(item['source_key'], 'invalid_ar_census', 255)}",
+            {
+                "partition": list(item["partition"]),
+                "reason": item.get("reason"),
+                "amount_minor": int(item["amount_minor"]),
+                "basis": "memo",
+            },
+        )
     return facts
 
 

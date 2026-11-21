@@ -10,6 +10,7 @@ import json
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+import account_maintenance_support as accounts_gov
 import pytest
 import sqlalchemy as sa
 import test_posting_bridge_pg as bridge_pg
@@ -568,10 +569,10 @@ def test_ias8_account_that_stopped_being_3100_postable_is_refused(engine, setup)
     iid, account = ias8_world(engine, env, legacy)
     decide_ias8(engine, env, iid, account)
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == account).values(is_active=False))
+        accounts_gov.retire(db, account)
         db.commit()
     assert legacy.run(engine, (iid,), apply=False)["refusals_by_reason"] == {"ias8_account_not_postable": 1}
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == account).values(is_active=True))
+        accounts_gov.activate(db, account)
         db.commit()
     assert legacy.run(engine, (iid,), apply=False)["counts"]["eligible"] == 1

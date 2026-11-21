@@ -8,6 +8,7 @@ import threading
 import time
 from uuid import UUID, uuid4
 
+import account_maintenance_support as accounts_gov
 import pytest
 import sqlalchemy as sa
 import test_posting_bridge_pg as bridge_pg
@@ -241,7 +242,7 @@ def test_inactive_liability_account_refuses_without_partial_state(engine):
     env = world(engine)
     iid = invoice(engine, env)
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == env.accounts["2000"]).values(is_active=False))
+        accounts_gov.retire(db, env.accounts["2000"])
         db.commit()
     refusal(engine, env, iid, "posting_account_not_postable")
     assert status(engine, iid) == InvoiceStatus.SUBMITTED
@@ -447,7 +448,7 @@ def add_account(engine, env, code, *, balance=NormalBalance.DEBIT):
 
 def recode(engine, account_id, code):
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == account_id).values(code=code))
+        accounts_gov.recode(db, account_id, code)
         db.commit()
 
 
