@@ -138,20 +138,22 @@ def _do_apply(args) -> dict[str, Any]:
 
 
 def _do_verify(args) -> dict[str, Any]:
-    spec, _ = planning.parse_spec(args.spec.read_bytes())
+    spec_bytes = args.spec.read_bytes()  # read once: the tenant binding and the body come from the same bytes
+    spec, _ = planning.parse_spec(spec_bytes)
     engine = _engine()
     with applying.read_only_session(engine) as db:
-        out = applying.verify(db, spec, _reader(args.spec.read_bytes()))
+        out = applying.verify(db, spec, _reader(spec_bytes))
         db.rollback()
     return out
 
 
 def _do_t1_plan(args) -> dict[str, Any]:
+    spec_bytes = args.spec.read_bytes()
     out = t1_mod.run_t1_plan(
         _engine(),
-        args.spec.read_bytes(),
+        spec_bytes,
         load_receipts,
-        _reader(args.spec.read_bytes()),
+        _reader(spec_bytes),
         planned_by=_operator(args.operator_ref),
     )
     return {"ready": True, "dry_run": True, **out}

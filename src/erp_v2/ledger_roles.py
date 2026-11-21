@@ -17,15 +17,20 @@ from collections.abc import Iterable
 from typing import Final
 from uuid import UUID
 
-from dotmac_accounting.models import Account
+from dotmac_accounting.models import Account, JournalEntry, JournalLine, JournalStatus
 from dotmac_kernel.setting_scopes import SettingScope
-from dotmac_kernel.settings_resolver import StrictSettingResolutionError, resolve_strict
+from dotmac_kernel.settings_resolver import SettingSpec, StrictSettingResolutionError, resolve_strict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 # Imported here, not lazily: importing it registers the ``ar.*`` setting specs, and that must happen before any module
 # declares a stand-in for them (a late registration would be a DuplicateSettingSpecError).
-from erp_v2.ledger_settings import PREPAYMENT_DEFAULT, PREPAYMENT_SPEC
+from erp_v2.ledger_settings import (
+    PREPAID_FUNDING_SPEC,
+    PREPAYMENT_DEFAULT,
+    PREPAYMENT_SPEC,
+    account_ref_matches,
+)
 
 AP_CONTROL_CODE: Final = "2000"
 PAYROLL_PAYABLE_CODE: Final = "2040"
@@ -76,35 +81,64 @@ def tax_role_account_ids(db: Session, tenant_id: UUID) -> set[str]:
     return ids
 
 
-def prepayment_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
-    """The account(s) ``ar.prepayment_liability_account`` names (code match wins, else exact name), in any status.
-
-    Fail-closed in the guard's direction: an invalid stored value falls back to the registered default reference, and a
-    name shared by several accounts (no code match) protects ALL of them. Nothing resolving means nothing to protect.
-    """
+def _setting_account_ids(db: Session, tenant_id: UUID, spec: SettingSpec, default: str | None) -> frozenset[UUID]:
     try:
-        value = resolve_strict(db, PREPAYMENT_SPEC, scope=SettingScope.tenant(tenant_id))
+        value = resolve_strict(db, spec, scope=SettingScope.tenant(tenant_id))
     except StrictSettingResolutionError:
-        value = PREPAYMENT_DEFAULT
-    if not isinstance(value, str) or not value.strip():
-        return frozenset()
-    rows = list(
-        db.execute(
-            select(Account.id, Account.code).where(
-                Account.tenant_id == tenant_id, (Account.code == value) | (Account.name == value)
+        value = default  # an invalid stored value falls back to the registered default reference (fail-closed)
+    return frozenset(account_ref_matches(db, tenant_id, value))
+
+
+def prepayment_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
+    """Every account ``ar.prepayment_liability_account`` can name, by the ONE shared resolver (id, else code, else every
+    exact-name match; any status). A name shared by several accounts protects ALL of them even though the mapper then
+    reads the setting as unset. Nothing resolving protects nothing."""
+    return _setting_account_ids(db, tenant_id, PREPAYMENT_SPEC, PREPAYMENT_DEFAULT)
+
+
+def prepaid_funding_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
+    """The same for ``ar.prepaid_funding_account`` (part of the credit tie; unset by default)."""
+    return _setting_account_ids(db, tenant_id, PREPAID_FUNDING_SPEC, None)
+
+
+# The T1 journal identity (holdings.models: OWNER, KIND_T1_POST); literals here because holdings imports this module.
+T1_OWNER: Final = "erp.migration"
+T1_KIND: Final = "ar_opening_credit"
+
+
+def t1_credit_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
+    """The credit account of every POSTED T1 journal: once T1 has funded an account, re-pointing the setting cannot
+    make that balance bare-postable. Identity-bound (owner/kind), no setting and no table."""
+    return frozenset(
+        db.scalars(
+            select(JournalLine.account_id)
+            .join(
+                JournalEntry,
+                (JournalEntry.tenant_id == JournalLine.tenant_id) & (JournalEntry.id == JournalLine.journal_id),
+            )
+            .where(
+                JournalEntry.tenant_id == tenant_id,
+                JournalEntry.source_owner == T1_OWNER,
+                JournalEntry.source_document_kind == T1_KIND,
+                JournalEntry.status == JournalStatus.POSTED,
+                JournalLine.credit_functional > 0,
             )
         )
     )
-    by_code = [r.id for r in rows if r.code == value]
-    return frozenset(by_code or [r.id for r in rows])
 
 
 def control_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
-    """Every control account of this tenant: the fixed codes plus the resolved AR prepayment account."""
+    """Every control account of this tenant: the fixed codes, both ``ar.*`` accounts, and every account a posted T1
+    journal credited."""
     fixed = db.scalars(
         select(Account.id).where(Account.tenant_id == tenant_id, Account.code.in_(CONTROL_ACCOUNT_CODES))
     )
-    return frozenset(fixed) | prepayment_account_ids(db, tenant_id)
+    return (
+        frozenset(fixed)
+        | prepayment_account_ids(db, tenant_id)
+        | prepaid_funding_account_ids(db, tenant_id)
+        | t1_credit_account_ids(db, tenant_id)
+    )
 
 
 def account_id_for_code(db: Session, tenant_id: UUID, code: str) -> UUID | None:

@@ -353,6 +353,7 @@ def test_target_account_checks(engine):
     cases = {
         "target_unknown": uuid4(),
         "target_not_asset": make_account(engine, env, "4100", klass="REV"),
+        "target_is_control": make_account(engine, env, "1400"),  # an otherwise valid empty debit-normal asset
         "target_not_postable": make_account(engine, env, "1100", kind=AccountKind.CONTROL, postable=False),
         "target_inactive": make_account(engine, env, "1101", active=False),
         "target_currency": make_account(engine, env, "1102", currency="USD"),

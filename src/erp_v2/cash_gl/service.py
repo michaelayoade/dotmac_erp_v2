@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 from erp_v2.banking import recon_models as recon
 from erp_v2.cash_gl.models import CashAccountRepoint, RepointStatus
 from erp_v2.governance import policy as governance
+from erp_v2.ledger_roles import control_account_ids
 from erp_v2.payroll_payouts import models as payout
 
 AUDIT_PROPOSED: Final = "erp.banking.cash_gl_repoint.proposed"
@@ -135,6 +136,8 @@ def _validate(db: Session, tenant_id: UUID, bank: BankAccount, target_id: UUID) 
         raise RepointRefused("target_inactive", "the target account is not active")
     if target.kind != AccountKind.POSTING or not target.posting_allowed:
         raise RepointRefused("target_not_postable", "the target account is not a postable account")
+    if target.id in control_account_ids(db, tenant_id):
+        raise RepointRefused("target_is_control", "a control account cannot be a bank account's cash ledger account")
     klass = db.scalar(select(AccountCategory.account_class).where(AccountCategory.id == target.category_id))
     if klass != AccountClass.ASSET or target.normal_balance != NormalBalance.DEBIT:
         raise RepointRefused("target_not_asset", "the target account is not a debit-normal ASSET account")

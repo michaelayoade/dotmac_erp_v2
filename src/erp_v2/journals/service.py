@@ -595,7 +595,7 @@ def prepare_ledger_fault_correction(
     evidence = _text(command.evidence_ref, "evidence reference", 255)
     description = _text(command.description, "description", 2000)
     if command.control_code not in LEDGER_FAULT_CONTROL_CODES:
-        raise JournalRefused("invalid_input", "the control account must be 2000, 2040 or 1410")
+        raise JournalRefused("invalid_input", "a ledger-fault correction covers only 2000, 2040 or 1410")
     key = _fault_key(command.source_journal_id, command.control_code)
     try:
         _actor(db, tenant_id, actor)

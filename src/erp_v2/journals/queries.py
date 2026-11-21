@@ -14,9 +14,9 @@ from sqlalchemy.orm import Session
 from erp_v2.journals import models as m
 from erp_v2.journals.models import ManualJournal
 from erp_v2.journals.service import LEGACY_OWNER
-from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES, control_account_ids  # noqa: F401  (set pinned by tests)
+from erp_v2.ledger_roles import control_account_ids
 
-# Subledger control accounts (AP control, payroll payable, staff loans): refused except through the
+# Control accounts (2000, 2040, 1410, 1400, 2045 and the AR prepayment accounts): refused except through the
 # owning subledger or a ledger-fault correction. The screens still flag any such journal they find
 # (a held legacy draft, or a system-built ledger-fault correction).
 PAGE_SIZE = 50

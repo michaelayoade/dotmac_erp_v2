@@ -20,10 +20,8 @@ from typing import Final
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from dotmac_accounting.models import Account
 from dotmac_kernel.settings_models import SettingDomain, SettingValueType
 from dotmac_kernel.settings_resolver import SettingSpec, register_specs, resolve_value
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 DOMAIN: Final = SettingDomain("billing_gl")
@@ -227,23 +225,10 @@ def _account(db: Session, tenant_id: UUID, value: object) -> str | None:
     The spec's defaults are names ("Customer prepayments"), so a non-UUID value is looked up by code, then by name.
     Zero or several matches read as unset (the dependent facts BLOCK). Postability is the bridge's check.
     """
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        if str(UUID(value)) == value:
-            found = list(
-                db.scalars(select(Account.id).where(Account.tenant_id == tenant_id, Account.id == UUID(value)))
-            )
-            return str(found[0]) if len(found) == 1 else None
-    except ValueError:
-        pass
-    for column in (Account.code, Account.name):
-        found = list(db.scalars(select(Account.id).where(Account.tenant_id == tenant_id, column == value)))
-        if len(found) == 1:
-            return str(found[0])
-        if found:
-            return None
-    return None
+    from erp_v2.ledger_settings import account_ref_matches
+
+    found = account_ref_matches(db, tenant_id, value)
+    return str(found[0]) if len(found) == 1 else None
 
 
 def load(db: Session, tenant_id: UUID) -> MapperSettings:
