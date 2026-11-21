@@ -18,8 +18,14 @@ from typing import Final
 from uuid import UUID
 
 from dotmac_accounting.models import Account
+from dotmac_kernel.setting_scopes import SettingScope
+from dotmac_kernel.settings_resolver import StrictSettingResolutionError, resolve_strict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+# Imported here, not lazily: importing it registers the ``ar.*`` setting specs, and that must happen before any module
+# declares a stand-in for them (a late registration would be a DuplicateSettingSpecError).
+from erp_v2.ledger_settings import PREPAYMENT_DEFAULT, PREPAYMENT_SPEC
 
 AP_CONTROL_CODE: Final = "2000"
 PAYROLL_PAYABLE_CODE: Final = "2040"
@@ -76,11 +82,6 @@ def prepayment_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
     Fail-closed in the guard's direction: an invalid stored value falls back to the registered default reference, and a
     name shared by several accounts (no code match) protects ALL of them. Nothing resolving means nothing to protect.
     """
-    from dotmac_kernel.setting_scopes import SettingScope
-    from dotmac_kernel.settings_resolver import StrictSettingResolutionError, resolve_strict
-
-    from erp_v2.ledger_settings import PREPAYMENT_DEFAULT, PREPAYMENT_SPEC
-
     try:
         value = resolve_strict(db, PREPAYMENT_SPEC, scope=SettingScope.tenant(tenant_id))
     except StrictSettingResolutionError:

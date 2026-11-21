@@ -23,7 +23,9 @@ from test_journals_pg import (  # noqa: F401  (hosted-Postgres fixtures)
     refused_control,
     refused_fix,
     run,
-    seed,
+)
+from test_journals_pg import (
+    seed as _seed,
 )
 from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (hosted-Postgres fixture)
 
@@ -39,6 +41,14 @@ def engine(_bridge_engine):  # noqa: F811
 
 
 CODES = ("1400", "2045", "2300")  # 2300 is the seeded "Customer prepayments" account (the setting's default)
+
+
+def seed(engine):
+    """The journals world plus the AR prepayment account under its default name (kept out of the shared seed so that
+    other worlds, which add their own "Customer prepayments", are not made ambiguous)."""
+    env = _seed(engine)
+    env.accounts["2300"] = _add(engine, env, "2300", "Customer prepayments")
+    return env
 
 
 def _add(engine, env, code, name):
