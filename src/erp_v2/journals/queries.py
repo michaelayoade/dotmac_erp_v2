@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from erp_v2.journals import models as m
 from erp_v2.journals.models import ManualJournal
 from erp_v2.journals.service import LEGACY_OWNER
-from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
+from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES, control_account_ids  # noqa: F401  (set pinned by tests)
 
 # Subledger control accounts (AP control, payroll payable, staff loans): refused except through the
 # owning subledger or a ledger-fault correction. The screens still flag any such journal they find
@@ -93,12 +93,13 @@ def detail(db: Session, *, tenant_id: UUID, manual_id: UUID) -> dict[str, Any] |
     if journal is None:
         return None
     lines = _lines(db, tenant_id, journal.id)
+    control_ids = control_account_ids(db, tenant_id)
     return {
         "manual": manual,
         "journal": journal,
         "lines": lines,
         "names": _names(db, tenant_id, [manual]),
-        "control_accounts": sorted({a.code for _, a in lines if a.code in CONTROL_ACCOUNT_CODES}),
+        "control_accounts": sorted({a.code for _, a in lines if a.id in control_ids}),
     }
 
 

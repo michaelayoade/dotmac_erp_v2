@@ -175,7 +175,7 @@ def journal(
     amount="5",
     status="DRAFT",
     doc_id=None,
-    debit="1400",
+    debit="1500",
     credit="1000",
     day=DAY,
     with_legacy=True,
@@ -250,8 +250,8 @@ def ar_pair(engine, env, *, twin_amount="100", amount="100", kind="INVOICE", mir
         module="AR",
         doc_type=kind,
         amount=amount,
-        debit="4000" if mirror else "1400",
-        credit="1400" if mirror else "4000",
+        debit="4000" if mirror else "1500",
+        credit="1500" if mirror else "4000",
         doc_status=doc_status,
     )
     twin = journal(
@@ -263,7 +263,7 @@ def ar_pair(engine, env, *, twin_amount="100", amount="100", kind="INVOICE", mir
         amount=twin_amount,
         status="POSTED",
         doc_id=draft.document,
-        debit="1400",
+        debit="1500",
         credit="4000",
     )
     return draft, twin
@@ -327,7 +327,7 @@ def census(engine, env):
     ar_pay_ok, _ = ar_pair(engine, env, kind="CUSTOMER_PAYMENT")
     ar_differs, _ = ar_pair(engine, env, twin_amount="99")
     ar_alone = journal(
-        engine, env, kind="INVOICE", module="AR", doc_type="INVOICE", amount="100", debit="1400", credit="4000"
+        engine, env, kind="INVOICE", module="AR", doc_type="INVOICE", amount="100", debit="1500", credit="4000"
     )
     other = [
         journal(engine, env, kind="BANK_RECONCILIATION", module="BANKING", doc_type="BANK_RECONCILIATION"),

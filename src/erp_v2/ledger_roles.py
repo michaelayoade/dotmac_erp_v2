@@ -4,8 +4,9 @@ No setting and no migration: the codes below are Finance-declared constants (con
 decision D-1) and are pinned by tests to the other places that already declare them. The resolvers
 are read-only and tenant-filtered; they never create an account.
 
-* A control account (2000 AP, 2040 payroll payable, 1410 staff loans) changes only through a document
-  of its owning subledger, or through the system-built correction of a proven ledger fault.
+* A control account (2000 AP, 2040 payroll payable, 1410 staff loans, 1400 AR, 2045 employee claims, and the AR
+  prepayment liability account named by ``ar.prepayment_liability_account``) changes only through a document of its
+  owning subledger, or (2000/2040/1410 only) through the system-built correction of a proven ledger fault.
 * A supplier-invoice tax line may only use an input-tax account (1455) that is not the line's own
   posting account.
 """
@@ -23,7 +24,15 @@ from sqlalchemy.orm import Session
 AP_CONTROL_CODE: Final = "2000"
 PAYROLL_PAYABLE_CODE: Final = "2040"
 STAFF_LOAN_CODE: Final = "1410"
-CONTROL_ACCOUNT_CODES: Final = frozenset({AP_CONTROL_CODE, PAYROLL_PAYABLE_CODE, STAFF_LOAN_CODE})
+AR_CONTROL_CODE: Final = "1400"
+EMPLOYEE_CLAIMS_CODE: Final = "2045"
+# S9b (plan 6-C2): 1400 and 2045 join the fixed control codes; the AR prepayment account is a runtime setting, so it
+# joins by resolution (``prepayment_account_ids``), not by a constant.
+CONTROL_ACCOUNT_CODES: Final = frozenset(
+    {AP_CONTROL_CODE, PAYROLL_PAYABLE_CODE, STAFF_LOAN_CODE, AR_CONTROL_CODE, EMPLOYEE_CLAIMS_CODE}
+)
+# The system-built ledger-fault door (journals) is NOT widened by the S9b tightening: it stays on the original three.
+LEDGER_FAULT_CONTROL_CODES: Final = frozenset({AP_CONTROL_CODE, PAYROLL_PAYABLE_CODE, STAFF_LOAN_CODE})
 # The flip-gate control checks (B-9, section 12.4). A code constant, not a setting and not a per-run declaration, so a
 # run cannot drop an account to pass; each signed bridge records the lists it checked. Changing a list is a code change.
 GATE_TIE_CODES: Final = ("1400", "1410", "2000", "2040", "2045")  # GL must equal the v2 owner subledger
@@ -61,6 +70,42 @@ def tax_role_account_ids(db: Session, tenant_id: UUID) -> set[str]:
     return ids
 
 
+def prepayment_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
+    """The account(s) ``ar.prepayment_liability_account`` names (code match wins, else exact name), in any status.
+
+    Fail-closed in the guard's direction: an invalid stored value falls back to the registered default reference, and a
+    name shared by several accounts (no code match) protects ALL of them. Nothing resolving means nothing to protect.
+    """
+    from dotmac_kernel.setting_scopes import SettingScope
+    from dotmac_kernel.settings_resolver import StrictSettingResolutionError, resolve_strict
+
+    from erp_v2.ledger_settings import PREPAYMENT_DEFAULT, PREPAYMENT_SPEC
+
+    try:
+        value = resolve_strict(db, PREPAYMENT_SPEC, scope=SettingScope.tenant(tenant_id))
+    except StrictSettingResolutionError:
+        value = PREPAYMENT_DEFAULT
+    if not isinstance(value, str) or not value.strip():
+        return frozenset()
+    rows = list(
+        db.execute(
+            select(Account.id, Account.code).where(
+                Account.tenant_id == tenant_id, (Account.code == value) | (Account.name == value)
+            )
+        )
+    )
+    by_code = [r.id for r in rows if r.code == value]
+    return frozenset(by_code or [r.id for r in rows])
+
+
+def control_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
+    """Every control account of this tenant: the fixed codes plus the resolved AR prepayment account."""
+    fixed = db.scalars(
+        select(Account.id).where(Account.tenant_id == tenant_id, Account.code.in_(CONTROL_ACCOUNT_CODES))
+    )
+    return frozenset(fixed) | prepayment_account_ids(db, tenant_id)
+
+
 def account_id_for_code(db: Session, tenant_id: UUID, code: str) -> UUID | None:
     """The tenant account with this code, in any status (codes are unique per tenant)."""
     return db.scalar(select(Account.id).where(Account.tenant_id == tenant_id, Account.code == code))
@@ -89,13 +134,8 @@ def control_codes_among(db: Session, tenant_id: UUID, account_ids: Iterable[UUID
     ids = set(account_ids)
     if not ids:
         return set()
-    return set(
-        db.scalars(
-            select(Account.code).where(
-                Account.tenant_id == tenant_id, Account.id.in_(ids), Account.code.in_(CONTROL_ACCOUNT_CODES)
-            )
-        )
-    )
+    control = control_account_ids(db, tenant_id)
+    return set(db.scalars(select(Account.code).where(Account.tenant_id == tenant_id, Account.id.in_(ids & control))))
 
 
 def _is_uuid(value: object) -> bool:
@@ -128,7 +168,7 @@ def invoice_account_violation(
     ``lines`` are ``(posting_account_ref, tax_amount, tax_account_ref)``. The liability must be the AP
     control account (2000). A taxed line's tax account must not be the line's own posting account and
     must be a declared input-tax account (1455); that also blocks WHT payable, 1440, 2120 and expense
-    accounts. No line or tax account may be a control account (2000/2040/1410): the liability pin alone
+    accounts. No line or tax account may be a control account (2000/2040/1410/1400/2045/prepayment): the liability pin alone
     would still let ``Dr 1410 / Cr 2000`` through as an invoice line. Read-only; nothing is created.
     """
     try:
@@ -138,16 +178,14 @@ def invoice_account_violation(
     if not same_account(liability_ref, ap_control):
         return "liability_not_ap_control", "A supplier invoice must be booked to the AP control account (2000)"
     rows = list(lines)
-    control_ids = set(
-        db.scalars(select(Account.id).where(Account.tenant_id == tenant_id, Account.code.in_(CONTROL_ACCOUNT_CODES)))
-    )
+    control_ids = set(control_account_ids(db, tenant_id))
     for number, (posting, tax, tax_ref) in enumerate(rows, start=1):
         refs = [posting, tax_ref] if tax is not None and tax > 0 else [posting]
         for ref in refs:
             if any(same_account(ref, control_id) for control_id in control_ids):
                 return (
                     "line_account_is_control",
-                    f"Line {number}: a control account (2000/2040/1410) cannot be a line or tax account; "
+                    f"Line {number}: a control account (2000/2040/1410/1400/2045/prepayment) cannot be a line or tax account; "
                     "correct it through the owning subledger document",
                 )
     tax_roles = tax_role_account_ids(db, tenant_id)

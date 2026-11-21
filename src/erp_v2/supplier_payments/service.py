@@ -67,7 +67,7 @@ from erp_v2.disbursement import policy as disbursement_policy
 from erp_v2.disbursement.models import KIND_SUPPLIER_PAYMENT, DisbursementFileReceipt
 from erp_v2.governance import policy as governance
 from erp_v2.journals import policy as journal_policy
-from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
+from erp_v2.ledger_roles import control_account_ids
 from erp_v2.payees import service as payee_service
 from erp_v2.payees.models import InstructionOrigin, InstructionStatus, PayeeBankInstruction, PayeeKind
 from erp_v2.posting import rules
@@ -216,10 +216,10 @@ def payer_references(db: Session, *, tenant_id: UUID, bank_account_id: UUID, cur
         raise PaymentRefused(
             "cash_account_not_postable", "The bank account's cash ledger account is not open for posting"
         )
-    if gl.code in CONTROL_ACCOUNT_CODES:
+    if gl.id in control_account_ids(db, tenant_id):
         raise PaymentRefused(
             "cash_account_is_control",
-            "The bank account's cash ledger account is a control account (2000/2040/1410); "
+            "The bank account's cash ledger account is a control account (2000/2040/1410/1400/2045/prepayment); "
             "a payment must never move a subledger control balance through the bank",
         )
     return value, str(account.id)

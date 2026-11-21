@@ -12,7 +12,8 @@ def test_constants_are_the_approved_sets():
     assert ledger_roles.AP_CONTROL_CODE == "2000"
     assert ledger_roles.PAYROLL_PAYABLE_CODE == "2040"
     assert ledger_roles.STAFF_LOAN_CODE == "1410"
-    assert ledger_roles.CONTROL_ACCOUNT_CODES == {"2000", "2040", "1410"}
+    assert ledger_roles.CONTROL_ACCOUNT_CODES == {"2000", "2040", "1410", "1400", "2045"}
+    assert ledger_roles.LEDGER_FAULT_CONTROL_CODES == {"2000", "2040", "1410"}  # the fault door is not widened
     assert ledger_roles.INVOICE_TAX_ACCOUNT_CODES == {"1455"}
 
 

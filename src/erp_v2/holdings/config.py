@@ -25,7 +25,8 @@ from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES, tax_role_account_ids
 from erp_v2.ledger_settings import PREPAID_FUNDING_SPEC, PREPAYMENT_SPEC
 
 KEY_PREFIX: Final = "migration.holding_account."
-# Control accounts the tie covers today (1400, 2045 and prepayment join CONTROL_ACCOUNT_CODES in S9, not here).
+# Control accounts the tie covers. 1400 and 2045 are in CONTROL_ACCOUNT_CODES since S9b (the union is kept explicit);
+# the prepayment account joins by resolution (``ledger_roles.prepayment_account_ids``), not by code.
 TIE_CONTROL_CODES: Final = frozenset(CONTROL_ACCOUNT_CODES | {"1400", "2045"})
 DEFAULTS: Final = {
     "2000": "AP migration clearing",
