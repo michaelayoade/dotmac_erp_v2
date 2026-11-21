@@ -82,11 +82,10 @@ reports `verifier_unavailable` and `importable=False`; adoption alone
 does not qualify rehearsal or activate imports. The 2026-10-12 Billing
 freeze and no repair/backfill rule remain in force.
 
-## AR opening admission (AS-IS rework of #72): billing a12 pinned, a13 follow-up
+## AR opening admission (AS-IS rework of #72): billing a13 pinned (S9 composition)
 
-Pin `dotmac-billing==0.1.0a12` (head `bi_0017_open_documents_index`). **Follow-up: pin a13** (R1 + `bi_0018` +
-`bi_0019`, Starter #1111) in the composition PR; a13 is not released (no tag) at the time of this rework. The code
-is written to run on both: the a13 behaviour was exercised locally against the a13 source tree, a12 is what CI pins.
+Pin `dotmac-billing==0.1.0a13` (R1 + `bi_0018` + `bi_0019`, head `bi_0019_opening_dual_control`). The earlier a12
+fallbacks are gone: every window provision passes `dual_control` explicitly.
 
 a12/a13 bind ONE window to ONE complete `OpeningManifestV2`; every command carries the whole manifest and its
 `partition` (customer x currency) only selects. `ar_opening_cli` runs census -> mint -> plan -> apply (provision as
@@ -114,8 +113,7 @@ Billing owner's a13 answers (paths under Starter `packages/dotmac-billing/src/do
 
 Other rules: customers are the imported wave-4 `customer_accounts` (`SubOriginPolicy.INCLUDE`; the account id is the
 legacy customer id); the mint creates billing accounts only and refuses `customer_not_imported`. The window binds the
-ERP two-person policy (#62) as a13's per-window `dual_control`, passed explicitly and read back; on a12 only policy ON
-can be honoured (OFF is refused). T1: `t1_credit_by_currency(manifest)` is the Sigma cash-lot residual of the sealed
+ERP two-person policy (#62) as a13's per-window `dual_control`, passed explicitly and read back (policy OFF is the default). T1: `t1_credit_by_currency(manifest)` is the Sigma cash-lot residual of the sealed
 manifest per currency (the seam for B-14's `ar_opening_credit`; cross-check against R1 only while the writer fence
 is held). T2/T3 are the B-15 mapper, not here. M3 `batch_controls` is NOT built (see the PR description).
 

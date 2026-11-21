@@ -73,13 +73,14 @@ DISPATCH: Final = MappingProxyType(
         (1, "reallocation"): _post(),
         (1, "refund"): _post(cash=CASH_SETTLEMENT),
         (1, "reversal"): _post(cash=CASH_REVERSAL, predecessor=True),
-        # V2 WHT, V3 non-cash: no public getter yet (ST-4b / R9).
-        (2, "withholding_accepted"): Rule(BLOCK, "fact_contract_unreadable", needs_fact=False),
-        (2, "withholding_reversed"): Rule(BLOCK, "fact_contract_unreadable", needs_fact=False),
-        (3, "non_cash_credit_granted"): Rule(BLOCK, "fact_contract_unreadable", needs_fact=False),
-        (3, "non_cash_credit_applied"): Rule(BLOCK, "fact_contract_unreadable", needs_fact=False),
-        (3, "non_cash_credit_application_reversed"): Rule(BLOCK, "fact_contract_unreadable", needs_fact=False),
-        (3, "non_cash_credit_reduced"): Rule(BLOCK, "fact_contract_unreadable", needs_fact=False),
+        # V2 WHT, V3 non-cash: readable through billing a13's public getters (R9), but no GL treatment is defined
+        # for them yet: the fact is read (integrity verified) and BLOCKED by name, never dropped.
+        (2, "withholding_accepted"): Rule(BLOCK, "wht_mapping_not_built"),
+        (2, "withholding_reversed"): Rule(BLOCK, "wht_mapping_not_built"),
+        (3, "non_cash_credit_granted"): Rule(BLOCK, "non_cash_credit_mapping_not_built"),
+        (3, "non_cash_credit_applied"): Rule(BLOCK, "non_cash_credit_mapping_not_built"),
+        (3, "non_cash_credit_application_reversed"): Rule(BLOCK, "non_cash_credit_mapping_not_built"),
+        (3, "non_cash_credit_reduced"): Rule(BLOCK, "non_cash_credit_mapping_not_built"),
         # V4 opening cash
         (4, "opening_cash_imported"): Rule(SKIP_OPENING),
         (4, "opening_cash_import_reversed"): Rule(SKIP_UNWIND),
