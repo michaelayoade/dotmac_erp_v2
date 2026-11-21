@@ -229,13 +229,3 @@ def test_a_currency_with_a_non_ngn_precision_refuses(engine, monkeypatch):
     with pytest.raises(HoldingRefused) as e:
         _r1(engine, env)
     assert e.value.code == "r1_precision_unsupported"
-
-
-def test_per_account_positions_and_the_window_manifest_stay_unbound_with_their_own_codes():
-    reader = hbilling.A13Billing(uuid4())
-    with pytest.raises(HoldingRefused) as e:
-        reader.account_positions(None)  # type: ignore[arg-type]
-    assert e.value.code == "account_positions_unbound"
-    with pytest.raises(HoldingRefused) as e:
-        reader.window_manifest_fingerprint(None, "w")  # type: ignore[arg-type]
-    assert e.value.code == "manifest_fingerprint_unavailable"

@@ -5,9 +5,10 @@ R1 is billing a13's public ``dotmac_billing.get_receivable_control_position_v1``
 bound with ``for_tenant`` (the holdings CLI does this from the run spec) or read from the session's
 ``app.current_tenant``. The adapter fails closed: any billing refusal, an unbound or mismatching tenant, or a currency
 whose precision is not the ERP minor exponent refuses ``r1_unavailable`` / ``r1_tenant_unbound`` /
-``r1_tenant_mismatch`` / ``r1_precision_unsupported``. Per-account positions and the window manifest are NOT bound
-here (they refuse ``account_positions_unbound`` / ``manifest_fingerprint_unavailable``). Amounts are MINOR units
-(integers); ``position_fingerprint`` binds a plan to the state it read.
+``r1_tenant_mismatch`` / ``r1_precision_unsupported``. Per-account positions come from the SEALED AR-opening window's
+admissions (``get_current_receivable_position``) and the window manifest from ``get_opening_window``; an unsealed,
+missing or different window refuses. Amounts are MINOR units (integers); ``position_fingerprint`` binds a plan to the
+state it read.
 
 R1 per currency: ``collectible_minor`` (open receivables, unknown_unverified counted: P-2), ``non_cash_minor``,
 ``available_credit_minor``, ``prepaid_funding_minor``. 1400 subledger = collectible - non_cash; prepayment subledger =
@@ -18,9 +19,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
+from sqlalchemy import select as sa_select
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -135,11 +138,89 @@ class A13Billing:
         )
         return R1Snapshot(fingerprint, currencies)
 
+    def _window(self, db: Session, scope, window_id: str | None):
+        from dotmac_billing import get_opening_window, get_opening_window_seal
+        from dotmac_billing.errors import BillingError
+
+        try:
+            window = get_opening_window(db, scope=scope)
+            seal = get_opening_window_seal(db, scope=scope) if window is not None else None
+        except BillingError as exc:
+            return refuse("billing_window_unavailable", str(getattr(exc, "code", "billing_refused")))
+        if window is None:
+            return refuse("billing_window_missing")
+        if window_id is not None and str(window.window_id) != str(window_id):
+            return refuse("billing_window_mismatch")
+        if seal is None:
+            return refuse("billing_window_not_sealed")
+        return window
+
     def account_positions(self, db: Session) -> Mapping[tuple[str, str], Position]:
-        return refuse("account_positions_unbound", "per-account billing positions are not bound to a13 yet")
+        """Per (legacy customer key, currency): the CURRENT position of every admitted AR-opening account, read from
+        billing (READ COMMITTED, read-write: ``get_current_receivable_position`` locks the account row; the caller
+        rolls back). The partitions are the ``ar_opening_admissions`` rows of the SEALED window; a row on another
+        window, a duplicate key, an incomplete position or a billing refusal refuses (never a zero)."""
+        from dotmac_billing import GetCurrentReceivablePositionV1, get_current_receivable_position
+        from dotmac_billing.errors import BillingError
+        from dotmac_kernel.money import Currency
+
+        from erp_v2.importer.ar_opening_models import ArOpeningAdmission
+
+        scope = self._scope(db)
+        window = self._window(db, scope, None)
+        rows = list(
+            db.scalars(
+                sa_select(ArOpeningAdmission)
+                .where(ArOpeningAdmission.tenant_id == scope.tenant_id)
+                .order_by(ArOpeningAdmission.source_account_key, ArOpeningAdmission.currency)
+            )
+        )
+        seen: set[tuple[str, str]] = set()
+        for row in rows:  # structural refusals first, before any billing read
+            if str(row.window_id) != str(window.window_id):
+                return refuse("admission_window_mismatch")
+            key = (row.source_account_key, row.currency)
+            if key in seen:
+                return refuse("account_positions_key_duplicate")
+            seen.add(key)
+        out: dict[tuple[str, str], Position] = {}
+        for row in rows:
+            key = (row.source_account_key, row.currency)
+            currency = Currency(row.currency, MINOR_EXPONENT)
+            try:
+                current = get_current_receivable_position(
+                    db,
+                    scope=scope,
+                    request=GetCurrentReceivablePositionV1(scope, row.billing_account_id, currency),
+                )
+            except BillingError as exc:
+                return refuse("account_positions_unavailable", str(getattr(exc, "code", "billing_refused")))
+            position = current.position
+            if position is None:
+                out[key] = Position(0, 0, 0, 0)  # proven pristine history (billing's own proof), not a guess
+                continue
+            if position.completeness != "complete":
+                return refuse("account_position_incomplete")
+            out[key] = Position(
+                collectible_minor=_minor(position.collectible_receivable.amount),
+                non_cash_minor=_minor(position.available_non_cash_credit.amount),
+                available_credit_minor=_minor(position.available_credit.amount),
+                prepaid_funding_minor=_minor(position.prepaid_funding.amount),
+            )
+        return out
 
     def window_manifest_fingerprint(self, db: Session, window_id: str) -> str:
-        return refuse("manifest_fingerprint_unavailable")
+        """The sealed billing window's bound manifest fingerprint (a missing, different or unsealed window refuses)."""
+        scope = self._scope(db)
+        return self._window(db, scope, window_id).manifest_fingerprint
+
+
+def _minor(amount) -> int:
+    """An exact minor-unit integer, or refuse: a value that is not a whole number of minor units is never rounded."""
+    scaled = Decimal(amount).scaleb(MINOR_EXPONENT)
+    if scaled != scaled.to_integral_value():
+        return refuse("r1_precision_unsupported", "amount is not a whole number of minor units")
+    return int(scaled)
 
 
 def default_reader() -> BillingReader:
