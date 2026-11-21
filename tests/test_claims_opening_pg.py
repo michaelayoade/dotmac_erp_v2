@@ -620,9 +620,8 @@ def test_p6_a_claim_recorded_on_2040_is_admitted_with_a_dr_2040_line_and_a_fragm
         items = result["admitted_items"]
         fragment = core.fragment_2040(items, result["items"], D("250.00"))
     assert fragment["reclass_2040"] == [dict(key=employee, amount="250.00")] and fragment["held_2040"] == []
-    assert str(scene.employees[employee]) != employee and gl(engine, env, "2040") == D("250.00") - D("250.00") + D(
-        "250.00"
-    )
+    assert str(scene.employees[employee]) != employee
+    assert gl(engine, env, "2040") == D(0)  # the imported Cr 250 and the reclass Dr 250
     assert str(cid) in {i.legacy_claim_id for i in items}
 
 
