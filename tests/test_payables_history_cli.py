@@ -457,7 +457,7 @@ def test_destination_requires_complete_exact_schema_before_planning(operator, he
     assert state["transaction_tenant"] is None
 
 
-def test_pins_are_a5_and_head_is_an_expected_stamped_head():
+def test_pins_are_a6_and_head_is_an_expected_stamped_head():
     from erp_v2.migrate import EXPECTED_HEADS, EXPECTED_STAMPED_HEADS
 
     assert cli.REQUIRED_PAYABLES_VERSION == "0.1.0a6"
@@ -488,6 +488,8 @@ def test_zero_row_assertion_covers_the_ruled_tables():
         "supplier_payment_withholdings",
         "historical_settlements",
         "settlement_observations",
+        "historical_credit_receipts",
+        "historical_credit_settlements",
     }
 
 

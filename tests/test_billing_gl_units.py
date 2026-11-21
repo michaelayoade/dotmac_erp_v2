@@ -309,3 +309,24 @@ def test_cli_refuses_operator_dsns_a_bad_tenant_and_apply_without_the_switch(mon
     for code in ("invalid_tenant_id", "operator_database_materials_forbidden", "explicit_billing_gl_apply_required"):
         assert code in out
     assert "documentation.invalid" not in out and tenant not in out
+
+
+def test_v2_v3_mapper_reads_match_the_real_a13_fact_contracts() -> None:
+    """The mapper's V2/V3 decode touches these attributes of billing's public fact types (R9); a rename in billing
+    fails here instead of degrading a fact to ``fact_read_failed`` at run time."""
+    from dataclasses import fields
+
+    from dotmac_billing import get_accounting_fact_v2, get_accounting_fact_v3
+    from dotmac_billing.contracts import (
+        AccountingEffectV1,
+        AccountingFactV2,
+        AccountingFactV3,
+        WithholdingDischargeEffectV1,
+    )
+
+    assert callable(get_accounting_fact_v2) and callable(get_accounting_fact_v3)
+    common = {"committed_at", "effects", "source_ref"}
+    assert common | {"withholding_discharges", "reverses_fact_id"} <= {f.name for f in fields(AccountingFactV2)}
+    assert common <= {f.name for f in fields(AccountingFactV3)}
+    assert {"lane", "amount_delta"} <= {f.name for f in fields(AccountingEffectV1)}
+    assert "settlement_id" in {f.name for f in fields(WithholdingDischargeEffectV1)}

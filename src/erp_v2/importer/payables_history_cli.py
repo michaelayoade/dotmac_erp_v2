@@ -42,6 +42,8 @@ PREIMPORT_EMPTY_TABLES = (
     "supplier_payment_withholdings",
     "historical_settlements",
     "settlement_observations",
+    "historical_credit_receipts",  # payables a6 (R5b): defence in depth
+    "historical_credit_settlements",
 )
 _EMPTY_TABLE_COUNT_SQL = {
     "supplier_payments": "SELECT count(*) FROM mod_payables.supplier_payments WHERE tenant_id = :tenant",
@@ -51,6 +53,10 @@ _EMPTY_TABLE_COUNT_SQL = {
     " WHERE tenant_id = :tenant",
     "historical_settlements": "SELECT count(*) FROM mod_payables.historical_settlements WHERE tenant_id = :tenant",
     "settlement_observations": "SELECT count(*) FROM mod_payables.settlement_observations WHERE tenant_id = :tenant",
+    "historical_credit_receipts": "SELECT count(*) FROM mod_payables.historical_credit_receipts"
+    " WHERE tenant_id = :tenant",
+    "historical_credit_settlements": "SELECT count(*) FROM mod_payables.historical_credit_settlements"
+    " WHERE tenant_id = :tenant",
 }
 # Settled historical admission (legacy_ap.settled_cli) writes historical_settlements itself, and a re-run of the
 # same list must stay a no-op, so that table is governed by the settled operator (rows only for invoices of its
