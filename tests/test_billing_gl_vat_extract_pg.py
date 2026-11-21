@@ -143,7 +143,7 @@ def test_the_legacy_reader_and_derivation_end_to_end(engine, legacy):
 
 
 def _superuser_engine(engine):
-    """The same database as a superuser (the fixture's owner role cannot relax FK triggers); disposed by the caller."""
+    """The same database as a superuser (the fixture's owner role cannot relax FK triggers)."""
     import os
 
     url = sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]).set(database=engine.url.database)

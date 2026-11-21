@@ -468,3 +468,18 @@ def test_opening_plan_applies_the_billing_cross_check() -> None:
     planned = vat_opening.plan(parsed, "a" * 64, check)
     assert planned["counts"] == {"load": 1, "e38": 1, "override": 0}
     assert planned["e38"][0]["reason"] == "open_initial_mismatch"
+
+
+def test_opening_plan_refuses_a_treatment_outside_the_configured_set_into_e38() -> None:
+    parsed = _parse([_item(treatment="standard"), _item(treatment="exempt-typo")])
+    planned = vat_opening.plan(parsed, "a" * 64, None, frozenset({"standard"}))
+    assert planned["counts"] == {"load": 1, "e38": 1, "override": 0}
+    assert planned["load"][0]["treatment"] == "standard"
+    assert (
+        planned["e38"][0]["reason"] == "treatment_not_in_settings" and planned["e38"][0]["treatment"] == "exempt-typo"
+    )
+    # an unset setting refuses every item (nothing is dropped, everything is itemised)
+    none_set = vat_opening.plan(parsed, "a" * 64, None, frozenset())
+    assert none_set["counts"]["load"] == 0 and len(none_set["e38"]) == 2
+    # no set passed (unit callers) keeps the old behaviour
+    assert vat_opening.plan(parsed, "a" * 64)["counts"]["load"] == 2

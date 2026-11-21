@@ -730,3 +730,42 @@ def test_only_the_vat_trigger_message_is_a_vat_invariant(engine, monkeypatch):
 
     monkeypatch.setattr(vat_plan, "persist", failing)
     assert run(engine, env)["blocked_by_reason"] == {"BLOCKED:integrity_refused": 1}
+
+
+def test_the_loader_treatment_set_is_the_tenants_configured_tax_accounts(engine):
+    env = world(engine)
+    configure(engine, env, tax_accounts={})
+    with Session(engine) as db:
+        assert vat_opening.configured_treatments(db, env.tenant_id) == frozenset()  # unset: nothing is in the set
+    configure(
+        engine,
+        env,
+        tax_accounts={
+            "standard": {"current": str(env.accounts["1440"]), "deferral": str(env.accounts["1455"])},
+            "zero": {"current": str(env.accounts["1440"]), "deferral": str(env.accounts["1455"])},
+        },
+    )
+    with Session(engine) as db:
+        configured = vat_opening.configured_treatments(db, env.tenant_id)
+    assert configured == frozenset({"standard", "zero"})
+    import json
+
+    def item(treatment, ref):
+        return {
+            "document_id": str(uuid4()),
+            "treatment": treatment,
+            "total": "120.00",
+            "tax": "20.00",
+            "open_initial": "120.00",
+            "journal_1455_credit": "20.00",
+            "reclass": [],
+            "deferral_account": str(env.accounts["1455"]),
+            "current_account": str(env.accounts["1440"]),
+            "legacy_ref": ref,
+            "finance_override": None,
+        }
+
+    body = {"version": 1, "tenant_id": str(env.tenant_id), "items": [item("standard", "A"), item("other", "B")]}
+    planned = vat_opening.plan(vat_opening.parse(json.dumps(body).encode()), "d" * 64, None, configured)
+    assert [r["legacy_ref"] for r in planned["load"]] == ["A"]
+    assert [(r["legacy_ref"], r["reason"]) for r in planned["e38"]] == [("B", "treatment_not_in_settings")]

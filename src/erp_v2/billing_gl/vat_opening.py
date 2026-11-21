@@ -164,10 +164,28 @@ def billing_check(db, tenant_id: UUID):
     return check
 
 
-def plan(parsed: dict[str, Any], input_sha: str, check=None) -> dict[str, Any]:
+def configured_treatments(db, tenant_id: UUID) -> frozenset[str]:
+    """The treatment codes of the tenant's ``tax_accounts`` setting: the same set the mapper resolves for live
+    invoices. Billing a13 exposes no treatment code for an imported open item (no tax snapshot is stored), so this
+    configured set, plus the operator treatment map whose sha the extract receipt records, is the control."""
+    from dotmac_kernel.settings_resolver import resolve_value
+
+    from erp_v2.billing_gl import settings
+
+    value = resolve_value(db, settings.DOMAIN, "tax_accounts", tenant_id=tenant_id, default={})
+    return frozenset(value) if isinstance(value, dict) else frozenset()
+
+
+def plan(
+    parsed: dict[str, Any], input_sha: str, check=None, treatments: frozenset[str] | None = None
+) -> dict[str, Any]:
+    """``treatments`` (when given) is the configured set every item's treatment must belong to; an item outside it is
+    an E38 item (``treatment_not_in_settings``), never loaded and never dropped."""
     load, e38 = [], []
     for item in parsed["items"]:
         remaining, reason = derive(item)
+        if reason is None and treatments is not None and item["treatment"] not in treatments:
+            reason = "treatment_not_in_settings"
         if reason is None and check is not None:
             reason = check(item)
         row = {
@@ -317,7 +335,12 @@ def main(argv: list[str] | None = None) -> int:
         engine = cli_common.engine()
         with Session(engine) as db:
             db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(parsed["tenant_id"])})
-            planned = plan(parsed, sha, billing_check(db, parsed["tenant_id"]))
+            planned = plan(
+                parsed,
+                sha,
+                billing_check(db, parsed["tenant_id"]),
+                configured_treatments(db, parsed["tenant_id"]),
+            )
             if args.action == "plan":
                 db.rollback()
                 return {"ready": True, "action": "plan", **planned}
