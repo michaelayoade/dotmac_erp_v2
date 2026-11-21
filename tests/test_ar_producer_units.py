@@ -812,9 +812,18 @@ def test_manual_basis_is_verified_and_names_the_manual_policy():
     assert basis.override_actor == "p" and basis.override_reason
 
 
-def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms(monkeypatch):
-    cfg = _complete_settings()
+def test_the_customer_screen_seams_fall_back_to_the_tenant_terms_and_the_name_snapshot(monkeypatch):
+    from erp_v2.customers_web import queries as customer_queries
+    from erp_v2.customers_web import terms as customer_terms
+
+    cfg = replace(_complete_settings(), terms={"net_30": 30, "net_14": 14})
+    monkeypatch.setattr(customer_terms, "code_for", lambda db_, tenant, customer: None)  # no customer code recorded
+    monkeypatch.setattr(customer_queries, "finance", lambda db_, tenant, customer: None)  # no finance row recorded
     assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_30"
+    monkeypatch.setattr(customer_terms, "code_for", lambda db_, tenant, customer: "net_14")
+    assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_14"  # a configured customer code
+    monkeypatch.setattr(customer_terms, "code_for", lambda db_, tenant, customer: "gone")
+    assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_30"  # no longer configured
     # resolved at create/update and stored; issue reads only the stored code
     monkeypatch.setattr(service.settings, "load", lambda db_, tenant: cfg)
     assert service.resolve_terms_code(Mock(), uuid4(), service.KIND_INVOICE, uuid4(), None) == "net_30"
@@ -829,5 +838,5 @@ def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms(monkeyp
         with pytest.raises(service.ArRefused) as e:
             service._stored_terms_code(SimpleNamespace(payment_terms_code=bad), cfg)
         assert e.value.code == refusal
-    snap = service._customer_document_snapshot(Mock(), uuid4(), SimpleNamespace(display_name="Acme"))
+    snap = service._customer_document_snapshot(Mock(), uuid4(), SimpleNamespace(id=uuid4(), display_name="Acme"))
     assert snap.legal_name == "Acme"

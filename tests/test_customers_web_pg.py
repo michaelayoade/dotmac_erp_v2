@@ -271,9 +271,8 @@ def test_downgrade_refuses_while_rows_exist(engine):
 # --- the screen as the runtime role -------------------------------------------------------------------------------
 
 
-def test_create_edit_suspend_activate_close_as_the_runtime_role(engine, runtime, monkeypatch):
+def test_create_edit_rename_suspend_activate_close_as_the_runtime_role(engine, runtime):
     env = world(engine)
-    monkeypatch.delattr(customers_service, "rename_account", raising=False)
     out = create(runtime, env)  # blank number: allocated from the series
     with Session(engine) as db:
         account = db.get(CustomerAccount, out.account_id)
@@ -317,6 +316,18 @@ def test_create_edit_suspend_activate_close_as_the_runtime_role(engine, runtime,
         assert queries.notes(db, env.tenant_id, out.account_id) == "Pays late"
         assert terms.code_for(db, env.tenant_id, out.account_id) == "net_14"
 
+    # the real customers a2 ``rename_account``, as the runtime role (its UPDATE on mod_customers is the owner's grant)
+    act(
+        runtime,
+        env,
+        service.update_customer,
+        account_id=out.account_id,
+        display_name="Acme Renamed Ltd",
+        finance=edited,
+        notes="Pays late",
+    )
+    with Session(engine) as db:
+        assert db.get(CustomerAccount, out.account_id).display_name == "Acme Renamed Ltd"
     for target, expected in ((AccountStatus.SUSPENDED, "SUSPENDED"), (AccountStatus.ACTIVE, "ACTIVE")):
         act(runtime, env, service.change_status, account_id=out.account_id, target=target)
         with Session(engine) as db:
@@ -330,16 +341,18 @@ def test_create_edit_suspend_activate_close_as_the_runtime_role(engine, runtime,
         refused(runtime, env, service.change_status, account_id=out.account_id, target=AccountStatus.ACTIVE)
         == "customer_closed"
     )
-    # a closed customer's finance fields stay editable (legacy edited inactive customers); no delete exists anywhere
-    act(
-        runtime,
-        env,
-        service.update_customer,
-        account_id=out.account_id,
-        display_name="Acme Ltd",
-        finance=edited,
-        notes="Closed 1",
-    )
+    # close is terminal: a rename, a finance-field edit and a notes edit are all refused, nothing is saved
+    before = finance_row(engine, env, out.account_id).billing_address
+    for over in (
+        {"display_name": "Closed Rename", "finance": edited, "notes": "Pays late"},
+        {"display_name": "Acme Renamed Ltd", "finance": FinanceInput(billing_address="1 Closed Street")},
+        {"display_name": "Acme Renamed Ltd", "finance": edited, "notes": "Closed note"},
+    ):
+        assert refused(runtime, env, service.update_customer, account_id=out.account_id, **over) == "customer_closed"
+    with Session(engine) as db:
+        assert db.get(CustomerAccount, out.account_id).display_name == "Acme Renamed Ltd"
+        assert queries.notes(db, env.tenant_id, out.account_id) == "Pays late"
+    assert finance_row(engine, env, out.account_id).billing_address == before == "9 Other Road"
     with Session(engine) as db:
         assert db.get(CustomerAccount, out.account_id).status == AccountStatus.CLOSED
 
@@ -432,40 +445,31 @@ def test_terms_must_be_a_configured_key_at_save(engine, runtime):
     )
 
 
-def test_a_rename_refuses_whole_until_a2_and_works_through_the_a2_command(engine, runtime, monkeypatch):
+def test_the_real_a2_rename_saves_with_the_other_fields_and_a_closed_account_is_refused(engine, runtime):
     env = world(engine)
     out = create(runtime, env)
-    monkeypatch.delattr(customers_service, "rename_account", raising=False)
-    changed = FinanceInput(trading_name="Should Not Save")
-    assert (
-        refused(
-            runtime, env, service.update_customer, account_id=out.account_id, display_name="Renamed", finance=changed
-        )
-        == "rename_unavailable"
-    )
-    assert finance_row(engine, env, out.account_id).trading_name == "Acme Trading"  # atomic: nothing else saved
-    with Session(engine) as db:
-        assert db.get(CustomerAccount, out.account_id).display_name == "Acme Ltd"
-
-    seen = {}
-
-    def fake_rename_account(db, *, scope, account_id, display_name):  # the a2 command's contract (Starter, unreleased)
-        seen.update(scope=scope, account_id=account_id, display_name=display_name)
-        account = customers_service.get_account(db, scope=scope, account_id=account_id)
-        account.display_name = display_name  # stands in for the owning module's own write
-        db.flush()
-
-    monkeypatch.setattr(customers_service, "rename_account", fake_rename_account, raising=False)
+    changed = FinanceInput(trading_name="Renamed Trading")
     act(runtime, env, service.update_customer, account_id=out.account_id, display_name="Renamed", finance=changed)
-    assert seen["display_name"] == "Renamed" and seen["account_id"] == out.account_id
     with Session(engine) as db:
         assert db.get(CustomerAccount, out.account_id).display_name == "Renamed"
-    assert finance_row(engine, env, out.account_id).trading_name == "Should Not Save"
+    assert finance_row(engine, env, out.account_id).trading_name == "Renamed Trading"
+    # the a2 refusal itself (rename of a CLOSED account) maps to the named code, and a failed edit saves nothing
+    act(runtime, env, service.change_status, account_id=out.account_id, target=AccountStatus.CLOSED, confirm_close=True)
+    assert (
+        refused(runtime, env, service.update_customer, account_id=out.account_id, display_name="Again", finance=changed)
+        == "customer_closed"
+    )
+    assert (
+        refused(runtime, env, lambda db, **kw: service._rename(db, env.tenant_id, out.account_id, "Direct"))
+        == "customer_closed"
+    )
+    with Session(engine) as db:
+        assert db.get(CustomerAccount, out.account_id).display_name == "Renamed"
+    assert finance_row(engine, env, out.account_id).trading_name == "Renamed Trading"
 
 
-def test_audit_events_carry_field_names_and_no_values(engine, runtime, monkeypatch):
+def test_audit_events_carry_field_names_and_no_values(engine, runtime):
     env = world(engine)
-    monkeypatch.delattr(customers_service, "rename_account", raising=False)
     out = create(runtime, env, notes="Secret note text")
     act(
         runtime,
@@ -647,3 +651,91 @@ def test_the_gate_check_reports_the_series_and_wave_four_completeness(engine, ru
     with Session(engine) as db:
         report = checks.ready(db, complete.tenant_id)
     assert report.ok and report.reasons == ()
+
+
+def test_invoice_prefill_uses_the_customers_terms_code_and_a_later_edit_leaves_the_draft(engine, runtime):
+    """Spec 2.6: ``ar.service.default_terms_for_customer`` / ``resolve_terms_code`` read the customer's code when it is
+    still a configured term, else the tenant default; a draft stores the code it resolved, so a customer edit after it
+    never moves the draft."""
+    from erp_v2.ar import service as ar_service
+
+    env = world(engine)
+    with Session(engine) as db:
+        _setting(db, ar_settings.DOMAIN, ar_settings.KEY_DEFAULT_TERMS, "net_14", env.tenant_id)
+        db.commit()
+    out = create(runtime, env)  # the customer's code is net_30; the tenant default is net_14
+    other = create(runtime, env, display_name="No terms", finance=FinanceInput(trading_name="No terms Ltd"))
+    with Session(engine) as db:
+        cfg = ar_settings.load(db, env.tenant_id)
+        assert ar_service.default_terms_for_customer(db, env.tenant_id, out.account_id, cfg) == "net_30"
+        assert ar_service.default_terms_for_customer(db, env.tenant_id, other.account_id, cfg) == "net_14"  # no code
+        assert ar_service.default_terms_for_customer(db, env.tenant_id, None, cfg) == "net_14"
+        assert ar_service.default_terms_for_customer(db, env.tenant_id, uuid4(), cfg) == "net_14"  # unknown customer
+        stored = ar_service.resolve_terms_code(db, env.tenant_id, "invoice", out.account_id, None)
+        assert stored == "net_30"
+        assert ar_service.resolve_terms_code(db, env.tenant_id, "invoice", out.account_id, "net_14") == "net_14"
+    draft = uuid4()
+    with engine.begin() as c:
+        c.execute(
+            sa.text(
+                "INSERT INTO erp_ar_drafts (id, tenant_id, kind, customer_account_id, currency, document_date, status, "
+                "prepared_by, dual_control, request_id, payment_terms_code) VALUES (:i, :t, 'invoice', :c, 'NGN', "
+                "'2026-01-12', 'draft', :p, false, :r, :code)"
+            ),
+            {"i": draft, "t": env.tenant_id, "c": out.account_id, "p": uuid4(), "r": uuid4(), "code": stored},
+        )
+    act(
+        runtime,
+        env,
+        service.update_customer,
+        account_id=out.account_id,
+        display_name="Acme Ltd",
+        finance=FinanceInput(payment_terms_code="net_14"),
+    )
+    with Session(engine) as db:
+        cfg = ar_settings.load(db, env.tenant_id)
+        assert ar_service.default_terms_for_customer(db, env.tenant_id, out.account_id, cfg) == "net_14"  # new default
+        assert (
+            db.scalar(sa.text("SELECT payment_terms_code FROM erp_ar_drafts WHERE id = :i"), {"i": draft}) == "net_30"
+        )  # the draft keeps its own
+
+
+def test_a_customer_code_that_is_no_longer_configured_falls_back_to_the_tenant_default(engine, runtime):
+    from erp_v2.ar import service as ar_service
+
+    env = world(engine)
+    with Session(engine) as db:
+        _setting(db, ar_settings.DOMAIN, ar_settings.KEY_DEFAULT_TERMS, "net_14", env.tenant_id)
+        db.commit()
+    out = create(runtime, env)  # net_30
+    with Session(engine) as db:
+        _setting(db, ar_settings.DOMAIN, ar_settings.KEY_TERMS, {"net_14": 14}, env.tenant_id)
+        db.commit()
+    with Session(engine) as db:
+        cfg = ar_settings.load(db, env.tenant_id)
+        assert ar_service.default_terms_for_customer(db, env.tenant_id, out.account_id, cfg) == "net_14"
+
+
+def test_the_document_customer_snapshot_carries_the_finance_fields(engine, runtime):
+    from erp_v2.ar import constants as ar_constants
+    from erp_v2.ar import service as ar_service
+
+    env = world(engine)
+    full = create(runtime, env)
+    bare = create(runtime, env, display_name="Bare Ltd", finance=FinanceInput(trading_name="Bare Trading"))
+    with Session(engine) as db:
+        snap = ar_service._customer_document_snapshot(db, env.tenant_id, db.get(CustomerAccount, full.account_id))
+        assert snap.legal_name == "Acme Ltd" and snap.trading_name == "Acme Trading"
+        assert snap.address.line_one == ADDRESS and snap.address.country_code == "NG"
+        assert [
+            (i.identifier_type, i.identifier_value, i.issuing_country_code) for i in snap.registered_identifiers
+        ] == [("TIN", TIN, "NG")]
+        plain = ar_service._customer_document_snapshot(db, env.tenant_id, db.get(CustomerAccount, bare.account_id))
+        assert plain.address.line_one == ar_constants.ADDRESS_NOT_RECORDED and plain.registered_identifiers == ()
+        # a customer with no finance row at all keeps the previous name-and-unrecorded-address snapshot
+        norow = customers_service.create_account(
+            db, scope=TenantScope(env.tenant_id), command=CreateCustomerAccount("NOROW-1", "No row")
+        )
+        legacy = ar_service._customer_document_snapshot(db, env.tenant_id, norow)
+        assert legacy.legal_name == "No row" and legacy.address.line_one == ar_constants.ADDRESS_NOT_RECORDED
+        db.rollback()

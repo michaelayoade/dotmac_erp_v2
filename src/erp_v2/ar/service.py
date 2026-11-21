@@ -49,6 +49,7 @@ from dotmac_billing.contracts import (
     PaymentInstructionsSnapshotV1,
     PostalAddressSnapshotV1,
     PresentationAssetReferenceV1,
+    RegisteredIdentifierSnapshotV1,
     ServicePeriodEvidenceV1,
     ServicePeriodStatus,
     SettlementFundingLane,
@@ -519,15 +520,33 @@ def _stored_terms_code(draft: ArDraft, cfg: settings.ArSettings) -> str:
 def default_terms_for_customer(
     db: Session, tenant_id: UUID, customer_account_id: UUID | None, cfg: settings.ArSettings
 ) -> str | None:
-    """Seam: pre-selected terms for a customer. Today the tenant default; the customer screen swaps in the customer's
-    ``erp_customer_finance`` terms here (one hunk), nowhere else."""
-    return cfg.default_terms_code
+    """Pre-selected terms for a customer: the customer's own terms code (``erp_customer_finance``, F-F) when it is still
+    one of the configured terms, else the tenant default. A draft stores the code it resolved, so a later edit of the
+    customer never moves it."""
+    from erp_v2.customers_web import terms as customer_terms
+
+    code = customer_terms.code_for(db, tenant_id, customer_account_id) if customer_account_id else None
+    return code if code in cfg.terms else cfg.default_terms_code
 
 
 def _customer_document_snapshot(db: Session, tenant_id: UUID, customer: Any) -> PartyDocumentSnapshotV1:
-    """Seam: the customer snapshot on a document. Today the name and an unrecorded address; the customer screen adds
-    its address / TIN fields here (one hunk)."""
-    return _customer_snapshot(customer.display_name)
+    """The customer snapshot on a document: legal name, trading name, billing address (or the unrecorded marker) and
+    the TIN identifier when present, from the customer screen's ``erp_customer_finance`` row. Document content, not
+    identity."""
+    from erp_v2.customers_web import queries as customer_queries
+
+    row = customer_queries.finance(db, tenant_id, customer.id)
+    if row is None:
+        return _customer_snapshot(customer.display_name)
+    tin = row.tax_identification_number
+    return PartyDocumentSnapshotV1(
+        legal_name=customer.display_name,
+        trading_name=row.trading_name,
+        address=PostalAddressSnapshotV1(
+            line_one=row.billing_address or constants.ADDRESS_NOT_RECORDED, country_code="NG"
+        ),
+        registered_identifiers=((RegisteredIdentifierSnapshotV1("TIN", tin, "NG"),) if tin else ()),
+    )
 
 
 def _customer_snapshot(display_name: str) -> PartyDocumentSnapshotV1:

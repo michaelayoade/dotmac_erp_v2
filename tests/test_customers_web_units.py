@@ -130,60 +130,27 @@ def test_an_actor_from_another_tenant_is_refused_without_an_audit_row(monkeypatc
     audit.assert_not_called()
 
 
-def test_create_refuses_with_a_named_reason_when_customers_imports_the_kernel_reference_runtime(monkeypatch):
-    """customers a1/a2 ``create_account`` imports ``dotmac_kernel.db``; a composed ERP process refuses that import."""
-    tenant = SimpleNamespace(id=uuid4())
-    party = SimpleNamespace(id=uuid4(), tenant_id=tenant.id)
-    db = Mock()
-    db.begin_nested.return_value.__enter__ = Mock()
-    db.begin_nested.return_value.__exit__ = Mock(return_value=False)
-    audit = Mock()
-    monkeypatch.setattr(service, "_audit", audit)
-    monkeypatch.setattr(service, "valid_terms", lambda db_, tenant_id: set())
-
-    def operation_runner(db_, *, operation, **kw):
-        operation(db_)
-
-    monkeypatch.setattr(service, "execute_once", operation_runner)
-    monkeypatch.setattr(service, "_number", lambda *a, **k: "C-1")
-    monkeypatch.setattr(
-        service.customers_service,
-        "create_account",
-        Mock(side_effect=RuntimeError("dotmac_kernel.db refuses to construct the reference runtime: sealed")),
-    )
-    with pytest.raises(CustomerRefused) as info:
-        service.create_customer(
-            db, tenant=tenant, party=party, request_id=uuid4(), display_name="X", finance=FinanceInput()
-        )
-    assert info.value.code == "create_unavailable"
-    assert audit.call_args.kwargs["action"] == service.AUDIT_REFUSED
-    monkeypatch.setattr(service.customers_service, "create_account", Mock(side_effect=RuntimeError("something else")))
-    with pytest.raises(RuntimeError, match="something else"):
-        service.create_customer(
-            db, tenant=tenant, party=party, request_id=uuid4(), display_name="X", finance=FinanceInput()
-        )
-
-
-# --- rename is behind customers a2 -------------------------------------------------------------------------------
-
-
-def test_rename_refuses_with_a_named_reason_until_a2_is_pinned(monkeypatch):
-    monkeypatch.delattr(service.customers_service, "rename_account", raising=False)
-    assert service.rename_available() is False
-    with pytest.raises(CustomerRefused) as info:
-        service._rename(Mock(), uuid4(), uuid4(), "New Name")
-    assert info.value.code == "rename_unavailable"
-
-
-def test_rename_calls_the_a2_command_when_it_exists(monkeypatch):
+def test_rename_calls_the_a2_command(monkeypatch):
     spy = Mock()
-    monkeypatch.setattr(service.customers_service, "rename_account", spy, raising=False)
+    monkeypatch.setattr(service.customers_service, "rename_account", spy)
     tenant_id, account_id = uuid4(), uuid4()
-    assert service.rename_available() is True
     service._rename(Mock(), tenant_id, account_id, "New Name")
     spy.assert_called_once()
     assert spy.call_args.kwargs["account_id"] == account_id and spy.call_args.kwargs["display_name"] == "New Name"
     assert spy.call_args.kwargs["scope"].tenant_id == tenant_id
+
+
+def test_a_rename_conflict_from_a2_is_the_named_customer_closed_refusal(monkeypatch):
+    from dotmac_customers.contracts import Conflict
+
+    monkeypatch.setattr(
+        service.customers_service,
+        "rename_account",
+        Mock(side_effect=Conflict("closed customer account cannot be renamed")),
+    )
+    with pytest.raises(CustomerRefused) as info:
+        service._rename(Mock(), uuid4(), uuid4(), "New Name")
+    assert info.value.code == "customer_closed"
 
 
 # --- status machine (CLOSED terminal) ----------------------------------------------------------------------------
@@ -526,14 +493,6 @@ def test_a_missing_request_id_is_a_refusal_not_a_server_error(browser):
     response = browser.client.post(f"{B}/new", data={"csrf_token": token, "display_name": "X"})
     assert response.status_code == 400 and "invalid_input" in response.text
     browser.spies["create_customer"].assert_not_called()
-
-
-def test_the_edit_form_says_when_rename_is_unavailable(browser, monkeypatch):
-    monkeypatch.setattr(routes.service, "rename_available", lambda: False)
-    browser.sign_in("preparer")
-    assert "Renaming is not available yet" in browser.client.get(f"{B}/{ID}/edit").text
-    monkeypatch.setattr(routes.service, "rename_available", lambda: True)
-    assert "Renaming is not available yet" not in browser.client.get(f"{B}/{ID}/edit").text
 
 
 def test_a_close_post_passes_the_confirmation_flag(browser):

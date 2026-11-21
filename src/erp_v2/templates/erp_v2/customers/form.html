@@ -4,7 +4,6 @@
 <h1>{% if account %}Edit {{ account.account_number }}{% else %}New customer{% endif %}</h1>
 <p><a href="{{ base }}">Customers</a>{% if account %} · <a href="{{ base }}/{{ account.id }}">Back to customer</a>{% endif %}</p>
 {% if error %}<p role="alert">{{ error }}</p>{% endif %}
-{% if account and not rename_available %}<p>Renaming is not available yet (it needs the next customers release). Leave the name unchanged to save the other fields.</p>{% endif %}
 <form method="post" action="{{ base }}/{% if account %}{{ account.id }}/edit{% else %}new{% endif %}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   {% if not account %}<input type="hidden" name="request_id" value="{{ request_id }}">

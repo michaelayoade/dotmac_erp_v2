@@ -15,7 +15,7 @@ importer writes as the migration role.
 The downgrade refuses while any row exists.
 
 Revision chain: e2_0033_billing_gl_vat -> this. e2_0034 stays reserved for the WHT follow-up; when created it chains
-after the then head. (Stacked; the coordinator re-chains at merge.)
+after the then head.
 """
 
 from __future__ import annotations

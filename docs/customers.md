@@ -39,20 +39,19 @@ party holds the permission. Admin and staff hold no write permission.
   (as legacy). Email: basic shape check.
 * Each POST runs in one savepoint and writes one audit event with field names only (never a contact, address, tax id,
   note or name): `erp.finance.customers.created | updated | status_changed | refused`.
-* Rename calls customers a2 `rename_account`. Until a2 is pinned the action refuses `rename_unavailable` and the whole
-  edit is refused (nothing saved). `rename_available()` flips on its own once the installed customers has the command.
-* **Known blocker for create**: customers a1/a2 `create_account` imports `dotmac_kernel.db` (the kernel's reference
-  runtime), which a composed ERP process refuses once its own runtime is bound. Create then refuses `create_unavailable`
-  with nothing written. Fix in Starter: import `dotmac_kernel.transactions.conflict_savepoint` (as ERP code does) in
-  `create_account` and `link_party_reference`. The PG tests stand in for the fixed import.
+* Rename calls customers a2 `rename_account` directly. A CLOSED customer is refused `customer_closed` for a rename, a
+  finance-field edit and a notes edit (close is terminal); nothing is saved. Concurrent edits of one customer serialise
+  on the finance row (`SELECT ... FOR UPDATE`).
+* Create calls customers a2 `create_account` directly (a2 imports `dotmac_kernel.transactions`, which a composed ERP
+  process allows).
 
 ## B-16 hook (read side, ready now)
 
-`customers_web.terms.code_for(db, tenant_id, customer_account_id)` returns the customer's terms code or None. The B-16
-invoice form should pre-select it and fall back to `ar.default_payment_terms_code` when it is None or no longer a key. A
-draft stores its own code, so a later customer edit never changes a draft or an issued invoice (PG-tested). The two `ar/*`
-hunks (pre-select in `ar/routes.py`; `ar/service._customer_snapshot` legal name, trading name, address, TIN) wait for #78
-to merge and are NOT in this PR.
+`customers_web.terms.code_for(db, tenant_id, customer_account_id)` returns the customer's terms code or None.
+`ar.service.default_terms_for_customer` pre-selects it when it is still one of the configured terms, else
+`ar.default_payment_terms_code`. A draft stores its own code, so a later customer edit never changes a draft or an
+issued invoice (PG-tested). `ar.service._customer_document_snapshot` builds the customer snapshot on a document from
+the finance row: legal name, trading name, billing address (or the unrecorded marker) and the TIN identifier when present.
 
 ## Gate check
 

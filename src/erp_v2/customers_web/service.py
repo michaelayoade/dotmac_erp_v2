@@ -11,10 +11,8 @@ Rules:
 * create is idempotent per hidden ``request_id`` (kernel idempotency); a blank account number is allocated from the
   ``customers.series.account_number`` series;
 * the payment terms code must be a key of ``ar.payment_terms`` at save (``payment_terms_unknown``);
-* ``create_account`` (a1, a2) imports the kernel reference runtime, which the composed ERP process refuses: until
-  Starter fixes that import, create refuses ``create_unavailable`` (nothing written);
-* rename calls customers a2 ``rename_account``. Until a2 is pinned (follow-up) the action refuses
-  ``rename_unavailable`` and writes nothing, so an edit that changes the display name is refused whole;
+* rename calls customers a2 ``rename_account`` (a2 is pinned); a CLOSED customer is refused ``customer_closed`` for a
+  rename, a finance-field edit and a notes edit alike (close is terminal), with nothing saved;
 * no delete: legacy delete becomes CLOSED (terminal, needs an explicit confirmation).
 """
 
@@ -208,6 +206,7 @@ def _finance_row(db: Session, tenant_id: UUID, account_id: UUID) -> CustomerFina
         select(CustomerFinance)
         .where(CustomerFinance.tenant_id == tenant_id, CustomerFinance.customer_account_id == account_id)
         .execution_options(populate_existing=True)
+        .with_for_update()  # a concurrent edit of the same customer waits instead of losing an update
     )
 
 
@@ -218,18 +217,13 @@ def _account(db: Session, tenant_id: UUID, account_id: UUID) -> CustomerAccount:
     return account
 
 
-def rename_available() -> bool:
-    """True once customers a2 (``rename_account``) is installed; the a2 pin is a follow-up."""
-    return callable(getattr(customers_service, "rename_account", None))
-
-
 def _rename(db: Session, tenant_id: UUID, account_id: UUID, display_name: str) -> None:
-    command = getattr(customers_service, "rename_account", None)
-    if command is None:
-        raise CustomerRefused(
-            "rename_unavailable", "Renaming needs dotmac-customers a2, which is not installed yet; nothing was saved"
+    try:
+        customers_service.rename_account(
+            db, scope=TenantScope(tenant_id), account_id=account_id, display_name=display_name
         )
-    command(db, scope=TenantScope(tenant_id), account_id=account_id, display_name=display_name)
+    except Conflict as exc:  # a2 refuses a rename of a CLOSED account
+        raise CustomerRefused("customer_closed", str(exc)) from exc
 
 
 # --- create -----------------------------------------------------------------------------------------------------
@@ -290,16 +284,6 @@ def create_customer(
                 )
             except Conflict as exc:
                 raise CustomerRefused("account_number_taken", "That account number is already in use") from exc
-            except RuntimeError as exc:
-                if "reference runtime" not in str(exc):
-                    raise
-                # customers a1 ``create_account`` imports ``dotmac_kernel.db`` (the kernel's reference runtime), which a
-                # composed ERP process refuses once its own runtime is bound. Fail closed with a named reason: the
-                # command raises before any write. Fixed in Starter by importing ``dotmac_kernel.transactions``.
-                raise CustomerRefused(
-                    "create_unavailable",
-                    "Creating a customer needs a customers release that does not import the kernel reference runtime",
-                ) from exc
             if note:
                 customers_service.set_profile(
                     session, scope=TenantScope(tenant.id), command=SetCustomerProfile(account.id, notes=note)
@@ -370,12 +354,14 @@ def update_customer(
 
     def work() -> Outcome:
         account = _account(db, tenant.id, account_id)
+        if account.status == AccountStatus.CLOSED:
+            raise CustomerRefused("customer_closed", "A closed customer cannot be edited")
         name = _display_name(display_name)
         clean = clean_finance(finance, terms=valid_terms(db, tenant.id))
         note = _notes(notes)
         changed: list[str] = []
         if name != account.display_name:
-            _rename(db, tenant.id, account_id, name)  # refuses whole until a2 is pinned
+            _rename(db, tenant.id, account_id, name)
             changed.append("display_name")
         profile = db.scalar(
             select(CustomerProfile).where(

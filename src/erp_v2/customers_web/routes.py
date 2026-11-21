@@ -103,7 +103,6 @@ def _form_context(
         values=values,
         terms=sorted(service.valid_terms(db, tenant.id)),
         series=settings.series_code(db, tenant.id),
-        rename_available=service.rename_available(),
         statuses=[s.value for s in service.CREATE_STATUSES],
         request_id=str(uuid4()),
         error=error,
