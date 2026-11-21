@@ -817,6 +817,7 @@ def test_a_direct_commit_inside_the_run_stays_tenant_scoped_without_any_manual_r
     monkeypatch.setattr(mapper_module, "Mapper", Probe)
     with engine.connect() as conn, Session(bind=conn) as db:
         db.execute(sa.text("SET ROLE app_user"))
+        db.execute(sa.text("RESET app.current_tenant"))  # pooled connections keep other tests' session-level scope
         db.commit()  # end that transaction: the run starts with no tenant scope at all
         assert db.execute(sa.text("SELECT current_setting('app.current_tenant', true)")).scalar_one() in (None, "")
         assert db.execute(sa.text("SELECT count(*) FROM mod_accounting.accounts")).scalar_one() == 0  # fails closed
