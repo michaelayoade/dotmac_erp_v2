@@ -95,6 +95,7 @@ def seed(engine, *, currency: str | None = "USD", adjustment: bool = False) -> S
         for code, category, balance in (
             ("1000", "AST", NormalBalance.DEBIT),
             ("1400", "AST", NormalBalance.DEBIT),
+            ("1500", "AST", NormalBalance.DEBIT),  # a plain asset (1400 is a control account since S9b)
             ("4000", "REV", NormalBalance.CREDIT),
             ("2000", "LIA", NormalBalance.CREDIT),
             ("2040", "LIA", NormalBalance.CREDIT),
@@ -1038,7 +1039,7 @@ def held_row(engine, env, journal_id, *, state, origin=m.ORIGIN_LEGACY_HELD):
         return row.id
 
 
-@pytest.mark.parametrize("code", ["2000", "2040", "1410"])
+@pytest.mark.parametrize("code", ["2000", "2040", "1410", "1400"])
 def test_v2_prepare_on_a_control_account_refuses_and_writes_nothing(engine, code):
     env = seed(engine)
     before = counts(engine, env)
@@ -1291,7 +1292,7 @@ def test_v2_fault_correction_source_must_be_a_posted_legacy_journal(engine):
 def test_v2_fault_correction_offset_may_not_be_a_control_account(engine):
     env = seed(engine)
     source = fault_source(engine, env)
-    for offset in ("2040", "1410", "2000"):
+    for offset in ("2040", "1410", "2000", "1400"):
         refused_fix(lambda offset=offset: prepare_fix(engine, env, source, offset=offset), "offset_is_control_account")
     refused_fix(lambda: prepare_fix(engine, env, source, code="1000"), "invalid_input")
 
@@ -1449,12 +1450,12 @@ def test_v2_a_live_correction_replays_only_for_the_same_offset(engine):
     first = prepare_fix(engine, env, source)
     assert prepare_fix(engine, env, source).replayed is True  # same fault, same offset
     before = counts(engine, env)
-    refused_fix(lambda: prepare_fix(engine, env, source, offset="1400"), "ledger_fault_correction_active")
+    refused_fix(lambda: prepare_fix(engine, env, source, offset="1500"), "ledger_fault_correction_active")
     assert counts(engine, env) == before
     request(engine, env, first)
-    refused_fix(lambda: prepare_fix(engine, env, source, offset="1400"), "ledger_fault_correction_active")
+    refused_fix(lambda: prepare_fix(engine, env, source, offset="1500"), "ledger_fault_correction_active")
     approve(engine, env, first)
-    refused_fix(lambda: prepare_fix(engine, env, source, offset="1400"), "ledger_fault_correction_active")
+    refused_fix(lambda: prepare_fix(engine, env, source, offset="1500"), "ledger_fault_correction_active")
     assert prepare_fix(engine, env, source).replayed is True  # posted: still the same one
 
 
@@ -1464,7 +1465,7 @@ def test_v2_after_a_rejection_a_new_version_with_another_offset_can_be_prepared_
     first = prepare_fix(engine, env, source)
     request(engine, env, first)
     reject_fix(engine, env, first)
-    second = prepare_fix(engine, env, source, offset="1400")
+    second = prepare_fix(engine, env, source, offset="1500")
     assert second.replayed is False and second.manual_id != first.manual_id
     with Session(engine) as db:
         assert db.get(JournalEntry, second.journal_id).source_version == "2"
@@ -1490,7 +1491,7 @@ def test_v2_after_a_reversal_a_new_version_can_be_prepared_and_the_fault_is_clea
         posting_date=DAY,
     )
     run(engine, env, service.approve_reversal, manual_id=first.manual_id, approver=env.parties["approver2"])
-    second = prepare_fix(engine, env, source, offset="1400")
+    second = prepare_fix(engine, env, source, offset="1500")
     assert second.replayed is False
     request(engine, env, second)
     approve(engine, env, second)

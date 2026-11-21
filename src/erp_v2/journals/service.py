@@ -60,7 +60,9 @@ from erp_v2.journals.models import ManualJournal
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
 from erp_v2.ledger_roles import (
     AP_CONTROL_CODE,
-    CONTROL_ACCOUNT_CODES,
+    AR_CONTROL_CODE,
+    EMPLOYEE_CLAIMS_CODE,
+    LEDGER_FAULT_CONTROL_CODES,
     PAYROLL_PAYABLE_CODE,
     STAFF_LOAN_CODE,
     account_id_for_code,
@@ -88,7 +90,10 @@ CONTROL_ROUTES: Final = {
     AP_CONTROL_CODE: "a supplier invoice (adjustment invoice) or supplier credit note",
     PAYROLL_PAYABLE_CODE: "a payroll run, an adjustment component in the next run, or a payout return",
     STAFF_LOAN_CODE: "a staff-loan entry or payroll internal recovery",
+    AR_CONTROL_CODE: "a billing document (invoice, credit note or receipt) or a governed holding command",
+    EMPLOYEE_CLAIMS_CODE: "an expense claim or a governed holding command",
 }
+CONTROL_ROUTE_DEFAULT: Final = "the owning subledger document or a governed holding command"
 ALLOWED_KINDS: Final = (JournalKind.STANDARD, JournalKind.ADJUSTMENT)
 MAX_LINES: Final = 200
 QUANTUM: Final = Decimal("0.000001")
@@ -313,7 +318,7 @@ def _refuse_control(codes: set[str]) -> None:
     raise JournalRefused(
         "control_account_requires_subledger_document",
         f"{', '.join(sorted(codes))} is a control account and is never posted bare; "
-        f"correct it through {CONTROL_ROUTES[code]}",
+        f"correct it through {CONTROL_ROUTES.get(code, CONTROL_ROUTE_DEFAULT)}",
     )
 
 
@@ -380,7 +385,9 @@ def _verify_ledger_fault(db: Session, tenant_id: UUID, journal: JournalEntry) ->
         source_id = UUID(source_text)
     except ValueError as exc:
         raise JournalRefused("ledger_fault_source_invalid", "the correction's source identity is malformed") from exc
-    control_id = account_id_for_code(db, tenant_id, control_code) if control_code in CONTROL_ACCOUNT_CODES else None
+    control_id = (
+        account_id_for_code(db, tenant_id, control_code) if control_code in LEDGER_FAULT_CONTROL_CODES else None
+    )
     if control_id is None:
         raise JournalRefused("ledger_fault_source_invalid", "the correction's control account is not valid")
     source = db.scalar(select(JournalEntry).where(JournalEntry.tenant_id == tenant_id, JournalEntry.id == source_id))
@@ -441,7 +448,7 @@ def _control_guard(
     account_ids: set[UUID] | None = None,
     reversal: bool = False,
 ) -> None:
-    """Refuse any control-account line (2000/2040/1410) not carried by its subledger document.
+    """Refuse any control-account line (2000/2040/1410/1400/2045/prepayment) not carried by its subledger document.
 
     A typed line set (prepare) is never admitted: the only door is the system-built ledger-fault
     correction, recognised by its source identity and re-verified here (not on a reversal, which
@@ -587,8 +594,8 @@ def prepare_ledger_fault_correction(
     moment = _now(now)
     evidence = _text(command.evidence_ref, "evidence reference", 255)
     description = _text(command.description, "description", 2000)
-    if command.control_code not in CONTROL_ACCOUNT_CODES:
-        raise JournalRefused("invalid_input", "the control account must be 2000, 2040 or 1410")
+    if command.control_code not in LEDGER_FAULT_CONTROL_CODES:
+        raise JournalRefused("invalid_input", "a ledger-fault correction covers only 2000, 2040 or 1410")
     key = _fault_key(command.source_journal_id, command.control_code)
     try:
         _actor(db, tenant_id, actor)

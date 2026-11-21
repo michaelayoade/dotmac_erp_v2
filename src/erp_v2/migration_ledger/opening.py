@@ -33,7 +33,6 @@ from uuid import UUID, uuid5
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES
 from erp_v2.migration_ledger import models as m
 from erp_v2.migration_ledger.common import (
     OPENING_PERIOD,
@@ -53,8 +52,10 @@ OPENING_KIND: Final = "opening_balance"
 IAS8_OWNER: Final = "erp.ias8"
 IAS8_KIND: Final = "prior_period_correction"
 RETAINED_EARNINGS: Final = "3100"
-# The four control accounts whose opening must equal their subledger (AR 1400 joins the ledger_roles three).
-CONTROL_CODES: Final = frozenset(CONTROL_ACCOUNT_CODES | {"1400"})
+# The four control accounts whose opening must equal their subledger. A literal on purpose: S9b widened
+# ``CONTROL_ACCOUNT_CODES`` (the guard) with 1400/2045/prepayment, and that must not silently add 2045 to what an
+# opening proof demands (the flip gate ties 2045 through ``GATE_TIE_CODES``). A test pins it.
+CONTROL_CODES: Final = frozenset({"2000", "2040", "1410", "1400"})
 _NAMESPACE: Final = UUID("8d3c4f0a-6b7e-4d19-a2c5-0e1f7b9a3c64")
 MAX_ROWS: Final = 5000
 

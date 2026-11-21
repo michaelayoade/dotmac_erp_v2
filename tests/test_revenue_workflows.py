@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from dotmac_accounting.contracts import AccountClass, AccountKind, NormalBalance
-from dotmac_accounting.models import Account, AccountCategory
+from dotmac_accounting.models import Account, AccountCategory, JournalEntry, JournalLine
 from dotmac_billing.models import BillingAccount, BillingDocument, ConfirmedSettlement
 from dotmac_kernel.idempotency_models import IdempotencyRecord
 from dotmac_kernel.models import Base, Party, PartyType, Tenant
@@ -52,6 +52,8 @@ def data():
             IdempotencyRecord.__table__,
             AccountCategory.__table__,
             Account.__table__,
+            JournalEntry.__table__,  # read by the control-account guard (T1-funded accounts)
+            JournalLine.__table__,
             SupplierInvoice.__table__,
             SupplierInvoiceLine.__table__,
             PaymentObligation.__table__,

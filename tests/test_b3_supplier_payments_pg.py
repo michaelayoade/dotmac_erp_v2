@@ -1357,7 +1357,7 @@ def test_v3_with_a_file_the_existing_codes_still_apply(engine):
     refused(lambda: record(engine, env, pid), "payee_instruction_unavailable")
 
 
-@pytest.mark.parametrize("code", ["2000", "2040", "1410"])
+@pytest.mark.parametrize("code", ["2000", "2040", "1410", "1400", "2045"])
 def test_a_bank_whose_cash_gl_is_a_control_account_is_refused(engine, code):
     env = world(engine)
     if code not in env.accounts:

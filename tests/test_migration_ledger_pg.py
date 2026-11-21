@@ -58,16 +58,20 @@ def world(engine, *, dual: bool = False) -> SimpleNamespace:
         }
         db.add_all(cats.values())
         db.flush()
+        cats["LIA"] = db.scalar(
+            sa.select(AccountCategory).where(AccountCategory.tenant_id == env.tenant_id, AccountCategory.code == "LIA")
+        )
         for code, cat, normal in (
             ("3100", "EQU", NormalBalance.CREDIT),
             ("6900", "EXP", NormalBalance.DEBIT),
             ("5000", "EXP", NormalBalance.DEBIT),
+            ("2105", "LIA", NormalBalance.CREDIT),  # the AR prepayment account (default name below)
         ):
             row = Account(
                 tenant_id=env.tenant_id,
                 category_id=cats[cat].id,
                 code=code,
-                name=f"Account {code}",
+                name="Customer prepayments" if code == "2105" else f"Account {code}",
                 kind=AccountKind.POSTING,
                 normal_balance=normal,
             )
@@ -873,17 +877,20 @@ def test_the_gate_refuses_when_the_recomputed_ledger_differs_from_the_bridge(eng
         )
 
 
-def test_control_accounts_are_tied_to_the_owner_subledgers_and_unavailable_ones_refuse_by_name(engine):
+def test_control_accounts_are_tied_to_the_owner_subledgers_and_a_reader_that_cannot_answer_refuses_by_name(
+    engine, monkeypatch
+):
+    from erp_v2.holdings.billing import A13Billing
+    from erp_v2.holdings.errors import HoldingRefused
     from erp_v2.migration_ledger import ledger_check
 
     env = world(engine)
     with Session(engine) as db:
         state = ledger_check.control_state(db, env.tenant_id)
-    # nothing posted: 2000, 2040, 1410 tie at 0 (the owner tables are read); 2030 is 0; the unbuilt owners refuse
-    assert {c for c, v in state.items() if v["ok"]} == {"1410", "2000", "2040"}
-    assert state["1400"]["reason"] == "control_subledger_unavailable:1400"
-    assert state["2045"]["reason"] == "control_subledger_unavailable:2045"
-    assert set(state) == {"1400", "1410", "2000", "2040", "2045"}  # 2030 and 2110 left the gate (report-only)
+    # nothing posted: every built owner subledger (payables, payroll, loans, billing R1) reads 0 and ties
+    assert {c for c, v in state.items() if v["ok"]} == {"1400", "1410", "2000", "2040", "prepayment"}
+    assert state["2045"]["reason"] == "control_subledger_unavailable:2045"  # the claims-opening PR builds it
+    assert set(state) == {"1400", "1410", "2000", "2040", "2045", "prepayment"}  # 2030/2110 are report-only
     with Session(engine) as db:
         reports = ledger_check.report_state(db, env.tenant_id)
     assert set(reports) == {"2030", "2110"} and reports["2030"]["zero"] is True
@@ -891,6 +898,18 @@ def test_control_accounts_are_tied_to_the_owner_subledgers_and_unavailable_ones_
     post_legacy(engine, env, date(2026, 1, 15), [("2000", "-5.00"), ("1000", "5.00")])
     with Session(engine) as db:
         assert ledger_check.control_state(db, env.tenant_id)["2000"]["reason"] == "control_not_tied:2000"
+
+    # billing that cannot answer: 1400 and the prepayment tie refuse by name (never a silent zero)
+    def broken(self, db):
+        raise HoldingRefused("r1_unavailable", "x")
+
+    monkeypatch.setattr(A13Billing, "r1", broken)
+    with Session(engine) as db:
+        state = ledger_check.control_state(db, env.tenant_id)
+    assert state["1400"] == {
+        "gl": "0.000000", "subledger": None, "ok": False, "reason": "control_subledger_unavailable:1400:r1_unavailable",
+    }  # fmt: skip
+    assert state["prepayment"]["reason"] == "control_subledger_unavailable:prepayment:r1_unavailable"
 
 
 def test_sign_binds_an_approval_reference_in_the_register_version_format(engine):

@@ -781,3 +781,54 @@ def test_the_lock_connection_is_not_idle_in_transaction_during_a_run(engine, mon
     monkeypatch.setattr(mapper.Mapper, "_run", probe)
     run(engine, env)
     assert seen["states"] and all(row[0] == "idle" for row in seen["states"])
+
+
+def test_a_direct_commit_inside_the_run_stays_tenant_scoped_without_any_manual_rescope(engine, monkeypatch):
+    """L3 (B15 re-chain review): the scope is armed by the kernel ``tenant_scope`` listener at the start of EVERY
+    transaction, so a direct ``db.commit()`` (not through the mapper's ``self.commit``) followed by a read is still
+    scoped. The session below starts with NO tenant set and runs as the RLS runtime role: an unscoped read would see
+    zero rows (RLS fails closed)."""
+    import erp_v2.billing_gl.mapper as mapper_module
+
+    env = world(engine)
+    seen: list[tuple[str | None, int]] = []
+
+    def observe(db):
+        tenant = db.execute(sa.text("SELECT current_setting('app.current_tenant', true)")).scalar_one()
+        visible = db.execute(sa.text("SELECT count(*) FROM mod_accounting.accounts")).scalar_one()
+        seen.append((tenant, visible))
+
+    class Probe:
+        def __init__(self, db, tenant_id, *, now, commit, enable_once):
+            self.db = db
+
+        def run(self):
+            observe(self.db)
+            self.db.commit()  # a direct commit: no ``self.commit``, no manual rescope
+            observe(self.db)
+            self.db.rollback()
+            observe(self.db)
+            self.db.commit()
+            observe(self.db)
+            from erp_v2.billing_gl.mapper import Report
+
+            return Report()
+
+    monkeypatch.setattr(mapper_module, "Mapper", Probe)
+    with engine.connect() as conn, Session(bind=conn) as db:
+        db.execute(sa.text("SET ROLE app_user"))
+        db.execute(sa.text("RESET app.current_tenant"))  # pooled connections keep other tests' session-level scope
+        db.commit()  # end that transaction: the run starts with no tenant scope at all
+        assert db.execute(sa.text("SELECT current_setting('app.current_tenant', true)")).scalar_one() in (None, "")
+        assert db.execute(sa.text("SELECT count(*) FROM mod_accounting.accounts")).scalar_one() == 0  # fails closed
+        db.rollback()
+        try:
+            cli.run_once(db, env.tenant_id, apply=True, enable_once=False, now=RUN_AT)
+            # after the block the session is usable and unscoped again (nothing leaks onto the connection)
+            assert db.execute(sa.text("SELECT current_setting('app.current_tenant', true)")).scalar_one() in (None, "")
+        finally:
+            db.rollback()
+            conn.execute(sa.text("RESET ROLE"))
+            conn.commit()
+    assert len(seen) == 4
+    assert all(tenant == str(env.tenant_id) and visible > 0 for tenant, visible in seen), seen

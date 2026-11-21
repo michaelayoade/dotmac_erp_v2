@@ -212,7 +212,8 @@ def _offset_account(db: Session, tenant_id: UUID, account_id: UUID) -> Account:
         raise LoanRefused("offset_not_postable", "The offset account is not open for posting")
     if control_codes_among(db, tenant_id, [account.id]):
         raise LoanRefused(
-            "offset_is_control_account", "The offset may not be a control account (AP, payroll payable or staff loan)"
+            "offset_is_control_account",
+            "The offset may not be a control account (AP, payroll payable, staff loan, AR, claims or AR prepayment)",
         )
     cash = db.scalar(
         select(BankAccount.id)
