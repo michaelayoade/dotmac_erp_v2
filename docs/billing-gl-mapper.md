@@ -33,10 +33,11 @@ the residual line on the settlement source system's cash account.
 | Fact | Disposition |
 |---|---|
 | V1 settlement_accepted | POST L + cash (Dr cash / Cr prepayment) |
-| V1 allocation / deallocation / reallocation | POST L (Dr prepayment / Cr 1400); empty effects NO_GL `lane_neutral` |
+| V1 allocation / deallocation / reallocation | POST L (Dr prepayment / Cr 1400) + the VAT release / un-release (rev 2); empty effects and no VAT NO_GL `lane_neutral` |
 | V1 refund | POST L + cash |
-| V1 reversal | POST L, + cash when the reversed fact is settlement-family; predecessor must be POSTED |
-| V1 invoice_issued, credit_note_issued | BLOCK `invoice_mapping_not_built` (rev 2) |
+| V1 reversal | POST L, + cash when the reversed fact is settlement-family; predecessor must be POSTED. A void of an invoice or credit note is the exact negation of the predecessor's posted journal and VAT movements (rev 2) |
+| V1 invoice_issued | POST: Dr 1400 grand total / Cr revenue per line / Cr deferral per treatment (rev 2) |
+| V1 credit_note_issued | POST: Dr revenue / Dr deferral min(t, R) / Dr current the rest / Cr 1400; closes out the deferral when open reaches 0 (rev 2) |
 | V2 (withholding) | read via `get_accounting_fact_v2` (billing a13, R9), then BLOCK `wht_mapping_not_built` |
 | V3 (non-cash credit) | read via `get_accounting_fact_v3` (a13, R9), then BLOCK `non_cash_credit_mapping_not_built` |
 | V4/V5 imported | SKIP `opening_gl_carried` if committed at or before the seal, else BLOCK `opening_fact_after_seal` |
@@ -103,3 +104,91 @@ BLOCKED/WAITING fact occurred in it.
 
 Every window up to now - settle closed; 0 BLOCKED/WAITING; 0 REFUSED V6; every pre-seal fact SKIP; no POSTED row before
 F10.
+
+## Rev 2: invoices, credit notes and cash-basis output VAT (e2_0033)
+
+Ruling (2026-11-18): output VAT is deferred on 1455 at issue and released to 1440 on payment AND on application of an
+advance. All of it is in the same one-journal-per-fact door; there is no new posting kind.
+
+- **Accounts.** Revenue: ERP's `erp_ar_line_accounts` per (document, line), no fallback (missing:
+  BLOCK `revenue_account_unmapped`). VAT: setting `billing_gl.tax_accounts` (treatment -> {current 1440, deferral 1455});
+  a treatment with tax that is unmapped blocks `tax_account_unmapped`. Cash for source `erp_v2.ar` is
+  `erp_ar_receipts.cash_account_id` of the settlement; other sources use `billing_gl.cash_account`.
+- **Invoice.** Before posting, the line accounts must equal the document fact exactly, line by line and in total
+  (`line_accounts_mismatch`); no rounding is absorbed. It creates a VAT position per treatment (D = tax, open = total).
+- **Release.** A settlement or advance application of d against a document releases
+  `min(R, HALF_EVEN(d x D / T))` from 1455 to 1440; the settlement that brings the document to 0 takes all of R.
+  A deallocation un-releases exactly that allocation's net release (full) or the same formula capped at it (partial);
+  a credit-note close-out is reversed first.
+- **Credit note.** Dr 1455 min(t, R), Dr 1440 the rest; if the invoice's open amount reaches 0 the remaining deferral
+  is closed out to 1440 (D-A6-9).
+- **Invariants** (database trigger backstop plus an in-transaction assertion; the mapper never clamps): 0 <= R <= D,
+  0 <= open <= T, open = 0 implies R = 0 (`vat_invariant`).
+- **Tables (W6).** `erp_billing_vat_positions` / `erp_billing_vat_movements`: append-only, FORCE RLS, `app_user` SELECT
+  and INSERT only. The downgrade refuses while rows exist.
+- **Migrated invoices (Q1).** `python -m erp_v2.billing_gl vat-opening plan|apply` (migration role, 0600 receipt, plan
+  sha) loads each carried open invoice's remaining deferral = legacy 1455 credit less the attributed reclass. A result
+  below 0, above the tax or unattributable is an E38 report item and is not loaded; a payment on such an invoice (or on any
+  imported document without a position) blocks `vat_position_missing`. The legacy extraction that feeds the input file is a
+  separate reader step.
+- **Gate.** `checks.ready` also requires `billing_gl.tax_accounts` to map every treatment to a current and a deferral
+  account and 0 BLOCKED VAT facts.
+
+### Rev 2 review amendments (architect, 2026-11-19)
+
+- **Release rate (spec 4.3 amendment).** The release denominator is the gross the deferral still covers: `T` for a
+  native invoice, the remaining gross at the opening (`open_initial`) for a migrated, part-paid invoice, because the
+  loaded `D` is the remaining deferral. `r = min(R, HALF_EVEN(d x D / basis))`.
+- **Opening-lot advances.** A V4 fact's `opening_cash_effects` `application` / `application_inverse` rows are settlements
+  of their document, exactly like settlement allocations.
+- **Ordering.** An allocation that sorts before its native invoice's issue fact is WAITING `waiting_document`; it does
+  not block the account (the invoice must post) and the next run's retry re-evaluates it. `vat_position_missing` is for
+  imported documents only.
+- **Bank from structure.** An `erp_v2.ar` settlement needs exactly one `erp_ar_receipts` row for its cash account, else
+  BLOCK `receipt_cash_unresolved`; there is no fallback to `billing_gl.cash_account`.
+- **Line accounts.** A credit note is compared with the document by SUMS only (B-16 writes one row per credit-note line,
+  billing one line per credit note). An unknown, inactive or non-postable revenue account blocks `revenue_account_invalid`.
+- **Void of a credit note** mirrors only the close-out still in force (a later deallocation may already have reversed it).
+- **Persist.** Journal and VAT movements are written in one savepoint; a database `vat_invariant` refusal blocks that one
+  fact, it does not abort the run.
+- **Opening loader.** `plan` cross-checks each item against billing (document exists, this tenant's imported open item,
+  total = original grand total, exposure = `open_initial`); a zero-tax carried invoice loads a zero position;
+  an E38 item can be resolved by a `finance_override` (stated deferral, evidence sha, reference) in a new, sha-bound plan.
+  The runtime role cannot create `origin = opening` positions or `fact_version = 0` movements.
+
+### Q1 legacy VAT extraction (`vat-extract`, P-B16-e)
+
+    python -m erp_v2.billing_gl vat-extract --tenant-id T --organization-id O --cutoff D --snapshot-sha256 S \
+        --out ITEMS.json --receipt R.json [--overrides OVERRIDES.json] [--treatment-map MAP.json]
+
+Read-only on both sides (env-only `MIGRATION_DATABASE_URL` and `LEGACY_DATABASE_URL`, `SET TRANSACTION READ ONLY`, rehearsal
+snapshot only). Both output files are created exclusively with mode 0600 before any read. The items file is the exact
+`vat-opening` input in canonical JSON, so a re-run on the same snapshot gives the same sha; the receipt is counts and
+aggregate tie amounts only.
+
+- **Ledger truth** is `gl.posted_ledger_line` on the deferral accounts (the `deferral_pair_account_id` of each VAT/GST code's
+  collected account) up to the cutoff. Reversal journals keep their original's source key, so reversed and voided
+  invoices and bounced payments net out. Legacy account ids are the v2 account ids.
+- **Invoice credit** = the net of INVOICE, AR_INVOICE_VAT_DEFERRAL and AR_INVOICE_RESTORE lines per invoice (the snapshot
+  shows all three on 1455). It must equal the deferrable tax of the invoice's lines, else the invoice is unattributable (E38).
+- **Reclass** = legacy's own prorate (`(allocated x line tax / invoice total)` to 0.01, HALF_EVEN) per allocation, only for
+  payments with a net CUSTOMER_PAYMENT_VAT_RECLASS journal; a payment whose recomputed total differs from its journal makes
+  its invoices unattributable.
+- **Link** to billing is the #72 import receipt (`opening_receivable_bases` of the receipts in `erp_ar_opening_admissions`):
+  never an invoice number. The admissions' snapshot sha must equal `--snapshot-sha256`, and the bases must equal the
+  imported open items (`carried_count_mismatch`).
+- Every carried invoice appears exactly once per treatment (zero-tax invoices as a zero position `none`); NGN only.
+- **Tie (independent).** The legacy GL of the deferral accounts at the cutoff must equal ERP v2's own B-9r opening balance
+  of those accounts (`tie_failed`), and the AP-module lines must equal minus the payables a6 remaining input deferral
+  (`ap_positions_mismatch`). Everything no carried invoice owns is a NAMED residue in the receipt (AR lines with no carried
+  owner by source, credit notes, non-carried invoice remainders, payments whose reclass does not re-derive, manual
+  non-AR/non-AP journals), with a `residue_sha256`. Finance acknowledges it by passing `--acknowledge-residue <sha>` AND `--operator-ref <the acknowledging
+  user>` (recorded in the receipt as `acknowledged_by`); until then the run writes no items file. The AP positions read is
+  tenant-filtered explicitly (the migration role bypasses RLS) and refuses if more than one tenant would be summed; the v2
+  opening read covers both the opening and IAS 8 owners.
+- **Credit notes.** Legacy posts a credit note's 1455 under the credit note's OWN id and keeps no link to the invoice it
+  reduces, so that amount is residue and every invoice touched by a payment that also allocates to a credit note is E38.
+- **Overrides** are a separate Finance-named input (`named_by`, evidence sha and reference per item), bound by sha in the
+  receipt. Only E38 items may be overridden (`override_on_loadable_item`); an override that matches no item refuses.
+- The receipt also carries the treatment-map sha and a legacy fingerprint (counts and max ids of `gl.posted_ledger_line`,
+  `ar.invoice`, `ar.payment_allocation`) so the output can be re-derived from it.

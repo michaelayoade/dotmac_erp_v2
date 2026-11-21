@@ -41,12 +41,13 @@ from dotmac_billing import (
     summarize_accounting_fact_window,
 )
 from dotmac_billing.document_queries import fact_index_digest_seed, fact_index_line
-from dotmac_billing.models import ConfirmedSettlement
+from dotmac_billing.models import AllocationEffect, ConfirmedSettlement
 from dotmac_kernel.cache import TenantScope
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from erp_v2.billing_gl import rules, settings
+from erp_v2.billing_gl import rules, settings, vat_plan
 from erp_v2.billing_gl.models import (
     BLOCKED,
     NO_GL,
@@ -59,11 +60,12 @@ from erp_v2.billing_gl.models import (
     FactPosting,
     FactWindow,
 )
-from erp_v2.billing_gl.rules import Disp, Effect, FactView
+from erp_v2.billing_gl.rules import AllocRow, Disp, Effect, FactView
 from erp_v2.journals.policy import FunctionalCurrencyError, functional_currency
 from erp_v2.posting import bridge
 from erp_v2.posting.rules import PostingRefused
 
+AR_SOURCE: Final = "erp_v2.ar"
 OWNER: Final = "billing"
 KIND: Final = "accounting_fact"
 ACTOR: Final = "erp.billing_gl"
@@ -139,6 +141,31 @@ def _fingerprint(source: _Source, posting_date: date, currency: str, lines) -> s
 
 def utc_day(day: date) -> datetime:
     return datetime.combine(day, time.min, tzinfo=UTC)
+
+
+def v4_alloc_rows(fact) -> tuple[AllocRow, ...]:
+    """Every settlement of a document by a V4 fact: settlement allocations AND opening-lot applications.
+
+    An advance drawn from an opening cash lot sits in ``opening_cash_effects`` (application / application_inverse),
+    not in ``settlement_allocations``; folding only the latter would leave such an application's VAT on 1455 forever.
+    """
+    rows = [
+        AllocRow(
+            a.allocation_effect_id,
+            a.allocation.document_id,
+            a.allocation.amount_delta.amount,
+            a.allocation.offsets_allocation_id,
+        )
+        for a in fact.settlement_allocations
+    ]
+    for effect in fact.opening_cash_effects:
+        if effect.effect_kind == "application":
+            rows.append(AllocRow(effect.effect_id, effect.document_id, effect.amount.amount, None))
+        elif effect.effect_kind == "application_inverse":
+            rows.append(
+                AllocRow(effect.effect_id, effect.document_id, -effect.amount.amount, effect.original_effect_id)
+            )
+    return tuple(rows)
 
 
 class Mapper:
@@ -250,6 +277,9 @@ class Mapper:
             fact = get_accounting_fact_v1(self.db, scope=self.scope, fact_id=cursor.fact_id)
             moneys = [e.amount_delta for e in fact.effects] + [a.amount_delta for a in fact.allocations]
             return FactView(
+                minor_units=moneys[0].currency.minor_units if moneys else 2,
+                alloc_rows=self._alloc_rows(entry) if rule.vat else (),
+                tax_snapshots=tuple((t.treatment_code, t.tax_amount.amount) for t in fact.tax_snapshots),
                 currency=moneys[0].currency.code if moneys else None,
                 committed_at=fact.committed_at,
                 effects=tuple(Effect(e.lane, e.amount_delta.amount) for e in fact.effects),
@@ -286,6 +316,8 @@ class Mapper:
             v4 = get_accounting_fact_v4(self.db, scope=self.scope, posting_group_id=entry.posting_group_id)
             moneys4 = [e.amount_delta for e in v4.effects]
             return FactView(
+                minor_units=moneys4[0].currency.minor_units if moneys4 else 2,
+                alloc_rows=v4_alloc_rows(v4),
                 currency=moneys4[0].currency.code if moneys4 else None,
                 committed_at=v4.committed_at,
                 effects=tuple(Effect(e.lane, e.amount_delta.amount) for e in v4.effects),
@@ -296,6 +328,33 @@ class Mapper:
             v5 = get_accounting_fact_v5(self.db, scope=self.scope, posting_group_id=entry.posting_group_id)
             return FactView(currency=None, committed_at=v5.committed_at, source_ref=v5.source_ref, **base)
         raise RuntimeError("fact_contract_unreadable")
+
+    def _alloc_rows(self, entry: AccountingFactIndexEntryV1) -> tuple[AllocRow, ...]:
+        """The persisted allocation effects of the fact's posting group (ids are needed to pair a deallocation)."""
+        rows = self.db.scalars(
+            select(AllocationEffect).where(
+                AllocationEffect.tenant_id == self.tenant_id,
+                AllocationEffect.posting_group_id == entry.posting_group_id,
+            )
+        )
+        return tuple(
+            AllocRow(r.id, r.document_id, Decimal(r.amount_delta), r.offsets_allocation_id)
+            for r in sorted(rows, key=lambda r: str(r.id))
+        )
+
+    def _receipt_cash_account(self, settlement_ids: tuple[UUID, ...]) -> set[str]:
+        """B-16 ``erp_ar_receipts.cash_account_id`` of the settlements (a structural join on the settlement id)."""
+        if not settlement_ids or not self.db.scalar(
+            sa.text("SELECT to_regclass('public.erp_ar_receipts') IS NOT NULL")
+        ):
+            return set()
+        found = self.db.execute(
+            sa.text(
+                "SELECT cash_account_id FROM erp_ar_receipts WHERE tenant_id = :t AND billing_settlement_id = ANY(:ids)"
+            ),
+            {"t": self.tenant_id, "ids": list(settlement_ids)},
+        )
+        return {str(row[0]) for row in found}
 
     def _settlement_source(self, settlement_id: UUID) -> str | None:
         """The settlement's source system: a read-only ORM read (no public getter without a billing-side write)."""
@@ -348,12 +407,44 @@ class Mapper:
         return target, day
 
     # --------------------------------------------------------------- process
-    def _env(self, view: FactView, rule: rules.Rule) -> rules.Env:
+    def _plan(self, rule: rules.Rule, view: FactView, entry, reversed_kind, pred) -> rules.Plan | None:
+        """The VAT / document plan of a fact (rev 2); None for kinds without one."""
+        if not rule.vat:
+            return None
+        if view.kind == "invoice_issued":
+            if self.receivable is None:
+                return rules.Plan(block="receivable_account_unmapped")
+            return vat_plan.issue_plan(self.db, self.scope, view, self.receivable, self.settings.tax_accounts)
+        if view.kind == "credit_note_issued":
+            if self.receivable is None:
+                return rules.Plan(block="receivable_account_unmapped")
+            return vat_plan.credit_plan(self.db, self.scope, view, self.receivable, self.settings.tax_accounts)
+        if view.kind == "reversal":
+            if view.reverses_fact_id is None:
+                return rules.Plan(block="waiting_predecessor")
+            return vat_plan.reversal_plan(
+                self.db, self.scope, view, reversed_kind, None if pred is None else pred.journal_id
+            )
+        return vat_plan.allocation_plan(self.db, self.scope, view)
+
+    def _env(self, view: FactView, rule: rules.Rule, entry=None, pred=None) -> rules.Env:
         sources: tuple[str, ...] = ()
         reversed_kind = None
+        cash_accounts = dict(self.settings.cash_accounts)
+        cash_block = None
         if rule.cash in (rules.CASH_SETTLEMENT, rules.CASH_REVERSAL):
-            found = [self._settlement_source(i) for i in self._settlement_ids_for(view, rule)]
+            ids = self._settlement_ids_for(view, rule)
+            found = [self._settlement_source(i) for i in ids]
             sources = tuple(s for s in found if s)
+            if AR_SOURCE in sources:
+                # The bank of an ERP receipt is STRUCTURE (its erp_ar_receipts row), never a typed setting: exactly
+                # one receipt row, else the fact blocks. There is no fallback to billing_gl.cash_account.
+                receipt_accounts = self._receipt_cash_account(ids)
+                cash_accounts = {k: v for k, v in cash_accounts.items() if k != AR_SOURCE}
+                if len(receipt_accounts) == 1:
+                    cash_accounts[AR_SOURCE] = next(iter(receipt_accounts))
+                else:
+                    cash_block = "receipt_cash_unresolved"
         if rule.cash == rules.CASH_REVERSAL and view.reverses_fact_id is not None:
             original = self._row(view.reverses_fact_id, 1)
             reversed_kind = None if original is None else original.effect_kind
@@ -362,10 +453,12 @@ class Mapper:
             receivable_account=self.receivable,
             prepayment_account=self.settings.prepayment_account,
             prepaid_funding_account=self.settings.prepaid_funding_account,
-            cash_accounts=self.settings.cash_accounts,
+            cash_accounts=cash_accounts,
+            cash_block=cash_block,
             seal_at=self.seal_at,
             settlement_sources=sources,
             reversed_kind=reversed_kind,
+            plan=self._plan(rule, view, entry, reversed_kind, pred),
         )
 
     def process(self, entry: AccountingFactIndexEntryV1) -> str:
@@ -389,12 +482,13 @@ class Mapper:
         try:
             with self.db.begin_nested():
                 view = self._view(entry, rule)
+                pred = None
                 if rule.predecessor and view.reverses_fact_id is not None:
                     pred = self._row(view.reverses_fact_id, 1)
                     if pred is None or pred.disposition not in (POSTED, NO_GL):
                         decision = rules.Decision(Disp.BLOCKED, "waiting_predecessor")
                         return self._finish(entry, view, decision, waiting=True)
-                decision = rules.decide(rule, view, self._env(view, rule))
+                decision = rules.decide(rule, view, self._env(view, rule, entry, pred))
         except BillingFactDigestChanged:
             raise
         except Exception as exc:  # a billing read refusal is a BLOCK that retries, never a crash
@@ -410,9 +504,13 @@ class Mapper:
         if decision.disposition == Disp.POST:
             return self._post(entry, view, decision)
         if decision.disposition == Disp.BLOCKED:
-            state = WAITING if waiting else BLOCKED
+            # waiting_document: this fact sorted before its own invoice's issue fact. It waits for that fact but does
+            # NOT block the account (the invoice must post), and the next run's retry re-evaluates it.
+            ordering = decision.reason == "waiting_document"
+            state = WAITING if (waiting or ordering) else BLOCKED
             self._record(entry, view.currency, state, decision.reason)
-            self.blocked_accounts.add(account)
+            if not ordering:
+                self.blocked_accounts.add(account)
             return state
         self._record(entry, view.currency, decision.disposition.value, decision.reason)
         return decision.disposition.value
@@ -442,16 +540,33 @@ class Mapper:
             fingerprint=_fingerprint(source, posting_date, view.currency or "", decision.lines),
         )
         try:
-            result = bridge.post_consequence(
-                self.db,
-                scope=self.scope,
-                consequence=consequence,
-                approval_ref=f"billing_gl:{self.map_digest}",
-                actor=ACTOR,
-                now=self.now,
-            )
+            with self.db.begin_nested():
+                result = bridge.post_consequence(
+                    self.db,
+                    scope=self.scope,
+                    consequence=consequence,
+                    approval_ref=f"billing_gl:{self.map_digest}",
+                    actor=ACTOR,
+                    now=self.now,
+                )
+                if decision.persist is not None:
+                    vat_plan.persist(
+                        self.db,
+                        self.tenant_id,
+                        view.fact_id,
+                        entry.cursor.fact_version,
+                        result.journal_id,
+                        decision.persist,
+                    )
         except PostingRefused as exc:
             self._record(entry, view.currency, BLOCKED, exc.code)
+            self.blocked_accounts.add(account)
+            return BLOCKED
+        except IntegrityError as exc:
+            # A database refusal: the journal rolled back with the savepoint, so this ONE fact blocks instead of
+            # aborting the run and stalling every account. Only the VAT trigger's own message is a vat_invariant.
+            reason = "vat_invariant" if "vat_invariant" in str(getattr(exc, "orig", exc)) else "integrity_refused"
+            self._record(entry, view.currency, BLOCKED, reason)
             self.blocked_accounts.add(account)
             return BLOCKED
         self._record(entry, view.currency, POSTED, None, result.journal_id)

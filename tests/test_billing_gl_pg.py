@@ -44,10 +44,9 @@ from sqlalchemy.orm import Session
 from test_journals_pg import seed
 from test_posting_bridge_pg import engine as _bridge_engine  # noqa: F401  (hosted-Postgres fixture)
 
-from erp_v2.billing_gl import cli, rules, settings
+from erp_v2.billing_gl import cli, settings
 from erp_v2.billing_gl.feature import billing_gl_feature
 from erp_v2.billing_gl.models import FactPosting, FactWindow
-from erp_v2.billing_gl.rules import Disp, Line
 from erp_v2.journals import service as journals
 from erp_v2.journals.routes import journals_web_feature
 from erp_v2.journals.service import JournalRefused
@@ -89,30 +88,6 @@ def _registries():
             )
 
 
-@pytest.fixture
-def invoice_rule(monkeypatch):
-    """Prove the dispatch is extensible: a test-only invoice mapping (Dr 1400 / Cr revenue) so the receipt ->
-    allocation lane can run end to end. NOT a product mapping (rev 2 is a separate scope decision)."""
-    holder = {}
-
-    def builder(rule, view, env):
-        amount = sum((e.delta for e in view.effects if e.lane == "receivable"), D(0))
-        return rules.Decision(
-            Disp.POST,
-            None,
-            (
-                Line(env.receivable_account, amount, D(0), "invoice"),
-                Line(holder["revenue"], D(0), amount, "revenue"),
-            ),
-        )
-
-    patched = dict(rules.DISPATCH)
-    patched[(1, "invoice_issued")] = rules.Rule(rules.POST)
-    monkeypatch.setattr(rules, "DISPATCH", patched)
-    monkeypatch.setitem(rules.BUILDERS, (1, "invoice_issued"), builder)
-    return holder
-
-
 def world(engine, *, floor="2025-12-01", **config):
     env = seed(engine, currency="NGN")
     with Session(engine) as db:
@@ -126,6 +101,8 @@ def world(engine, *, floor="2025-12-01", **config):
             ("2100", "Customer prepayments", "LIA2", NormalBalance.CREDIT),
             ("2150", "Prepaid funding", "LIA2", NormalBalance.CREDIT),
             ("1010", "Bank cash", "AST2", NormalBalance.DEBIT),
+            ("1440", "Output VAT", "LIA2", NormalBalance.CREDIT),
+            ("1455", "Deferred output VAT", "LIA2", NormalBalance.CREDIT),
         ):
             row = Account(
                 tenant_id=env.tenant_id,
@@ -146,6 +123,7 @@ def world(engine, *, floor="2025-12-01", **config):
             "history_floor": floor,
             "enabled": True,
             "cash_account": {"integrator": str(env.accounts["1010"]), "opening_refund": str(env.accounts["1010"])},
+            "tax_accounts": {"standard": {"current": str(env.accounts["1440"]), "deferral": str(env.accounts["1455"])}},
             "ar": {settings.PREPAYMENT_KEY: "Customer prepayments"},
             **config,
         },
@@ -197,6 +175,28 @@ def seed_billing(engine, env, fn):
         return SimpleNamespace(id=ident)
 
 
+def with_lines(engine, env, invoice, *, pre_tax="100.00", tax="20.00", treatment="standard"):
+    """B-16 normally writes erp_ar_line_accounts at issue; here the (stub) table is filled the same way."""
+    with Session(engine) as db:
+        db.execute(
+            sa.text(
+                "INSERT INTO erp_ar_line_accounts (id, tenant_id, billing_document_id, line_number, "
+                "revenue_account_id, pre_tax, tax, treatment_code) VALUES (:i, :t, :d, 1, :r, :p, :x, :c)"
+            ),
+            {
+                "i": uuid4(),
+                "t": env.tenant_id,
+                "d": invoice.id,
+                "r": env.accounts["4000"],
+                "p": pre_tax,
+                "x": tax,
+                "c": treatment,
+            },
+        )
+        db.commit()
+    return invoice
+
+
 def gl(engine, env) -> dict[str, Decimal]:
     with Session(engine) as db:
         rows = db.execute(
@@ -234,9 +234,8 @@ def tie(engine, env, accounts):
 # ------------------------------------------------------------------- the T2 lane
 
 
-def test_receipt_allocation_refund_reversal_tie_exactly_at_every_fact(engine, invoice_rule):
+def test_receipt_allocation_refund_reversal_tie_exactly_at_every_fact(engine):
     env = world(engine)
-    invoice_rule["revenue"] = str(env.accounts["4000"])
     with Session(engine) as db:
         account = new_account(db, TenantScope(env.tenant_id))
         db.commit()
@@ -248,9 +247,11 @@ def test_receipt_allocation_refund_reversal_tie_exactly_at_every_fact(engine, in
 
         return db.get(BillingAccount, account_id)
 
-    invoice = seed_billing(engine, env, lambda db, sc: new_invoice(db, sc, acct(db), when=at(0)))
+    invoice = with_lines(
+        engine, env, seed_billing(engine, env, lambda db, sc: new_invoice(db, sc, acct(db), when=at(0)))
+    )
     report = run(engine, env)
-    assert report["posted"] == 1 and report["windows_closed"] >= 1
+    assert report["posted"] == 1 and report["windows_closed"] >= 1, report["blocked_by_reason"]
     pos, _ = tie(engine, env, accounts)
     assert pos["receivable"] == D("120.00")
 
@@ -289,9 +290,8 @@ def test_receipt_allocation_refund_reversal_tie_exactly_at_every_fact(engine, in
     assert journals_n == 6
 
 
-def test_replay_redelivery_and_dry_run_are_no_ops(engine, invoice_rule):
+def test_replay_redelivery_and_dry_run_are_no_ops(engine):
     env = world(engine)
-    invoice_rule["revenue"] = str(env.accounts["4000"])
     with Session(engine) as db:
         account = new_account(db, TenantScope(env.tenant_id))
         db.commit()
@@ -319,7 +319,7 @@ def test_replay_redelivery_and_dry_run_are_no_ops(engine, invoice_rule):
     assert (gl(engine, env), len(rows(engine, env))) == snapshot
 
 
-def test_late_committed_fact_in_a_closed_window_triggers_repage(engine, invoice_rule):
+def test_late_committed_fact_in_a_closed_window_triggers_repage(engine):
     env = world(engine)
     with Session(engine) as db:
         account = new_account(db, TenantScope(env.tenant_id))
@@ -344,9 +344,8 @@ def test_late_committed_fact_in_a_closed_window_triggers_repage(engine, invoice_
 # ------------------------------------------------- blocking, healing, period close
 
 
-def test_block_is_per_account_and_a_config_fix_heals_without_staff(engine, invoice_rule):
+def test_block_is_per_account_and_a_config_fix_heals_without_staff(engine):
     env = world(engine)
-    invoice_rule["revenue"] = str(env.accounts["4000"])
     scope_t = TenantScope(env.tenant_id)
     with Session(engine) as db:
         a, b = new_account(db, scope_t), new_account(db, scope_t)
@@ -360,7 +359,9 @@ def test_block_is_per_account_and_a_config_fix_heals_without_staff(engine, invoi
             db, sc, db.get(model, ids[0]), "75.00", when=at(1), lane=SettlementFundingLane.PREPAID_FUNDING
         ),
     )
-    seed_billing(engine, env, lambda db, sc: new_invoice(db, sc, db.get(model, ids[0]), when=at(2)))
+    with_lines(
+        engine, env, seed_billing(engine, env, lambda db, sc: new_invoice(db, sc, db.get(model, ids[0]), when=at(2)))
+    )
     seed_billing(engine, env, lambda db, sc: receipt(db, sc, db.get(model, ids[1]), "30.00", when=at(3)))
     report = run(engine, env)
     assert dispositions(engine, env) == {"BLOCKED": 1, "WAITING": 1, "POSTED": 1}
@@ -657,6 +658,7 @@ def test_days_without_a_window_row_block_period_close_and_the_gate(engine):
         report = ready(db, env.tenant_id, now=RUN_AT, settle_seconds=300, seal_at=None, history_floor=date(2025, 12, 1))
     assert report["missing_windows"] > 0 and report["ready"] is False
     run(engine, env)
+    mapped = {"standard": {"current": str(env.accounts["1440"]), "deferral": str(env.accounts["1455"])}}
     with Session(engine) as db:
         done = ready(
             db,
@@ -666,6 +668,7 @@ def test_days_without_a_window_row_block_period_close_and_the_gate(engine):
             seal_at=None,
             history_floor=date(2025, 12, 1),
             max_floor=date(2025, 12, 1),
+            tax_accounts=mapped,
         )
         late = ready(
             db,

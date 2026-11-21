@@ -152,6 +152,24 @@ def facts_incomplete(db: Session, tenant_id: UUID, start: date, end: date, *, no
     return any(blockers.values())
 
 
+VAT_REASONS: Final = (
+    "tax_account_unmapped",
+    "revenue_account_unmapped",
+    "line_accounts_mismatch",
+    "vat_position_missing",
+    "vat_invariant",
+    "vat_allocation_unresolved",
+    "invoice_document_unresolved",
+)
+
+
+def tax_accounts_mapped(tax_accounts: dict[str, dict[str, str]]) -> bool:
+    """Rev 2 gate input: at least one treatment, each with both a current (1440) and a deferral (1455) account."""
+    return bool(tax_accounts) and all(
+        isinstance(v, dict) and v.get("current") and v.get("deferral") for v in tax_accounts.values()
+    )
+
+
 def ready(
     db: Session,
     tenant_id: UUID,
@@ -162,6 +180,7 @@ def ready(
     history_floor: date,
     rescan_days: int = 7,
     max_floor: date = HISTORY_FLOOR_MAX,
+    tax_accounts: dict[str, dict[str, str]] | None = None,
 ) -> dict:
     """The B15.7 gate inputs. Each failing input is listed; ``ready`` is true only when none fails.
 
@@ -208,7 +227,18 @@ def ready(
         .select_from(FactPosting)
         .where(FactPosting.tenant_id == tenant_id, FactPosting.disposition == "POSTED")
     )
+    vat_blocked = db.scalar(
+        select(func.count())
+        .select_from(FactPosting)
+        .where(
+            FactPosting.tenant_id == tenant_id,
+            FactPosting.disposition.in_(PENDING),
+            FactPosting.reason.in_(VAT_REASONS),
+        )
+    )
     report = {
+        "vat_blocked": vat_blocked or 0,
+        "tax_accounts_mapped": tax_accounts_mapped(tax_accounts or {}),
         "unclosed_windows": unclosed or 0,
         "missing_windows": missing,
         "floor_too_late": history_floor > max_floor,
@@ -225,6 +255,8 @@ def ready(
         or report["refused_v6"]
         or report["pre_seal_not_skip"]
         or report["posted"]
+        or report["vat_blocked"]
+        or not report["tax_accounts_mapped"]
     )
     return report
 

@@ -64,6 +64,17 @@ def _cash_accounts(value: object) -> None:
             raise ValueError("Each cash account must be a canonical account id") from exc
 
 
+def _tax_accounts(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("Use a JSON object mapping treatment code to its current and deferral accounts")
+    for treatment, accounts in value.items():
+        if not isinstance(treatment, str) or not treatment.strip() or not isinstance(accounts, dict):
+            raise ValueError("Each treatment maps to an object with 'current' and 'deferral'")
+        if set(accounts) != {"current", "deferral"}:
+            raise ValueError("Each treatment needs exactly 'current' and 'deferral'")
+        _cash_accounts({k: v for k, v in accounts.items()})
+
+
 SPECS: Final = [
     SettingSpec(
         domain=DOMAIN,
@@ -86,6 +97,19 @@ SPECS: Final = [
         ),
         inherits=False,
         validator=_cash_accounts,
+    ),
+    SettingSpec(
+        domain=DOMAIN,
+        key="tax_accounts",
+        value_type=SettingValueType.json,
+        default={},
+        label="Output VAT accounts per tax treatment",
+        description=(
+            "JSON object: treatment code -> {current: output VAT account (1440), deferral: deferred output VAT "
+            "account (1455)}. A treatment with tax that is unmapped, or lacks either account, blocks its invoices."
+        ),
+        inherits=False,
+        validator=_tax_accounts,
     ),
     SettingSpec(
         domain=DOMAIN,
@@ -173,6 +197,7 @@ register_specs(list(SPECS))
 class MapperSettings:
     enabled: bool
     cash_accounts: dict[str, str]
+    tax_accounts: dict[str, dict[str, str]]
     posting_timezone: str
     closed_period_policy: str
     settle_seconds: int
@@ -188,6 +213,7 @@ class MapperSettings:
         body = {
             "cash_accounts": dict(sorted(self.cash_accounts.items())),
             "closed_period_policy": self.closed_period_policy,
+            "tax_accounts": {k: dict(sorted(v.items())) for k, v in sorted(self.tax_accounts.items())},
             "posting_timezone": self.posting_timezone,
             "prepaid_funding_account": self.prepaid_funding_account,
             "prepayment_account": self.prepayment_account,
@@ -225,9 +251,13 @@ def load(db: Session, tenant_id: UUID) -> MapperSettings:
         return resolve_value(db, domain, key, tenant_id=tenant_id, default=default)
 
     cash = read("cash_account", {})
+    tax = read("tax_accounts", {})
     return MapperSettings(
         enabled=read("enabled", False) is True,
         cash_accounts={str(k): str(v) for k, v in cash.items()} if isinstance(cash, dict) else {},
+        tax_accounts={str(k): {str(a): str(b) for a, b in v.items()} for k, v in tax.items()}
+        if isinstance(tax, dict)
+        else {},
         posting_timezone=str(read("posting_timezone", "Africa/Lagos")),
         closed_period_policy=str(read("closed_period_policy", NEXT_OPEN_PERIOD)),
         settle_seconds=int(read("settle_seconds", 300)),  # type: ignore[call-overload]

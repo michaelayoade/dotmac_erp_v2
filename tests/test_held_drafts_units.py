@@ -490,7 +490,7 @@ def test_migration_revision_and_chain():
     from erp_v2.migrations.versions import e2_0028_migration_ledger as successor
 
     assert successor.down_revision == "e2_0027_held_draft_decisions"  # B-9 chains after this one
-    assert "e2_0032_ar_producer" in EXPECTED_HEADS  # B-16 (e2_0032) is the one e2 head
+    assert "e2_0033_billing_gl_vat" in EXPECTED_HEADS  # B-16 (e2_0032) is the one e2 head
     assert "e2_0027_held_draft_decisions" not in EXPECTED_HEADS
     assert "e2_0028_migration_ledger" not in EXPECTED_HEADS
     assert "e2_0026_admission_reviews" not in EXPECTED_HEADS

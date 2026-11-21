@@ -254,3 +254,54 @@ def positions(db, tenant_id: UUID, account_ids, currency="NGN") -> dict[str, Dec
 
 
 __all__ = ["TenantScope"]
+
+
+def credit_note(db, scope, original, *, pre_tax="50.00", tax="10.00", when, currency="NGN"):
+    """A credit note against one issued invoice (the original's id; the lines are the caller's)."""
+    from dotmac_billing.commands import IssueCreditNote
+    from dotmac_billing.service import issue_credit_note
+
+    total = Decimal(pre_tax) + Decimal(tax)
+    return issue_credit_note(
+        db,
+        scope=scope,
+        command=IssueCreditNote(
+            original_document_id=original.id,
+            pre_tax_amount=money(pre_tax, currency),
+            tax_amount=money(tax, currency),
+            total_amount=money(total, currency),
+            reason="service credit",
+            series_code="credit",
+            reference_date=date(2026, 1, 10),
+            actor_ref="billing-test",
+            correlation_id=f"cn:{uuid4().hex}",
+            occurred_at=when,
+            document_profile_code="invoice.standard",
+            document_profile_version="1",
+            tax_snapshots=(
+                AppliedTaxSnapshotV1(
+                    treatment_code="standard",
+                    jurisdiction_code="zone",
+                    policy_id="tax-policy",
+                    policy_version="1",
+                    rate=Decimal("0.200000"),
+                    taxable_basis=money(pre_tax, currency),
+                    tax_amount=money(tax, currency),
+                ),
+            ),
+        ),
+        numbering=Numbering(),
+    )
+
+
+def void(db, scope, document, *, when):
+    from dotmac_billing.service import void_document
+
+    return void_document(
+        db,
+        scope=scope,
+        document_id=document.id,
+        actor_ref="billing-test",
+        occurred_at=when,
+        source_ref=f"void-{uuid4().hex}",
+    )
