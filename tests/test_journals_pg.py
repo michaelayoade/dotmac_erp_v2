@@ -100,7 +100,6 @@ def seed(engine, *, currency: str | None = "USD", adjustment: bool = False) -> S
             ("2000", "LIA", NormalBalance.CREDIT),
             ("2040", "LIA", NormalBalance.CREDIT),
             ("1410", "AST", NormalBalance.DEBIT),
-            ("2045", "LIA", NormalBalance.CREDIT),
         ):
             row = Account(
                 tenant_id=tenant_id,
@@ -1040,7 +1039,7 @@ def held_row(engine, env, journal_id, *, state, origin=m.ORIGIN_LEGACY_HELD):
         return row.id
 
 
-@pytest.mark.parametrize("code", ["2000", "2040", "1410", "1400", "2045"])
+@pytest.mark.parametrize("code", ["2000", "2040", "1410", "1400"])
 def test_v2_prepare_on_a_control_account_refuses_and_writes_nothing(engine, code):
     env = seed(engine)
     before = counts(engine, env)
@@ -1293,7 +1292,7 @@ def test_v2_fault_correction_source_must_be_a_posted_legacy_journal(engine):
 def test_v2_fault_correction_offset_may_not_be_a_control_account(engine):
     env = seed(engine)
     source = fault_source(engine, env)
-    for offset in ("2040", "1410", "2000", "1400", "2045"):
+    for offset in ("2040", "1410", "2000", "1400"):
         refused_fix(lambda offset=offset: prepare_fix(engine, env, source, offset=offset), "offset_is_control_account")
     refused_fix(lambda: prepare_fix(engine, env, source, code="1000"), "invalid_input")
 

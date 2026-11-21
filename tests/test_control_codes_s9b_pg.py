@@ -47,6 +47,7 @@ def seed(engine):
     """The journals world plus the AR prepayment account under its default name (kept out of the shared seed so that
     other worlds, which add their own "Customer prepayments", are not made ambiguous)."""
     env = _seed(engine)
+    env.accounts["2045"] = _add(engine, env, "2045", "Claims")
     env.accounts["2300"] = _add(engine, env, "2300", "Customer prepayments")
     return env
 
