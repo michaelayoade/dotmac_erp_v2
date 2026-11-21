@@ -7,8 +7,9 @@
   posting, i.e. every line whose owner is not the legacy import, the opening/IAS 8 owners or a rounding correction).
   It must be 0 for every row: no tolerance.
 * ``control_state``: for each code in ``ledger_roles.GATE_TIE_CODES`` (and the resolved prepayment account) the GL net
-  against the live v2 owner subledger, read from the owner tables (1400 and prepayment from billing R1, 2045 from
-  expenses a2). A subledger that cannot answer REFUSES with a named reason; it is never skipped.
+  against the live v2 owner subledger, read from the owner tables (1400 and prepayment from billing R1; 2045 still
+  refuses until the claims-opening PR reads expenses a2). A subledger that cannot answer REFUSES with a named reason;
+  it is never skipped.
 * ``report_state``: the codes in ``REPORT_ZERO_CODES`` (2030) and ``REPORT_WHT_CODES`` (2110) are REPORTED, never
   gated (flip-gate profile ``as_is_v1``, AS-IS-MIGRATION-REPLAN section 4).
 
@@ -144,7 +145,7 @@ def _sub_1410(db: Session, tenant: UUID) -> Decimal:
 
 
 _SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410}
-# 1400, 2045 and the prepayment account are tied by the dedicated readers below (billing R1, expenses a2). 2110 is
+# 1400 and the prepayment account are tied by the dedicated readers below (billing R1); 2045 is NOT built here. 2110 is
 # report-only (``report_state``). These ties net ALL currencies together except the billing ones, which are the
 # functional currency only (any other currency with a balance refuses: no FX tie exists).
 
@@ -202,17 +203,7 @@ def _sub_1400(db: Session, tenant: UUID) -> Decimal:
     return Decimal(_billing_position(db, tenant, "1400").receivable()).scaleb(-2)
 
 
-def _sub_2045(db: Session, tenant: UUID) -> Decimal:
-    from dotmac_expenses.liability import claims_payable_total
-
-    refs = [
-        str(i) for (i,) in db.execute(sa.select(Account.id).where(Account.tenant_id == tenant, Account.code == "2045"))
-    ]
-    refs.append("2045")
-    return -sum((Decimal(claims_payable_total(db, tenant_id=tenant, liability_account_ref=r)) for r in refs), ZERO)
-
-
-_DEDICATED = {"1400": _sub_1400, "2045": _sub_2045}
+_DEDICATED = {"1400": _sub_1400}
 
 
 def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
@@ -221,8 +212,17 @@ def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
     state: dict[str, dict[str, Any]] = {}
     for code in GATE_TIE_CODES:
         gl = _gl_net(db, tenant, code)
+        reader = _SUBLEDGERS.get(code) or _DEDICATED.get(code)
+        if reader is None:  # 2045: the expenses a2 subledger is read by the claims-opening PR; until then it REFUSES
+            state[code] = {
+                "gl": fmt(gl),
+                "subledger": None,
+                "ok": False,
+                "reason": f"control_subledger_unavailable:{code}",
+            }
+            continue
         try:
-            sub = (_SUBLEDGERS.get(code) or _DEDICATED[code])(db, tenant)
+            sub = reader(db, tenant)
         except _Unavailable as exc:
             state[code] = {"gl": fmt(gl), "subledger": None, "ok": False, "reason": exc.reason}
             continue

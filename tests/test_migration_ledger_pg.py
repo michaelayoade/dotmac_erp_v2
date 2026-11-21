@@ -887,8 +887,9 @@ def test_control_accounts_are_tied_to_the_owner_subledgers_and_a_reader_that_can
     env = world(engine)
     with Session(engine) as db:
         state = ledger_check.control_state(db, env.tenant_id)
-    # nothing posted: every owner subledger (payables, payroll, loans, billing R1, expenses a2) reads 0 and ties
-    assert {c for c, v in state.items() if v["ok"]} == {"1400", "1410", "2000", "2040", "2045", "prepayment"}
+    # nothing posted: every built owner subledger (payables, payroll, loans, billing R1) reads 0 and ties
+    assert {c for c, v in state.items() if v["ok"]} == {"1400", "1410", "2000", "2040", "prepayment"}
+    assert state["2045"]["reason"] == "control_subledger_unavailable:2045"  # the claims-opening PR builds it
     assert set(state) == {"1400", "1410", "2000", "2040", "2045", "prepayment"}  # 2030/2110 are report-only
     with Session(engine) as db:
         reports = ledger_check.report_state(db, env.tenant_id)
@@ -909,24 +910,6 @@ def test_control_accounts_are_tied_to_the_owner_subledgers_and_a_reader_that_can
         "gl": "0.000000", "subledger": None, "ok": False, "reason": "control_subledger_unavailable:1400:r1_unavailable",
     }  # fmt: skip
     assert state["prepayment"]["reason"] == "control_subledger_unavailable:prepayment:r1_unavailable"
-
-
-def test_the_2045_tie_reads_the_expenses_claims_payable_total(engine, monkeypatch):
-    import dotmac_expenses.liability as liability
-
-    from erp_v2.migration_ledger import ledger_check
-
-    env = world(engine)
-    seen = []
-    monkeypatch.setattr(
-        liability,
-        "claims_payable_total",
-        lambda db, *, tenant_id, liability_account_ref: seen.append(liability_account_ref) or Decimal("10"),
-    )
-    with Session(engine) as db:
-        state = ledger_check.control_state(db, env.tenant_id)
-    assert state["2045"]["subledger"] == "-10.000000" and state["2045"]["reason"] == "control_not_tied:2045"
-    assert "2045" in seen  # read by code (and by id when the account exists)
 
 
 def test_sign_binds_an_approval_reference_in_the_register_version_format(engine):
