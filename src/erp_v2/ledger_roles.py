@@ -101,14 +101,11 @@ def prepaid_funding_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]
     return _setting_account_ids(db, tenant_id, PREPAID_FUNDING_SPEC, None)
 
 
-# The T1 journal identity (holdings.models: OWNER, KIND_T1_POST); literals here because holdings imports this module.
-T1_OWNER: Final = "erp.migration"
-T1_KIND: Final = "ar_opening_credit"
-
-
 def t1_credit_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
     """The credit account of every POSTED T1 journal: once T1 has funded an account, re-pointing the setting cannot
     make that balance bare-postable. Identity-bound (owner/kind), no setting and no table."""
+    from erp_v2.holdings.models import KIND_T1_POST, OWNER  # lazy: holdings imports this module
+
     return frozenset(
         db.scalars(
             select(JournalLine.account_id)
@@ -118,8 +115,8 @@ def t1_credit_account_ids(db: Session, tenant_id: UUID) -> frozenset[UUID]:
             )
             .where(
                 JournalEntry.tenant_id == tenant_id,
-                JournalEntry.source_owner == T1_OWNER,
-                JournalEntry.source_document_kind == T1_KIND,
+                JournalEntry.source_owner == OWNER,
+                JournalEntry.source_document_kind == KIND_T1_POST,
                 JournalEntry.status == JournalStatus.POSTED,
                 JournalLine.credit_functional > 0,
             )

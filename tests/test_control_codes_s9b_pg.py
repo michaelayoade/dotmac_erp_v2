@@ -254,3 +254,16 @@ def test_a_refusal_writes_nothing(engine):
     env = seed(engine)
     with pytest.raises(JournalRefused):
         run(engine, env, service.prepare_journal, actor=env.parties["preparer"], command=control_command(env, "1400"))
+
+
+def test_holdings_resolve_account_accepts_the_id_form_like_the_mapper_and_the_guard(engine):
+    from erp_v2.holdings.config import resolve_account
+    from erp_v2.holdings.errors import HoldingRefused
+
+    env = seed(engine)
+    target = env.accounts["1500"]
+    with Session(engine) as db:
+        for form in (str(target), "1500"):
+            assert resolve_account(db, env.tenant_id, form, what="t").id == target
+        with pytest.raises(HoldingRefused):
+            resolve_account(db, env.tenant_id, str(uuid4()), what="t")  # an id that is not this tenant's account
