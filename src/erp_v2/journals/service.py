@@ -93,7 +93,7 @@ CONTROL_ROUTES: Final = {
     AR_CONTROL_CODE: "a billing document (invoice, credit note or receipt) or a governed holding command",
     EMPLOYEE_CLAIMS_CODE: "an expense claim or a governed holding command",
 }
-CONTROL_ROUTE_DEFAULT: Final = "the owning subledger document (billing receipt or allocation) or a governed holding command"
+CONTROL_ROUTE_DEFAULT: Final = "the owning subledger document or a governed holding command"
 ALLOWED_KINDS: Final = (JournalKind.STANDARD, JournalKind.ADJUSTMENT)
 MAX_LINES: Final = 200
 QUANTUM: Final = Decimal("0.000001")
@@ -385,7 +385,9 @@ def _verify_ledger_fault(db: Session, tenant_id: UUID, journal: JournalEntry) ->
         source_id = UUID(source_text)
     except ValueError as exc:
         raise JournalRefused("ledger_fault_source_invalid", "the correction's source identity is malformed") from exc
-    control_id = account_id_for_code(db, tenant_id, control_code) if control_code in LEDGER_FAULT_CONTROL_CODES else None
+    control_id = (
+        account_id_for_code(db, tenant_id, control_code) if control_code in LEDGER_FAULT_CONTROL_CODES else None
+    )
     if control_id is None:
         raise JournalRefused("ledger_fault_source_invalid", "the correction's control account is not valid")
     source = db.scalar(select(JournalEntry).where(JournalEntry.tenant_id == tenant_id, JournalEntry.id == source_id))

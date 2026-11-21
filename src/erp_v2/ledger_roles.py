@@ -168,7 +168,8 @@ def invoice_account_violation(
     ``lines`` are ``(posting_account_ref, tax_amount, tax_account_ref)``. The liability must be the AP
     control account (2000). A taxed line's tax account must not be the line's own posting account and
     must be a declared input-tax account (1455); that also blocks WHT payable, 1440, 2120 and expense
-    accounts. No line or tax account may be a control account (2000/2040/1410/1400/2045/prepayment): the liability pin alone
+    accounts. No line or tax account may be a control account (2000/2040/1410/1400/2045 or the prepayment
+    account): the liability pin alone
     would still let ``Dr 1410 / Cr 2000`` through as an invoice line. Read-only; nothing is created.
     """
     try:
@@ -185,7 +186,8 @@ def invoice_account_violation(
             if any(same_account(ref, control_id) for control_id in control_ids):
                 return (
                     "line_account_is_control",
-                    f"Line {number}: a control account (2000/2040/1410/1400/2045/prepayment) cannot be a line or tax account; "
+                    f"Line {number}: a control account (2000/2040/1410/1400/2045/prepayment) cannot be a line or "
+                    "tax account; "
                     "correct it through the owning subledger document",
                 )
     tax_roles = tax_role_account_ids(db, tenant_id)
