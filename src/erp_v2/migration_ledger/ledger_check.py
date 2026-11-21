@@ -166,10 +166,11 @@ def _gl_net_ids(db: Session, tenant: UUID, ids) -> Decimal:
     )
 
 
-def _billing_position(db: Session, tenant: UUID, tag: str):
-    """Billing R1 for the functional currency, read in its OWN REPEATABLE READ READ ONLY session (R1 needs that posture
-    and the bridge signs inside a write transaction), bracketed by the ledger sha before and after: a ledger that moved
-    while R1 was read is ``moved_during_gate``. Any other currency with a balance has no FX tie and refuses."""
+def _billing_position(db: Session, tenant: UUID, tag: str, read_gl):
+    """Billing R1 for the functional currency AND the GL it is tied to, as ``(position, gl)``. R1 is read in its OWN
+    REPEATABLE READ READ ONLY session (R1 needs that posture and the bridge signs inside a write transaction). The
+    order is: ledger sha, then the GL (``read_gl()``), then R1, then the ledger sha again: a ledger that moved at any
+    point in between is ``moved_during_gate``. Any other currency with a balance has no FX tie and refuses."""
     from erp_v2.holdings import positions
     from erp_v2.holdings.apply import read_only_session
     from erp_v2.holdings.billing import A13Billing, Position
@@ -178,6 +179,7 @@ def _billing_position(db: Session, tenant: UUID, tag: str):
 
     functional = functional_currency(db, tenant)
     before = positions.v2_posted_sha(db, tenant)
+    gl = read_gl()
     try:
         with read_only_session(db.get_bind().engine) as billing_db:
             try:
@@ -196,14 +198,29 @@ def _billing_position(db: Session, tenant: UUID, tag: str):
             or position.prepaid_funding_minor
         ):
             raise _Unavailable(f"control_subledger_fx:{tag}")
-    return r1.currencies.get(functional, Position(0, 0, 0, 0))
+    return r1.currencies.get(functional, Position(0, 0, 0, 0)), gl
 
 
-def _sub_1400(db: Session, tenant: UUID) -> Decimal:
-    return Decimal(_billing_position(db, tenant, "1400").receivable()).scaleb(-2)
+def _billing_tie(db: Session, tenant: UUID, tag: str, read_gl, subledger) -> dict[str, Any]:
+    """One billing-backed tie entry; the GL is read inside the ``moved_during_gate`` bracket."""
+    box: dict[str, Decimal] = {}
 
+    def gl_once() -> Decimal:
+        box["gl"] = read_gl()
+        return box["gl"]
 
-_DEDICATED = {"1400": _sub_1400}
+    try:
+        position, gl = _billing_position(db, tenant, tag, gl_once)
+    except _Unavailable as exc:
+        gl = box.get("gl")
+        return {"gl": None if gl is None else fmt(gl), "subledger": None, "ok": False, "reason": exc.reason}
+    sub = subledger(position)
+    return {
+        "gl": fmt(gl),
+        "subledger": fmt(sub),
+        "ok": gl == sub,
+        "reason": None if gl == sub else f"control_not_tied:{tag}",
+    }
 
 
 def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
@@ -211,8 +228,17 @@ def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
     ledger moved while it read, a foreign-currency balance) is ``ok: False`` with a named reason, never skipped."""
     state: dict[str, dict[str, Any]] = {}
     for code in GATE_TIE_CODES:
+        if code == "1400":
+            state[code] = _billing_tie(
+                db,
+                tenant,
+                "1400",
+                lambda: _gl_net(db, tenant, "1400"),
+                lambda position: Decimal(position.receivable()).scaleb(-2),
+            )
+            continue
         gl = _gl_net(db, tenant, code)
-        reader = _SUBLEDGERS.get(code) or _DEDICATED.get(code)
+        reader = _SUBLEDGERS.get(code)
         if reader is None:  # 2045: the expenses a2 subledger is read by the claims-opening PR; until then it REFUSES
             state[code] = {
                 "gl": fmt(gl),
@@ -237,12 +263,14 @@ def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
 
 
 def _prepayment_tie(db: Session, tenant: UUID) -> dict[str, Any]:
-    """GL(the resolved ``ar.prepayment_liability_account``) == -(R1 available credit + prepaid funding)."""
-    from erp_v2.holdings.config import prepayment_account
+    """GL(the resolved ``ar.prepayment_liability_account`` plus a separate ``ar.prepaid_funding_account`` when it
+    resolves) == -(R1 available credit + prepaid funding)."""
+    from erp_v2.holdings.config import prepaid_funding_account, prepayment_account
     from erp_v2.holdings.errors import HoldingRefused
 
     try:
         account = prepayment_account(db, tenant)
+        funding = prepaid_funding_account(db, tenant)
     except HoldingRefused as exc:
         return {
             "gl": None,
@@ -250,17 +278,14 @@ def _prepayment_tie(db: Session, tenant: UUID) -> dict[str, Any]:
             "ok": False,
             "reason": f"control_subledger_unavailable:prepayment:{exc.code}",
         }
-    gl = _gl_net_ids(db, tenant, [account.id])
-    try:
-        sub = -Decimal(_billing_position(db, tenant, "prepayment").credit()).scaleb(-2)
-    except _Unavailable as exc:
-        return {"gl": fmt(gl), "subledger": None, "ok": False, "reason": exc.reason}
-    return {
-        "gl": fmt(gl),
-        "subledger": fmt(sub),
-        "ok": gl == sub,
-        "reason": None if gl == sub else "control_not_tied:prepayment",
-    }
+    ids = {account.id} | ({funding.id} if funding is not None else set())
+    return _billing_tie(
+        db,
+        tenant,
+        "prepayment",
+        lambda: _gl_net_ids(db, tenant, ids),
+        lambda position: -Decimal(position.credit()).scaleb(-2),
+    )
 
 
 def report_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:

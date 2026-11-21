@@ -260,10 +260,10 @@ def test_holdings_resolve_account_accepts_the_id_form_like_the_mapper_and_the_gu
     from erp_v2.holdings.config import resolve_account
     from erp_v2.holdings.errors import HoldingRefused
 
-    env = seed(engine)
+    env, other = seed(engine), seed(engine)
     target = env.accounts["1500"]
     with Session(engine) as db:
         for form in (str(target), "1500"):
             assert resolve_account(db, env.tenant_id, form, what="t").id == target
-        with pytest.raises(HoldingRefused):
-            resolve_account(db, env.tenant_id, str(uuid4()), what="t")  # an id that is not this tenant's account
+        with pytest.raises(HoldingRefused):  # a REAL account id, but of another tenant: never resolved
+            resolve_account(db, env.tenant_id, str(other.accounts["1500"]), what="t")

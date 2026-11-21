@@ -378,3 +378,99 @@ def test_a_foreign_currency_billing_balance_has_no_tie_and_refuses(engine, tmp_p
 
     monkeypatch.setattr(hbilling.A13Billing, "r1", with_usd)
     assert _gate(engine, w)["1400"]["reason"] == "control_subledger_fx:1400"
+
+
+# --- G1/G2: a separate prepaid-funding account, and the GL read inside the moved_during_gate bracket ---------------
+
+
+def _funding(engine, w, monkeypatch, funding_minor=3000):
+    """A separate ``ar.prepaid_funding_account`` (2106) and a billing R1 that carries a prepaid-funding position."""
+    from dotmac_kernel.settings_resolver import SettingChangeContext, upsert_by_key
+
+    from erp_v2.ledger_settings import LEDGER_POLICY_DOMAIN, PREPAID_FUNDING_KEY
+
+    with Session(engine) as db:
+        cat = db.scalar(
+            sa.select(AccountCategory).where(AccountCategory.tenant_id == w.tenant, AccountCategory.code == "LIA")
+        )
+        row = Account(
+            tenant_id=w.tenant,
+            category_id=cat.id,
+            code="2106",
+            name="Prepaid funding",
+            kind=AccountKind.POSTING,
+            normal_balance=NormalBalance.CREDIT,
+        )
+        db.add(row)
+        db.flush()
+        w.accounts["2106"] = row.id
+        upsert_by_key(
+            db,
+            LEDGER_POLICY_DOMAIN,
+            PREPAID_FUNDING_KEY,
+            "2106",
+            tenant_id=w.tenant,
+            changed_by=SettingChangeContext(reason="test"),
+        )
+        db.commit()
+    real = hbilling.A13Billing.r1
+
+    def with_funding(self, db):
+        out = real(self, db)
+        cur = out.currencies["NGN"]
+        pos = hbilling.Position(cur.collectible_minor, cur.non_cash_minor, cur.available_credit_minor, funding_minor)
+        return hbilling.R1Snapshot(out.position_fingerprint, {**out.currencies, "NGN": pos})
+
+    monkeypatch.setattr(hbilling.A13Billing, "r1", with_funding)
+
+
+def _verify_prepayment(engine, w):
+    spec, _ = planning.parse_spec(w.spec)
+    with applying.read_only_session(engine) as db:
+        out = applying.verify(db, spec, cli._reader(w.spec), owner_readers=w.readers)
+        db.rollback()
+    return next(
+        c for c in out["checks"] if c["check"] == "control_equals_subledger" and c["code"] == planning.PREPAYMENT
+    )
+
+
+def test_a_separate_prepaid_funding_account_is_part_of_the_prepayment_tie_in_the_gate_and_in_holdings_verify(
+    engine, tmp_path, monkeypatch
+):
+    w = _flip(engine, tmp_path)
+    _t1(engine, w)
+    _funding(engine, w, monkeypatch)
+    _post(engine, w.tenant, w.accounts, "2106", D("-30.00"))  # the funding balance billing reports (3000 minor)
+    tie = _gate(engine, w)["prepayment"]
+    assert tie["ok"], tie
+    assert D(tie["gl"]) == D(tie["subledger"]) == -D(sum(p["cash_lot_minor"] for p in w.parties) + 3000).scaleb(-2)
+    assert _verify_prepayment(engine, w)["ok"]
+
+
+def test_a_stray_balance_on_the_funding_account_fails_the_prepayment_tie(engine, tmp_path, monkeypatch):
+    w = _flip(engine, tmp_path)
+    _t1(engine, w)
+    _funding(engine, w, monkeypatch)
+    _post(engine, w.tenant, w.accounts, "2106", D("-30.00"))
+    _post(engine, w.tenant, w.accounts, "2106", D("-5.00"))  # a stray credit on the funding account
+    assert _gate(engine, w)["prepayment"]["reason"] == "control_not_tied:prepayment"
+    assert _verify_prepayment(engine, w)["ok"] is False
+
+
+def test_the_gl_read_is_inside_the_moved_during_gate_bracket(engine, tmp_path, monkeypatch):
+    from erp_v2.migration_ledger import ledger_check
+
+    w = _flip(engine, tmp_path)
+    _t1(engine, w)
+    real, fired = ledger_check._gl_net, []
+
+    def post_after_the_read(db, tenant, code):
+        value = real(db, tenant, code)
+        if code == "1400" and not fired:
+            fired.append(1)
+            _post(engine, w.tenant, w.accounts, "1400", D("0.01"))  # the ledger moves right after the GL read
+        return value
+
+    monkeypatch.setattr(ledger_check, "_gl_net", post_after_the_read)
+    state = _gate(engine, w)["1400"]
+    assert fired and state["ok"] is False and state["reason"] == "moved_during_gate:1400"
