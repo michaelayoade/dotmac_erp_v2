@@ -41,38 +41,38 @@ def _engine():
 
 
 def run_once(db, tenant_id: UUID, *, apply: bool, enable_once: bool, now: datetime | None = None) -> dict:
-    """One pass in an already-open session; commits only when ``apply``. Returns the report."""
-    import sqlalchemy as sa
+    """One pass in an already-open session; commits only when ``apply``. Returns the report.
+
+    The tenant scope is structural: kernel ``DatabaseRuntime.tenant_scope`` primes ``app.current_tenant`` at the start
+    of EVERY transaction this session opens inside the block (an ``after_begin`` listener), so a commit, a rollback or
+    a direct ``db.commit()`` anywhere in the mapper can never leave a later read unscoped. The scope is
+    transaction-local, so nothing outlives the block on a pooled connection.
+    """
+    from dotmac_kernel.session_runtime import DatabaseRuntime
 
     from erp_v2.billing_gl.mapper import Mapper
 
-    def scope_tenant() -> None:  # transaction-local: it must be set again in every transaction the mapper opens
-        db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant_id)})
-
-    def commit_and_rescope() -> None:
-        db.commit()
-        scope_tenant()
-
-    scope_tenant()
-    mapper = Mapper(
-        db,
-        tenant_id,
-        now=now or datetime.now(UTC),
-        commit=commit_and_rescope if apply else (lambda: None),
-        enable_once=enable_once,
-    )
-    try:
-        report = mapper.run()
-    except BaseException:
-        db.rollback()
-        raise
-    summary = report.as_dict()
-    if apply and (report.posted or report.blocked or report.waiting or report.windows_closed):
-        _audit(db, tenant_id, AUDIT_RUN, summary)
-    if apply:
-        db.commit()
-    else:
-        db.rollback()
+    runtime = DatabaseRuntime(engine=db.get_bind())  # only its tenant_scope is used; no connection is opened
+    with runtime.tenant_scope(db, tenant_id):
+        mapper = Mapper(
+            db,
+            tenant_id,
+            now=now or datetime.now(UTC),
+            commit=db.commit if apply else (lambda: None),
+            enable_once=enable_once,
+        )
+        try:
+            report = mapper.run()
+        except BaseException:
+            db.rollback()
+            raise
+        summary = report.as_dict()
+        if apply and (report.posted or report.blocked or report.waiting or report.windows_closed):
+            _audit(db, tenant_id, AUDIT_RUN, summary)
+        if apply:
+            db.commit()
+        else:
+            db.rollback()
     return summary
 
 

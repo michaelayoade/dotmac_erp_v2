@@ -219,12 +219,12 @@ def test_journal_lines_are_gross_credit_control_debit_holding_for_positive_items
     assert len(only_positive) == 2 and sum(ln.debit for ln in only_positive) == sum(ln.credit for ln in only_positive)
 
 
-def test_the_default_billing_reader_refuses_r1_unavailable_until_an_erp_adapter_is_bound():
-    """a13 ships R1 in ``dotmac_billing.control_position``, but no ERP adapter is bound to it by the S9 composition:
-    the default reader still refuses (an unbound adapter must never read as zero)."""
-    reader = billing.default_reader()
+def test_the_default_billing_reader_is_the_a13_adapter_and_the_stub_still_refuses_r1_unavailable():
+    """S9b: ``default_reader`` is bound to a13's real R1 (PG tests in test_holdings_a13_reader_pg). The stub used when
+    billing has no R1 still refuses, so an unbound reader can never read as zero."""
+    assert isinstance(billing.default_reader(), billing.A13Billing)
     with pytest.raises(HoldingRefused) as e:
-        reader.r1(None)  # type: ignore[arg-type]
+        billing.UnavailableBilling().r1(None)  # type: ignore[arg-type]
     assert e.value.code == "r1_unavailable"
 
 
@@ -345,3 +345,48 @@ def test_the_real_72_census_output_is_consumed_by_the_b14_adapter():
     for es in att.explained.values():
         for e in es:
             assert e.source_key.startswith(("partition:", "ar_unapplied_credit_note:", "row:"))
+
+
+def test_the_cli_reads_the_spec_file_once_for_verify_and_t1_plan(monkeypatch, tmp_path):
+    """S9b F3: the tenant binding and the body must come from the same bytes (no second read)."""
+    import json
+    from argparse import Namespace
+    from uuid import uuid4
+
+    from erp_v2.holdings import cli
+
+    spec = tmp_path / "spec.json"
+    spec.write_bytes(json.dumps({
+        "version": 1, "tenant_id": str(uuid4()), "window_id": str(uuid4()), "capture_date": "2026-01-20",
+        "evidence_ref": "E", "params": {}, "receipts": {},
+    }).encode())  # fmt: skip
+    reads = []
+    real = type(spec).read_bytes
+
+    def counting(self):
+        if self == spec:
+            reads.append(1)
+        return real(self)
+
+    monkeypatch.setattr(type(spec), "read_bytes", counting)
+    monkeypatch.setattr(cli, "_engine", lambda: object())
+    monkeypatch.setattr(cli, "billing_reader", lambda: object())
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def rollback(self):
+            pass
+
+    monkeypatch.setattr(cli.applying, "read_only_session", lambda engine: Session())
+    monkeypatch.setattr(cli.applying, "verify", lambda db, spec_, reader: {"ready": True})
+    monkeypatch.setattr(cli.t1_mod, "run_t1_plan", lambda *a, **k: {})
+    cli._do_verify(Namespace(spec=spec))
+    assert len(reads) == 1
+    reads.clear()
+    cli._do_t1_plan(Namespace(spec=spec, operator_ref="op"))
+    assert len(reads) == 1

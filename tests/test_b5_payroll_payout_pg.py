@@ -1557,9 +1557,13 @@ def test_v3_statutory_batches_fail_closed_with_their_own_code(engine):
     assert batch_row(engine, batch_id).status == "draft"
 
 
-@pytest.mark.parametrize("code", ["2000", "2040"])
+@pytest.mark.parametrize("code", ["2000", "2040", "1400", "2045"])
 def test_a_bank_whose_cash_gl_is_a_control_account_is_refused_for_payroll_too(engine, code):
+    import test_b1_supplier_invoice_post_pg as b1
+
     env = world(engine)
+    if code not in env.accounts:
+        env.accounts[code] = b1.add_account(engine, env, code)
     run_id = finalized(engine, env)
     with Session(engine) as db:
         db.execute(

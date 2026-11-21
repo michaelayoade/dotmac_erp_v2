@@ -27,6 +27,7 @@ from erp_v2.holdings import plan as planning
 from erp_v2.holdings import positions
 from erp_v2.holdings.attribution import ZERO
 from erp_v2.holdings.billing import BillingReader
+from erp_v2.holdings.config import prepaid_funding_account
 from erp_v2.holdings.errors import refuse
 from erp_v2.holdings.models import (
     HOLDINGS_TABLE,
@@ -279,6 +280,9 @@ def verify(
             sub = Decimal(r1.receivable()).scaleb(-2)
         elif code == PREPAYMENT:
             sub = -Decimal(r1.credit()).scaleb(-2)
+            funding = prepaid_funding_account(db, tenant)
+            if funding is not None and funding.id != snap.controls[PREPAYMENT].id:
+                gl = gl + positions.gl_net(db, tenant, funding.id)  # a separate prepaid-funding account
         else:
             sub = sum((v for (_p, c), v in snap.owner_sub[code].items() if c == f), ZERO)
         checks.append(

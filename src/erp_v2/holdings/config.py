@@ -22,10 +22,11 @@ from sqlalchemy.orm import Session
 from erp_v2.holdings.errors import refuse
 from erp_v2.holdings.models import HOLDING_CODES, PREPAYMENT
 from erp_v2.ledger_roles import CONTROL_ACCOUNT_CODES, tax_role_account_ids
-from erp_v2.ledger_settings import PREPAID_FUNDING_SPEC, PREPAYMENT_SPEC
+from erp_v2.ledger_settings import PREPAID_FUNDING_SPEC, PREPAYMENT_SPEC, account_ref_matches
 
 KEY_PREFIX: Final = "migration.holding_account."
-# Control accounts the tie covers today (1400, 2045 and prepayment join CONTROL_ACCOUNT_CODES in S9, not here).
+# Control accounts the tie covers. 1400 and 2045 are in CONTROL_ACCOUNT_CODES since S9b (the union is kept explicit);
+# the prepayment account joins by resolution (``ledger_roles.prepayment_account_ids``), not by code.
 TIE_CONTROL_CODES: Final = frozenset(CONTROL_ACCOUNT_CODES | {"1400", "2045"})
 DEFAULTS: Final = {
     "2000": "AP migration clearing",
@@ -50,19 +51,11 @@ def resolve_account(db: Session, tenant: UUID, reference: object, *, what: str) 
     """The one active, postable account whose code or exact name is ``reference``; anything else refuses."""
     if not isinstance(reference, str) or not reference.strip() or reference != reference.strip():
         refuse("holding_account_invalid", f"{what}: reference is not text")
-    rows = list(
-        db.scalars(
-            select(Account).where(
-                Account.tenant_id == tenant, (Account.code == reference) | (Account.name == reference)
-            )
-        )
-    )
-    # a code match wins over a name match (codes are unique; names are not)
-    by_code = [a for a in rows if a.code == reference]
-    chosen = by_code or rows
-    if len(chosen) != 1:
+    # the shared resolver (id, else code, else every exact name): the same order the mapper and the guard use
+    found = account_ref_matches(db, tenant, reference)
+    if len(found) != 1:
         refuse("holding_account_invalid", f"{what}: does not resolve to exactly one account")
-    a = chosen[0]
+    a = db.scalar(select(Account).where(Account.tenant_id == tenant, Account.id == found[0]))
     if not a.is_active or not a.posting_allowed or a.kind != AccountKind.POSTING:
         refuse("holding_account_invalid", f"{what}: account is not active and postable")
     return AccountRef(a.id, a.code, a.name)

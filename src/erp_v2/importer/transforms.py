@@ -87,7 +87,8 @@ WHT_TAX_TYPES: Final = frozenset({"WITHHOLDING"})
 # Finance-declared account roles (decision D-1). Declared here, not imported from ``erp_v2.ledger_roles``: the importer
 # is sealed from the validated workflows (tests/test_preflip_import_path_exemption.py), and a test pins these
 # constants equal to ledger_roles so they cannot drift.
-CONTROL_ACCOUNT_CODES: Final = frozenset({"2000", "2040", "1410"})  # AP, payroll payable, staff loans
+# AP, payroll payable, staff loans, AR, employee claims (the runtime prepayment account is judged on the destination)
+CONTROL_ACCOUNT_CODES: Final = frozenset({"2000", "2040", "1410", "1400", "2045"})
 INVOICE_TAX_ACCOUNT_CODES: Final = frozenset({"1455"})  # input tax (V1)
 INPUT_VAT_RELEASE_CODES: Final = frozenset({"1440"})  # release target
 TAX_ROLE_CODES: Final = INVOICE_TAX_ACCOUNT_CODES | INPUT_VAT_RELEASE_CODES

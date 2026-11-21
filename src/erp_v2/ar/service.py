@@ -340,7 +340,7 @@ def _revenue_account(db: Session, tenant_id: UUID, account_id: UUID | None) -> A
         raise ArRefused("revenue_account_unknown", "A line's revenue account was not found")
     if not account.is_active or not account.posting_allowed or account.kind != AccountKind.POSTING:
         raise ArRefused("revenue_account_not_postable", f"Account {account.code} is not open for posting")
-    if account.code in ledger_roles.CONTROL_ACCOUNT_CODES or account.code == constants.AR_CONTROL_CODE:
+    if account.id in ledger_roles.control_account_ids(db, tenant_id) or account.code == constants.AR_CONTROL_CODE:
         raise ArRefused("revenue_account_is_control", f"Account {account.code} is a control account")
     if str(account.id) in ledger_roles.tax_role_account_ids(db, tenant_id):
         raise ArRefused("revenue_account_is_tax", f"Account {account.code} holds VAT and cannot be a revenue account")
@@ -1374,7 +1374,7 @@ def _cash_account(db: Session, *, tenant_id: UUID, bank_account_id: UUID, code: 
     gl = db.scalar(select(Account).where(Account.tenant_id == tenant_id, Account.id == UUID(value)))
     if gl is None or not gl.is_active or not gl.posting_allowed or gl.kind != AccountKind.POSTING:
         raise ArRefused("cash_account_not_postable", "The bank account's cash ledger account is not open for posting")
-    if gl.code in ledger_roles.CONTROL_ACCOUNT_CODES or gl.code == constants.AR_CONTROL_CODE:
+    if gl.id in ledger_roles.control_account_ids(db, tenant_id) or gl.code == constants.AR_CONTROL_CODE:
         raise ArRefused("cash_account_is_control", "The bank account's cash ledger account is a control account")
     return gl.id
 

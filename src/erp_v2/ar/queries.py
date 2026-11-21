@@ -80,8 +80,10 @@ def bank_accounts(db: Session, tenant_id: UUID, currency: str | None) -> list[Ba
 
 def revenue_account_choices(db: Session, tenant_id: UUID) -> list[Account]:
     """Active postable accounts a line may use: never control, tax-role or holding accounts."""
-    blocked_ids = {UUID(i) for i in ledger_roles.tax_role_account_ids(db, tenant_id)} | holding_account_ids(
-        db, tenant_id
+    blocked_ids = (
+        {UUID(i) for i in ledger_roles.tax_role_account_ids(db, tenant_id)}
+        | holding_account_ids(db, tenant_id)
+        | set(ledger_roles.control_account_ids(db, tenant_id))
     )
     blocked_codes = ledger_roles.CONTROL_ACCOUNT_CODES | {constants.AR_CONTROL_CODE}
     rows = db.scalars(

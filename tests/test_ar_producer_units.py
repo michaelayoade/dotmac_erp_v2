@@ -160,9 +160,13 @@ def _account(code="4000", *, active=True, postable=True, kind=None):
     )
 
 
-def _db_returning(account, *, tax_ids=(), holding_ids=(), monkeypatch=None):
+def _db_returning(account, *, tax_ids=(), holding_ids=(), control_ids=None, monkeypatch=None):
     db = Mock()
     db.scalar.return_value = account
+    if control_ids is None:  # the real resolver finds the fixed codes by code; the stub does the same for the account
+        fixed = account is not None and account.code in service.ledger_roles.CONTROL_ACCOUNT_CODES
+        control_ids = (account.id,) if fixed else ()
+    monkeypatch.setattr(service.ledger_roles, "control_account_ids", lambda db_, tenant: frozenset(control_ids))
     monkeypatch.setattr(service.ledger_roles, "tax_role_account_ids", lambda db_, tenant: {str(i) for i in tax_ids})
     monkeypatch.setattr(service.queries, "holding_account_ids", lambda db_, tenant: set(holding_ids))
     return db
@@ -175,6 +179,7 @@ def _db_returning(account, *, tax_ids=(), holding_ids=(), monkeypatch=None):
         ("2040", "revenue_account_is_control"),
         ("1410", "revenue_account_is_control"),
         ("1400", "revenue_account_is_control"),
+        ("2045", "revenue_account_is_control"),
     ],
 )
 def test_control_accounts_are_refused_as_revenue(monkeypatch, code, expected):
@@ -182,6 +187,14 @@ def test_control_accounts_are_refused_as_revenue(monkeypatch, code, expected):
     with pytest.raises(ArRefused) as info:
         service._revenue_account(db, uuid4(), uuid4())
     assert info.value.code == expected
+
+
+def test_the_resolved_prepayment_account_is_refused_as_revenue_whatever_its_code(monkeypatch):
+    prepay = _account("2300")
+    db = _db_returning(prepay, control_ids=(prepay.id,), monkeypatch=monkeypatch)
+    with pytest.raises(ArRefused) as info:
+        service._revenue_account(db, uuid4(), prepay.id)
+    assert info.value.code == "revenue_account_is_control"
 
 
 def test_tax_role_holding_inactive_and_unpostable_accounts_are_refused(monkeypatch):

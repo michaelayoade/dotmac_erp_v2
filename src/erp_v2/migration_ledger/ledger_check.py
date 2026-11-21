@@ -6,8 +6,10 @@
 * ``difference_rows``: recomputed v2 posted minus the expected v2 (the bridge's planned v2 plus every v2-native
   posting, i.e. every line whose owner is not the legacy import, the opening/IAS 8 owners or a rounding correction).
   It must be 0 for every row: no tolerance.
-* ``control_state``: for each code in ``ledger_roles.GATE_TIE_CODES`` the GL net against the live v2 owner subledger,
-  read from the owner tables. A subledger that does not exist yet REFUSES with a named reason; it is never skipped.
+* ``control_state``: for each code in ``ledger_roles.GATE_TIE_CODES`` (and the resolved prepayment account) the GL net
+  against the live v2 owner subledger, read from the owner tables (1400 and prepayment from billing R1; 2045 still
+  refuses until the claims-opening PR reads expenses a2). A subledger that cannot answer REFUSES with a named reason;
+  it is never skipped.
 * ``report_state``: the codes in ``REPORT_ZERO_CODES`` (2030) and ``REPORT_WHT_CODES`` (2110) are REPORTED, never
   gated (flip-gate profile ``as_is_v1``, AS-IS-MIGRATION-REPLAN section 4).
 
@@ -28,7 +30,7 @@ from sqlalchemy.orm import Session
 from erp_v2.holdings.models import KIND_STRADDLE_POST as STRADDLE_KIND
 from erp_v2.holdings.models import KIND_SUBKOBO_POST as SUBKOBO_KIND
 from erp_v2.holdings.models import OWNER as STRADDLE_OWNER
-from erp_v2.ledger_roles import GATE_TIE_CODES, REPORT_WHT_CODES, REPORT_ZERO_CODES
+from erp_v2.ledger_roles import GATE_TIE_CODES, GATE_TIE_RESOLVED, REPORT_WHT_CODES, REPORT_ZERO_CODES
 from erp_v2.migration_ledger.common import OPENING_PERIOD, ZERO, canonical_sha, fmt
 from erp_v2.migration_ledger.rounding_verify import ROUNDING_KIND
 
@@ -151,17 +153,102 @@ def _sub_2045(db: Session, tenant: UUID) -> Decimal:
 
 
 _SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410, "2045": _sub_2045}
-# NOT in ``_SUBLEDGERS`` because no owner subledger exists in v2 yet, so the gate REFUSES with a named reason (never
-# skips): 1400 (billing a13 R1 not pinned). 2110 is report-only (``report_state``).
-# These ties net ALL currencies together; the per-currency tie is the pending check ``control_ties_per_currency``.
+# 1400 and the prepayment account are tied by the dedicated readers below (billing R1); 2045 (S8) reads the expenses
+# a2 owner tables in this session. 2110 is report-only (``report_state``). These ties net ALL currencies together
+# except the billing ones, which are the functional currency only (any other currency with a balance refuses: no FX
+# tie exists).
+
+
+class _Unavailable(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _gl_net_ids(db: Session, tenant: UUID, ids) -> Decimal:
+    return Decimal(
+        db.scalar(
+            sa.select(sa.func.coalesce(sa.func.sum(PostedLedgerLine.debit - PostedLedgerLine.credit), 0)).where(
+                PostedLedgerLine.tenant_id == tenant, PostedLedgerLine.account_id.in_(list(ids))
+            )
+        )
+    )
+
+
+def _billing_position(db: Session, tenant: UUID, tag: str, read_gl):
+    """Billing R1 for the functional currency AND the GL it is tied to, as ``(position, gl)``. R1 is read in its OWN
+    REPEATABLE READ READ ONLY session (R1 needs that posture and the bridge signs inside a write transaction). The
+    order is: ledger sha, then the GL (``read_gl()``), then R1, then the ledger sha again: a ledger that moved at any
+    point in between is ``moved_during_gate``. Any other currency with a balance has no FX tie and refuses."""
+    from erp_v2.holdings import positions
+    from erp_v2.holdings.apply import read_only_session
+    from erp_v2.holdings.billing import A13Billing, Position
+    from erp_v2.holdings.errors import HoldingRefused
+    from erp_v2.journals.policy import functional_currency
+
+    functional = functional_currency(db, tenant)
+    before = positions.v2_posted_sha(db, tenant)
+    gl = read_gl()
+    try:
+        with read_only_session(db.get_bind().engine) as billing_db:
+            try:
+                r1 = A13Billing(tenant).r1(billing_db)
+            finally:
+                billing_db.rollback()
+    except HoldingRefused as exc:
+        raise _Unavailable(f"control_subledger_unavailable:{tag}:{exc.code}") from exc
+    if positions.v2_posted_sha(db, tenant) != before:
+        raise _Unavailable(f"moved_during_gate:{tag}")
+    for currency, position in r1.currencies.items():
+        if currency != functional and (
+            position.collectible_minor
+            or position.non_cash_minor
+            or position.available_credit_minor
+            or position.prepaid_funding_minor
+        ):
+            raise _Unavailable(f"control_subledger_fx:{tag}")
+    return r1.currencies.get(functional, Position(0, 0, 0, 0)), gl
+
+
+def _billing_tie(db: Session, tenant: UUID, tag: str, read_gl, subledger) -> dict[str, Any]:
+    """One billing-backed tie entry; the GL is read inside the ``moved_during_gate`` bracket."""
+    box: dict[str, Decimal] = {}
+
+    def gl_once() -> Decimal:
+        box["gl"] = read_gl()
+        return box["gl"]
+
+    try:
+        position, gl = _billing_position(db, tenant, tag, gl_once)
+    except _Unavailable as exc:
+        gl = box.get("gl")
+        return {"gl": None if gl is None else fmt(gl), "subledger": None, "ok": False, "reason": exc.reason}
+    sub = subledger(position)
+    return {
+        "gl": fmt(gl),
+        "subledger": fmt(sub),
+        "ok": gl == sub,
+        "reason": None if gl == sub else f"control_not_tied:{tag}",
+    }
 
 
 def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
-    """The GATED ties (exact, GL against the owner subledger)."""
+    """The GATED ties (exact, GL against the owner subledger). A reader that cannot answer (billing refuses, the
+    ledger moved while it read, a foreign-currency balance) is ``ok: False`` with a named reason, never skipped."""
     state: dict[str, dict[str, Any]] = {}
     for code in GATE_TIE_CODES:
+        if code == "1400":
+            state[code] = _billing_tie(
+                db,
+                tenant,
+                "1400",
+                lambda: _gl_net(db, tenant, "1400"),
+                lambda position: Decimal(position.receivable()).scaleb(-2),
+            )
+            continue
         gl = _gl_net(db, tenant, code)
-        if code not in _SUBLEDGERS:
+        reader = _SUBLEDGERS.get(code)
+        if reader is None:  # no owner subledger exists: the gate REFUSES with a named reason, never skips
             state[code] = {
                 "gl": fmt(gl),
                 "subledger": None,
@@ -169,14 +256,45 @@ def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
                 "reason": f"control_subledger_unavailable:{code}",
             }
             continue
-        sub = _SUBLEDGERS[code](db, tenant)
+        try:
+            sub = reader(db, tenant)
+        except _Unavailable as exc:
+            state[code] = {"gl": fmt(gl), "subledger": None, "ok": False, "reason": exc.reason}
+            continue
         state[code] = {
             "gl": fmt(gl),
             "subledger": fmt(sub),
             "ok": gl == sub,
             "reason": None if gl == sub else f"control_not_tied:{code}",
         }
+    state["prepayment"] = _prepayment_tie(db, tenant)
     return state
+
+
+def _prepayment_tie(db: Session, tenant: UUID) -> dict[str, Any]:
+    """GL(the resolved ``ar.prepayment_liability_account`` plus a separate ``ar.prepaid_funding_account`` when it
+    resolves) == -(R1 available credit + prepaid funding)."""
+    from erp_v2.holdings.config import prepaid_funding_account, prepayment_account
+    from erp_v2.holdings.errors import HoldingRefused
+
+    try:
+        account = prepayment_account(db, tenant)
+        funding = prepaid_funding_account(db, tenant)
+    except HoldingRefused as exc:
+        return {
+            "gl": None,
+            "subledger": None,
+            "ok": False,
+            "reason": f"control_subledger_unavailable:prepayment:{exc.code}",
+        }
+    ids = {account.id} | ({funding.id} if funding is not None else set())
+    return _billing_tie(
+        db,
+        tenant,
+        "prepayment",
+        lambda: _gl_net_ids(db, tenant, ids),
+        lambda position: -Decimal(position.credit()).scaleb(-2),
+    )
 
 
 def report_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
@@ -194,6 +312,7 @@ def report_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
 def control_lists() -> dict[str, list[str]]:
     return {
         "tie": list(GATE_TIE_CODES),
+        "tie_resolved": list(GATE_TIE_RESOLVED),
         "report_zero": list(REPORT_ZERO_CODES),
         "report_wht": list(REPORT_WHT_CODES),
     }

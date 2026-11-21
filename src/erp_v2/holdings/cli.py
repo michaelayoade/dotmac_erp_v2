@@ -38,8 +38,18 @@ from erp_v2.migration_ledger.common import sha_text, strict_json, text
 APPLY_ENV = "ERP_HOLDING_APPLY"
 
 
-def billing_reader() -> BillingReader:  # patched by tests and by the a13 binding
+def billing_reader() -> BillingReader:  # patched by tests
     return default_reader()
+
+
+def _reader(spec_bytes: bytes) -> BillingReader:
+    """The billing reader bound to the run spec's tenant (a reader without ``for_tenant`` is used as is)."""
+    reader = billing_reader()
+    bind = getattr(reader, "for_tenant", None)
+    if bind is None:
+        return reader
+    spec, _ = planning.parse_spec(spec_bytes)
+    return bind(spec.tenant_id)
 
 
 def _require_apply(flag: bool) -> None:
@@ -99,7 +109,7 @@ def _plan_receipt(path: Path, sha: str) -> dict[str, Any]:
 def _do_plan(args) -> dict[str, Any]:
     spec_bytes = args.spec.read_bytes()
     out = applying.run_plan(
-        _engine(), spec_bytes, load_receipts, billing_reader(), planned_by=_operator(args.operator_ref)
+        _engine(), spec_bytes, load_receipts, _reader(spec_bytes), planned_by=_operator(args.operator_ref)
     )
     return {"ready": True, "dry_run": True, **out}
 
@@ -122,23 +132,29 @@ def _do_apply(args) -> dict[str, Any]:
         refuse("window_already_applied", "this window was applied from a different plan")
     if prior:
         return {"ready": True, "replayed": True, "plan_sha256": args.plan_sha}
-    plan = applying.run_plan(engine, spec_bytes, load_receipts, billing_reader(), planned_by=approved["planned_by"])
+    plan = applying.run_plan(engine, spec_bytes, load_receipts, _reader(spec_bytes), planned_by=approved["planned_by"])
     with Session(engine) as db, db.begin():
         return applying.apply(db, spec, plan, approved_sha=args.plan_sha, applied_by=operator)
 
 
 def _do_verify(args) -> dict[str, Any]:
-    spec, _ = planning.parse_spec(args.spec.read_bytes())
+    spec_bytes = args.spec.read_bytes()  # read once: the tenant binding and the body come from the same bytes
+    spec, _ = planning.parse_spec(spec_bytes)
     engine = _engine()
     with applying.read_only_session(engine) as db:
-        out = applying.verify(db, spec, billing_reader())
+        out = applying.verify(db, spec, _reader(spec_bytes))
         db.rollback()
     return out
 
 
 def _do_t1_plan(args) -> dict[str, Any]:
+    spec_bytes = args.spec.read_bytes()
     out = t1_mod.run_t1_plan(
-        _engine(), args.spec.read_bytes(), load_receipts, billing_reader(), planned_by=_operator(args.operator_ref)
+        _engine(),
+        spec_bytes,
+        load_receipts,
+        _reader(spec_bytes),
+        planned_by=_operator(args.operator_ref),
     )
     return {"ready": True, "dry_run": True, **out}
 
@@ -149,7 +165,7 @@ def _do_t1_apply(args) -> dict[str, Any]:
     spec, _ = planning.parse_spec(spec_bytes)
     approved = _plan_receipt(args.plan_receipt, args.plan_sha)
     engine = _engine()
-    plan = t1_mod.run_t1_plan(engine, spec_bytes, load_receipts, billing_reader(), planned_by=approved["planned_by"])
+    plan = t1_mod.run_t1_plan(engine, spec_bytes, load_receipts, _reader(spec_bytes), planned_by=approved["planned_by"])
     if plan["plan"]["already_posted"]:
         if plan["plan"]["posted_fingerprint"] != args.plan_sha:  # L1: a replay needs the posted journal's fingerprint
             refuse("t1_already_posted_by_another_plan")

@@ -12,7 +12,8 @@ def test_constants_are_the_approved_sets():
     assert ledger_roles.AP_CONTROL_CODE == "2000"
     assert ledger_roles.PAYROLL_PAYABLE_CODE == "2040"
     assert ledger_roles.STAFF_LOAN_CODE == "1410"
-    assert ledger_roles.CONTROL_ACCOUNT_CODES == {"2000", "2040", "1410"}
+    assert ledger_roles.CONTROL_ACCOUNT_CODES == {"2000", "2040", "1410", "1400", "2045"}
+    assert ledger_roles.LEDGER_FAULT_CONTROL_CODES == {"2000", "2040", "1410"}  # the fault door is not widened
     assert ledger_roles.INVOICE_TAX_ACCOUNT_CODES == {"1455"}
 
 
@@ -23,7 +24,7 @@ def test_payroll_and_loan_codes_are_pinned_to_the_payroll_declarations():
 
 
 def test_the_journal_screens_use_the_shared_control_set():
-    assert queries.CONTROL_ACCOUNT_CODES is ledger_roles.CONTROL_ACCOUNT_CODES
+    assert queries.control_account_ids is ledger_roles.control_account_ids
 
 
 def test_same_account_compares_by_uuid_value():
@@ -35,3 +36,10 @@ def test_same_account_compares_by_uuid_value():
     assert not ledger_roles.same_account("2000", value)  # unparsable
     assert not ledger_roles.same_account(None, value)
     assert not ledger_roles.same_account("", value)
+
+
+def test_the_opening_proof_control_set_is_the_original_four_not_the_guard_set():
+    from erp_v2.migration_ledger import opening
+
+    assert opening.CONTROL_CODES == {"2000", "2040", "1410", "1400"}
+    assert opening.CONTROL_CODES < ledger_roles.CONTROL_ACCOUNT_CODES  # 2045 is guarded, but not an opening input
