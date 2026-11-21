@@ -69,16 +69,7 @@ def test_non_uuid_legacy_customer_key_is_customer_not_imported() -> None:
         cli.wave4_account_id(None, scope=SimpleNamespace(tenant_id=TENANT), legacy_customer_key="cust-1")
 
 
-def test_a12_window_cannot_bind_dual_control_off_and_a13_field_is_passed_explicitly() -> None:
-    from dataclasses import make_dataclass
-
-    a12 = make_dataclass("W12", [("x", int)])
-    a13 = make_dataclass("W13", [("x", int), ("dual_control", str)])
-    assert cli.window_dual_control_kwargs(a13, "off") == {"dual_control": "off"}
-    assert cli.window_dual_control_kwargs(a13, "on") == {"dual_control": "on"}
-    assert cli.window_dual_control_kwargs(a12, "on") == {}
-    with pytest.raises(cli.OperatorRefusal, match="window_dual_control_unbindable_pin_billing_a13"):
-        cli.window_dual_control_kwargs(a12, "off")
+def test_window_dual_control_read_back_must_equal_the_policy() -> None:
     with pytest.raises(cli.OperatorRefusal, match="window_dual_control_differs_from_policy"):
         cli._verify_window_dual_control(SimpleNamespace(dual_control="off"), "on")
     cli._verify_window_dual_control(SimpleNamespace(dual_control="off"), "off")

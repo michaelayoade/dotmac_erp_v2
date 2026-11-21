@@ -1,4 +1,4 @@
-"""AR opening on real PostgreSQL with the real billing a12 lane (hosted CI only, ERP_TEST_POSTGRES_URL).
+"""AR opening on real PostgreSQL with the real billing a13 lane (hosted CI only, ERP_TEST_POSTGRES_URL).
 
 mint -> plan -> provision (app_admin) -> import every partition (restricted writer) -> seal; 0 GL; receipts.
 """
@@ -200,7 +200,7 @@ def _apply(engine, w, plan, oid, **kw):
         occurred_at=NOW,
         applied_by="tester",
         coupled_watermark=kw.pop("fence", FENCE),
-        dual_control=kw.pop("dual", True),  # pinned a12 windows are two-person; a13 binds the policy per window
+        dual_control=kw.pop("dual", True),  # a13 binds the policy per window
         env=kw.pop("env", {"ERP_AR_OPENING_APPLY": "1"}),
     )
 
@@ -235,7 +235,7 @@ def test_mint_refuses_a_customer_the_wave4_import_did_not_land(engine):
 
 
 def test_plan_previews_clean_with_the_unapplied_credit_note_out_of_the_manifest_p1(engine):
-    """P-1 against the pinned billing (a12): a partition carried WITHOUT its unapplied credit note previews clean."""
+    """P-1 against the pinned billing (a13): a partition carried WITHOUT its unapplied credit note previews clean."""
 
     w = _world(engine)
     plan, oid = _plan(engine, w)
@@ -286,21 +286,10 @@ def test_provision_import_seal_with_the_restricted_writer_and_zero_gl(engine):
 
 
 def test_dual_control_is_bound_explicitly_from_the_policy_and_read_back(engine):
-    """a12 (pinned) has no per-window dual_control: policy OFF is refused, nothing provisioned. On a13 the explicit
-    policy value is bound at provision and the read-back equals it (run locally against the a13 source)."""
+    """The explicit policy value is bound at provision (billing a13, immutable) and the read-back equals it."""
 
-    from dotmac_billing.opening_window_contracts import OpeningWindowV1
-
-    a13 = "dual_control" in OpeningWindowV1.__dataclass_fields__
     w = _world(engine)
     plan, oid = _plan(engine, w, "off")  # the plan is built under the policy (OFF) it will be applied under
-    if not a13:
-        with pytest.raises(OperatorRefusal, match="window_dual_control_unbindable_pin_billing_a13"):
-            _apply(engine, w, plan, oid, dual=False)
-        with Session(engine) as db:
-            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(w.tenant)})
-            assert get_opening_window(db, scope=w.scope) is None
-        return
     with pytest.raises(OperatorRefusal, match="authority_dual_control_differs_from_policy"):
         apply_opening(
             engine,

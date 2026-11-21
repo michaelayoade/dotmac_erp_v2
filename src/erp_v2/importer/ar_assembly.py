@@ -185,7 +185,7 @@ class ErpOpeningAuthority:
     role_oid: int  # read from pg_roles at run time for WRITER_ROLE
     expected_coupled_watermark: str
     # The ERP #62 two-person policy as billing a13's per-window "off" | "on". Must be explicit: a provision whose
-    # window binds anything else (or any value while this is None) is refused. a12 windows carry no such field.
+    # window binds anything else (or any value while this is None) is refused.
     expected_dual_control: str | None = None
 
     # --- OpeningLaneAssemblyAuthorityV1 ----------------------------------------------------------------------
@@ -292,7 +292,7 @@ class ErpProvisionVerifier:
             or window.principal_name != WRITER_ROLE
             or window.principal_oid != self.role_oid
             or window.provision_authority_ref != self.migration_authority_ref
-            or (hasattr(window, "dual_control") and window.dual_control != self.expected_dual_control)
+            or window.dual_control != self.expected_dual_control
         ):
             return None
         return OpeningWindowProvisionVerificationV1(
