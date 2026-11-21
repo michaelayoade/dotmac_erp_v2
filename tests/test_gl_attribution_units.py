@@ -327,10 +327,13 @@ def test_u6_an_exact_fragment_attributes_per_employee_and_a_mismatch_makes_the_j
 # --- the holdings tightening ---------------------------------------------------------------------------------------
 
 
-def spec_with(receipts):
+TENANT = uuid4()
+
+
+def spec_with(receipts, *, tenant=TENANT, capture="2026-01-20"):
     return json.dumps(
         {
-            "version": 1, "tenant_id": str(uuid4()), "window_id": str(uuid4()), "capture_date": "2026-01-20",
+            "version": 1, "tenant_id": str(tenant), "window_id": str(uuid4()), "capture_date": capture,
             "evidence_ref": "E", "params": {}, "receipts": receipts,
         }
     ).encode()  # fmt: skip
@@ -351,12 +354,13 @@ def test_load_receipts_verifies_each_receipt_sha_is_listed_in_the_manifest(tmp_p
     rec = tmp_path / "r.json"
     rec.write_bytes(r.raw)
 
-    def manifest(shas):
+    def manifest(shas, *, tenant=TENANT, capture="2026-01-20"):
         body = {
             "kind": "gl-attribution-manifest", "version": 1, "v2_posted_sha256": "9" * 64,
+            "tenant_scope": hashlib.sha256(str(tenant).encode()).hexdigest(), "capture_date": capture,
             "codes": {f"c{i}": {"receipt_sha256": s} for i, s in enumerate(shas)},
         }  # fmt: skip
-        path = tmp_path / "m.json"
+        path = tmp_path / f"m-{uuid4().hex}.json"
         path.write_bytes(json.dumps(body).encode())
         return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
@@ -372,6 +376,12 @@ def test_load_receipts_verifies_each_receipt_sha_is_listed_in_the_manifest(tmp_p
     with pytest.raises(HoldingRefused) as e:
         holdings_cli.load_receipts(spec)
     assert e.value.code == "gl_attribution_not_in_manifest"
+    # F3: a manifest produced for another tenant or another capture date
+    for other in (manifest([r.sha256], tenant=uuid4()), manifest([r.sha256], capture="2026-01-21")):
+        spec, _ = planning.parse_spec(spec_with({"gl_attribution": {"2040": ref}, "gl_attribution_manifest": other}))
+        with pytest.raises(HoldingRefused) as e:
+            holdings_cli.load_receipts(spec)
+        assert e.value.code == "attribution_manifest_other_scope"
 
 
 def test_a_stale_manifest_refuses_and_a_fresh_one_passes():
@@ -384,3 +394,31 @@ def test_a_stale_manifest_refuses_and_a_fresh_one_passes():
     with pytest.raises(HoldingRefused) as e:
         planning.check_manifest_fresh(planning.Receipts(None, None, {}, {}, "2" * 64), Snap())
     assert e.value.code == "attribution_manifest_stale"
+
+
+def test_f4_legacy_party_keys_are_canonicalised_and_an_unparseable_key_is_left_as_is():
+    from uuid import UUID
+
+    from erp_v2.migration_ledger import attribution_cli as acli
+
+    k = uuid4()
+    assert acli._canonical(str(k).upper()) == str(k) == str(UUID(str(k)))
+    assert acli._canonical("E1") == "E1"
+
+
+def test_f1_sources_require_declaration_unit():
+    from erp_v2.migration_ledger import attribution_cli as acli
+
+    acli.Sources(absent=acli.SOURCE_NAMES).require()
+    for kwargs, code in (
+        ({"absent": ["unpaid_plan", "settled_plan", "s8"]}, "source_required:import_itemised"),
+        ({"absent": ["import_itemised", "unpaid_plan", "s8"]}, "source_required:settled_plan"),
+        ({"absent": ["import_itemised", "unpaid_plan", "settled_plan"]}, "source_required:s8_receipt"),
+        (
+            {"absent": ["import_itemised", "unpaid_plan", "settled_plan"], "s8_receipt": b"{}"},
+            "source_required:s8_fragment",
+        ),
+    ):
+        with pytest.raises(LedgerRefused) as e:
+            acli.Sources(**kwargs).require()
+        assert e.value.code == code

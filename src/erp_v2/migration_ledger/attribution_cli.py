@@ -21,6 +21,7 @@ import hashlib
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -28,6 +29,7 @@ from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
+from dotmac_accounting.contracts import JournalStatus
 from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
 from sqlalchemy.orm import Session
 
@@ -40,6 +42,7 @@ from erp_v2.holdings.models import (
     KIND_WRITEOFF_POST,
     OWNER,
 )
+from erp_v2.holdings.plan import OPENING_OWNER
 from erp_v2.migration_ledger import attribution_rules as rules
 from erp_v2.migration_ledger import cli_common as cli
 from erp_v2.migration_ledger import gl_attribution as core
@@ -47,6 +50,7 @@ from erp_v2.migration_ledger import register
 from erp_v2.migration_ledger.common import (
     ZERO,
     LedgerRefused,
+    canonical_sha,
     day,
     refuse,
     sha256_bytes,
@@ -127,7 +131,7 @@ def _owners(
     for j, key, rule in legacy.execute(sa.text(sql), {"ids": journal_ids, "d": capture}):
         if j is None or key is None:
             continue
-        found[str(j)][Party(kind, str(key))].add(str(rule))
+        found[str(j)][Party(kind, _canonical(str(key)))].add(str(rule))
     return {j: {p: frozenset(r) for p, r in per.items()} for j, per in found.items()}
 
 
@@ -151,7 +155,9 @@ def _invoice_facts(
     for inv, sup, posted, residual in legacy.execute(
         sa.text(rules.INVOICE_RESIDUAL_SQL), {"ids": ids, "d": capture, "functional": functional}
     ):
-        out[str(inv)] = core.InvoiceFact(str(sup), core.exact2(Decimal(residual), f"invoice:{inv}"), bool(posted))
+        out[str(inv)] = core.InvoiceFact(
+            _canonical(str(sup)), core.exact2(Decimal(residual), f"invoice:{inv}"), bool(posted)
+        )
     return out
 
 
@@ -162,8 +168,13 @@ def _party_kinds_2040(db: Session, tenant: UUID) -> None:
         refuse("party_kind_unexpected")
 
 
+SOURCE_NAMES = ("import_itemised", "unpaid_plan", "settled_plan", "s8")
+
+
 class Sources:
-    """The optional sha-bound input bytes of the producer (None when the source is absent)."""
+    """The sha-bound input bytes of the producer. Every source is supplied OR declared absent (``--absent <name>``):
+    an undeclared missing source refuses ``source_required:<name>`` (a silently missing source would leave refused
+    items unexplained while their register rows stay open). The S8 source is the receipt plus its fragment, together."""
 
     def __init__(
         self,
@@ -173,13 +184,111 @@ class Sources:
         settled_plan: bytes | None = None,
         s8_receipt: bytes | None = None,
         s8_fragment: bytes | None = None,
+        absent: Iterable[str] = (),
     ) -> None:
         self.import_itemised, self.unpaid_plan, self.settled_plan = import_itemised, unpaid_plan, settled_plan
         self.s8_receipt, self.s8_fragment = s8_receipt, s8_fragment
+        self.absent = frozenset(absent)
 
     def sha(self, name: str) -> str | None:
         raw = getattr(self, name)
         return None if raw is None else sha256_bytes(raw)
+
+    def require(self) -> None:
+        unknown = self.absent - set(SOURCE_NAMES)
+        if unknown:
+            refuse(f"absent_source_unknown:{sorted(unknown)[0]}")
+        for name in SOURCE_NAMES:
+            parts = ("s8_receipt", "s8_fragment") if name == "s8" else (name,)
+            supplied = [getattr(self, part) is not None for part in parts]
+            if name in self.absent:
+                if any(supplied):
+                    refuse(f"absent_source_supplied:{name}")
+            elif not all(supplied):
+                refuse(f"source_required:{parts[supplied.index(False)]}")
+
+    @property
+    def declared_absent(self) -> list[str]:
+        return sorted(self.absent)
+
+
+def _s8_journals(db: Session, tenant: UUID) -> list[str]:
+    """Every claim-family reclass journal of the tenant (any control code it touches)."""
+    return sorted(
+        str(i)
+        for i in db.scalars(
+            sa.select(JournalEntry.id).where(
+                JournalEntry.tenant_id == tenant,
+                JournalEntry.source_owner == OWNER,
+                JournalEntry.source_document_kind == KIND_CLAIM_RECLASS,
+            )
+        )
+    )
+
+
+def _check_s8_receipt(raw: bytes, fragment_sha: str | None, *, tenant: UUID, snapshot_sha: str, v2_journals: list[str]):
+    """The S8 apply receipt is bound by kind, self sha, tenant, snapshot and the v2 reclass journal id."""
+    s8 = strict_json(raw, "invalid_s8_receipt")
+    if not isinstance(s8, dict) or s8.get("kind") != "claims-opening":
+        refuse("s8_receipt_invalid")
+    stated = s8.get("receipt_sha256")
+    if not isinstance(stated, str) or canonical_sha({k: v for k, v in s8.items() if k != "receipt_sha256"}) != stated:
+        refuse("s8_receipt_invalid")
+    bindings = s8.get("bindings")
+    if not isinstance(bindings, dict) or bindings.get("tenant_id") != str(tenant):
+        refuse("s8_receipt_not_bound")
+    if bindings.get("snapshot_sha256") != snapshot_sha:
+        refuse("s8_receipt_not_bound")
+    if s8.get("fragment_2040_sha256") != fragment_sha:
+        refuse("s8_fragment_not_bound")
+    journal = s8.get("journal")
+    posted = journal.get("journal_id") if isinstance(journal, dict) else None
+    if len(v2_journals) > 1 or (posted is None) != (not v2_journals) or (v2_journals and str(posted) != v2_journals[0]):
+        refuse("s8_receipt_not_bound")
+
+
+def _legacy_account_check(legacy: sa.Connection, accounts: list[str], code: str) -> None:
+    """The producer filters legacy lines by the v2 account ids (legacy id == v2 id): each must exist in legacy
+    ``gl.account`` under the same code, else a named refusal instead of a generic ``legacy_import_differs``."""
+    found = {
+        str(i)
+        for (i,) in legacy.execute(
+            sa.text("SELECT account_id::text FROM gl.account WHERE account_code = :c AND account_id::text = ANY(:a)"),
+            {"c": code, "a": accounts},
+        )
+    }
+    if found != set(accounts):
+        refuse(f"legacy_account_not_found:{code}")
+
+
+def _canonical(key: str) -> str:
+    try:
+        return str(UUID(key))
+    except ValueError:
+        return key
+
+
+def _owner_sub_keys(db: Session, tenant: UUID, code: str, functional: str) -> set[str]:
+    """The owner-subledger party keys (real tables), all of which must be canonical UUID text: the legacy keys are
+    canonicalised with ``str(UUID(k))``, so a differently written subledger key would split every party in two."""
+    from erp_v2.holdings import positions
+
+    keys = {p.key for (p, _ccy), v in positions.owner_sub(db, tenant, code, functional).items() if v != 0}
+    if any(_canonical(k) != k for k in keys):
+        refuse(f"party_key_not_canonical:{code}")
+    return keys
+
+
+def _check_opening(db: Session, tenant: UUID, cutoff: date) -> None:
+    """The cutoff receipt carries no snapshot binding of its own: the v2 B-9 opening must be POSTED with its posting
+    date equal to the cutoff (the ``cutoff_evidence`` rule)."""
+    rows = db.execute(
+        sa.select(JournalEntry.status, JournalEntry.posting_date).where(
+            JournalEntry.tenant_id == tenant, JournalEntry.source_owner == OPENING_OWNER
+        )
+    ).all()
+    if not rows or any(status != JournalStatus.POSTED or posted != cutoff for status, posted in rows):
+        refuse("cutoff_differs_from_opening")
 
 
 def produce(
@@ -200,7 +309,11 @@ def produce(
 
     if shas.get("p_attr_receipt") != rules.P_ATTR_RECEIPT_SHA256:
         refuse("p_attr_receipt_not_pinned")
+    sources.require()
     functional = functional_currency(db, tenant)
+    # NOTE (F7): inside ONE REPEATABLE READ transaction the ledger cannot move, so ``moved_during_attribution`` below
+    # can never fire; it is kept as a tripwire. The real staleness guard is the manifest's ledger sha, which the
+    # holdings plan compares with the ledger it reads (``attribution_manifest_stale``).
     v2_sha = positions.v2_posted_sha(db, tenant)
 
     itemised: list[tuple[str, str, str]] = []
@@ -222,19 +335,24 @@ def produce(
         fragment, held_2040, fragment_unkeyed = core.parse_fragment(
             strict_json(sources.s8_fragment, "invalid_claims_fragment")
         )
-        if sources.s8_receipt is None:
-            refuse("s8_receipt_required")
-        s8 = strict_json(sources.s8_receipt, "invalid_s8_receipt")
-        if not isinstance(s8, dict) or s8.get("fragment_2040_sha256") != sources.sha("s8_fragment"):
-            refuse("s8_fragment_not_bound")
+        _check_s8_receipt(
+            sources.s8_receipt or b"",
+            sources.sha("s8_fragment"),
+            tenant=tenant,
+            snapshot_sha=str(shas.get("legacy_snapshot")),
+            v2_journals=_s8_journals(db, tenant),
+        )
 
     receipts: dict[str, core.CodeReceipt] = {}
     reasons_unclassified: dict[str, int] = {}
     for code in rules.CODES:
         accounts = _account_ids(db, tenant, code)
+        _legacy_account_check(legacy, accounts, code)
         lines = _legacy_lines(legacy, accounts, capture, cutoff)
         journal_ids = sorted({ln.journal for ln in lines})
         v2, v2_gl = _v2_journals(db, tenant, code)
+        if code == "2040" and fragment is None and any(j.kind == "claim_reclass" for j in v2):
+            refuse("s8_fragment_required")  # the S8 reclass journal cannot be attributed without its fragment
         owners = _owners(legacy, code, journal_ids, capture)
         zero = frozenset()
         k2_pairs = 0
@@ -256,13 +374,18 @@ def produce(
         elif code == "2040":
             _party_kinds_2040(db, tenant)
             held = list(held_2040)
+        sub_keys = _owner_sub_keys(db, tenant, code, functional)
         receipts[code] = core.build_code_receipt(
             core.CodeInputs(code, functional, tuple(lines), owners, zero, v2_gl, tuple(v2), tuple(held), fragment)
         )
         if code in rules.K2_CODES:
             receipts[code].summary["k2_zero_units"] = k2_pairs
+        receipt_parties = {p["key"] for p in receipts[code].body["parties"]}
+        receipts[code].summary["owner_sub_parties"] = len(sub_keys)
+        receipts[code].summary["party_overlap"] = len(receipt_parties & sub_keys)  # S11: the keys must meet
+    _check_opening(db, tenant, cutoff)
     if positions.v2_posted_sha(db, tenant) != v2_sha:
-        refuse("moved_during_attribution")
+        refuse("moved_during_attribution")  # a tripwire, see the note above
     manifest_sources = {
         **{k: shas.get(k) for k in ("legacy_snapshot", "cutoff_receipt", "p_attr_receipt")},
         **{
@@ -277,7 +400,7 @@ def produce(
         v2_posted_sha256=v2_sha,
         receipts=receipts,
         reasons_unclassified=reasons_unclassified,
-        extra={"claims_fragment_unkeyed": fragment_unkeyed},
+        extra={"claims_fragment_unkeyed": fragment_unkeyed, "declared_absent": sources.declared_absent},
     )
     return {"receipts": receipts, "manifest": manifest, "currency": functional}
 
@@ -323,6 +446,10 @@ def parser() -> argparse.ArgumentParser:
     for name in ("import-itemised", "unpaid-plan", "settled-plan", "s8-receipt", "s8-fragment"):
         p.add_argument(f"--{name}", type=Path)
         p.add_argument(f"--{name}-sha256")
+    p.add_argument(
+        "--absent", action="append", default=[], choices=SOURCE_NAMES,
+        help="declare a source absent (repeatable); every source is otherwise required",
+    )  # fmt: skip
     p.add_argument("--out-dir", type=Path, required=True)
     return p
 
@@ -343,7 +470,11 @@ def run(args: argparse.Namespace) -> dict[str, str]:
         refuse("tenant_not_in_snapshot_extent")
     cutoff_raw = _bound(args.cutoff_receipt, args.cutoff_receipt_sha256, "cutoff_receipt")
     p_attr_raw = _bound(args.p_attr_receipt, args.p_attr_receipt_sha256, "p_attr_receipt")
-    cutoff = opening.parse_import_receipt(strict_json(cutoff_raw or b"", "invalid_import_receipt"))
+    cutoff_body = strict_json(cutoff_raw or b"", "invalid_import_receipt")
+    cutoff = opening.parse_import_receipt(cutoff_body)
+    carried = cutoff_body.get("snapshot_sha256") or (cutoff_body.get("bindings") or {}).get("snapshot_sha256")
+    if carried is not None and carried != manifest.snapshot_sha256:  # the receipt names a snapshot: it must be ours
+        refuse("cutoff_receipt_snapshot_mismatch")
     if cutoff > capture:
         refuse("capture_before_cutoff")
     sources = Sources(
@@ -352,6 +483,7 @@ def run(args: argparse.Namespace) -> dict[str, str]:
         settled_plan=_bound(args.settled_plan, args.settled_plan_sha256, "settled_plan"),
         s8_receipt=_bound(args.s8_receipt, args.s8_receipt_sha256, "s8_receipt"),
         s8_fragment=_bound(args.s8_fragment, args.s8_fragment_sha256, "s8_fragment"),
+        absent=args.absent,
     )
     if not args.out_dir.is_dir():
         refuse("out_dir_missing")

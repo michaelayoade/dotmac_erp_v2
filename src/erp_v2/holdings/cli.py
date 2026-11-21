@@ -88,6 +88,11 @@ def load_receipts(spec: planning.RunSpec) -> planning.Receipts:
 
         raw, manifest_sha = _read_bound(spec.gl_attribution_manifest)
         manifest, _ = gl_manifest.parse_manifest(raw)
+        if (
+            manifest["tenant_scope"] != hashlib.sha256(str(spec.tenant_id).encode()).hexdigest()
+            or manifest["capture_date"] != spec.capture_date.isoformat()
+        ):
+            refuse("attribution_manifest_other_scope", "the manifest was produced for another tenant or capture date")
         manifest_ledger_sha = manifest["v2_posted_sha256"]
         listed = {entry["receipt_sha256"] for entry in manifest["codes"].values()}
         shas[planning.MANIFEST_RECEIPT] = manifest_sha

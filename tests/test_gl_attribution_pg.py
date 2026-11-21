@@ -21,6 +21,7 @@ import pytest
 import sqlalchemy as sa
 from dotmac_accounting import service as accounting
 from dotmac_accounting.contracts import CreateJournal, JournalKind, JournalLineInput, SourceIdentity
+from dotmac_accounting.models import JournalEntry
 from dotmac_kernel.cache import TenantScope
 from sqlalchemy.orm import Session
 from test_holdings_pg import (
@@ -47,11 +48,13 @@ from erp_v2.migration_ledger import attribution_cli as acli
 from erp_v2.migration_ledger import attribution_rules as rules
 from erp_v2.migration_ledger import models as m
 from erp_v2.migration_ledger import register
-from erp_v2.migration_ledger.common import LedgerRefused
+from erp_v2.migration_ledger.common import LedgerRefused, canonical_sha
 from erp_v2.migration_ledger.rounding_verify import ROUNDING_KIND
 
 D = Decimal
-CUTOFF, CAPTURE = date(2025, 12, 31), date(2026, 1, 20)
+# the destination's only fiscal year is FY2026, so the B-9 opening is posted on the cutoff 2026-01-02
+CUTOFF, CAPTURE = date(2026, 1, 2), date(2026, 1, 20)
+ORG = uuid4()
 SHA = "b" * 64
 
 
@@ -61,7 +64,7 @@ LEGACY_DDL = """
 CREATE SCHEMA gl; CREATE SCHEMA ap; CREATE SCHEMA payroll; CREATE SCHEMA expense;
 CREATE TABLE gl.account (account_id uuid PRIMARY KEY, account_code text);
 CREATE TABLE gl.journal_entry (journal_entry_id uuid PRIMARY KEY, status text, posting_date date,
-  reversal_journal_id uuid, correlation_id text);
+  reversal_journal_id uuid, correlation_id text, organization_id uuid);
 CREATE TABLE gl.posted_ledger_line (ledger_line_id serial PRIMARY KEY, journal_entry_id uuid, account_id uuid,
   debit_amount numeric(20,6), credit_amount numeric(20,6), posting_date date, source_document_type text,
   source_document_id uuid);
@@ -113,9 +116,16 @@ class Legacy:
     def account(self, account_id, code):
         self.sql("INSERT INTO gl.account VALUES (:a, :c)", a=account_id, c=code)
 
-    def journal(self, jid, day, lines, *, status="POSTED", reversal=None, corr=None):
+    def register(self, env):
+        for code in ("2000", "2040", "1410"):
+            self.account(env.accounts[code], code)
+
+    def journal(self, jid, day, lines, *, status="POSTED", reversal=None, corr=None, org=ORG):
         """``lines``: (account id, code or None, net debit - credit, source type, source id)."""
-        self.sql("INSERT INTO gl.journal_entry VALUES (:j, :s, :d, :r, :c)", j=jid, s=status, d=day, r=reversal, c=corr)
+        self.sql(
+            "INSERT INTO gl.journal_entry VALUES (:j, :s, :d, :r, :c, :o)",
+            j=jid, s=status, d=day, r=reversal, c=corr, o=org,
+        )  # fmt: skip
         for account_id, code, amount, stype, sid in lines:
             amount = D(amount)
             self.sql(
@@ -185,7 +195,12 @@ def mirror_v2(engine, env, lg, code, *, day_open=date(2026, 1, 2), day_legacy=da
 
 
 def legacy_world(engine, lg):
-    return world(engine)
+    """A destination with its B-9 opening posted on the cutoff (a marker journal on non-control accounts) and its
+    control accounts known to the legacy snapshot."""
+    env = world(engine)
+    lg.register(env)
+    post_v2(engine, env, CUTOFF, "1000", D("1"), "erp.opening", "opening")
+    return env
 
 
 def produce(engine, env, lg, tmp_path, *, sources=None, tenant=None):
@@ -198,7 +213,7 @@ def produce(engine, env, lg, tmp_path, *, sources=None, tenant=None):
             try:
                 out = acli.produce(
                     conn, db, tenant=tenant or env.tenant_id, capture=CAPTURE, cutoff=CUTOFF, shas=shas,
-                    sources=sources or acli.Sources(),
+                    sources=sources or acli.Sources(absent=acli.SOURCE_NAMES),
                 )  # fmt: skip
             finally:
                 db.rollback()
@@ -296,7 +311,7 @@ def flip_env(engine, lg, tmp_path):
         mirror_v2(engine, env, lg, code)
     # S8: the claim-family reclass journal (Dr 2040 50.00)
     post_v2(engine, env, date(2026, 1, 4), "2040", D("50.00"), "erp.migration", "claim_family_reclass")
-    spec = make_spec(tmp_path)
+    spec = make_spec(tmp_path, tenant=env.tenant_id)
     env.spec_dict = spec
     env.tmp = tmp_path
     env.f = f
@@ -324,7 +339,32 @@ def register_sources(engine, env, tmp_path, f, *, unpaid_body, itemised_body, he
         db.commit()
 
 
-def sources_for(env, tmp_path, f, *, fragment_amounts=("30.00", "20.00")):
+def s8_journal(engine, env):
+    with Session(engine) as db:
+        return str(
+            db.scalar(
+                sa.select(JournalEntry.id).where(
+                    JournalEntry.tenant_id == env.tenant_id, JournalEntry.source_document_kind == "claim_family_reclass"
+                )
+            )
+        )
+
+
+def s8_receipt_bytes(engine, env, frag_bytes, *, snapshot="1" * 64, **override):
+    """An S8 apply receipt as ``claims_opening.core.apply_receipt`` writes it (kind, bindings, journal, fragment sha,
+    self sha); ``override`` replaces top-level fields before the self sha is computed."""
+    body = {
+        "kind": "claims-opening", "version": 1,
+        "bindings": {"tenant_id": str(env.tenant_id), "snapshot_sha256": snapshot},
+        "journal": {"journal_id": s8_journal(engine, env), "replayed": False},
+        "fragment_2040_sha256": hashlib.sha256(frag_bytes).hexdigest(),
+        **override,
+    }  # fmt: skip
+    body["receipt_sha256"] = canonical_sha(body)
+    return json.dumps(body).encode()
+
+
+def sources_for(engine, env, f, *, fragment_amounts=("30.00", "20.00"), snapshot="1" * 64):
     unpaid = {"version": 1, "mode": "plan", "refusals": [{"invoice_id": str(f.IB1), "reason": "source_journal_status"}]}
     itemised = {
         "queue": [
@@ -343,17 +383,25 @@ def sources_for(env, tmp_path, f, *, fragment_amounts=("30.00", "20.00")):
         "held_2040_unkeyed": 0,
     }  # fmt: skip
     frag_bytes = json.dumps(fragment, sort_keys=True).encode()
-    s8 = json.dumps({"kind": "claims-opening", "fragment_2040_sha256": hashlib.sha256(frag_bytes).hexdigest()}).encode()
     return (
         unpaid,
         itemised,
         acli.Sources(
             import_itemised=json.dumps(itemised).encode(),
             unpaid_plan=json.dumps(unpaid).encode(),
-            s8_receipt=s8,
+            s8_receipt=s8_receipt_bytes(engine, env, frag_bytes, snapshot=snapshot),
             s8_fragment=frag_bytes,
+            absent=["settled_plan"],
         ),
     )
+
+
+def clone(sources, **changes):
+    fields = {
+        name: getattr(sources, name)
+        for name in ("import_itemised", "unpaid_plan", "settled_plan", "s8_receipt", "s8_fragment")
+    }
+    return acli.Sources(**{**fields, "absent": sources.absent, **changes})
 
 
 def spec_with_receipts(engine, env, shas_dir, out):
@@ -378,7 +426,7 @@ def items_of(plan, code):
 def test_p1_p2_p3_the_flip_itemises_every_difference_and_the_controls_tie_after_apply(engine, legacy, tmp_path):
     env = flip_env(engine, legacy, tmp_path)
     f = env.f
-    unpaid, itemised, sources = sources_for(env, tmp_path, f)
+    unpaid, itemised, sources = sources_for(engine, env, f)
     register_sources(engine, env, tmp_path, f, unpaid_body=unpaid, itemised_body=itemised)
     out = produce(engine, env, legacy, tmp_path, sources=sources)
     _shas, out_dir = written(out, tmp_path)
@@ -447,14 +495,15 @@ def test_p1_p2_p3_the_flip_itemises_every_difference_and_the_controls_tie_after_
 def test_p1_the_owner_rules_resolve_line_level_journal_level_any_line_and_reversal_owners(engine, legacy, tmp_path):
     env = flip_env(engine, legacy, tmp_path)
     f = env.f
-    out = produce(engine, env, legacy, tmp_path)
+    _u, _i, sources = sources_for(engine, env, f)
+    out = produce(engine, env, legacy, tmp_path, sources=sources)
     body = receipt(out, "2000")
     parties = {p["key"]: D(p["gl"]) for p in body["parties"]}
     # A: invoices -100 -50, the reversed -20/+20, the any-line payment +10 and the K3 orphan +5
     assert parties == {str(f.SA): D("-135"), str(f.SB): D("-80"), str(f.SC): D("-30")}
     unattributed = {u["journal_id"]: (D(u["amount"]), u["shared"]) for u in body["unattributed"]}
     assert unattributed == {str(f.JP): (D("40"), True), str(f.JS): (D("7"), False), str(f.OR2): (D("3"), False)}
-    assert body["opening_residue"] == "0.00" and body["held"] == []
+    assert body["opening_residue"] == "0.00" and len(body["held"]) == 2
     rules_seen = {
         r["source_document_type"]: r["journals_by_rule"]
         for r in out["manifest"]["by_source_type"]
@@ -546,7 +595,7 @@ def test_p2a_k2_backfill_reclass_pairs_cancel_as_zero_units_and_every_other_case
 def test_p4_the_manifest_goes_stale_when_anything_posts_and_a_holding_journal_present_refuses(engine, legacy, tmp_path):
     env = flip_env(engine, legacy, tmp_path)
     f = env.f
-    unpaid, itemised, sources = sources_for(env, tmp_path, f)
+    unpaid, itemised, sources = sources_for(engine, env, f)
     register_sources(engine, env, tmp_path, f, unpaid_body=unpaid, itemised_body=itemised)
     out = produce(engine, env, legacy, tmp_path, sources=sources)
     _shas, out_dir = written(out, tmp_path)
@@ -575,11 +624,13 @@ def test_p5_integrity_faults_refuse_by_name(engine, legacy, tmp_path):
         produce(engine, env, legacy, tmp_path / "a")
     assert e.value.code == "legacy_import_differs:2000"
     native = world(engine)  # a native posting before the flip
+    legacy.register(native)
     seed_gl(engine, native, "2040", D("-5"))
     with pytest.raises(LedgerRefused) as e:
         produce(engine, native, legacy, tmp_path / "b")
     assert e.value.code == "native_posting_before_flip:2040"
     straddle = world(engine)  # a straddle line on 2040
+    legacy.register(straddle)
     post_v2(engine, straddle, date(2026, 1, 5), "2040", D("1"), "erp.migration", "migration_straddle")
     with pytest.raises(LedgerRefused) as e:
         produce(engine, straddle, legacy, tmp_path / "c")
@@ -597,13 +648,10 @@ def test_p5_a_rounding_journal_is_its_own_unattributed_row(engine, legacy, tmp_p
 
 def run_flip_receipts(engine, env, legacy, tmp_path, *, residual=None, claim=True):
     f = env.f
-    unpaid, itemised, sources = sources_for(env, tmp_path, f)
+    unpaid, itemised, sources = sources_for(engine, env, f)
     if residual is not None:  # a plan that records the legacy residual: gl_signed_minor is then stored in the register
         unpaid["refusals"][0]["residual"] = residual
-        sources = acli.Sources(
-            import_itemised=sources.import_itemised, unpaid_plan=json.dumps(unpaid).encode(),
-            s8_receipt=sources.s8_receipt, s8_fragment=sources.s8_fragment,
-        )  # fmt: skip
+        sources = clone(sources, unpaid_plan=json.dumps(unpaid).encode())
     register_sources(engine, env, tmp_path, f, unpaid_body=unpaid, itemised_body=itemised, claim=claim)
     out = produce(engine, env, legacy, tmp_path, sources=sources)
     _shas, out_dir = written(out, tmp_path)
@@ -691,7 +739,7 @@ def test_p8_an_open_2040_liability_for_a_non_employee_beneficiary_refuses_party_
 def test_the_producer_is_pinned_to_the_p_attr_receipt_and_the_s8_fragment_must_be_bound(engine, legacy, tmp_path):
     env = flip_env(engine, legacy, tmp_path)
     f = env.f
-    _unpaid, _itemised, sources = sources_for(env, tmp_path, f)
+    _unpaid, _itemised, sources = sources_for(engine, env, f)
     with legacy.engine.connect() as conn, conn.begin(), applying.read_only_session(engine) as db:
         conn.execute(sa.text("SET TRANSACTION READ ONLY"))
         shas = {"legacy_snapshot": "1" * 64, "cutoff_receipt": "2" * 64, "p_attr_receipt": "3" * 64}
@@ -701,8 +749,8 @@ def test_the_producer_is_pinned_to_the_p_attr_receipt_and_the_s8_fragment_must_b
             )
         assert e.value.code == "p_attr_receipt_not_pinned"
         shas["p_attr_receipt"] = rules.P_ATTR_RECEIPT_SHA256
-        bad = acli.Sources(
-            s8_receipt=b'{"fragment_2040_sha256": "' + b"0" * 64 + b'"}', s8_fragment=sources.s8_fragment
+        bad = clone(
+            sources, s8_receipt=s8_receipt_bytes(engine, env, sources.s8_fragment, fragment_2040_sha256="0" * 64)
         )
         with pytest.raises(LedgerRefused) as e:
             acli.produce(conn, db, tenant=env.tenant_id, capture=CAPTURE, cutoff=CUTOFF, shas=shas, sources=bad)
@@ -712,7 +760,7 @@ def test_the_producer_is_pinned_to_the_p_attr_receipt_and_the_s8_fragment_must_b
 def test_a_fragment_off_by_a_cent_makes_the_s8_journal_unattributed_and_flags_it(engine, legacy, tmp_path):
     env = flip_env(engine, legacy, tmp_path)
     f = env.f
-    _u, _i, sources = sources_for(env, tmp_path, f, fragment_amounts=("30.01", "20.00"))
+    _u, _i, sources = sources_for(engine, env, f, fragment_amounts=("30.01", "20.00"))
     out = produce(engine, env, legacy, tmp_path, sources=sources)
     r = out["receipts"]["2040"]
     assert r.flags and r.flags[0]["reason"] == "fragment_mismatch"
@@ -725,7 +773,7 @@ def test_the_cli_reads_both_databases_read_only_pops_the_dsns_and_writes_only_06
 ):
     env = flip_env(engine, legacy, tmp_path)
     f = env.f
-    _u, _i, sources = sources_for(env, tmp_path, f)
+    _u, _i, sources = sources_for(engine, env, f, snapshot="5" * 64)
     files = {}
     for name, raw in (
         ("itemised", sources.import_itemised),
@@ -763,6 +811,7 @@ def test_the_cli_reads_both_databases_read_only_pops_the_dsns_and_writes_only_06
         "--unpaid-plan", str(files["unpaid"][0]), "--unpaid-plan-sha256", files["unpaid"][1],
         "--s8-receipt", str(files["s8"][0]), "--s8-receipt-sha256", files["s8"][1],
         "--s8-fragment", str(files["frag"][0]), "--s8-fragment-sha256", files["frag"][1],
+        "--absent", "settled_plan",
     ]  # fmt: skip
     dest_url = engine.url.render_as_string(hide_password=False)
     monkeypatch.setenv("MIGRATION_DATABASE_URL", dest_url)
@@ -791,3 +840,156 @@ def test_the_cli_reads_both_databases_read_only_pops_the_dsns_and_writes_only_06
     monkeypatch.setenv("LEGACY_DATABASE_URL", legacy.url.render_as_string(hide_password=False))
     assert acli.main(argv) == 2 and list(again.iterdir()) == []
     assert isinstance(UUID(str(env.tenant_id)), UUID) and Path(out).is_dir()
+
+
+# --- review fixes F1-F5 ------------------------------------------------------------------------------------------------
+
+
+def run_produce(engine, env, legacy, sources, *, capture=CAPTURE, cutoff=CUTOFF, snapshot="1" * 64):
+    shas = {"legacy_snapshot": snapshot, "cutoff_receipt": "2" * 64, "p_attr_receipt": rules.P_ATTR_RECEIPT_SHA256}
+    with legacy.engine.connect() as conn, conn.begin():
+        conn.execute(sa.text("SET TRANSACTION READ ONLY"))
+        with applying.read_only_session(engine) as db:
+            try:
+                return acli.produce(
+                    conn, db, tenant=env.tenant_id, capture=capture, cutoff=cutoff, shas=shas, sources=sources
+                )
+            finally:
+                db.rollback()
+
+
+def test_f1_every_source_is_supplied_or_declared_absent_and_the_declaration_is_recorded(engine, legacy, tmp_path):
+    env = flip_env(engine, legacy, tmp_path)
+    _u, _i, full = sources_for(engine, env, env.f)
+    out = run_produce(engine, env, legacy, full)
+    assert out["manifest"]["declared_absent"] == ["settled_plan"]
+    for name, fields in (
+        ("import_itemised", ("import_itemised",)),
+        ("unpaid_plan", ("unpaid_plan",)),
+        ("s8_receipt", ("s8_receipt",)),
+        ("s8_fragment", ("s8_fragment",)),
+    ):
+        with pytest.raises(LedgerRefused) as e:  # missing and not declared
+            run_produce(engine, env, legacy, clone(full, **{f: None for f in fields}))
+        assert e.value.code == f"source_required:{name}"
+    with pytest.raises(LedgerRefused) as e:  # settled_plan is neither supplied nor declared
+        run_produce(engine, env, legacy, clone(full, absent=[]))
+    assert e.value.code == "source_required:settled_plan"
+    with pytest.raises(LedgerRefused) as e:  # a declared-absent source that is supplied anyway
+        run_produce(engine, env, legacy, clone(full, absent=["settled_plan", "import_itemised"]))
+    assert e.value.code == "absent_source_supplied:import_itemised"
+    declared = clone(full, import_itemised=None, absent=["settled_plan", "import_itemised"])
+    assert run_produce(engine, env, legacy, declared)["manifest"]["declared_absent"] == [
+        "import_itemised",
+        "settled_plan",
+    ]
+    with pytest.raises(LedgerRefused) as e:
+        run_produce(engine, env, legacy, clone(full, absent=["settled_plan", "nonsense"]))
+    assert e.value.code == "absent_source_unknown:nonsense"
+
+
+def test_f1_an_s8_reclass_journal_on_2040_without_the_fragment_refuses(engine, legacy, tmp_path):
+    env = flip_env(engine, legacy, tmp_path)
+    _u, _i, full = sources_for(engine, env, env.f)
+    no_s8 = clone(full, s8_receipt=None, s8_fragment=None, absent=["settled_plan", "s8"])
+    with pytest.raises(LedgerRefused) as e:
+        run_produce(engine, env, legacy, no_s8)
+    assert e.value.code == "s8_fragment_required"
+
+
+def test_f2_the_s8_receipt_is_bound_by_kind_self_sha_tenant_snapshot_and_journal(engine, legacy, tmp_path):
+    env = flip_env(engine, legacy, tmp_path)
+    _u, _i, full = sources_for(engine, env, env.f)
+    frag = full.s8_fragment
+    good = json.loads(full.s8_receipt)
+
+    def receipt_with(**changes):
+        body = {k: v for k, v in {**good, **changes}.items() if k != "receipt_sha256"}
+        body["receipt_sha256"] = canonical_sha(body)
+        return json.dumps(body).encode()
+
+    cases = {
+        "s8_receipt_invalid": [
+            receipt_with(kind="other"),
+            json.dumps({**good, "version": 2}).encode(),  # edited after its self sha was written
+        ],
+        "s8_receipt_not_bound": [
+            receipt_with(bindings={"tenant_id": str(uuid4()), "snapshot_sha256": "1" * 64}),
+            receipt_with(bindings={"tenant_id": str(env.tenant_id), "snapshot_sha256": "9" * 64}),
+            receipt_with(journal={"journal_id": str(uuid4())}),
+            receipt_with(journal={"journal_id": None}),
+        ],
+        "s8_fragment_not_bound": [receipt_with(fragment_2040_sha256="0" * 64)],
+    }
+    for code, raws in cases.items():
+        for raw in raws:
+            with pytest.raises(LedgerRefused) as e:
+                run_produce(engine, env, legacy, clone(full, s8_receipt=raw))
+            assert e.value.code == code, raw
+    assert frag and run_produce(engine, env, legacy, full)["receipts"]["2040"].flags == []
+
+
+def test_f2_the_v2_opening_must_be_posted_on_the_cutoff(engine, legacy, tmp_path):
+    env = flip_env(engine, legacy, tmp_path)
+    _u, _i, full = sources_for(engine, env, env.f)
+    with pytest.raises(LedgerRefused) as e:  # a cutoff that is not the date the opening was posted on
+        run_produce(engine, env, legacy, full, cutoff=date(2026, 1, 3))
+    assert e.value.code == "cutoff_differs_from_opening"
+    bare = world(engine)  # no B-9 opening posted at all
+    legacy.register(bare)
+    with pytest.raises(LedgerRefused) as e:
+        run_produce(engine, bare, legacy, acli.Sources(absent=acli.SOURCE_NAMES))
+    assert e.value.code == "cutoff_differs_from_opening"
+
+
+def test_f4_party_keys_are_canonical_and_a_non_canonical_owner_subledger_key_refuses(
+    engine, legacy, tmp_path, monkeypatch
+):
+    env = legacy_world(engine, legacy)
+    legacy.journal(uuid4(), date(2026, 1, 5), [(env.accounts["2000"], "2000", "-10", "JOURNAL", None)])
+    mirror_v2(engine, env, legacy, "2000")
+    supplier = uuid4()
+    monkeypatch.setattr(
+        positions,
+        "owner_sub",
+        lambda db, t, code, ccy: {(Party("supplier", str(supplier).upper()), "NGN"): D("-5")} if code == "2000" else {},
+    )
+    with pytest.raises(LedgerRefused) as e:
+        produce(engine, env, legacy, tmp_path)
+    assert e.value.code == "party_key_not_canonical:2000"
+    monkeypatch.setattr(
+        positions,
+        "owner_sub",
+        lambda db, t, code, ccy: {(Party("supplier", str(supplier)), "NGN"): D("-5")} if code == "2000" else {},
+    )
+    summary = produce(engine, env, legacy, tmp_path / "ok")["receipts"]["2000"].summary
+    assert summary["owner_sub_parties"] == 1 and summary["party_overlap"] == 0  # reported for the S11 key check
+    assert acli._canonical(str(supplier).upper()) == str(supplier) and acli._canonical("E1") == "E1"
+
+
+def test_f5_a_control_account_unknown_to_legacy_is_a_named_refusal(engine, legacy, tmp_path):
+    env = world(engine)  # the legacy snapshot has no gl.account row for this tenant's control accounts
+    with pytest.raises(LedgerRefused) as e:
+        produce(engine, env, legacy, tmp_path)
+    assert e.value.code == "legacy_account_not_found:2000"
+    legacy.account(env.accounts["2000"], "2040")  # the right id under the wrong code is not found either
+    with pytest.raises(LedgerRefused) as e:
+        produce(engine, env, legacy, tmp_path / "b")
+    assert e.value.code == "legacy_account_not_found:2000"
+
+
+def test_f5_a_reclass_in_another_organisation_is_not_paired(engine, legacy, tmp_path):
+    env = legacy_world(engine, legacy)
+    a2040 = env.accounts["2040"]
+    source, reclass, source2, reclass2 = uuid4(), uuid4(), uuid4(), uuid4()
+    pre = "EXPENSE-RECLASS-BACKFILL-JE-"
+    day = date(2026, 1, 6)
+    legacy.journal(source, day, [(a2040, "2040", "-4", "EXPENSE_REIMBURSEMENT", None)])
+    legacy.journal(reclass, day, [(a2040, "2040", "4", "RECLASS", None)], corr=f"{pre}{source}", org=uuid4())
+    legacy.journal(source2, day, [(a2040, "2040", "-2", "EXPENSE_REIMBURSEMENT", None)])
+    legacy.journal(reclass2, day, [(a2040, "2040", "2", "RECLASS", None)], corr=f"{pre}{source2}")
+    mirror_v2(engine, env, legacy, "2040")
+    out = produce(engine, env, legacy, tmp_path)
+    unattributed = {u["journal_id"] for u in receipt(out, "2040")["unattributed"]}
+    assert {str(source), str(reclass)} <= unattributed  # different organisation: ordinary rule
+    assert not unattributed & {str(source2), str(reclass2)}  # same organisation: a zero unit

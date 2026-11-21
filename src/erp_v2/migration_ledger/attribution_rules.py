@@ -154,6 +154,7 @@ K2_SQL: Final = (
     f"({posted_by('r')}) AS r_posted, (s.journal_entry_id IS NOT NULL AND {posted_by('s')}) AS s_posted "
     "FROM gl.journal_entry r LEFT JOIN gl.journal_entry s "
     f"ON r.correlation_id = '{K2_PREFIX}' || s.journal_entry_id::text "
+    "AND r.organization_id IS NOT DISTINCT FROM s.organization_id "
     f"WHERE left(r.correlation_id, {len(K2_PREFIX)}) = '{K2_PREFIX}'"
 )
 

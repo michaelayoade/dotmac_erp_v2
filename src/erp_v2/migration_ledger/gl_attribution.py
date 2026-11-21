@@ -423,6 +423,9 @@ def parse_manifest(raw: bytes) -> tuple[dict[str, Any], str]:
     if not isinstance(body, dict) or body.get("kind") != MANIFEST_KIND or body.get("version") != 1:
         refuse("invalid_attribution_manifest")
     sha_text(body.get("v2_posted_sha256"), "invalid_attribution_manifest")
+    sha_text(body.get("tenant_scope"), "invalid_attribution_manifest")
+    if not isinstance(body.get("capture_date"), str):
+        refuse("invalid_attribution_manifest")
     codes = body.get("codes")
     if not isinstance(codes, dict):
         refuse("invalid_attribution_manifest")
