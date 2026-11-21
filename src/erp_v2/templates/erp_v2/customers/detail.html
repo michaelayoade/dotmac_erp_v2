@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}{{ account.account_number }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>{{ account.account_number }} — {{ account.display_name }}</h1>
+<p><a href="{{ base }}">Customers</a> · <a href="{{ base }}/{{ account.id }}/edit">Edit</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>Status</dt><dd>{{ account.status.value|lower }}</dd>
+  <dt>Trading name</dt><dd>{{ finance.trading_name if finance and finance.trading_name else '' }}</dd>
+  <dt>Tax id</dt><dd>{{ finance.tax_identification_number if finance and finance.tax_identification_number else '' }}</dd>
+  <dt>Payment terms</dt><dd>{{ finance.payment_terms_code if finance and finance.payment_terms_code else 'default' }}</dd>
+  <dt>Contact</dt><dd>{{ finance.contact_name if finance and finance.contact_name else '' }} {{ finance.contact_email if finance and finance.contact_email else '' }} {{ finance.contact_phone if finance and finance.contact_phone else '' }}</dd>
+  <dt>Billing address</dt><dd>{{ finance.billing_address if finance and finance.billing_address else '' }}</dd>
+  <dt>Open invoices</dt><dd>{{ open_items }}</dd>
+</dl>
+<h2>Billing accounts</h2>
+<table><thead><tr><th>Currency</th><th>Billing account</th></tr></thead><tbody>
+{% for b in billing_accounts %}<tr><td>{{ b.currency }}</td><td>{{ b.id }}</td></tr>
+{% else %}<tr><td colspan="2">No billing account yet (created at first use).</td></tr>{% endfor %}
+</tbody></table>
+<h2>Status</h2>
+{% for target, label in (('ACTIVE', 'Activate'), ('SUSPENDED', 'Suspend (inactive)')) %}
+{% if account.status.value != target and account.status.value != 'CLOSED' %}
+<form method="post" action="{{ base }}/{{ account.id }}/status"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="target" value="{{ target }}"><button type="submit">{{ label }}</button></form>
+{% endif %}{% endfor %}
+{% if account.status.value != 'CLOSED' %}
+<form method="post" action="{{ base }}/{{ account.id }}/status"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="target" value="CLOSED">
+  <label><input type="checkbox" name="confirm" value="close"> I understand closing is permanent</label> <button type="submit">Close customer</button></form>
+{% endif %}
+{% endblock %}

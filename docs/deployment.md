@@ -364,6 +364,13 @@ this does not authorize adjusting balances or switching traffic.
   finance_approver, `...read` for both so a poster can review a draft; admin and staff hold none) with the role
   profile `erp.web` version 6. Needs the billing a13 command surface (unreleased; S9). Off by
   default: `ar.producer.enabled` is set in the UI at F10 together with `billing_gl.enabled`. No environment variable.
+- Customer screen (F-F; `docs/customers.md`) adds the head `e2_0035_customer_finance` (chained after `e2_0033`; `e2_0034`
+  stays reserved for WHT): one table,
+  `erp_customer_finance` (RLS forced; W10: runtime SELECT, INSERT and a column-limited UPDATE, no DELETE; a trigger
+  makes the identity columns immutable and refuses DELETE even for the owner; the downgrade refuses while any row
+  exists), and one permission (`erp.finance.customers.manage` for finance_preparer; admin and staff hold none) with the
+  role profile `erp.web` version 7. Routes under `/finance/customers`. Settings entered in the UI:
+  `customers.series.account_number`. No environment variable.
 - Statutory payees (PR-4b; `docs/payee-bank-instructions.md`) adds the head `e2_0024_statutory_payees` (after
   `e2_0023_staff_loan_entries`): one CHECK on `payee_bank_instructions` widened to allow kind `statutory`. The e2
   head in this section moves to it. Before the first statutory remittance Finance proposes and approves one

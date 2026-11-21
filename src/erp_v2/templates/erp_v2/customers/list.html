@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Customers — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Customers</h1>
+<p><a href="{{ base }}/new">New customer</a></p>
+<form method="get" action="{{ base }}">
+  <label>Search <input name="q" value="{{ q }}" maxlength="100"></label>
+  <label>Status <select name="status"><option value="">All</option>
+    {% for s in all_statuses %}<option value="{{ s }}" {% if s == status %}selected{% endif %}>{{ s|lower }}</option>{% endfor %}
+  </select></label>
+  <button type="submit">Filter</button>
+</form>
+<table><thead><tr><th>Number</th><th>Name</th><th>Trading name</th><th>Terms</th><th>Status</th></tr></thead><tbody>
+{% for r in rows %}<tr>
+  <td><a href="{{ base }}/{{ r.account.id }}">{{ r.account.account_number }}</a></td>
+  <td>{{ r.account.display_name }}</td>
+  <td>{{ r.finance.trading_name if r.finance and r.finance.trading_name else '' }}</td>
+  <td>{{ r.finance.payment_terms_code if r.finance and r.finance.payment_terms_code else '' }}</td>
+  <td>{{ r.account.status.value|lower }}</td>
+</tr>{% else %}<tr><td colspan="5">No customers found.</td></tr>{% endfor %}
+</tbody></table>
+<p>{{ total }} customer{{ '' if total == 1 else 's' }} · page {{ page }} of {{ pages }}
+{% if page > 1 %}· <a href="{{ base }}?q={{ q|urlencode }}&amp;status={{ status }}&amp;page={{ page - 1 }}">Previous</a>{% endif %}
+{% if page < pages %}· <a href="{{ base }}?q={{ q|urlencode }}&amp;status={{ status }}&amp;page={{ page + 1 }}">Next</a>{% endif %}</p>
+{% endblock %}

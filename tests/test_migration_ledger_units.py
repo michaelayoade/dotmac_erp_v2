@@ -426,7 +426,7 @@ def test_migration_revision_and_chain():
 
     assert migration.revision == "e2_0028_migration_ledger"
     assert migration.down_revision == "e2_0027_held_draft_decisions"  # #69 merged before this build started
-    assert "e2_0033_billing_gl_vat" in EXPECTED_HEADS  # e2_0030..e2_0032 chain after this one
+    assert "e2_0035_customer_finance" in EXPECTED_HEADS  # e2_0030..e2_0035 chain after this one
     assert "e2_0028_migration_ledger" not in EXPECTED_HEADS
     assert "e2_0027_held_draft_decisions" not in EXPECTED_HEADS  # linear chain: one e2 head
 
