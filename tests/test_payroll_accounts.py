@@ -9,6 +9,7 @@ import json
 from types import SimpleNamespace
 from uuid import uuid4
 
+import account_maintenance_support as accounts_gov
 import pytest
 import sqlalchemy as sa
 from dotmac_accounting.contracts import AccountClass, AccountKind, NormalBalance
@@ -254,8 +255,7 @@ def test_resolver_rejects_loan_class_drift_and_inactive_accounts(seeded):
         with pytest.raises(setup.OperatorRefusal, match="account_category_conflict"):
             setup.resolve_future_deduction_accounts(db, parsed.tenant_id)
     asset.account_class = AccountClass.ASSET
-    loan.is_active = False
-    db.flush()
+    accounts_gov.retire(db, loan.id)
     with pytest.raises(setup.OperatorRefusal, match="future_payroll_account_invalid"):
         setup.resolve_future_deduction_accounts(db, parsed.tenant_id)
     with pytest.raises(setup.OperatorRefusal, match="future_payroll_account_invalid"):

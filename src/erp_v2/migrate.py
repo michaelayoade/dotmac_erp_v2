@@ -50,12 +50,12 @@ class MigrationConfigurationError(RuntimeError):
 # on the dedicated test server, 2026-11-08: 31 stamped, 333 tables).
 EXPECTED_HEADS: tuple[str, ...] = (
     "0030_credential_tenant_key",  # kernel 0.1.0a107
-    "ac_0003_draft_void",  # accounting 0.1.0a2
+    "ac_0004_account_maintenance",  # accounting 0.1.0a3
     "ao_0001_ai_operations",  # ai-operations 0.1.0a1
     "ap_0003_withdrawals",  # approvals 0.1.0a9
     "as_0001_assets",  # assets 0.1.0a1
     "ay_0001_analytics",  # analytics 0.1.0a1
-    "bi_0017_open_documents_index",  # billing 0.1.0a12
+    "bi_0019_opening_dual_control",  # billing 0.1.0a13
     "bk_0001_banking",  # banking 0.1.0a1
     "cg_0002_approval_withdrawals",  # commercial-agreements 0.1.0a4
     "cl_0001_collections",  # collections 0.1.0a1
@@ -63,7 +63,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "do_0001_documents",  # documents 0.1.0a1
     "e2_0032_ar_producer",  # assembly e2 head, B-16 AR producer
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1
-    "ex_0001_expenses",  # expenses 0.1.0a1
+    "ex_0002_claim_liabilities",  # expenses 0.1.0a2
     "fi_0002_selectable_planes",  # files 0.1.0a7
     "fm_0001_forms",  # forms 0.2.0a1
     "fn_0001_asset_accounting",  # finance 0.2.0a1
@@ -71,13 +71,13 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "im_0001_import_runs",  # imports 0.2.0a1
     "iv_0001_inventory",  # inventory 0.2.0a1
     "nu_0001_numbering",  # numbering 0.1.0a3
-    "pa_0005_reversal_settled_history",  # payables 0.1.0a5
+    "pa_0006_tax_release_hist_credit",  # payables 0.1.0a6
     "pc_0001_procurement",  # procurement 0.1.0a1
     "pe_0001_people_directory",  # people 0.1.0a2
     "pj_0001_projects",  # projects 0.1.0a1
     "pm_0006_cash_qualification",  # payments 0.1.0a3
     "pt_0001_party_context",  # party 0.1.0a1
-    "py_0003_settlement_reversal",  # payroll 0.1.0a5
+    "py_0004_liability_adjustments",  # payroll 0.1.0a6
     "sa_0001_sales",  # sales 0.1.0a1
     "tk_0001_tickets",  # ticketing 0.1.0a4
     "tx_0005_tax_dependencies",  # tax 0.1.0a7
@@ -88,7 +88,6 @@ _ABSORBED_HEADS: tuple[str, ...] = (
     "0030_credential_tenant_key",
     "pe_0001_people_directory",
     "bk_0001_banking",  # e2_0013 depends on banking tables
-    "bi_0017_open_documents_index",  # e2_0029 depends on the billing opening tables (grants to the writer role)
 )
 EXPECTED_STAMPED_HEADS: tuple[str, ...] = tuple(h for h in EXPECTED_HEADS if h not in _ABSORBED_HEADS)
 
