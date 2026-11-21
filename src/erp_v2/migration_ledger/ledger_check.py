@@ -142,9 +142,17 @@ def _sub_1410(db: Session, tenant: UUID) -> Decimal:
     return Decimal(queries.book_position(db, tenant_id=tenant).subledger_total)
 
 
-_SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410}
+def _sub_2045(db: Session, tenant: UUID) -> Decimal:
+    """Claims (expenses a2): minus the outstanding total of the non-reversed liabilities on the 2045 account."""
+    from dotmac_expenses import claims_payable_total
+
+    ids = db.scalars(sa.select(Account.id).where(Account.tenant_id == tenant, Account.code == "2045"))
+    return -sum((claims_payable_total(db, tenant_id=tenant, liability_account_ref=str(i)) for i in ids), Decimal(0))
+
+
+_SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410, "2045": _sub_2045}
 # NOT in ``_SUBLEDGERS`` because no owner subledger exists in v2 yet, so the gate REFUSES with a named reason (never
-# skips): 1400 (billing a13 R1 not pinned), 2045 (expenses a2 not pinned). 2110 is report-only (``report_state``).
+# skips): 1400 (billing a13 R1 not pinned). 2110 is report-only (``report_state``).
 # These ties net ALL currencies together; the per-currency tie is the pending check ``control_ties_per_currency``.
 
 

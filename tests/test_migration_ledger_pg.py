@@ -545,7 +545,7 @@ def gate(engine, env):
 
 @pytest.fixture
 def owners_available(monkeypatch):
-    """The owner subledgers not built in v2 yet (1400, 2045) stand in as zero; the gate REFUSES without them."""
+    """The owner subledger not built in v2 yet (1400) stands in as zero; the gate REFUSES without it (2045 is real)."""
     from erp_v2.migration_ledger import ledger_check
 
     zero = lambda db, tenant: Decimal(0)  # noqa: E731
@@ -713,14 +713,16 @@ SPEC_SECTION_4_CHECKS = {
     "straddle_reproduced",
     "e15_subkobo_posted",
     "post_flip_tools_unused",
+    "claims_reclass_matches_admissions",
 }
+BUILT_CHECKS = {"post_flip_tools_unused", "claims_reclass_matches_admissions"}
 
 
 def test_the_profile_check_names_are_pinned_to_spec_section_4():
     # removing a name (or adding one) is a visible change to this pinned set, never a silent tuple edit
     assert set(register.AS_IS_V1_CHECKS) == SPEC_SECTION_4_CHECKS
-    assert callable(register.AS_IS_V1_CHECKS["post_flip_tools_unused"])
-    assert register.profile_checks_pending() == sorted(SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"})
+    assert all(callable(register.AS_IS_V1_CHECKS[name]) for name in BUILT_CHECKS)
+    assert register.profile_checks_pending() == sorted(SPEC_SECTION_4_CHECKS - BUILT_CHECKS)
 
 
 def test_the_gate_refuses_profile_checks_unbuilt_for_every_none(engine, owners_available, monkeypatch):
@@ -738,7 +740,7 @@ def test_the_gate_refuses_profile_checks_unbuilt_for_every_none(engine, owners_a
     monkeypatch.undo()
     # the shipped mapping refuses: every owner check is still None
     assert register.profile_checks_pending() and all(
-        register.AS_IS_V1_CHECKS[k] is None for k in SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"}
+        register.AS_IS_V1_CHECKS[k] is None for k in SPEC_SECTION_4_CHECKS - BUILT_CHECKS
     )
 
 
@@ -880,9 +882,8 @@ def test_control_accounts_are_tied_to_the_owner_subledgers_and_unavailable_ones_
     with Session(engine) as db:
         state = ledger_check.control_state(db, env.tenant_id)
     # nothing posted: 2000, 2040, 1410 tie at 0 (the owner tables are read); 2030 is 0; the unbuilt owners refuse
-    assert {c for c, v in state.items() if v["ok"]} == {"1410", "2000", "2040"}
+    assert {c for c, v in state.items() if v["ok"]} == {"1410", "2000", "2040", "2045"}
     assert state["1400"]["reason"] == "control_subledger_unavailable:1400"
-    assert state["2045"]["reason"] == "control_subledger_unavailable:2045"
     assert set(state) == {"1400", "1410", "2000", "2040", "2045"}  # 2030 and 2110 left the gate (report-only)
     with Session(engine) as db:
         reports = ledger_check.report_state(db, env.tenant_id)

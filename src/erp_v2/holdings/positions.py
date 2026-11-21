@@ -15,7 +15,6 @@ from dotmac_accounting.models import Account, JournalEntry, PostedLedgerLine
 from sqlalchemy.orm import Session
 
 from erp_v2.holdings.attribution import ZERO, Party
-from erp_v2.holdings.errors import refuse
 from erp_v2.holdings.models import KIND_T1_POST, OWNER
 
 _OPEN_OBLIGATION: Final = ("OPEN", "PARTIALLY_SETTLED")
@@ -120,8 +119,17 @@ def sub_1410(db: Session, tenant: UUID, functional: str) -> dict[tuple[Party, st
 
 
 def sub_2045(db: Session, tenant: UUID) -> dict[tuple[Party, str], Decimal]:
-    """Claims (expenses a2): the per-employee historical claim-liability read is not pinned (S9)."""
-    return refuse("subledger_read_unavailable:2045")
+    """Claims (expenses a2): the open liabilities on the 2045 account, per claimant (employee party) and currency."""
+    from dotmac_expenses import claim_liability_outstanding, open_claim_liabilities
+
+    ids = {str(i) for i in db.scalars(sa.select(Account.id).where(Account.tenant_id == tenant, Account.code == "2045"))}
+    out: dict[tuple[Party, str], Decimal] = {}
+    for row in open_claim_liabilities(db, tenant_id=tenant):
+        if row.liability_account_ref not in ids:
+            continue
+        key = (Party("employee", str(row.claimant_party_id)), row.currency_code)
+        out[key] = out.get(key, ZERO) - claim_liability_outstanding(row)
+    return out
 
 
 OWNER_READERS: Final = {"2000": sub_2000, "2040": sub_2040, "2045": sub_2045}

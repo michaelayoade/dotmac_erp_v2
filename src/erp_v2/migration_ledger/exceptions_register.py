@@ -59,7 +59,10 @@ def gather(db: Session, tenant, spec) -> tuple[list[register.Fact], set[str], st
             Path(text(e["path"], "invalid_spec_schema", 1024)), sha_text(e["sha256"], "invalid_spec_schema")
         )
         body = strict_json(data, "invalid_receipt_json")
-        adapter = register.from_ar_census if e["kind"] == register.SRC_AR_CENSUS else register.from_import_itemised
+        adapter = {
+            register.SRC_AR_CENSUS: register.from_ar_census,
+            register.SRC_CLAIMS: register.from_claims_opening,
+        }.get(e["kind"], register.from_import_itemised)
         facts += adapter(body)
         sources.add(e["kind"])
         shas.append(sha)
