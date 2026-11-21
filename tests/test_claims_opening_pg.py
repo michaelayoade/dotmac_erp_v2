@@ -886,3 +886,18 @@ def test_f7_a_destination_journal_that_differs_from_the_legacy_family_lines_abor
     with pytest.raises(ClaimsRefusal) as e:
         scene.plan()
     assert e.value.reason == "claims_evidence_failure:destination_journal_differs"
+
+
+def test_f9_an_integrity_fault_on_a_no_net_payable_claim_aborts_the_plan(engine, tmp_path):
+    env = world(engine)
+    scene = Scene(engine, env, tmp_path)
+    scene.claim(
+        net="100.00",
+        net_null=True,
+        dest=False,
+        dest_lines=[("6000", "100.00", "0"), ("2110", "0", "99.00"), ("1000", "0", "1.00")],
+    )
+    scene.build()
+    with pytest.raises(ClaimsRefusal) as e:
+        scene.plan()
+    assert e.value.reason == "claims_evidence_failure:destination_journal_differs"

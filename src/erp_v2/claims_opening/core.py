@@ -160,6 +160,10 @@ def build_plan(
         try:  # the claim's REAL family net and carried account (no residual check): E37 amount, held_2040
             carried, net = verifier.family_net(tenant, row, db)
         except ClaimEvidenceError as exc:
+            if exc.reason in ABORT_REASONS or exc.reason.startswith(ABORT_PREFIXES):
+                raise ClaimsRefusal(
+                    f"claims_evidence_failure:{exc.reason}"
+                ) from exc  # an integrity fault: never hidden
             carried, net = exc.carried_code, exc.amount if exc.amount is not None else Decimal(0)
         detail.append(_refusal(db, tenant, row, "claim_net_payable_missing", carried, net))
     detail.sort(key=lambda d: d["legacy_claim_id"])
