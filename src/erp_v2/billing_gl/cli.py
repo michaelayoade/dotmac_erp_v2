@@ -46,12 +46,19 @@ def run_once(db, tenant_id: UUID, *, apply: bool, enable_once: bool, now: dateti
 
     from erp_v2.billing_gl.mapper import Mapper
 
-    db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant_id)})
+    def scope_tenant() -> None:  # transaction-local: it must be set again in every transaction the mapper opens
+        db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant_id)})
+
+    def commit_and_rescope() -> None:
+        db.commit()
+        scope_tenant()
+
+    scope_tenant()
     mapper = Mapper(
         db,
         tenant_id,
         now=now or datetime.now(UTC),
-        commit=db.commit if apply else (lambda: None),
+        commit=commit_and_rescope if apply else (lambda: None),
         enable_once=enable_once,
     )
     try:

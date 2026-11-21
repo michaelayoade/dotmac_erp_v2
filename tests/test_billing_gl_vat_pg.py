@@ -22,6 +22,7 @@ from billing_gl_support import (
     receipt,
     void,
 )
+from dotmac_billing import models as bm
 from dotmac_billing.models import BillingAccount
 from dotmac_kernel.cache import TenantScope
 from sqlalchemy.exc import DBAPIError
@@ -780,7 +781,15 @@ def test_original_treatments_of_a_migrated_invoice_are_its_loaded_vat_positions(
     loaded = invoice(engine, env, acct, lines=False)  # migrated shape: no ERP line accounts
     bare = invoice(engine, env, acct, when=1, lines=False)  # an E38-residue invoice: never loaded
     with Session(engine) as db:
-        before_bare = ar_queries.original_treatments(db, env.tenant_id, bare.id)
+        # The fixture invoice carries a billing tax snapshot (a native-shaped fact); the migrated rule ignores it.
+        obligations = [line.obligation_id for line in ar_queries.billing_lines(db, env.tenant_id, bare.id)]
+        snapshots = db.scalars(
+            sa.select(bm.AppliedTaxSnapshot.treatment_code).where(
+                bm.AppliedTaxSnapshot.tenant_id == env.tenant_id,
+                (bm.AppliedTaxSnapshot.document_id == bare.id) | (bm.AppliedTaxSnapshot.obligation_id.in_(obligations)),
+            )
+        ).all()
+    assert snapshots  # the case under test: a snapshot exists, no position is loaded
     run(engine, env, enable_once=True)
     with engine.begin() as conn:  # the owner role plays the mapper's SKIP of a carried opening document (see above)
         conn.execute(sa.text("ALTER TABLE erp_billing_fact_postings DISABLE TRIGGER erp_billing_fact_postings_guard"))
@@ -817,7 +826,6 @@ def test_original_treatments_of_a_migrated_invoice_are_its_loaded_vat_positions(
     with Session(engine) as db:
         assert ar_queries.original_treatments(db, env.tenant_id, loaded.id) == {"standard"}  # standard credit OK
         assert "zero" not in ar_queries.original_treatments(db, env.tenant_id, loaded.id)  # a zero credit refuses
-        # No loaded position (an E38-residue invoice) adds nothing: the set is only what billing itself carries
-        # (the opening import stores no snapshot, so a real migrated residue invoice has the empty set: refused).
-        assert ar_queries.original_treatments(db, env.tenant_id, bare.id) == before_bare
+        # A migrated invoice with a billing snapshot but NO loaded position has the empty set: a taxed credit refuses.
+        assert ar_queries.original_treatments(db, env.tenant_id, bare.id) == set()
         assert ar_queries.original_treatments(db, env.tenant_id, uuid4()) == set()

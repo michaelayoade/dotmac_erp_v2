@@ -336,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             cli_common.operator(args.operator_ref)
         engine = cli_common.engine()
         with Session(engine) as db:
-            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(parsed["tenant_id"])})
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(parsed["tenant_id"])})
             planned = plan(
                 parsed,
                 sha,

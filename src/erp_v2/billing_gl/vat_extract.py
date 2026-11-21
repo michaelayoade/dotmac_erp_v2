@@ -618,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
         dest, legacy_engine = cli_common.engine(), cli_common.legacy_engine()
         with Session(dest) as db:
             db.execute(sa.text("SET TRANSACTION READ ONLY"))
-            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant)})
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant)})
             carried = read_carried(db, tenant, args.snapshot_sha256)
             db.rollback()
         with legacy_engine.connect() as conn:
@@ -634,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
             mapping = {str(k): str(v) for k, v in strict_json(raw_map).items()}
         with Session(dest) as db:
             db.execute(sa.text("SET TRANSACTION READ ONLY"))
-            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant)})
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant)})
             v2_opening = read_v2_opening(db, tenant, data.deferral_accounts)
             ap_positions = read_ap_positions(db, tenant, data.deferral_accounts)
             db.rollback()
@@ -659,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         data_bytes, sha = seal(body)
         with Session(dest) as db:  # the preview runs the same two gates as the real plan, from the destination
             db.execute(sa.text("SET TRANSACTION READ ONLY"))
-            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant)})
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant)})
             preview = vat_opening.plan(
                 vat_opening.parse(data_bytes),
                 sha,

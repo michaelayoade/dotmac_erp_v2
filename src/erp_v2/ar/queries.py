@@ -220,23 +220,22 @@ def allocation_rows(
 
 
 def original_treatments(db: Session, tenant_id: UUID, document_id: UUID) -> set[str]:
-    """VAT treatments carried by an invoice: native = its line accounts; migrated = the treatments of the 1455 positions
-    the opening VAT loader keyed (``VatPosition``), plus any billing tax-snapshot codes (the opening import stores none,
-    so the loaded positions are what the mapper will find for a credit note's VAT)."""
+    """VAT treatments carried by an invoice. Native (it has ERP line accounts) = its line accounts' treatments.
+    Migrated (no line accounts) = ONLY the treatments of the 1455 positions the opening VAT loader keyed
+    (``VatPosition``): that is what the mapper finds for a credit note's VAT, so a billing snapshot without a loaded
+    position must not make a taxed credit acceptable (the mapper would BLOCK it after billing issued)."""
     rows = line_accounts(db, tenant_id, document_id)
     if rows:
         return {row.treatment_code for row in rows if row.treatment_code}
-    obligation_ids = [line.obligation_id for line in billing_lines(db, tenant_id, document_id) if line.obligation_id]
-    statement = select(bm.AppliedTaxSnapshot.treatment_code).where(
-        bm.AppliedTaxSnapshot.tenant_id == tenant_id,
-        (bm.AppliedTaxSnapshot.document_id == document_id) | (bm.AppliedTaxSnapshot.obligation_id.in_(obligation_ids)),
-    )
     from erp_v2.billing_gl.models import VatPosition
 
-    positions = select(VatPosition.treatment_code).where(
-        VatPosition.tenant_id == tenant_id, VatPosition.document_id == document_id
+    return set(
+        db.scalars(
+            select(VatPosition.treatment_code).where(
+                VatPosition.tenant_id == tenant_id, VatPosition.document_id == document_id
+            )
+        )
     )
-    return set(db.scalars(statement)) | set(db.scalars(positions))
 
 
 def credit_notes_for(db: Session, tenant_id: UUID, document_id: UUID) -> list[bm.BillingDocument]:
