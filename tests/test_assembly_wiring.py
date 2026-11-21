@@ -42,7 +42,7 @@ EXPECTED_MODULE_VERSIONS = {
     "billing": "0.1.0a13",
     "collections": "0.1.0a1",
     "commercial_agreements": "0.1.0a4",
-    "customers": "0.1.0a1",
+    "customers": "0.1.0a2",
     "documents": "0.1.0a1",
     "durable_timers": "0.1.0a1",
     "expenses": "0.1.0a2",

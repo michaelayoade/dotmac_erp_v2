@@ -59,7 +59,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "bk_0001_banking",  # banking 0.1.0a1
     "cg_0002_approval_withdrawals",  # commercial-agreements 0.1.0a4
     "cl_0001_collections",  # collections 0.1.0a1
-    "cu_0001_customer_accounts",  # customers 0.1.0a1
+    "cu_0001_customer_accounts",  # customers 0.1.0a2
     "do_0001_documents",  # documents 0.1.0a1
     "e2_0032_ar_producer",  # assembly e2 head, B-16 AR producer
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1

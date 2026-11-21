@@ -340,15 +340,14 @@ wheels = [
 
 [[package]]
 name = "dotmac-customers"
-version = "0.1.0a1"
+version = "0.1.0a2"
 source = { registry = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" }
 dependencies = [
     { name = "dotmac-kernel" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-customers/0.1.0a1/dotmac_customers-0.1.0a1.tar.gz", hash = "sha256:444745e0bac12565bdf7c150cc5ceb38649f39aecb5c4a5334982c825dea43f4" }
 wheels = [
-    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-customers/0.1.0a1/dotmac_customers-0.1.0a1-py3-none-any.whl", hash = "sha256:ebbb19116c2709a25518dd574b4c788e3f46d41b6b6d7cffd818d46437754c1d" },
+    { url = "https://registry.dotmac.io/api/packages/dotmac/pypi/files/dotmac-customers/0.1.0a2/dotmac_customers-0.1.0a2-py3-none-any.whl", hash = "sha256:dafac1aef8443e3629be7851793826c6764e507d9c1ec8f3d2752b8cf83eddd0" },
 ]
 
 [[package]]
@@ -442,7 +441,7 @@ requires-dist = [
     { name = "dotmac-billing", specifier = "==0.1.0a13", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-collections", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-commercial-agreements", specifier = "==0.1.0a4", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
-    { name = "dotmac-customers", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
+    { name = "dotmac-customers", specifier = "==0.1.0a2", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-documents", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-durable-timers", specifier = "==0.1.0a1", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
     { name = "dotmac-expenses", specifier = "==0.1.0a2", index = "https://registry.dotmac.io/api/packages/dotmac/pypi/simple/" },
