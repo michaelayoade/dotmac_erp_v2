@@ -2,6 +2,7 @@
 column names verified (metadata only) on the rehearsal snapshot ``erp_legacy_fresh``, and the destination reader's
 refusals. Hosted CI only (ERP_TEST_POSTGRES_URL)."""
 
+from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
 from uuid import uuid4
@@ -142,18 +143,25 @@ def test_the_legacy_reader_and_derivation_end_to_end(engine, legacy):
     assert vx.seal({**again[0], "tenant_id": body["tenant_id"]}) == vx.seal(body)  # deterministic re-run
 
 
-def _superuser_engine(engine):
-    """The same database as a superuser (the fixture's owner role cannot relax FK triggers)."""
+@contextmanager
+def _superuser_connection(engine):
+    """A connection to the same database as a superuser (the fixture's owner role cannot relax FK triggers). The
+    engine is disposed in a ``finally`` whatever the body does."""
     import os
 
     url = sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]).set(database=engine.url.database)
-    return sa.create_engine(url, hide_parameters=True)
+    admin = sa.create_engine(url, hide_parameters=True)
+    try:
+        with admin.connect() as conn:
+            yield conn
+    finally:
+        admin.dispose()
 
 
 def test_the_destination_reader_refuses_without_admissions_or_on_a_different_snapshot(engine):
     tenant = uuid4()
     # The real e2_0029 table exists at the head; every statement below runs in a transaction that is rolled back.
-    with _superuser_engine(engine).connect() as conn:
+    with _superuser_connection(engine) as conn:
         conn.exec_driver_sql("DROP TABLE public.erp_ar_opening_admissions")  # DDL is transactional: rolled back below
         with Session(bind=conn) as db:
             assert db.scalar(sa.text("SELECT to_regclass('public.erp_ar_opening_admissions') IS NOT NULL")) is False
@@ -162,7 +170,7 @@ def test_the_destination_reader_refuses_without_admissions_or_on_a_different_sna
         conn.rollback()
     assert unavailable.value.code == "ar_admissions_unavailable"
     digest = "b" * 64
-    with _superuser_engine(engine).connect() as conn:
+    with _superuser_connection(engine) as conn:
         conn.exec_driver_sql("SET LOCAL session_replication_role = replica")  # the tenant FK is not under test
         conn.execute(
             sa.text(
@@ -249,7 +257,7 @@ def test_read_ap_positions_filters_the_tenant_explicitly(engine):
     tenant, other, ref = uuid4(), uuid4(), str(uuid4())
     # The real payables a6 table exists; its supplier-invoice and tenant FKs are not under test, so the rows go in
     # under replica role inside a transaction that is rolled back.
-    with _superuser_engine(engine).connect() as conn:
+    with _superuser_connection(engine) as conn:
         conn.exec_driver_sql("SET LOCAL session_replication_role = replica")
         for t, amount in ((tenant, "5.00"), (tenant, "2.50"), (other, "100.00")):
             conn.execute(

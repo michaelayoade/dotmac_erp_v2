@@ -8,6 +8,7 @@ Hosted CI only (ERP_TEST_POSTGRES_URL).
 from decimal import Decimal
 from uuid import uuid4
 
+import account_maintenance_support
 import pytest
 import sqlalchemy as sa
 from billing_gl_support import (
@@ -242,7 +243,7 @@ def test_opening_position_releases_vat_on_payment(engine):
     import json
 
     parsed = vat_opening.parse(json.dumps(spec).encode())
-    planned = vat_opening.plan(parsed, "d" * 64)
+    planned = vat_opening.plan(parsed, "d" * 64, check=lambda _item: None, treatments=frozenset({"standard"}))
     with Session(engine) as db:
         assert vat_opening.apply(db, env.tenant_id, planned) == {"written": 1, "already_loaded": 0}
         db.commit()
@@ -425,21 +426,7 @@ def test_an_unknown_or_inactive_revenue_account_blocks(engine):
         }
     _raw_lines(engine, env, docs[unknown], [(uuid4(), "100.00", "20.00")])  # an id that is no account
     with Session(engine) as db:
-        # accounting a3 requires a recorded account change in the same transaction for a flag change
-        db.execute(
-            sa.text(
-                "INSERT INTO mod_accounting.account_changes (id, tenant_id, account_id, change_kind, old_code, "
-                "new_code, old_kind, new_kind, old_posting_allowed, new_posting_allowed, old_is_active, "
-                "new_is_active, reason, actor_ref, evidence, occurred_at) "
-                "SELECT gen_random_uuid(), tenant_id, id, 'RETIRE', code, code, kind, kind, posting_allowed, "
-                "posting_allowed, is_active, false, 'test retire', 'test', '{}'::jsonb, now() "
-                "FROM mod_accounting.accounts WHERE id = :a"
-            ),
-            {"a": env.accounts["4000"]},
-        )
-        db.execute(
-            sa.text("UPDATE mod_accounting.accounts SET is_active = false WHERE id = :a"), {"a": env.accounts["4000"]}
-        )
+        account_maintenance_support.retire(db, env.accounts["4000"])
         db.commit()
     _raw_lines(engine, env, first.id, [(env.accounts["4000"], "100.00", "20.00")])
     report = run(engine, env)
@@ -529,6 +516,8 @@ def test_opening_lot_applications_release_and_unrelease_the_loaded_vat(engine):
     planned = vat_opening.plan(
         vat_opening.parse(json.dumps({"version": 1, "tenant_id": str(env.tenant_id), "items": [item]}).encode()),
         "d" * 64,
+        check=lambda _item: None,
+        treatments=frozenset({"standard"}),
     )
     with Session(engine) as db:
         vat_opening.apply(db, env.tenant_id, planned)
@@ -700,7 +689,12 @@ def test_the_opening_loader_refuses_after_the_flip(engine):
     }
     import json
 
-    planned = vat_opening.plan(vat_opening.parse(json.dumps(spec).encode()), "d" * 64)
+    planned = vat_opening.plan(
+        vat_opening.parse(json.dumps(spec).encode()),
+        "d" * 64,
+        check=lambda _item: None,
+        treatments=frozenset({"standard"}),
+    )
     # A payment already exists on the listed document: the exposure is no longer the opening exposure.
     settlement = seed_billing(
         engine, env, lambda db, sc: receipt(db, sc, db.get(BillingAccount, acct), "50.00", when=at(1))
@@ -766,6 +760,64 @@ def test_the_loader_treatment_set_is_the_tenants_configured_tax_accounts(engine)
         }
 
     body = {"version": 1, "tenant_id": str(env.tenant_id), "items": [item("standard", "A"), item("other", "B")]}
-    planned = vat_opening.plan(vat_opening.parse(json.dumps(body).encode()), "d" * 64, None, configured)
+    planned = vat_opening.plan(
+        vat_opening.parse(json.dumps(body).encode()), "d" * 64, check=lambda _item: None, treatments=configured
+    )
     assert [r["legacy_ref"] for r in planned["load"]] == ["A"]
     assert [(r["legacy_ref"], r["reason"]) for r in planned["e38"]] == [("B", "treatment_not_in_settings")]
+
+
+def test_original_treatments_of_a_migrated_invoice_are_its_loaded_vat_positions(engine):
+    """B-16's credit-note treatment check on a migrated invoice (``ar.service``: ``item.treatment_code`` must be in
+    ``queries.original_treatments``) uses the treatments the Q1 loader keyed the 1455 positions on, because the opening
+    import stores no billing tax snapshot. An invoice with no loaded position carries none: a taxed credit refuses."""
+    import json
+
+    from erp_v2.ar import queries as ar_queries
+
+    env = world(engine, enabled=False)  # the loader runs at F7, before F10
+    acct = account_and_model(engine, env)
+    loaded = invoice(engine, env, acct, lines=False)  # migrated shape: no ERP line accounts
+    bare = invoice(engine, env, acct, when=1, lines=False)  # an E38-residue invoice: never loaded
+    with Session(engine) as db:
+        before_bare = ar_queries.original_treatments(db, env.tenant_id, bare.id)
+    run(engine, env, enable_once=True)
+    with engine.begin() as conn:  # the owner role plays the mapper's SKIP of a carried opening document (see above)
+        conn.execute(sa.text("ALTER TABLE erp_billing_fact_postings DISABLE TRIGGER erp_billing_fact_postings_guard"))
+        conn.execute(
+            sa.text(
+                "UPDATE erp_billing_fact_postings SET disposition = 'SKIP', reason = 'opening_gl_carried' "
+                "WHERE tenant_id = :t AND effect_kind = 'invoice_issued'"
+            ),
+            {"t": env.tenant_id},
+        )
+        conn.execute(sa.text("ALTER TABLE erp_billing_fact_postings ENABLE TRIGGER erp_billing_fact_postings_guard"))
+    item = {
+        "document_id": str(loaded.id),
+        "treatment": "standard",
+        "total": "120.00",
+        "tax": "20.00",
+        "open_initial": "120.00",
+        "journal_1455_credit": "20.00",
+        "reclass": [],
+        "deferral_account": str(env.accounts["1455"]),
+        "current_account": str(env.accounts["1440"]),
+        "legacy_ref": "INV-MIG-1",
+        "finance_override": None,
+    }
+    planned = vat_opening.plan(
+        vat_opening.parse(json.dumps({"version": 1, "tenant_id": str(env.tenant_id), "items": [item]}).encode()),
+        "d" * 64,
+        check=lambda _item: None,
+        treatments=frozenset({"standard"}),
+    )
+    with Session(engine) as db:
+        assert vat_opening.apply(db, env.tenant_id, planned) == {"written": 1, "already_loaded": 0}
+        db.commit()
+    with Session(engine) as db:
+        assert ar_queries.original_treatments(db, env.tenant_id, loaded.id) == {"standard"}  # standard credit OK
+        assert "zero" not in ar_queries.original_treatments(db, env.tenant_id, loaded.id)  # a zero credit refuses
+        # No loaded position (an E38-residue invoice) adds nothing: the set is only what billing itself carries
+        # (the opening import stores no snapshot, so a real migrated residue invoice has the empty set: refused).
+        assert ar_queries.original_treatments(db, env.tenant_id, bare.id) == before_bare
+        assert ar_queries.original_treatments(db, env.tenant_id, uuid4()) == set()

@@ -657,6 +657,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.overrides:
             body, overrides = apply_overrides(body, args.overrides.read_bytes())
         data_bytes, sha = seal(body)
+        with Session(dest) as db:  # the preview runs the same two gates as the real plan, from the destination
+            db.execute(sa.text("SET TRANSACTION READ ONLY"))
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant)})
+            preview = vat_opening.plan(
+                vat_opening.parse(data_bytes),
+                sha,
+                check=vat_opening.billing_check(db, tenant),
+                treatments=vat_opening.configured_treatments(db, tenant),
+            )["counts"]
+            db.rollback()
         os.write(fd_out, data_bytes)
         payload = {
             "ready": True,
@@ -665,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
             "acknowledged_by": args.operator_ref if _has_residue(report["residue"]) else None,
             "items_sha256": sha,
             "overrides": overrides,
-            "plan_preview": vat_opening.plan(vat_opening.parse(data_bytes), sha)["counts"],
+            "plan_preview": preview,
         }
     except _Acknowledge:
         pass  # the receipt (with the residue and its sha) is already set; no items file is written

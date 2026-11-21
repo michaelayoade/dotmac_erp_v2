@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -177,16 +178,17 @@ def configured_treatments(db, tenant_id: UUID) -> frozenset[str]:
 
 
 def plan(
-    parsed: dict[str, Any], input_sha: str, check=None, treatments: frozenset[str] | None = None
+    parsed: dict[str, Any], input_sha: str, *, check: Callable[[dict[str, Any]], str | None], treatments: frozenset[str]
 ) -> dict[str, Any]:
-    """``treatments`` (when given) is the configured set every item's treatment must belong to; an item outside it is
-    an E38 item (``treatment_not_in_settings``), never loaded and never dropped."""
+    """Both gates are required (a gate must not be relaxable by omission). ``treatments`` is the configured set every
+    item's treatment must belong to; an item outside it is an E38 item (``treatment_not_in_settings``), never loaded
+    and never dropped. ``check`` is the billing cross-check (``billing_check``)."""
     load, e38 = [], []
     for item in parsed["items"]:
         remaining, reason = derive(item)
-        if reason is None and treatments is not None and item["treatment"] not in treatments:
+        if reason is None and item["treatment"] not in treatments:
             reason = "treatment_not_in_settings"
-        if reason is None and check is not None:
+        if reason is None:
             reason = check(item)
         row = {
             "document_id": str(item["document_id"]),
@@ -338,8 +340,8 @@ def main(argv: list[str] | None = None) -> int:
             planned = plan(
                 parsed,
                 sha,
-                billing_check(db, parsed["tenant_id"]),
-                configured_treatments(db, parsed["tenant_id"]),
+                check=billing_check(db, parsed["tenant_id"]),
+                treatments=configured_treatments(db, parsed["tenant_id"]),
             )
             if args.action == "plan":
                 db.rollback()

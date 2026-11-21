@@ -220,7 +220,9 @@ def allocation_rows(
 
 
 def original_treatments(db: Session, tenant_id: UUID, document_id: UUID) -> set[str]:
-    """VAT treatments carried by an invoice: native = its line accounts; migrated = billing's own tax snapshots."""
+    """VAT treatments carried by an invoice: native = its line accounts; migrated = the treatments of the 1455 positions
+    the opening VAT loader keyed (``VatPosition``), plus any billing tax-snapshot codes (the opening import stores none,
+    so the loaded positions are what the mapper will find for a credit note's VAT)."""
     rows = line_accounts(db, tenant_id, document_id)
     if rows:
         return {row.treatment_code for row in rows if row.treatment_code}
@@ -229,7 +231,12 @@ def original_treatments(db: Session, tenant_id: UUID, document_id: UUID) -> set[
         bm.AppliedTaxSnapshot.tenant_id == tenant_id,
         (bm.AppliedTaxSnapshot.document_id == document_id) | (bm.AppliedTaxSnapshot.obligation_id.in_(obligation_ids)),
     )
-    return set(db.scalars(statement))
+    from erp_v2.billing_gl.models import VatPosition
+
+    positions = select(VatPosition.treatment_code).where(
+        VatPosition.tenant_id == tenant_id, VatPosition.document_id == document_id
+    )
+    return set(db.scalars(statement)) | set(db.scalars(positions))
 
 
 def credit_notes_for(db: Session, tenant_id: UUID, document_id: UUID) -> list[bm.BillingDocument]:

@@ -331,7 +331,7 @@ def test_opening_remaining_is_the_legacy_credit_less_the_attributed_reclass() ->
 )
 def test_unloadable_opening_items_become_e38_items_not_positions(override, reason) -> None:
     parsed = _parse([_item(**override), _item()])
-    planned = vat_opening.plan(parsed, "a" * 64)
+    planned = vat_opening.plan(parsed, "a" * 64, check=lambda _item: None, treatments=frozenset({"standard", "none"}))
     assert planned["counts"] == {"load": 1, "e38": 1, "override": 0} and planned["e38"][0]["reason"] == reason
 
 
@@ -341,9 +341,21 @@ def test_opening_plan_sha_is_stable_and_input_bound() -> None:
     import json
 
     raw = json.dumps(body).encode()
-    first = vat_opening.plan(vat_opening.parse(raw), "b" * 64)
-    assert first["plan_sha256"] == vat_opening.plan(vat_opening.parse(raw), "b" * 64)["plan_sha256"]
-    assert first["plan_sha256"] != vat_opening.plan(vat_opening.parse(raw), "c" * 64)["plan_sha256"]
+    first = vat_opening.plan(
+        vat_opening.parse(raw), "b" * 64, check=lambda _item: None, treatments=frozenset({"standard", "none"})
+    )
+    assert (
+        first["plan_sha256"]
+        == vat_opening.plan(
+            vat_opening.parse(raw), "b" * 64, check=lambda _item: None, treatments=frozenset({"standard", "none"})
+        )["plan_sha256"]
+    )
+    assert (
+        first["plan_sha256"]
+        != vat_opening.plan(
+            vat_opening.parse(raw), "c" * 64, check=lambda _item: None, treatments=frozenset({"standard", "none"})
+        )["plan_sha256"]
+    )
 
 
 def test_opening_input_refuses_duplicates_unknown_keys_and_bad_amounts() -> None:
@@ -449,12 +461,19 @@ def test_opening_loader_accepts_zero_tax_positions_and_a_governed_override() -> 
         reclass=["25.00"],  # would be negative_remaining
         finance_override={"deferred": "4.00", "evidence_sha256": "e" * 64, "ref": "FIN-7"},
     )
-    planned = vat_opening.plan(_parse([zero, override]), "a" * 64)
+    planned = vat_opening.plan(
+        _parse([zero, override]), "a" * 64, check=lambda _item: None, treatments=frozenset({"standard", "none"})
+    )
     assert planned["counts"] == {"load": 2, "e38": 0, "override": 1}
     assert planned["load"][0]["deferred"] == "0.000000" and planned["load"][0]["deferral_account"] is None
     assert planned["load"][1]["deferred"] == "4.000000" and planned["load"][1]["override_evidence_sha256"] == "e" * 64
     bad = _item(finance_override={"deferred": "21.00", "evidence_sha256": "e" * 64, "ref": "FIN-8"})
-    assert vat_opening.plan(_parse([bad]), "a" * 64)["e38"][0]["reason"] == "override_out_of_range"
+    assert (
+        vat_opening.plan(_parse([bad]), "a" * 64, check=lambda _item: None, treatments=frozenset({"standard", "none"}))[
+            "e38"
+        ][0]["reason"]
+        == "override_out_of_range"
+    )
 
 
 def test_opening_plan_applies_the_billing_cross_check() -> None:
@@ -465,21 +484,22 @@ def test_opening_plan_applies_the_billing_cross_check() -> None:
         seen.append(item["legacy_ref"])
         return "open_initial_mismatch" if len(seen) == 1 else None
 
-    planned = vat_opening.plan(parsed, "a" * 64, check)
+    planned = vat_opening.plan(parsed, "a" * 64, check=check, treatments=frozenset({"standard"}))
     assert planned["counts"] == {"load": 1, "e38": 1, "override": 0}
     assert planned["e38"][0]["reason"] == "open_initial_mismatch"
 
 
 def test_opening_plan_refuses_a_treatment_outside_the_configured_set_into_e38() -> None:
     parsed = _parse([_item(treatment="standard"), _item(treatment="exempt-typo")])
-    planned = vat_opening.plan(parsed, "a" * 64, None, frozenset({"standard"}))
+    planned = vat_opening.plan(parsed, "a" * 64, check=lambda _item: None, treatments=frozenset({"standard"}))
     assert planned["counts"] == {"load": 1, "e38": 1, "override": 0}
     assert planned["load"][0]["treatment"] == "standard"
     assert (
         planned["e38"][0]["reason"] == "treatment_not_in_settings" and planned["e38"][0]["treatment"] == "exempt-typo"
     )
     # an unset setting refuses every item (nothing is dropped, everything is itemised)
-    none_set = vat_opening.plan(parsed, "a" * 64, None, frozenset())
+    none_set = vat_opening.plan(parsed, "a" * 64, check=lambda _item: None, treatments=frozenset())
     assert none_set["counts"]["load"] == 0 and len(none_set["e38"]) == 2
-    # no set passed (unit callers) keeps the old behaviour
-    assert vat_opening.plan(parsed, "a" * 64)["counts"]["load"] == 2
+    # both gates are required keyword-only parameters: omission is a TypeError, never a silent skip
+    with pytest.raises(TypeError):
+        vat_opening.plan(parsed, "a" * 64)  # type: ignore[call-arg]

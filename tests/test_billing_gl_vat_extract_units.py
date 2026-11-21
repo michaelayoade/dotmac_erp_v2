@@ -134,7 +134,15 @@ def test_zero_tax_invoice_is_a_zero_position_and_every_carried_invoice_appears_o
     assert len(by_doc) == 2 and all(len(v) == 1 for v in by_doc.values())  # one treatment each, exactly once
     z = by_doc[str(zero.document_id)][0]
     assert z["treatment"] == "none" and z["tax"] == "0.000000" and z["deferral_account"] is None
-    assert vat_opening.plan(vat_opening.parse(json.dumps(body).encode()), "a" * 64)["counts"]["load"] == 2
+    assert (
+        vat_opening.plan(
+            vat_opening.parse(json.dumps(body).encode()),
+            "a" * 64,
+            check=lambda _item: None,
+            treatments=frozenset(i["treatment"] for i in body["items"]),
+        )["counts"]["load"]
+        == 2
+    )
     assert report["zero_tax_items"] == 1
 
 
@@ -208,7 +216,15 @@ def test_finance_overrides_are_a_separate_named_input_bound_by_sha() -> None:
     merged, meta = vx.apply_overrides(body, raw)
     assert merged["items"][0]["finance_override"]["deferred"] == "20.000000" and meta["count"] == 1
     assert meta["named_by"] == "finance.lead" and len(meta["sha256"]) == 64
-    assert vat_opening.plan(vat_opening.parse(json.dumps(merged).encode()), "a" * 64)["counts"]["override"] == 1
+    assert (
+        vat_opening.plan(
+            vat_opening.parse(json.dumps(merged).encode()),
+            "a" * 64,
+            check=lambda _item: None,
+            treatments=frozenset(i["treatment"] for i in merged["items"]),
+        )["counts"]["override"]
+        == 1
+    )
     override["overrides"][0]["document_id"] = str(uuid4())
     with pytest.raises(LedgerRefused) as unmatched:
         vx.apply_overrides(body, json.dumps(override).encode())
