@@ -11,6 +11,7 @@ import os
 import stat
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -182,12 +183,42 @@ def make_spec(tmp_path, *, window=WINDOW, params=None):
 
         return {"path": str(p), "sha256": hashlib.sha256(raw).hexdigest()}
 
+    manifest = write(tmp_path / "gl-attribution-manifest.json", attribution_manifest(["2000", "1410"], [ap, loans]))
     spec = {
         "version": 1, "tenant_id": None, "window_id": window, "capture_date": "2026-01-20",
         "evidence_ref": "EVID-1", "params": params or {},
-        "receipts": {"census": ref(census), "gl_attribution": {"2000": ref(ap), "1410": ref(loans)}},
+        "receipts": {
+            "census": ref(census), "gl_attribution": {"2000": ref(ap), "1410": ref(loans)},
+            "gl_attribution_manifest": ref(manifest),
+        },
     }  # fmt: skip
     return spec
+
+
+def attribution_manifest(codes, files, ledger_sha="c" * 64):
+    import hashlib
+
+    return {
+        "kind": "gl-attribution-manifest", "version": 1, "v2_posted_sha256": ledger_sha,
+        "codes": {c: {"receipt_sha256": hashlib.sha256(f.read_bytes()).hexdigest()} for c, f in zip(codes, files, strict=True)},
+    }  # fmt: skip
+
+
+def restamp(engine, env):
+    """The attribution manifest describes the ledger as produced (the runbook runs the producer after T1): re-stamp it
+    with the current ledger sha, as a fresh producer run would."""
+    import hashlib
+
+    body = json.loads(env.spec)
+    ref = body["receipts"]["gl_attribution_manifest"]
+    path = Path(ref["path"])
+    manifest = json.loads(path.read_bytes())
+    with Session(engine) as db:
+        manifest["v2_posted_sha256"] = positions.v2_posted_sha(db, env.tenant_id)
+        db.rollback()
+    path.write_text(json.dumps(manifest))
+    ref["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    env.spec = json.dumps(body).encode()
 
 
 def spec_bytes(env, spec):
@@ -245,6 +276,7 @@ def t1(engine, env, bill=None, **kw):
 
 
 def holding_plan(engine, env, bill=None, planned_by=OP_A):
+    restamp(engine, env)
     return applying.run_plan(
         engine, env.spec, cli.load_receipts, bill or billing(), planned_by=planned_by, owner_readers=env.readers
     )
@@ -967,6 +999,8 @@ def test_the_cli_plans_dry_by_default_applies_only_with_the_switch_and_writes_pr
         == 0
     )
     assert net(engine, env, "2105") == D("-200")
+    restamp(engine, env)  # the producer runs after T1: the manifest carries the ledger as it now stands
+    spec_path.write_bytes(env.spec)
     env_dsn()
     plan_receipt = tmp_path / "plan.json"
     assert cli.main(["plan", "--spec", str(spec_path), "--receipt", str(plan_receipt), "--operator-ref", OP_A]) == 0

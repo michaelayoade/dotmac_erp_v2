@@ -37,6 +37,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Final
 from uuid import UUID
 
@@ -51,9 +52,11 @@ SRC_HELD: Final = "held_drafts"
 SRC_IMPORT: Final = "import_itemised"
 SRC_REVIEWS: Final = "admission_reviews"
 SRC_AR_CENSUS: Final = "ar_census"
+SRC_AP_ADMISSION: Final = "ap_admission"
 SRC_MANUAL: Final = "manual"
 SRC_NA: Final = "not_applicable"
-RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS)  # B-2 outcomes load from the database, never from a receipt file
+# B-2 outcomes load from the database, never from a receipt file
+RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS, SRC_AP_ADMISSION)
 
 # class by importer queue reason (#68 Q_* constants); an unknown reason is refused, never guessed.
 IMPORT_CLASS: Final = {
@@ -285,6 +288,56 @@ def from_ar_census(body: Any) -> list[Fact]:
             },
         )
     return facts
+
+
+def classify_ap_admission(body: Any) -> tuple[list[tuple[str, str, str, int | None]], list[tuple[str, str]]]:
+    """The private AP admission plan files (0600, sha-bound) as ``(classified, unclassified)``.
+
+    ``body`` is the plan of ``payables_history_cli`` (unpaid: ``refusals[{invoice_id, reason}]``) or of
+    ``legacy_ap.settled_cli`` (settled: ``invoices[{invoice_id, outcome, reason, ...}]``). ``classified`` rows are
+    ``(class, 'invoice:<id>', reason, gl_signed_minor | None)`` for a reason in the CLOSED map;
+    ``unclassified`` rows are ``('invoice:<id>', reason)``: such a refusal is NOT explained (the supplier's E37
+    ``partygap`` carries it and the
+    attribution manifest lists the reason). ``gl_signed_minor`` is read only when the plan row carries a ``residual``
+    (the legacy residual; GL-signed amount = its negative); the current plan files do not, so it is then None."""
+    from erp_v2.migration_ledger.attribution_rules import ADMISSION_CLASS, SRC_SETTLED, SRC_UNPAID
+
+    if not isinstance(body, dict):
+        refuse("invalid_ap_admission")
+    if isinstance(body.get("refusals"), list):
+        kind, rows = SRC_UNPAID, body["refusals"]
+    elif isinstance(body.get("invoices"), list):
+        kind, rows = SRC_SETTLED, [r for r in body["invoices"] if isinstance(r, dict) and r.get("outcome") == "refused"]
+    else:
+        return refuse("invalid_ap_admission")
+    classified: list[tuple[str, str, str, int | None]] = []
+    unclassified: list[tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("reason"), str):
+            refuse("invalid_ap_admission")
+        key = "invoice:" + text(row.get("invoice_id"), "invalid_ap_admission", 255)
+        reason = row["reason"]
+        bare = reason.removeprefix("apply_").removeprefix("legacy_evidence:")
+        klass = ADMISSION_CLASS[kind].get(bare)
+        if klass is None:
+            unclassified.append((key, reason))
+            continue
+        residual = row.get("residual")
+        minor = None if residual is None else -int(Decimal(str(residual)) * 100)
+        classified.append((klass, key, reason, minor))
+    return classified, unclassified
+
+
+def from_ap_admission(body: Any) -> list[Fact]:
+    """Open work items for landed AP invoices refused at admission: ``invoice:<id>`` under the class of the closed
+    reason map (E02 unpaid, E03c settled allocation anomaly, E08 deferral, E11 overpaid). A reason outside the map
+    yields NO fact (it is not an explained item; see ``classify_ap_admission``)."""
+    classified, _unclassified = classify_ap_admission(body)
+    evidence = canonical_sha(body)
+    return [
+        Fact(klass, key, SRC_AP_ADMISSION, None, evidence, {"reason": reason, "gl_signed_minor": minor})
+        for klass, key, reason, minor in classified
+    ]
 
 
 def from_admission_reviews(db: Session, tenant: UUID) -> list[Fact]:

@@ -79,14 +79,28 @@ def load_receipts(spec: planning.RunSpec) -> planning.Receipts:
         )
         shas["census"] = census_sha
     atts = {}
+    manifest_ledger_sha = None
+    listed: set[str] = set()
+    if spec.gl_attribution:
+        if spec.gl_attribution_manifest is None:
+            refuse("gl_attribution_manifest_required")
+        from erp_v2.migration_ledger import gl_attribution as gl_manifest
+
+        raw, manifest_sha = _read_bound(spec.gl_attribution_manifest)
+        manifest, _ = gl_manifest.parse_manifest(raw)
+        manifest_ledger_sha = manifest["v2_posted_sha256"]
+        listed = {entry["receipt_sha256"] for entry in manifest["codes"].values()}
+        shas[planning.MANIFEST_RECEIPT] = manifest_sha
     for code, ref in sorted(spec.gl_attribution.items()):
         raw, sha = _read_bound(ref)
+        if sha not in listed:
+            refuse("gl_attribution_not_in_manifest", code)
         att, _ = attr.parse_gl_attribution(raw)
         if att.code != code:
             refuse("invalid_gl_attribution", "receipt code differs from the spec")
         atts[code] = att
         shas[f"gl_attribution:{code}"] = sha
-    return planning.Receipts(census, census_sha, atts, shas)
+    return planning.Receipts(census, census_sha, atts, shas, manifest_ledger_sha)
 
 
 def _engine():
