@@ -304,7 +304,6 @@ def test_create_edit_rename_suspend_activate_close_as_the_runtime_role(engine, r
         account_id=out.account_id,
         display_name="Acme Ltd",
         finance=edited,
-        notes="Pays late",
     )
     row = finance_row(engine, env, out.account_id)
     assert (row.tax_identification_number, row.payment_terms_code, row.billing_address) == (
@@ -313,7 +312,6 @@ def test_create_edit_rename_suspend_activate_close_as_the_runtime_role(engine, r
         "9 Other Road",
     )
     with Session(engine) as db:
-        assert queries.notes(db, env.tenant_id, out.account_id) == "Pays late"
         assert terms.code_for(db, env.tenant_id, out.account_id) == "net_14"
 
     # the real customers a2 ``rename_account``, as the runtime role (its UPDATE on mod_customers is the owner's grant)
@@ -324,7 +322,6 @@ def test_create_edit_rename_suspend_activate_close_as_the_runtime_role(engine, r
         account_id=out.account_id,
         display_name="Acme Renamed Ltd",
         finance=edited,
-        notes="Pays late",
     )
     with Session(engine) as db:
         assert db.get(CustomerAccount, out.account_id).display_name == "Acme Renamed Ltd"
@@ -341,17 +338,15 @@ def test_create_edit_rename_suspend_activate_close_as_the_runtime_role(engine, r
         refused(runtime, env, service.change_status, account_id=out.account_id, target=AccountStatus.ACTIVE)
         == "customer_closed"
     )
-    # close is terminal: a rename, a finance-field edit and a notes edit are all refused, nothing is saved
+    # close is terminal: a rename and a finance-field edit are both refused, nothing is saved
     before = finance_row(engine, env, out.account_id).billing_address
     for over in (
-        {"display_name": "Closed Rename", "finance": edited, "notes": "Pays late"},
+        {"display_name": "Closed Rename", "finance": edited},
         {"display_name": "Acme Renamed Ltd", "finance": FinanceInput(billing_address="1 Closed Street")},
-        {"display_name": "Acme Renamed Ltd", "finance": edited, "notes": "Closed note"},
     ):
         assert refused(runtime, env, service.update_customer, account_id=out.account_id, **over) == "customer_closed"
     with Session(engine) as db:
         assert db.get(CustomerAccount, out.account_id).display_name == "Acme Renamed Ltd"
-        assert queries.notes(db, env.tenant_id, out.account_id) == "Pays late"
     assert finance_row(engine, env, out.account_id).billing_address == before == "9 Other Road"
     with Session(engine) as db:
         assert db.get(CustomerAccount, out.account_id).status == AccountStatus.CLOSED
@@ -470,14 +465,13 @@ def test_the_real_a2_rename_saves_with_the_other_fields_and_a_closed_account_is_
 
 def test_audit_events_carry_field_names_and_no_values(engine, runtime):
     env = world(engine)
-    out = create(runtime, env, notes="Secret note text")
+    out = create(runtime, env)
     act(
         runtime,
         env,
         service.update_customer,
         account_id=out.account_id,
         display_name="Acme Ltd",
-        notes="Another note",
         finance=FinanceInput(
             trading_name="Acme Trading",
             tax_identification_number="CHANGED-TIN",
@@ -511,14 +505,11 @@ def test_audit_events_carry_field_names_and_no_values(engine, runtime):
         ADDRESS,
         CONTACT,
         "Acme Trading",
-        "Secret note text",
-        "Another note",
         "not-an-email",
     ):
         assert value not in blob, value
     updated = next(r for r in rows if r.action == service.AUDIT_UPDATED)
     assert updated.details["fields"] == [
-        "notes",
         "tax_identification_number",
         "payment_terms_code",
         "contact_name",

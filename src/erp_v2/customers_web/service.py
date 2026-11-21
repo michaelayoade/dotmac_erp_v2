@@ -1,7 +1,7 @@
-"""Customer screen commands (F-F): create, edit (rename, finance fields, notes) and status.
+"""Customer screen commands (F-F): create, edit (rename, finance fields) and status.
 
 dotmac-customers stays the single writer of its own tables: this module calls its service commands
-(``create_account``, ``transition_account``, ``set_profile``, and ``rename_account`` from a2) and never UPDATEs
+(``create_account``, ``transition_account`` and ``rename_account`` from a2) and never UPDATEs
 ``mod_customers``. The finance fields are written to the ERP-owned ``erp_customer_finance`` only.
 
 Rules:
@@ -12,7 +12,7 @@ Rules:
   ``customers.series.account_number`` series;
 * the payment terms code must be a key of ``ar.payment_terms`` at save (``payment_terms_unknown``);
 * rename calls customers a2 ``rename_account`` (a2 is pinned); a CLOSED customer is refused ``customer_closed`` for a
-  rename, a finance-field edit and a notes edit alike (close is terminal), with nothing saved;
+  rename, and a finance-field edit alike (close is terminal), with nothing saved;
 * no delete: legacy delete becomes CLOSED (terminal, needs an explicit confirmation).
 """
 
@@ -31,9 +31,8 @@ from dotmac_customers.contracts import (
     CreateCustomerAccount,
     CustomerError,
     NotFound,
-    SetCustomerProfile,
 )
-from dotmac_customers.models import CustomerAccount, CustomerProfile
+from dotmac_customers.models import CustomerAccount
 from dotmac_kernel.audit import write_audit_event
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.idempotency import IdempotencyConflict, execute_once, fingerprint_of
@@ -139,10 +138,6 @@ def _display_name(value: str | None) -> str:
     if name is None:
         raise CustomerRefused("display_name_required", "Enter the customer's name")
     return name
-
-
-def _notes(value: str | None) -> str | None:
-    return _text(value, "Notes", 4000, multiline=True)
 
 
 # --- plumbing ---------------------------------------------------------------------------------------------------
@@ -261,7 +256,6 @@ def create_customer(
     finance: FinanceInput,
     account_number: str | None = None,
     status: AccountStatus = AccountStatus.ACTIVE,
-    notes: str | None = None,
     now: datetime | None = None,
 ) -> Outcome:
     now = now or datetime.now(UTC)
@@ -271,7 +265,6 @@ def create_customer(
         if status not in CREATE_STATUSES:
             raise CustomerRefused("invalid_input", "A new customer starts as active or prospect")
         clean = clean_finance(finance, terms=valid_terms(db, tenant.id))
-        note = _notes(notes)
         given = _text(account_number, "Account number", MAX_ACCOUNT_NUMBER)
 
         def operation(session: Session) -> dict[str, object]:
@@ -284,10 +277,6 @@ def create_customer(
                 )
             except Conflict as exc:
                 raise CustomerRefused("account_number_taken", "That account number is already in use") from exc
-            if note:
-                customers_service.set_profile(
-                    session, scope=TenantScope(tenant.id), command=SetCustomerProfile(account.id, notes=note)
-                )
             session.add(
                 CustomerFinance(
                     tenant_id=tenant.id,
@@ -311,7 +300,6 @@ def create_customer(
                     "number": given,
                     "name": name,
                     "status": status.value,
-                    "notes": note,
                     **{k: getattr(clean, k) for k in FINANCE_FIELDS},
                 }
             ),
@@ -327,7 +315,7 @@ def create_customer(
                 action=AUDIT_CREATED,
                 success=True,
                 details={
-                    "fields": ["display_name", *_provided(clean), *(["notes"] if note else [])],
+                    "fields": ["display_name", *_provided(clean)],
                     "status": status.value,
                 },
             )
@@ -347,7 +335,6 @@ def update_customer(
     account_id: UUID,
     display_name: str | None,
     finance: FinanceInput,
-    notes: str | None = None,
     now: datetime | None = None,
 ) -> Outcome:
     now = now or datetime.now(UTC)
@@ -358,23 +345,10 @@ def update_customer(
             raise CustomerRefused("customer_closed", "A closed customer cannot be edited")
         name = _display_name(display_name)
         clean = clean_finance(finance, terms=valid_terms(db, tenant.id))
-        note = _notes(notes)
         changed: list[str] = []
         if name != account.display_name:
             _rename(db, tenant.id, account_id, name)
             changed.append("display_name")
-        profile = db.scalar(
-            select(CustomerProfile).where(
-                CustomerProfile.tenant_id == tenant.id, CustomerProfile.account_id == account_id
-            )
-        )
-        if (profile.notes if profile else None) != note:
-            customers_service.set_profile(
-                db,
-                scope=TenantScope(tenant.id),
-                command=SetCustomerProfile(account_id, segment=profile.segment if profile else None, notes=note),
-            )
-            changed.append("notes")
         row = _finance_row(db, tenant.id, account_id)
         if row is None:
             row = CustomerFinance(

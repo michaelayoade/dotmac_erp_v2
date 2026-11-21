@@ -11,7 +11,6 @@
   <dt>Payment terms</dt><dd>{{ finance.payment_terms_code if finance and finance.payment_terms_code else 'default' }}</dd>
   <dt>Contact</dt><dd>{{ finance.contact_name if finance and finance.contact_name else '' }} {{ finance.contact_email if finance and finance.contact_email else '' }} {{ finance.contact_phone if finance and finance.contact_phone else '' }}</dd>
   <dt>Billing address</dt><dd>{{ finance.billing_address if finance and finance.billing_address else '' }}</dd>
-  <dt>Notes</dt><dd>{{ notes or '' }}</dd>
   <dt>Open invoices</dt><dd>{{ open_items }}</dd>
 </dl>
 <h2>Billing accounts</h2>

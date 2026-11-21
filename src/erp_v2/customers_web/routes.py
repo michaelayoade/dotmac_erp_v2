@@ -95,7 +95,6 @@ def _form_context(
         row = queries.finance(db, tenant.id, account.id) if account is not None else None
         values = {name: (getattr(row, name) or "") if row else "" for name in service.FINANCE_FIELDS}
         values["display_name"] = account.display_name if account is not None else ""
-        values["notes"] = (queries.notes(db, tenant.id, account.id) or "") if account is not None else ""
     return _ctx(
         request,
         party,
@@ -166,7 +165,6 @@ async def customer_create(
             account_number=values.get("account_number"),
             display_name=values.get("display_name"),
             status=_status(values.get("status") or AccountStatus.ACTIVE.value),
-            notes=values.get("notes"),
             finance=_finance(values),
         )
     except CustomerRefused as exc:
@@ -203,7 +201,6 @@ def _detail_page(
             party,
             account=account,
             finance=queries.finance(db, tenant.id, account.id),
-            notes=queries.notes(db, tenant.id, account.id),
             billing_accounts=billing,
             open_items=queries.open_item_count(db, tenant.id, billing),
             error=error,
@@ -252,7 +249,6 @@ async def customer_save(
             party=party,
             account_id=account_id,
             display_name=values.get("display_name"),
-            notes=values.get("notes"),
             finance=_finance(values),
         )
     except CustomerRefused as exc:

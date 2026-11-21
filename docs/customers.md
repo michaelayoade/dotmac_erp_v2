@@ -17,8 +17,8 @@ party holds the permission. Admin and staff hold no write permission.
 
 ## Where each field lives
 
-* dotmac-customers (the owning module, single writer): account number, display name, status, notes (profile). This
-  package only calls its service commands (`create_account`, `transition_account`, `set_profile`, `rename_account`).
+* dotmac-customers (the owning module, single writer): account number, display name, status. This
+  package only calls its service commands (`create_account`, `transition_account`, `rename_account`).
   A source-grep test asserts no other ERP code writes `mod_customers`.
 * ERP table `erp_customer_finance` (`e2_0035`): trading name, tax id, payment terms code, primary contact (name, email,
   phone) and billing address. Keyed by the plain customer account id (UNIQUE per tenant), never financial identity: billing
@@ -37,10 +37,10 @@ party holds the permission. Admin and staff hold no write permission.
 * The payment terms code must be a key of `ar.payment_terms` at save (`payment_terms_unknown`). A customer's code is
   at most 40 characters (`payment_terms_code_too_long`). Tax id: trimmed, printable, at most 50, format not validated
   (as legacy). Email: basic shape check.
-* Each POST runs in one savepoint and writes one audit event with field names only (never a contact, address, tax id,
-  note or name): `erp.finance.customers.created | updated | status_changed | refused`.
+* Each POST runs in one savepoint and writes one audit event with field names only (never a contact, address, tax id
+  or name): `erp.finance.customers.created | updated | status_changed | refused`.
 * Rename calls customers a2 `rename_account` directly. A CLOSED customer is refused `customer_closed` for a rename, a
-  finance-field edit and a notes edit (close is terminal); nothing is saved. Concurrent edits of one customer serialise
+  finance-field edit (close is terminal); nothing is saved. Concurrent edits of one customer serialise
   on the finance row (`SELECT ... FOR UPDATE`).
 * Create calls customers a2 `create_account` directly (a2 imports `dotmac_kernel.transactions`, which a composed ERP
   process allows).

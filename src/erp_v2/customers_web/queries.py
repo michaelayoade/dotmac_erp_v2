@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from dotmac_billing import models as bm
-from dotmac_customers.models import CustomerAccount, CustomerProfile
+from dotmac_customers.models import CustomerAccount
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -70,14 +70,6 @@ def finance(db: Session, tenant_id: UUID, account_id: UUID) -> CustomerFinance |
     return db.scalar(
         select(CustomerFinance).where(
             CustomerFinance.tenant_id == tenant_id, CustomerFinance.customer_account_id == account_id
-        )
-    )
-
-
-def notes(db: Session, tenant_id: UUID, account_id: UUID) -> str | None:
-    return db.scalar(
-        select(CustomerProfile.notes).where(
-            CustomerProfile.tenant_id == tenant_id, CustomerProfile.account_id == account_id
         )
     )
 

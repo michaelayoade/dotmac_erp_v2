@@ -259,7 +259,7 @@ def test_the_only_customer_commands_called_are_the_owning_modules_service_functi
         and n.func.value.id == "customers_service"
     }
     assert called <= CUSTOMER_WRITE_COMMANDS | {"get_account"}, called
-    assert {"create_account", "transition_account", "set_profile"} <= called
+    assert {"create_account", "transition_account", "rename_account"} <= called
 
 
 def test_the_screen_never_deletes_and_never_touches_ar_sources():
@@ -422,7 +422,6 @@ def _known_account(monkeypatch):
     )
     monkeypatch.setattr(routes.queries, "account", lambda db, tenant_id, account_id: account)
     monkeypatch.setattr(routes.queries, "finance", lambda db, tenant_id, account_id: None)
-    monkeypatch.setattr(routes.queries, "notes", lambda db, tenant_id, account_id: None)
     monkeypatch.setattr(routes.queries, "listing", lambda db, tenant_id, **kw: ([], 0))
     monkeypatch.setattr(routes.queries, "billing_accounts", lambda db, tenant_id, account_id: [])
     monkeypatch.setattr(routes.queries, "open_item_count", lambda db, tenant_id, accounts: 0)

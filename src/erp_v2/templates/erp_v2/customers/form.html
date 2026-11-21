@@ -21,7 +21,6 @@
   <p><label>Contact email <input name="contact_email" maxlength="254" value="{{ values.get('contact_email', '') }}"></label></p>
   <p><label>Contact phone <input name="contact_phone" maxlength="50" value="{{ values.get('contact_phone', '') }}"></label></p>
   <p><label>Billing address <textarea name="billing_address" maxlength="500" rows="3">{{ values.get('billing_address', '') }}</textarea></label></p>
-  <p><label>Notes <textarea name="notes" maxlength="4000" rows="3">{{ values.get('notes', '') }}</textarea></label></p>
   <button type="submit">Save customer</button>
 </form>
 {% endblock %}
