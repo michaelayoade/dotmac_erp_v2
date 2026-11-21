@@ -47,6 +47,9 @@ LEDGER_FAULT_CONTROL_CODES: Final = frozenset({AP_CONTROL_CODE, PAYROLL_PAYABLE_
 # The flip-gate control checks (B-9, section 12.4). A code constant, not a setting and not a per-run declaration, so a
 # run cannot drop an account to pass; each signed bridge records the lists it checked. Changing a list is a code change.
 GATE_TIE_CODES: Final = ("1400", "1410", "2000", "2040", "2045")  # GL must equal the v2 owner subledger
+# A tie whose GL account is resolved from a setting, not a code: the AR prepayment account (== -(available credit +
+# prepaid funding) of billing R1). Recorded in the signed bridge body beside GATE_TIE_CODES.
+GATE_TIE_RESOLVED: Final = ("prepayment",)
 REPORT_ZERO_CODES: Final = ("2030",)  # retired (D-EX-9): REPORTED, not a gate (as_is_v1): net over all periods
 REPORT_WHT_CODES: Final = ("2110",)  # REPORTED, not a gate (as_is_v1): GL against the WHT ledger
 INVOICE_TAX_ACCOUNT_CODES: Final = frozenset({"1455"})

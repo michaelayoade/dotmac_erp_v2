@@ -318,3 +318,63 @@ def test_a_duplicate_admission_key_refuses_because_assemble_would_silently_overw
             hbilling.A13Billing(w.tenant).account_positions(db)
         db.rollback()
     assert e.value.code == "account_positions_key_duplicate"
+
+
+# --- (d2): the flip gate ties 1400 and the prepayment account to real billing R1 ----------------------------------
+
+
+def _gate(engine, w):
+    from erp_v2.migration_ledger import ledger_check
+
+    with Session(engine) as db:
+        return ledger_check.control_state(db, w.tenant)
+
+
+def test_the_gate_ties_1400_and_the_prepayment_account_to_billing_r1_after_t1(engine, tmp_path):
+    w = _flip(engine, tmp_path)
+    before = _gate(engine, w)  # legacy GL still carries the cash-lot credit inside 1400: not yet tied
+    assert before["1400"]["ok"] is False and before["1400"]["reason"] == "control_not_tied:1400"
+    assert before["prepayment"]["reason"] == "control_not_tied:prepayment"
+    _t1(engine, w)
+    after = _gate(engine, w)
+    assert after["1400"]["ok"] and after["prepayment"]["ok"], after
+    assert (
+        D(after["1400"]["gl"])
+        == D(after["1400"]["subledger"])
+        == D(sum(p["carried_minor"] for p in w.parties)).scaleb(-2)
+    )
+    assert (
+        D(after["prepayment"]["gl"])
+        == D(after["prepayment"]["subledger"])
+        == -D(sum(p["cash_lot_minor"] for p in w.parties)).scaleb(-2)
+    )
+
+
+def test_the_gate_refuses_1400_on_a_difference_and_when_the_ledger_moves_during_the_read(engine, tmp_path, monkeypatch):
+    w = _flip(engine, tmp_path)
+    _t1(engine, w)
+    _post(engine, w.tenant, w.accounts, "1400", D("1.00"))  # a 1.00 difference against billing
+    state = _gate(engine, w)
+    assert state["1400"]["ok"] is False and state["1400"]["reason"] == "control_not_tied:1400"
+    real = hbilling.A13Billing.r1
+
+    def moving(self, db):
+        out = real(self, db)
+        _post(engine, w.tenant, w.accounts, "1400", D("0.01"))  # the ledger moves while R1 is being read
+        return out
+
+    monkeypatch.setattr(hbilling.A13Billing, "r1", moving)
+    state = _gate(engine, w)
+    assert state["1400"] == {**state["1400"], "ok": False, "subledger": None, "reason": "moved_during_gate:1400"}
+
+
+def test_a_foreign_currency_billing_balance_has_no_tie_and_refuses(engine, tmp_path, monkeypatch):
+    w = _flip(engine, tmp_path)
+    real = hbilling.A13Billing.r1
+
+    def with_usd(self, db):
+        out = real(self, db)
+        return hbilling.R1Snapshot(out.position_fingerprint, {**out.currencies, "USD": hbilling.Position(5, 0, 0, 0)})
+
+    monkeypatch.setattr(hbilling.A13Billing, "r1", with_usd)
+    assert _gate(engine, w)["1400"]["reason"] == "control_subledger_fx:1400"

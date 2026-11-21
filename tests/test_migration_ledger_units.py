@@ -487,6 +487,7 @@ def test_the_gate_control_lists_are_code_constants():
     assert ledger_check.GATE_PROFILE == "as_is_v1"
     assert ledger_check.control_lists() == {
         "tie": ["1400", "1410", "2000", "2040", "2045"],
+        "tie_resolved": ["prepayment"],
         "report_zero": ["2030"],
         "report_wht": ["2110"],
     }
