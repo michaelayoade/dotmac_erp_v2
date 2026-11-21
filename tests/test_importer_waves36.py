@@ -73,7 +73,7 @@ def test_pipeline_aggregates_reports_and_heads() -> None:
         receipt = run_import(s, d, (spec,))
         assert receipt.complete
         assert (receipt.read, receipt.written) == (1, 1)
-        assert "ac_0003_draft_void" in receipt.destination_heads
+        assert "ac_0004_account_maintenance" in receipt.destination_heads
         assert d.execute(sa.text("SELECT code, kind FROM accounts")).one() == (
             "1000",
             "asset",

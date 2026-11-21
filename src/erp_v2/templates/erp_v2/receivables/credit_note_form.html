@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Credit note — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>{% if draft %}Credit note draft{% else %}New credit note{% endif %}</h1>
+<p><a href="{{ base }}">Receivables</a> · <a href="{{ base }}/drafts">Open drafts</a></p>
+{% if not enabled %}<p role="alert">Receivables entry is not enabled for this tenant.</p>{% endif %}
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<p role="note">Legacy credit notes are cleared by R8; do not re-issue. Re-issuing one here would reverse its revenue twice.</p>
+{% if notice %}<p role="note">Open register items for this customer: {% for item in notice %}{{ item }}{% if not loop.last %}, {% endif %}{% endfor %}.</p>{% endif %}
+{% if currency_error %}<p role="alert">{{ currency_error }}</p>{% else %}
+{% if not original %}
+<p>A credit note is issued against one named invoice and cannot exceed what is still outstanding on it. Open the invoice and choose "Credit this invoice".</p>
+{% else %}
+<p>Invoice {{ original.document_number }} ({{ currency }} {{ original.grand_total }}). Credit lines carry their own revenue account (pre-filled from the invoice) and tax code.</p>
+{% set editable = (not draft) or draft.status == 'draft' %}
+{% if editable %}
+<form method="post" action="{% if draft %}{{ base }}/drafts/{{ draft.id }}{% else %}{{ base }}/credit-notes/new{% endif %}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="request_id" value="{{ request_id }}">
+  <input type="hidden" name="original_document_id" value="{{ original.id }}">
+  <input type="hidden" name="customer_account_id" value="{{ customer_account_id }}">
+  <p><label>Credit note date <input type="date" name="document_date" value="{{ draft.document_date if draft else today }}" required></label></p>
+  <p><label>Reason <input name="reason" maxlength="500" value="{{ draft.reason if draft and draft.reason else '' }}" required></label></p>
+  {% include "erp_v2/receivables/_lines.html" %}
+  <button type="submit">Save draft</button>
+</form>
+{% if draft %}
+<form method="post" action="{{ base }}/drafts/{{ draft.id }}/issue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Issue credit note</button></form>
+<form method="post" action="{{ base }}/drafts/{{ draft.id }}/discard"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Discard draft</button></form>
+{% endif %}
+{% else %}
+<p>This draft is {{ draft.status }}.{% if draft.billing_document_id %} <a href="{{ base }}/documents/{{ draft.billing_document_id }}">View the credit note</a>.{% endif %}</p>
+{% endif %}
+{% endif %}
+{% endif %}
+{% endblock %}

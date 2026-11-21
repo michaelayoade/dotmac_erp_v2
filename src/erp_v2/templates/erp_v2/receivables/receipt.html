@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Receipt {{ receipt.receipt_number if receipt else '' }} — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Receipt {{ receipt.receipt_number if receipt else '(not posted)' }}</h1>
+<p><a href="{{ base }}">Receivables</a></p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<dl>
+  <dt>Customer</dt><dd>{{ customer.display_name if customer else draft.customer_account_id }}</dd>
+  <dt>Status</dt><dd>{{ 'reversed' if reversed else draft.status }}</dd>
+  <dt>Amount</dt><dd>{{ draft.currency }} {{ draft.amount }}</dd>
+  {% if receipt %}<dt>Received on</dt><dd>{{ receipt.received_on }}</dd>
+  <dt>Bank reference</dt><dd>{{ receipt.bank_reference }}</dd>{% endif %}
+</dl>
+<h2>Allocations</h2>
+<table><thead><tr><th>Invoice</th><th>Amount</th><th></th></tr></thead><tbody>
+{% for a in allocations %}<tr><td><a href="{{ base }}/documents/{{ a.document_id }}">{{ a.document_id }}</a></td><td>{{ a.amount_delta }}</td>
+<td>{% if not reversed %}<form method="post" action="{{ base }}/allocations/{{ a.id }}/deallocate">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="request_id" value="{{ request_id }}"><input type="hidden" name="document_id" value="{{ a.document_id }}"><input type="hidden" name="occurred_on" value="{{ today }}"><button type="submit">Deallocate</button></form>{% endif %}</td></tr>
+{% else %}<tr><td colspan="3">No allocations: the whole amount is customer credit.</td></tr>{% endfor %}
+</tbody></table>
+{% if receipt and not reversed %}
+<h2>Reverse this receipt</h2>
+<p>Deallocates every allocation of this receipt and removes the receipt from the customer's credit.</p>
+<form method="post" action="{{ base }}/receipts/{{ draft.id }}/reverse">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><label>Reason <select name="reason"><option value="void">Void (entered in error)</option><option value="bounced">Bounced</option></select></label></p>
+  <p><label>Date <input type="date" name="occurred_on" value="{{ today }}" required></label></p>
+  <button type="submit">Reverse receipt</button>
+</form>
+{% endif %}
+{% endblock %}

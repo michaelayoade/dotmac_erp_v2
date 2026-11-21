@@ -219,7 +219,9 @@ def test_journal_lines_are_gross_credit_control_debit_holding_for_positive_items
     assert len(only_positive) == 2 and sum(ln.debit for ln in only_positive) == sum(ln.credit for ln in only_positive)
 
 
-def test_the_default_billing_reader_refuses_r1_unavailable_on_a12():
+def test_the_default_billing_reader_refuses_r1_unavailable_until_an_erp_adapter_is_bound():
+    """a13 ships R1 in ``dotmac_billing.control_position``, but no ERP adapter is bound to it by the S9 composition:
+    the default reader still refuses (an unbound adapter must never read as zero)."""
     reader = billing.default_reader()
     with pytest.raises(HoldingRefused) as e:
         reader.r1(None)  # type: ignore[arg-type]

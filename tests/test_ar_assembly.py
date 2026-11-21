@@ -46,9 +46,13 @@ def _target(p):
     )
 
 
-def _authority(asm=None, *, oid=4242):
+def _authority(asm=None, *, oid=4242, dual_control: str | None = "off"):
     return ErpOpeningAuthority(
-        assembly=asm or assembly(), migration_authority_ref=REF, role_oid=oid, expected_coupled_watermark=FENCE
+        assembly=asm or assembly(),
+        migration_authority_ref=REF,
+        role_oid=oid,
+        expected_coupled_watermark=FENCE,
+        expected_dual_control=dual_control,
     )
 
 
@@ -193,7 +197,7 @@ def test_new_snapshot_row_the_census_does_not_know_is_refused() -> None:
         grown.manifest()
 
 
-def _window(asm, *, principal=WRITER_ROLE, oid=4242, ref=REF, manifest=None):
+def _window(asm, *, principal=WRITER_ROLE, oid=4242, ref=REF, manifest=None, dual_control="off"):
     manifest = manifest or asm.manifest()
     return OpeningWindowV1(
         scope=TenantScope(TENANT),
@@ -206,6 +210,7 @@ def _window(asm, *, principal=WRITER_ROLE, oid=4242, ref=REF, manifest=None):
         principal_oid=oid,
         provision_authority_ref=ref,
         recorded_at=NOW,
+        dual_control=dual_control,  # explicit, never billing's default
     )
 
 
@@ -225,6 +230,14 @@ def test_provision_verifier_passes_and_refuses_a_wrong_principal_oid_name_or_man
     assert verify(_window(asm, ref="dotmac-debt-register v9")) is None
     other = assembly(extra_invoices=[invoice("inv-new", total="1.00", posted=True)])
     assert verify(_window(asm, manifest=other.manifest())) is None  # a different manifest
+    assert verify(_window(asm, dual_control="on")) is None  # the window binds a policy other than the ERP's (OFF)
+    unset = _authority(asm, oid=4242, dual_control=None).provision_verifier()  # an unset ERP policy binds nothing
+    assert (
+        unset.verify_provision(
+            OpeningWindowProvisionVerificationRequestV1(ProvisionOpeningWindowV1(_window(asm)), "d" * 64)
+        )
+        is None
+    )
 
 
 def _seal(asm, *, accounts=None, held=(), watermark=FENCE, ref=REF):

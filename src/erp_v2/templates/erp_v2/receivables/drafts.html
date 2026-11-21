@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Receivables drafts — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>Open drafts</h1>
+<p><a href="{{ base }}">Receivables</a> · <a href="{{ base }}/invoices/new">New invoice</a> · <a href="{{ base }}/receipts/new">New receipt</a></p>
+<table><thead><tr><th>Kind</th><th>Date</th><th>Customer</th><th>Prepared</th></tr></thead><tbody>
+{% for d in drafts %}<tr><td><a href="{{ base }}/{{ 'receipts' if d.kind == 'receipt' else 'drafts' }}/{{ d.id }}">{{ d.kind|replace('_', ' ') }}</a></td><td>{{ d.document_date }}</td><td>{{ d.customer_account_id }}</td><td>{{ d.created_at }}</td></tr>
+{% else %}<tr><td colspan="4">No open drafts.</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}

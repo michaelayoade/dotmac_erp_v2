@@ -1,0 +1,23 @@
+{# Line rows shared by the invoice and credit note forms: existing lines first, then blank rows. #}
+<table>
+  <thead><tr><th>Description</th><th>Quantity</th><th>Unit amount</th><th>Revenue account</th><th>Tax code</th></tr></thead>
+  <tbody>
+  {% set rows = lines|list %}
+  {% for i in range(rows|length + 3) %}
+    {% set ln = rows[i] if i < rows|length else none %}
+    <tr>
+      <td><input name="line_description" maxlength="500" value="{{ ln.description if ln else '' }}" aria-label="Description"></td>
+      <td><input name="line_quantity" inputmode="decimal" value="{{ ln.quantity if ln else '' }}" aria-label="Quantity"></td>
+      <td><input name="line_unit_amount" inputmode="decimal" value="{{ ln.unit_amount if ln else '' }}" aria-label="Unit amount"></td>
+      <td><select name="line_revenue_account_id" aria-label="Revenue account">
+        <option value="">Select</option>
+        {% for a in revenue_accounts %}<option value="{{ a.id }}" {% if (ln and ln.revenue_account_id and ln.revenue_account_id|string == a.id|string) or (not ln and default_revenue and default_revenue == a.id|string) %}selected{% endif %}>{{ a.code }} — {{ a.name }}</option>{% endfor %}
+      </select></td>
+      <td><select name="line_tax_code_id" aria-label="Tax code">
+        <option value="">No tax</option>
+        {% for t in tax_codes %}<option value="{{ t.id }}" {% if ln and ln.tax_code_id and ln.tax_code_id|string == t.id|string %}selected{% endif %}>{{ t.code }} — {{ t.name }}</option>{% endfor %}
+      </select></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>

@@ -277,23 +277,12 @@ def _set_tenant(db, tenant_id: UUID) -> None:
     db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant_id)})
 
 
-def window_dual_control_kwargs(window_cls, wanted: str) -> dict:
-    """a13 binds `dual_control` per window ("off" | "on") and it is immutable. a12 has no such field and its windows
-    behave as two-person ("on", the legacy default): then only a policy of ON can be honoured; OFF is refused so the
-    policy is never silently overridden. (Remove this fallback with the a13 pin.)"""
-
-    if "dual_control" in getattr(window_cls, "__dataclass_fields__", {}):
-        return {"dual_control": wanted}
-    _require(wanted == "on", "window_dual_control_unbindable_pin_billing_a13")
-    return {}
-
-
 def _verify_window_dual_control(window, wanted: str) -> None:
-    """Read-back: the window's bound `dual_control` must equal the ERP policy (a12 windows carry none: "on")."""
+    """Read-back: the window's bound `dual_control` (billing a13, immutable once provisioned) must equal the ERP
+    policy."""
 
     _require(window is not None, "window_missing")
-    bound = getattr(window, "dual_control", "on")
-    _require(bound == wanted, "window_dual_control_differs_from_policy")
+    _require(window.dual_control == wanted, "window_dual_control_differs_from_policy")
 
 
 def role_oid(db, name: str = WRITER_ROLE) -> int:
@@ -407,7 +396,6 @@ def _apply_opening(
         )
         existing = get_opening_window(db, scope=scope)
         if existing is None:
-            window_kwargs = window_dual_control_kwargs(OpeningWindowV1, wanted)
             db.execute(sa.text("SET LOCAL ROLE app_admin"))
             window = OpeningWindowV1(
                 scope=scope,
@@ -420,7 +408,7 @@ def _apply_opening(
                 principal_oid=role_oid(db),
                 provision_authority_ref=authority.migration_authority_ref,
                 recorded_at=occurred_at,
-                **window_kwargs,
+                dual_control=wanted,  # explicit: never billing's default
             )
             billing.provision_opening_window(
                 db, scope=scope, command=ProvisionOpeningWindowV1(window), verifier=authority.provision_verifier()

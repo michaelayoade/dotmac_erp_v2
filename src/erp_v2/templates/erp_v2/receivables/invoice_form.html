@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Invoice — Dotmac ERP{% endblock %}
+{% block content %}
+<h1>{% if draft %}Invoice draft{% else %}New invoice{% endif %}</h1>
+<p><a href="{{ base }}">Receivables</a> · <a href="{{ base }}/drafts">Open drafts</a></p>
+{% if not enabled %}<p role="alert">Receivables entry is not enabled for this tenant: saving, issuing and posting are refused until it is switched on in settings.</p>{% endif %}
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if currency_error %}<p role="alert">{{ currency_error }}</p>{% else %}
+<p>Amounts are in {{ currency }}. Tax comes from the selected tax code's rule. Discount (negative) lines are not supported. When the invoice is issued, any unallocated customer credit is applied first-in-first-out (a setting).</p>
+{% set editable = (not draft) or draft.status == 'draft' %}
+{% if editable %}
+<form method="post" action="{% if draft %}{{ base }}/drafts/{{ draft.id }}{% else %}{{ base }}/invoices/new{% endif %}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="request_id" value="{{ request_id }}">
+  <p><label>Customer <select name="customer_account_id" required>
+    <option value="">Select a customer</option>
+    {% for c in customers %}<option value="{{ c.id }}" {% if customer_account_id and customer_account_id|string == c.id|string %}selected{% endif %}>{{ c.account_number }} — {{ c.display_name }}</option>{% endfor %}
+  </select></label></p>
+  <p><label>Payment terms <select name="payment_terms_code">
+    {% for code, days in terms.items() %}<option value="{{ code }}" {% if (draft and draft.payment_terms_code == code) or (not (draft and draft.payment_terms_code) and default_terms == code) %}selected{% endif %}>{{ code }} ({{ days }} days)</option>{% endfor %}
+  </select></label></p>
+  <p><label>Due date (optional; overrides the terms) <input type="date" name="due_date" value="{{ draft.due_date if draft and draft.due_date else '' }}"></label></p>
+  <p><label>Invoice date <input type="date" name="document_date" value="{{ draft.document_date if draft else today }}" required></label></p>
+  {% include "erp_v2/receivables/_lines.html" %}
+  <button type="submit">Save draft</button>
+</form>
+{% if draft %}
+<form method="post" action="{{ base }}/drafts/{{ draft.id }}/issue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Issue invoice</button></form>
+<form method="post" action="{{ base }}/drafts/{{ draft.id }}/discard"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Discard draft</button></form>
+{% endif %}
+{% else %}
+<p>This draft is {{ draft.status }}.{% if draft.billing_document_id %} <a href="{{ base }}/documents/{{ draft.billing_document_id }}">View the invoice</a>.{% endif %}</p>
+{% endif %}
+{% endif %}
+{% endblock %}

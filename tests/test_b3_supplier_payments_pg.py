@@ -12,6 +12,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+import account_maintenance_support as accounts_gov
 import pytest
 import sqlalchemy as sa
 import test_b1_supplier_invoice_post_pg as b1
@@ -333,7 +334,7 @@ def test_bank_account_must_be_active_open_cash_ledger_and_functional_currency(en
             .where(BankAccount.id == env.bank_id)
             .values(cash_account_ref=str(env.accounts["1000"]))
         )
-        db.execute(sa.update(Account).where(Account.id == env.accounts["1000"]).values(is_active=False))
+        accounts_gov.retire(db, env.accounts["1000"])
         db.commit()
     refused(lambda: prepare(engine, env, oid), "cash_account_not_postable")
     assert counts(engine, env)["supplier_payments"] == 0
@@ -603,7 +604,7 @@ def test_inactive_cash_account_after_approval_refuses_without_partial_state(engi
     oid = open_obligation(engine, env)
     pid = approved_payment(engine, env, oid)
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == env.accounts["1000"]).values(is_active=False))
+        accounts_gov.retire(db, env.accounts["1000"])
         db.commit()
     before = counts(engine, env)
     refused(lambda: record(engine, env, pid), "posting_account_not_postable")

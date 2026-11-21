@@ -357,6 +357,13 @@ this does not authorize adjusting balances or switching traffic.
   replication or any membership, and PostgreSQL below 15. The migration role needs CREATEROLE only if the role does
   not exist yet (migrations are run by an operator as `erp_owner`, never by the deploy pipeline); production and rehearsal use runbook R1 (a superuser pre-creates the role; `docs/mapping-billing.md`),
   because `app_admin` reaches `erp_owner`'s would-be ADMIN row. Membership is cluster-global: confirm the ERP cluster is not the CP cluster first.
+- AR producer (B-16; `docs/ar-producer.md`) adds the head `e2_0032_ar_producer` (follows `e2_0031`): four tables, `erp_ar_drafts`, `erp_ar_draft_lines`,
+  `erp_ar_line_accounts` and `erp_ar_receipts` (RLS forced; W5: runtime column-limited UPDATE on drafts, DML on draft
+  lines bounded by a trigger, SELECT and INSERT only on the other two; append-only triggers; the downgrade refuses while
+  any row exists), and three permissions (`erp.finance.receivables.prepare` for finance_preparer, `...post` for
+  finance_approver, `...read` for both so a poster can review a draft; admin and staff hold none) with the role
+  profile `erp.web` version 6. Needs the billing a13 command surface (unreleased; S9). Off by
+  default: `ar.producer.enabled` is set in the UI at F10 together with `billing_gl.enabled`. No environment variable.
 - Statutory payees (PR-4b; `docs/payee-bank-instructions.md`) adds the head `e2_0024_statutory_payees` (after
   `e2_0023_staff_loan_entries`): one CHECK on `payee_bank_instructions` widened to allow kind `statutory`. The e2
   head in this section moves to it. Before the first statutory remittance Finance proposes and approves one
