@@ -52,11 +52,12 @@ SRC_HELD: Final = "held_drafts"
 SRC_IMPORT: Final = "import_itemised"
 SRC_REVIEWS: Final = "admission_reviews"
 SRC_AR_CENSUS: Final = "ar_census"
+SRC_CLAIMS: Final = "claims_opening"
 SRC_AP_ADMISSION: Final = "ap_admission"
 SRC_MANUAL: Final = "manual"
 SRC_NA: Final = "not_applicable"
 # B-2 outcomes load from the database, never from a receipt file
-RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS, SRC_AP_ADMISSION)
+RECEIPT_KINDS: Final = (SRC_IMPORT, SRC_AR_CENSUS, SRC_CLAIMS, SRC_AP_ADMISSION)
 
 # class by importer queue reason (#68 Q_* constants); an unknown reason is refused, never guessed.
 IMPORT_CLASS: Final = {
@@ -338,6 +339,38 @@ def from_ap_admission(body: Any) -> list[Fact]:
         Fact(klass, key, SRC_AP_ADMISSION, None, evidence, {"reason": reason, "gl_signed_minor": minor})
         for klass, key, reason, minor in classified
     ]
+
+
+def from_claims_opening(body: Any) -> list[Fact]:
+    """The S8 claims-opening apply receipt: one E37 ``claim:<legacy id>`` item per refused claim (no names). Accepts
+    only ``kind == "claims-opening"`` whose ``receipt_sha256`` matches its own body; an unknown reason is refused."""
+    from erp_v2.claims_opening.reasons import CLASS_CODE, REASONS
+
+    if not isinstance(body, dict) or body.get("kind") != "claims-opening" or not isinstance(body.get("items"), list):
+        refuse("invalid_claims_opening")
+    stated = body.get("receipt_sha256")
+    if not isinstance(stated, str) or canonical_sha({k: v for k, v in body.items() if k != "receipt_sha256"}) != stated:
+        refuse("claims_opening_sha_mismatch")
+    facts: list[Fact] = []
+    for item in body["items"]:
+        if not isinstance(item, dict) or item.get("class") != CLASS_CODE:
+            refuse("invalid_claims_opening")
+        reason = item.get("reason")
+        if not isinstance(reason, str) or reason not in REASONS:
+            refuse("unknown_queue_reason", "add the reason to the claims reason table; never guess")
+        key = text(item.get("key"), "invalid_claims_opening", 255)
+        if not key.startswith("claim:") or type(item.get("gl_signed_minor")) is not int:
+            refuse("invalid_claims_opening")
+        detail = {
+            "reason": reason,
+            "carried_code": item.get("carried_code"),
+            "amount": item.get("amount"),
+            "gl_signed_minor": item["gl_signed_minor"],  # the amount B-14 itemises on the carried control account
+            "claimant_party_id": item.get("claimant_party_id"),
+            "employee_id": item.get("employee_id"),
+        }
+        facts.append(Fact(CLASS_CODE, key, SRC_CLAIMS, None, stated, detail))
+    return facts
 
 
 def from_admission_reviews(db: Session, tenant: UUID) -> list[Fact]:
@@ -635,6 +668,26 @@ def _post_flip_tools_unused(db: Session, tenant: UUID) -> list[str]:
     return ["post_flip_tool_used_before_flip"] if used else []
 
 
+def _claims_reclass_matches_admissions(db: Session, tenant: UUID) -> list[str]:
+    """S8: with historical claim receipts there is exactly one posted claim-family reclass journal and its
+    fingerprint equals the set fingerprint recomputed from the receipts; with none there is no such journal."""
+    from dotmac_accounting.contracts import JournalStatus
+
+    from erp_v2.claims_opening import reclass
+    from erp_v2.claims_opening.reasons import ClaimsRefusal
+
+    try:
+        journal = reclass.posted_reclass(db, tenant)
+        expected = reclass.recomputed_fingerprint(db, tenant)
+    except ClaimsRefusal:
+        return ["claims_reclass_matches_admissions"]
+    if expected is None:
+        return ["claims_reclass_matches_admissions"] if journal is not None else []
+    if journal is None or journal.status != JournalStatus.POSTED or journal.source_fingerprint != expected:
+        return ["claims_reclass_matches_admissions"]
+    return []
+
+
 # The section-4 checks of profile ``as_is_v1`` (AS-IS-MIGRATION-REPLAN, sections 4.1-4.5): name -> ``check(db, tenant)``
 # returning its refusal reasons, or None while the owner that wires it is not on main. EVERY None refuses the gate
 # (``profile_checks_unbuilt``), so the gate can never pass with an unbuilt check. An owner PR replaces its None with the
@@ -653,6 +706,7 @@ AS_IS_V1_CHECKS: Final[dict[str, Callable[[Session, UUID], list[str]] | None]] =
     "straddle_reproduced": None,  # STRADDLE-SPEC (W8): every E39 journal has its migration_straddle journals (B-14)
     "e15_subkobo_posted": None,  # E15: one migration_subkobo journal per key = legacy lines (6 dp) + ONE residue line
     "post_flip_tools_unused": _post_flip_tools_unused,  # rule 0.2 (built)
+    "claims_reclass_matches_admissions": _claims_reclass_matches_admissions,  # S8 (built)
 }
 
 

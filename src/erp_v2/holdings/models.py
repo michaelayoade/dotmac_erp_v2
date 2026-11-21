@@ -53,6 +53,7 @@ POSTING_KINDS: Final = (
     KIND_T1_POST,
     KIND_STRADDLE_POST,
     KIND_SUBKOBO_POST,
+    KIND_CLAIM_RECLASS,
 )
 
 # uuid5 namespaces (constants; never random) for the once-only document identities.

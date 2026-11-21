@@ -61,6 +61,7 @@ def gather(db: Session, tenant, spec) -> tuple[list[register.Fact], set[str], st
         body = strict_json(data, "invalid_receipt_json")
         adapter = {
             register.SRC_AR_CENSUS: register.from_ar_census,
+            register.SRC_CLAIMS: register.from_claims_opening,
             register.SRC_AP_ADMISSION: register.from_ap_admission,
         }.get(e["kind"], register.from_import_itemised)
         facts += adapter(body)

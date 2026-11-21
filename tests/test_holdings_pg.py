@@ -521,13 +521,10 @@ def test_non_functional_currency_refuses(engine, tmp_path):
     assert e.value.code == "holding_fx_unsupported"
 
 
-def test_the_unreadable_2045_subledger_refuses_by_name_without_an_injected_reader(engine, tmp_path):
-    env = flip_world(engine, tmp_path)
-    t1(engine, env)
-    env.readers = {k: v for k, v in env.readers.items() if k != "2045"}
-    with pytest.raises(HoldingRefused) as e:
-        holding_plan(engine, env)
-    assert e.value.code == "subledger_read_unavailable:2045"
+def test_the_2045_subledger_is_the_real_expenses_a2_read_and_empty_without_admissions(engine):
+    env = world(engine)
+    with Session(engine) as db:  # S8: no longer refuses; the claims owner tables are read (see test_claims_opening_pg)
+        assert positions.sub_2045(db, env.tenant_id) == {}
 
 
 def test_the_real_owner_readers_run_against_the_real_tables(engine, tmp_path):
