@@ -65,7 +65,7 @@ K2_PREFIX: Final = "EXPENSE-RECLASS-BACKFILL-JE-"
 K2_CODES: Final = ("2040",)
 
 # v2 non-legacy journal kinds (owner / source_document_kind) that the receipt knows.
-# S8's claim-family reclass (owner erp.migration, ``KIND_CLAIM_RECLASS``) is consumed on 2040 only; sub-kobo journals
+# S8's claim-family reclass journal is consumed on 2040 only (read, never built here); sub-kobo journals
 # (``KIND_SUBKOBO_POST``) count with the legacy-owner journals.
 SUBKOBO_KINDS: Final = (KIND_SUBKOBO_POST,)
 
