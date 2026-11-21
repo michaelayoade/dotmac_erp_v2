@@ -277,7 +277,13 @@ def test_serialization_failures_retry_up_to_three_times_then_refuse():
 
 def test_only_the_holdings_package_builds_the_four_migration_kinds():
     src = Path(__file__).resolve().parent.parent / "src" / "erp_v2"
-    allowed = {src / "holdings", src / "posting" / "rules.py", src / "migrations"}
+    # S8: the ONE claim-family reclass kind is built by claims_opening/reclass.py (from the holdings constants, never a literal)
+    allowed = {
+        src / "holdings",
+        src / "posting" / "rules.py",
+        src / "migrations",
+        src / "claims_opening" / "reclass.py",
+    }
     literal = re.compile(r"""["'](%s)["']""" % "|".join(POSTING_KINDS))
     owner = re.compile(r"""["']erp\.migration["']""")
     offenders = []

@@ -111,6 +111,10 @@ POLICIES: Final = MappingProxyType(
         ("erp.migration", "migration_straddle"): RefPolicy(),
         # B-14 E15 sub-kobo units: legacy lines re-posted exactly (6 dp) plus one residue line on the rounding account.
         ("erp.migration", "migration_subkobo"): RefPolicy(),
+        # S8 claims opening: ONE journal per flip window, system-built from the owner receipts just written (Dr each
+        # carried claim-family account 2040/2030/2110, Cr 2045 per claimant), once-only uuid5 identity. A system door
+        # onto control accounts 2040 and 2045 (approved plan section 0.2). ONLY erp_v2.claims_opening.reclass builds it.
+        ("erp.migration", "claim_family_reclass"): RefPolicy(),
     }
 )
 

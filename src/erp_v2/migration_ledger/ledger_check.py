@@ -144,10 +144,19 @@ def _sub_1410(db: Session, tenant: UUID) -> Decimal:
     return Decimal(queries.book_position(db, tenant_id=tenant).subledger_total)
 
 
-_SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410}
-# 1400 and the prepayment account are tied by the dedicated readers below (billing R1); 2045 is NOT built here. 2110 is
-# report-only (``report_state``). These ties net ALL currencies together except the billing ones, which are the
-# functional currency only (any other currency with a balance refuses: no FX tie exists).
+def _sub_2045(db: Session, tenant: UUID) -> Decimal:
+    """Claims (expenses a2): minus the outstanding total of the non-reversed liabilities on the 2045 account."""
+    from dotmac_expenses import claims_payable_total
+
+    ids = db.scalars(sa.select(Account.id).where(Account.tenant_id == tenant, Account.code == "2045"))
+    return -sum((claims_payable_total(db, tenant_id=tenant, liability_account_ref=str(i)) for i in ids), Decimal(0))
+
+
+_SUBLEDGERS = {"2000": _sub_2000, "2040": _sub_2040, "1410": _sub_1410, "2045": _sub_2045}
+# 1400 and the prepayment account are tied by the dedicated readers below (billing R1); 2045 (S8) reads the expenses
+# a2 owner tables in this session. 2110 is report-only (``report_state``). These ties net ALL currencies together
+# except the billing ones, which are the functional currency only (any other currency with a balance refuses: no FX
+# tie exists).
 
 
 class _Unavailable(Exception):
@@ -239,7 +248,7 @@ def control_state(db: Session, tenant: UUID) -> dict[str, dict[str, Any]]:
             continue
         gl = _gl_net(db, tenant, code)
         reader = _SUBLEDGERS.get(code)
-        if reader is None:  # 2045: the expenses a2 subledger is read by the claims-opening PR; until then it REFUSES
+        if reader is None:  # no owner subledger exists: the gate REFUSES with a named reason, never skips
             state[code] = {
                 "gl": fmt(gl),
                 "subledger": None,

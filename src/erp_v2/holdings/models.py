@@ -43,6 +43,9 @@ KIND_WRITEOFF_POST: Final = "holding_writeoff"
 KIND_T1_POST: Final = "ar_opening_credit"
 KIND_STRADDLE_POST: Final = "migration_straddle"
 KIND_SUBKOBO_POST: Final = "migration_subkobo"
+# S8: the ONE claim-family reclass journal of the flip window (Dr 2040/2030/2110, Cr 2045 per claimant); built only by
+# ``erp_v2.claims_opening.reclass``.
+KIND_CLAIM_RECLASS: Final = "claim_family_reclass"
 POSTING_KINDS: Final = (
     KIND_HOLDING_POST,
     KIND_RELEASE_POST,
@@ -50,6 +53,7 @@ POSTING_KINDS: Final = (
     KIND_T1_POST,
     KIND_STRADDLE_POST,
     KIND_SUBKOBO_POST,
+    KIND_CLAIM_RECLASS,
 )
 
 # uuid5 namespaces (constants; never random) for the once-only document identities.

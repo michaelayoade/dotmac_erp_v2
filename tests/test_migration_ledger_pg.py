@@ -549,12 +549,11 @@ def gate(engine, env):
 
 @pytest.fixture
 def owners_available(monkeypatch):
-    """The owner subledgers not built in v2 yet (1400, 2045) stand in as zero; the gate REFUSES without them."""
+    """The owner subledger not built in v2 yet (1400) stands in as zero; the gate REFUSES without it."""
     from erp_v2.migration_ledger import ledger_check
 
     zero = lambda db, tenant: Decimal(0)  # noqa: E731
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "1400", zero)
-    monkeypatch.setitem(ledger_check._SUBLEDGERS, "2045", zero)
     # tests of the other reasons: the unbuilt checks (None) become no-ops; the built ones stay (see the unbuilt tests)
     monkeypatch.setattr(
         register, "AS_IS_V1_CHECKS", {k: v or (lambda db, tenant: []) for k, v in register.AS_IS_V1_CHECKS.items()}
@@ -717,14 +716,16 @@ SPEC_SECTION_4_CHECKS = {
     "straddle_reproduced",
     "e15_subkobo_posted",
     "post_flip_tools_unused",
+    "claims_reclass_matches_admissions",
 }
+BUILT_CHECKS = {"post_flip_tools_unused", "claims_reclass_matches_admissions"}
 
 
 def test_the_profile_check_names_are_pinned_to_spec_section_4():
     # removing a name (or adding one) is a visible change to this pinned set, never a silent tuple edit
     assert set(register.AS_IS_V1_CHECKS) == SPEC_SECTION_4_CHECKS
-    assert callable(register.AS_IS_V1_CHECKS["post_flip_tools_unused"])
-    assert register.profile_checks_pending() == sorted(SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"})
+    assert all(callable(register.AS_IS_V1_CHECKS[name]) for name in BUILT_CHECKS)
+    assert register.profile_checks_pending() == sorted(SPEC_SECTION_4_CHECKS - BUILT_CHECKS)
 
 
 def test_the_gate_refuses_profile_checks_unbuilt_for_every_none(engine, owners_available, monkeypatch):
@@ -742,7 +743,7 @@ def test_the_gate_refuses_profile_checks_unbuilt_for_every_none(engine, owners_a
     monkeypatch.undo()
     # the shipped mapping refuses: every owner check is still None
     assert register.profile_checks_pending() and all(
-        register.AS_IS_V1_CHECKS[k] is None for k in SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"}
+        register.AS_IS_V1_CHECKS[k] is None for k in SPEC_SECTION_4_CHECKS - BUILT_CHECKS
     )
 
 
@@ -888,8 +889,8 @@ def test_control_accounts_are_tied_to_the_owner_subledgers_and_a_reader_that_can
     with Session(engine) as db:
         state = ledger_check.control_state(db, env.tenant_id)
     # nothing posted: every built owner subledger (payables, payroll, loans, billing R1) reads 0 and ties
-    assert {c for c, v in state.items() if v["ok"]} == {"1400", "1410", "2000", "2040", "prepayment"}
-    assert state["2045"]["reason"] == "control_subledger_unavailable:2045"  # the claims-opening PR builds it
+    assert {c for c, v in state.items() if v["ok"]} == {"1400", "1410", "2000", "2040", "2045", "prepayment"}
+    assert state["2045"]["subledger"] == "0.000000"  # S8: the real expenses a2 read
     assert set(state) == {"1400", "1410", "2000", "2040", "2045", "prepayment"}  # 2030/2110 are report-only
     with Session(engine) as db:
         reports = ledger_check.report_state(db, env.tenant_id)
