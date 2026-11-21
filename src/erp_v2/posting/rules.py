@@ -86,6 +86,11 @@ POLICIES: Final = MappingProxyType(
         # is refused by the ERP workflow, so none are posted).
         ("payables", "supplier_payment"): RefPolicy(),
         ("payables", "supplier_payment_reversal"): RefPolicy(),
+        # B-15 live billing -> GL mapper: one journal per billing accounting fact (document_id = fact id, version =
+        # fact version, fingerprint = fact digest). Lines are system-built from the fact's lane effects: Dr/Cr the
+        # 1400 receivable, the prepayment liability (or the prepaid-funding account) and the settlement source's
+        # cash account, all Account UUIDs resolved from the tenant, never typed. W4/B15.6.
+        ("billing", "accounting_fact"): RefPolicy(),
         ("payroll", "payroll_run"): RefPolicy(frozenset({"2040"})),
         ("payroll", "payroll_liability_settlement"): RefPolicy(frozenset({"2040"})),
         # payroll a5: bank-returned salary. Dr the ORIGINAL bank cash GL (Account UUID) / Cr 2040.
@@ -94,6 +99,18 @@ POLICIES: Final = MappingProxyType(
         # bank account's cash GL (advance) or a Finance-chosen non-control offset (adjustment, control
         # difference). Both refs are Account UUIDs, resolved from the tenant's records, never typed.
         ("erp", "staff_loan_entry"): RefPolicy(),
+        # B-14 migration holdings (W1: four new system doors onto control accounts). Lines are system-built from
+        # re-derived owner state, once-only uuid5 identities, Account UUIDs resolved from the tenant. ONLY
+        # erp_v2.holdings builds these kinds (a test greps).
+        ("erp.migration", "migration_holding"): RefPolicy(),
+        ("erp.migration", "holding_release"): RefPolicy(),
+        ("erp.migration", "holding_writeoff"): RefPolicy(),
+        ("erp.migration", "ar_opening_credit"): RefPolicy(),
+        # B-14 straddle reproduction (W8): a legacy journal dated across the history cutoff, re-posted balanced at its
+        # legacy accounts and days; refuses control accounts, so no control door is used.
+        ("erp.migration", "migration_straddle"): RefPolicy(),
+        # B-14 E15 sub-kobo units: legacy lines re-posted exactly (6 dp) plus one residue line on the rounding account.
+        ("erp.migration", "migration_subkobo"): RefPolicy(),
     }
 )
 

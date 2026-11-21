@@ -1,569 +1,281 @@
-"""Billing opening translation: evidence in, exact residuals out."""
+"""Billing opening translation (rev 2): one complete a12 manifest, F1 reversed, whole-partition exclusion."""
 
 from __future__ import annotations
 
-import uuid
-from datetime import date, datetime, timezone
+from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
-from dotmac_billing.contracts import (
-    PartyDocumentSnapshotV1,
-    PaymentInstructionsSnapshotV1,
-    PostalAddressSnapshotV1,
+from ar_opening_support import (
+    TENANT,
+    UTC,
+    alloc,
+    capture,
+    context,
+    invoice,
+    partition,
+    payment,
+    two_partition_manifest,
 )
-from dotmac_billing.opening_contracts import OpeningCaptureV1, OpeningPartitionV1
+from dotmac_billing import OpeningTargetV1, opening_manifest_fingerprint_v2
+from dotmac_billing.opening_receivable_validation import (
+    opening_account_import_blockers_v2,
+    preview_opening_account_import_batch_v2,
+)
+from dotmac_kernel.cache import TenantScope
 
 from erp_v2.importer.billing_opening import (
-    OpeningTranslationContext,
     OpeningTranslationError,
-    build_manifest,
+    build_complete_manifest,
+    build_import_command,
     translate_partition,
 )
 
-UTC = timezone.utc
-PARTITION = OpeningPartitionV1(source_account_key="cust-1", account_id=uuid.uuid4(), currency="NGN", precision=2)
-SNAPSHOT = PartyDocumentSnapshotV1(
-    legal_name="Party Ltd",
-    address=PostalAddressSnapshotV1(line_one="1 Harbour Rd", country_code="NG"),
-)
-CTX = OpeningTranslationContext(
-    partition=PARTITION,
-    seller=SNAPSHOT,
-    customer_snapshot=lambda _key: SNAPSHOT,
-    payment_instructions=PaymentInstructionsSnapshotV1(method_code="bank_transfer"),
-)
 
-
-def _invoice(**overrides):
-    base = {
-        "invoice_id": "inv-1",
-        "invoice_number": "INV-1",
-        "customer_key": "cust-1",
-        "invoice_date": datetime(2026, 1, 5, tzinfo=UTC),
-        "due_date": date(2026, 2, 4),
-        "currency_code": "NGN",
-        "subtotal": Decimal("930.23"),
-        "tax_amount": Decimal("69.77"),
-        "total_amount": Decimal("1000.00"),
-        "status": "posted",
-        "dotmac_sub_id": None,
-        "splynx_id": None,
-        "customer_dotmac_sub_id": None,
-    }
-    base.update(overrides)
-    return base
-
-
-def test_open_invoice_residual_after_partial_payment() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice()],
-        allocations=[
-            {
-                "invoice_id": "inv-1",
-                "payment_id": "pay-1",
-                "amount_allocated": Decimal("400.00"),
-                "allocated_at": datetime(2026, 1, 20, tzinfo=UTC),
-            }
-        ],
-        payments=[
-            {
-                "payment_id": "pay-1",
-                "amount": Decimal("400.00"),
-                "payment_date": datetime(2026, 1, 20, tzinfo=UTC),
-                "reference": "RCPT-1",
-                "status": "confirmed",
-                "dotmac_sub_id": None,
-                "splynx_id": None,
-            }
-        ],
-    )
-    assert not result.blockers
-    (item,) = result.items
-    assert item.residual_minor == 60000
-    assert item.original is not None and item.original.document_number == "INV-1"
-    assert item.collection.status == "unknown_unverified"
-    assert item.collection.automated_collection_allowed is False
-    assert result.open_ar_minor == 60000
-    assert result.cash_lots == ()
-
-
-def test_void_overpaid_inexact_and_unallocated_cash() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[
-            _invoice(invoice_id="inv-void", status="voided"),
-            _invoice(invoice_id="inv-over", invoice_number="INV-2"),
-            _invoice(invoice_id="inv-bad", invoice_number="INV-3", total_amount=Decimal("10.001")),
-        ],
-        allocations=[
-            {
-                "invoice_id": "inv-over",
-                "payment_id": "pay-9",
-                "amount_allocated": Decimal("1200.00"),
-                "allocated_at": datetime(2026, 1, 20, tzinfo=UTC),
-            }
-        ],
-        payments=[
-            {
-                "payment_id": "pay-9",
-                "amount": Decimal("1500.00"),
-                "payment_date": datetime(2026, 1, 20, tzinfo=UTC),
-                "reference": "RCPT-9",
-                "status": "confirmed",
-                "dotmac_sub_id": None,
-                "splynx_id": None,
-            },
-            {
-                "payment_id": "pay-free",
-                "amount": Decimal("50.00"),
-                "payment_date": datetime(2026, 1, 21, tzinfo=UTC),
-                "reference": "RCPT-10",
-                "status": "confirmed",
-                "dotmac_sub_id": None,
-                "splynx_id": None,
-            },
-        ],
-    )
-    assert result.items == ()
-    reasons = {b.source_key: b.reason for b in result.blockers}
-    assert "overpaid" in reasons["inv-over"]
-    assert "precision" in reasons["inv-bad"]
-    dispositions = {d.identity.key: d.disposition for d in result.dispositions}
-    assert dispositions["inv-void"] == "excluded"
-    lots = {lot.lot_id: lot.residual_minor for lot in result.cash_lots}
-    assert lots == {"legacy-payment:pay-9": 30000, "legacy-payment:pay-free": 5000}
-
-
-def test_manifest_controls_and_counts() -> None:
-    result = translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[])
-    tenant_id = uuid.uuid4()
-    capture = OpeningCaptureV1(
-        source_system="legacy-erp",
-        source_repository_sha="74fa788a",
-        installation_id="prod",
-        schema_heads=("legacy-head",),
-        snapshot_id="snap-1",
-        captured_at=datetime(2026, 11, 8, tzinfo=UTC),
-        economic_cutoff=datetime(2026, 11, 8, tzinfo=UTC),
-        recorded_cutoff=datetime(2026, 11, 8, tzinfo=UTC),
-        isolation="repeatable-read-dump",
-        population_version="1",
-        source_authority_ref="ops:2026-11-08",
-        account_mapping_version="erp-billing-opening/1",
-        cash_mapping_version="erp-billing-opening/1",
-    )
-    manifest = build_manifest(tenant_id=tenant_id, capture=capture, translation=result)
-    assert manifest.counts.eligible == 1
-    assert manifest.controls[0].open_ar_minor == 100000
-    assert manifest.controls[0].collectible_receivable_minor == 0
-    assert manifest.receivables[0].residual_minor == 100000
-
-
-def _capture() -> OpeningCaptureV1:
-    return OpeningCaptureV1(
-        source_system="legacy-erp",
-        source_repository_sha="74fa788a",
-        installation_id="prod",
-        schema_heads=("legacy-head",),
-        snapshot_id="snap-1",
-        captured_at=datetime(2026, 11, 8, tzinfo=UTC),
-        economic_cutoff=datetime(2026, 11, 8, tzinfo=UTC),
-        recorded_cutoff=datetime(2026, 11, 8, tzinfo=UTC),
-        isolation="repeatable-read-dump",
-        population_version="1",
-        source_authority_ref="ops:2026-11-08",
-        account_mapping_version="erp-billing-opening/1",
-        cash_mapping_version="erp-billing-opening/1",
+def _target(p):
+    return OpeningTargetV1(
+        scope=TenantScope(TENANT),
+        account_id=p.account_id,
+        currency=p.currency,
+        precision=p.precision,
+        expected_position_fingerprint="0" * 64,
+        posting_watermark="0",
     )
 
 
-def test_preflight_round_trip_without_verifier_is_honest() -> None:
-    import pytest
-    from dotmac_billing import OpeningTargetV1, opening_manifest_fingerprint_v2
-    from dotmac_kernel.cache import TenantScope
-
-    from erp_v2.importer.billing_opening import (
-        OpeningTranslationError,
-        build_import_command,
-        preflight_opening_import,
-    )
-
-    result = translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[])
-    tenant_id = uuid.uuid4()
-    manifest = build_manifest(tenant_id=tenant_id, capture=_capture(), translation=result)
-    target = OpeningTargetV1(
-        scope=TenantScope(tenant_id),
-        account_id=PARTITION.account_id,
-        currency="NGN",
-        precision=2,
-        expected_position_fingerprint="dest-observed-fingerprint",
-        posting_watermark="dest-watermark",
-    )
-    preflight = preflight_opening_import(
-        translation=result,
+def _cmd(manifest, p):
+    return build_import_command(
         manifest=manifest,
-        target=target,
-        migration_authority_ref="approval:2026-11-08",
-        occurred_at=datetime(2026, 11, 8, tzinfo=UTC),
+        target=_target(p),
+        migration_authority_ref="dotmac-debt-register v1",
+        occurred_at=datetime(2026, 11, 20, tzinfo=UTC),
+        partition=p,
     )
-    # Fingerprint agrees with the module's own computation, residuals
-    # round-trip, and with no verifier configured the module preview
-    # refuses admissibility - never importable in this state.
-    assert preflight.manifest_fingerprint == opening_manifest_fingerprint_v2(manifest)
-    assert preflight.receivable_residual_minor == 100000
-    assert preflight.importable is False
-    assert "verifier_unavailable" in preflight.preview_blocker_codes
 
-    bad_target = OpeningTargetV1(
-        scope=TenantScope(tenant_id),
-        account_id=PARTITION.account_id,
-        currency="USD",
-        precision=2,
-        expected_position_fingerprint="x",
-        posting_watermark="y",
+
+def _reasons(t):
+    return {(b.source_key, b.reason) for b in t.blockers}
+
+
+def test_every_origin_is_translated_with_origin_independent_identity() -> None:
+    (t1, _t2), _m = two_partition_manifest()
+    by_key = {i.source_invoice_key: i for i in t1.items}
+    assert set(by_key) == {"inv-1", "inv-2", "inv-3"}  # Sub-origin, Splynx and native, all admitted
+    assert {i.source_identity.kind for i in t1.items} == {"invoice"}
+    # origin lives in the evidence digest, not the identity: same key, different origin, different digest
+    native = translate_partition(context=context("c"), invoices=[invoice("x")], allocations=[], payments=[])
+    sub = translate_partition(
+        context=context("c"), invoices=[invoice("x", dotmac_sub_id="s-1")], allocations=[], payments=[]
     )
-    with pytest.raises(OpeningTranslationError, match="disagrees"):
-        build_import_command(
-            manifest=manifest,
-            target=bad_target,
-            migration_authority_ref="approval:2026-11-08",
-            occurred_at=datetime(2026, 11, 8, tzinfo=UTC),
+    assert native.items[0].source_identity == sub.items[0].source_identity
+    assert native.items[0].source_evidence_digest != sub.items[0].source_evidence_digest
+    assert t1.origin_residual_minor == {"native": 3000, "dotmac_sub": 60000, "splynx": 50000}
+
+
+def test_residual_is_total_minus_allocations_and_discharges_are_exact() -> None:
+    (t1, _), _m = two_partition_manifest()
+    inv1 = next(i for i in t1.items if i.source_invoice_key == "inv-1")
+    assert inv1.residual_minor == 60000
+    assert [d.amount_minor for d in inv1.historical_discharges] == [40000]
+    assert inv1.historical_discharges[0].source_key == "pay-1"
+
+
+def test_every_discharging_payment_is_a_cash_lot_and_unallocated_cash_is_the_residual() -> None:
+    (t1, t2), _m = two_partition_manifest()
+    lots = {lot.source_identity.key: lot for lot in t1.cash_lots}
+    assert set(lots) == {"pay-1", "pay-2"}  # pay-closed only touched a closed invoice: history, no lot
+    assert lots["pay-1"].gross_minor == 45000 and lots["pay-1"].residual_minor == 5000
+    assert lots["pay-2"].residual_minor == 0  # fully allocated, still a lot (its discharge needs it)
+    assert t1.ignored_payments == ("pay-closed",)
+    assert [lot.residual_minor for lot in t2.cash_lots] == [2000]  # unallocated cash with no discharge
+
+
+def test_closed_invoice_is_history_not_an_item() -> None:
+    (t1, _), _m = two_partition_manifest()
+    assert t1.closed_invoices == ("inv-closed",)
+    assert "inv-closed" not in {i.source_invoice_key for i in t1.items}
+
+
+def test_unapplied_credit_note_is_kept_out_of_the_manifest_and_the_partition_is_carried() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1"), invoice("cn-1", total="-25.00", invoice_type="CREDIT_NOTE")],
+        allocations=[],
+        payments=[payment("p-1", "10.00")],
+    )
+    assert t.carryable and not t.blockers
+    assert [(n.source_key, n.reason) for n in t.unapplied_credit_notes] == [("cn-1", "credit_transfer_unsupported")]
+    assert [i.source_invoice_key for i in t.items] == ["inv-1"] and [
+        lot.source_identity.key for lot in t.cash_lots
+    ] == ["p-1"]
+    assert "cn-1" not in {d.identity.key for d in t.dispositions}  # never in the billing population
+
+
+def test_credit_note_with_allocation_links_still_excludes_the_whole_partition() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1"), invoice("cn-1", total="50.00", invoice_type="CREDIT_NOTE")],
+        allocations=[alloc("p-1", "cn-1", "20.00")],
+        payments=[payment("p-1", "20.00")],
+    )
+    assert not t.carryable and t.items == () and t.unapplied_credit_notes == []
+    assert _reasons(t) == {("cn-1", "credit_transfer_unsupported")}
+
+
+def test_standalone_inexact_row_is_a_partition_blocker_not_a_dropped_row() -> None:
+    t = translate_partition(
+        context=context("c"), invoices=[invoice("inv-1"), invoice("bad", total="10.005")], allocations=[], payments=[]
+    )
+    assert not t.carryable and _reasons(t) == {("bad", "amount_not_exact")}
+
+
+def test_over_allocated_invoice_is_a_named_blocker() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1", total="100.00")],
+        allocations=[alloc("p-1", "inv-1", "70.00"), alloc("p-2", "inv-1", "70.00")],
+        payments=[payment("p-1", "70.00"), payment("p-2", "70.00")],
+    )
+    assert _reasons(t) == {("inv-1", "invoice_residual_nonpositive")}
+
+
+def test_allocation_to_an_invoice_outside_the_population_blocks() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1")],
+        allocations=[alloc("p-1", "ghost", "10.00")],
+        payments=[payment("p-1", "10.00")],
+    )
+    assert _reasons(t) == {("p-1", "payment_allocation_outside_population")}
+
+
+def test_allocation_by_a_payment_of_another_partition_blocks_the_invoice() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1")],
+        allocations=[alloc("other", "inv-1", "10.00")],
+        payments=[],
+    )
+    assert _reasons(t) == {("inv-1", "payment_allocation_outside_population")}
+
+
+def test_inexact_amount_is_a_blocker_never_rounded() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1", total="10.001")],
+        allocations=[],
+        payments=[payment("p-1", "5.005")],
+    )
+    assert _reasons(t) == {("inv-1", "amount_not_exact"), ("p-1", "amount_not_exact")}
+
+
+def test_overallocated_payment_is_a_blocker() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1", total="100.00")],
+        allocations=[alloc("p-1", "inv-1", "60.00")],
+        payments=[payment("p-1", "50.00")],
+    )
+    assert ("p-1", "payment_overallocated") in _reasons(t)
+
+
+def test_missing_provenance_column_is_refused_not_treated_as_native() -> None:
+    row = invoice("inv-1")
+    del row["splynx_id"]
+    with pytest.raises(OpeningTranslationError, match="lacks splynx_id"):
+        translate_partition(context=context("c"), invoices=[row], allocations=[], payments=[])
+    pay = payment("p-1", "1.00")
+    del pay["dotmac_sub_id"]
+    with pytest.raises(OpeningTranslationError, match="lacks dotmac_sub_id"):
+        translate_partition(context=context("c"), invoices=[invoice("inv-1")], allocations=[], payments=[pay])
+
+
+def test_duplicate_ids_refuse() -> None:
+    with pytest.raises(OpeningTranslationError, match="duplicate invoice"):
+        translate_partition(
+            context=context("c"), invoices=[invoice("inv-1"), invoice("inv-1")], allocations=[], payments=[]
         )
 
 
-# --- F1: Sub-origin receivables are never ERP v2's (census + exclusion) ---
-
-AT = datetime(2026, 1, 20, tzinfo=UTC)
-
-
-def _alloc(invoice_id: str, payment_id: str, amount: str) -> dict:
-    return {
-        "invoice_id": invoice_id,
-        "payment_id": payment_id,
-        "amount_allocated": Decimal(amount),
-        "allocated_at": AT,
-    }
+def test_collection_evidence_stays_unknown_unverified() -> None:
+    (t1, _), _m = two_partition_manifest()
+    assert {i.collection.status for i in t1.items} == {"unknown_unverified"}
 
 
-def _payment(payment_id: str, amount: str, **overrides) -> dict:
-    row = {
-        "payment_id": payment_id,
-        "amount": Decimal(amount),
-        "payment_date": AT,
-        "reference": f"RCPT-{payment_id}",
-        "status": "confirmed",
-        "dotmac_sub_id": None,
-        "splynx_id": None,
-    }
-    row.update(overrides)
-    return row
-
-
-def _reasons(result) -> dict[str, str]:
-    return {b.source_key: b.reason for b in result.blockers}
-
-
-def test_sub_origin_invoices_excluded_with_allocations_payments_and_credit_notes() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[
-            _invoice(invoice_id="native-1", invoice_number="N-1"),
-            _invoice(invoice_id="sub-1", invoice_number="S-1", dotmac_sub_id="sub-ext-1"),
-            _invoice(invoice_id="sub-cn", invoice_number="S-CN", dotmac_sub_id="sub-ext-2", invoice_type="CREDIT_NOTE"),
-        ],
-        allocations=[_alloc("sub-1", "pay-sub", "300.00"), _alloc("native-1", "pay-nat", "100.00")],
-        payments=[_payment("pay-sub", "300.00", dotmac_sub_id="sx"), _payment("pay-nat", "100.00")],
-    )
-    assert not result.blockers
-    assert [i.source_invoice_key for i in result.items] == ["native-1"]
-    assert result.items[0].residual_minor == 90000
-    assert result.cash_lots == ()
-    ex = result.exclusions
-    assert ex.invoices == ("sub-1",)
-    assert ex.credit_notes == ("sub-cn",)
-    assert ex.allocations == ("pay-sub:sub-1",)
-    assert ex.payments == ("pay-sub",)
-    assert ex.mixed_payments == ()
-    assert ex.totals_minor["payments"] == 30000
-    excluded = {d.identity.key: d for d in result.dispositions if d.disposition == "excluded"}
-    assert set(excluded) == {"sub-1", "sub-cn"}  # invoices only; payments reconcile in the census
-    assert all(d.identity.kind == "invoice" for d in result.dispositions)
-    assert all(d.reason == "sub_origin" for d in excluded.values())
-    assert result.census["balanced"] is True
-    assert result.census["invoices"] == {
-        "source": 3,
-        "translated": 1,
-        "excluded_void": 0,
-        "excluded_sub_origin": 2,
-        "blocked": 0,
-    }
-    assert result.census["payments"]["excluded_sub_origin"] == 1
-
-
-def test_erp_payment_on_sub_invoice_blocks_with_evidence_and_no_split() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[
-            _invoice(invoice_id="native-1", invoice_number="N-1"),
-            _invoice(invoice_id="sub-1", invoice_number="S-1", dotmac_sub_id="x"),
-        ],
-        allocations=[_alloc("native-1", "pay-mix", "100.00"), _alloc("sub-1", "pay-mix", "250.00")],
-        payments=[_payment("pay-mix", "400.00")],
-    )
-    reasons = _reasons(result)
-    assert "exceptions review" in reasons["pay-mix"] and "unapplied 5000" in reasons["pay-mix"]
-    assert reasons["native-1"] == "discharged by payment under review"
-    assert result.cash_lots == () and result.items == ()
-    (split,) = result.exclusions.mixed_payments
-    assert (split.gross_minor, split.sub_share_minor, split.native_share_minor, split.remainder_minor) == (
-        40000,
-        25000,
-        10000,
-        5000,
-    )
-    assert result.exclusions.payments == ()  # not "excluded whole": ERP cash is never dropped silently
-    assert result.census["payments"]["blocked"] == 1
-
-
-def test_erp_payment_wholly_on_sub_invoices_with_remainder_blocks_and_reports_amount() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice(invoice_id="sub-1", invoice_number="S-1", dotmac_sub_id="x")],
-        allocations=[_alloc("sub-1", "pay-1", "100.00")],
-        payments=[_payment("pay-1", "130.00")],
-    )
-    assert "unapplied 3000" in _reasons(result)["pay-1"]
-    assert result.exclusions.payments == ()
-    assert result.cash_lots == ()
-
-
-def test_allocation_to_absent_void_or_blocked_invoice_blocks_payment() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[
-            _invoice(invoice_id="void-1", invoice_number="V", status="voided"),
-            _invoice(invoice_id="bad-1", invoice_number="B", total_amount=Decimal("10.001")),
-            _invoice(invoice_id="ok-1", invoice_number="O"),
-        ],
-        allocations=[
-            _alloc("ghost", "pay-a", "10.00"),
-            _alloc("void-1", "pay-v", "10.00"),
-            _alloc("bad-1", "pay-b", "10.00"),
-            _alloc("ok-1", "pay-ok", "10.00"),
-        ],
-        payments=[
-            _payment("pay-a", "10.00"),
-            _payment("pay-v", "10.00"),
-            _payment("pay-b", "10.00"),
-            _payment("pay-ok", "10.00"),
-        ],
-    )
-    reasons = _reasons(result)
-    assert reasons["pay-a"] == "allocation targets invoice absent from export"
-    assert reasons["pay-v"] == "allocation targets void or blocked invoice"
-    assert reasons["pay-b"] == "allocation targets void or blocked invoice"
-    assert "pay-ok" not in reasons
-    assert result.census["payments"]["blocked"] == 3
-    assert result.census["payments"]["fully_allocated"] == 1
-
-
-def test_row_missing_field_is_refused() -> None:
-    for field_name in ("dotmac_sub_id", "splynx_id", "customer_dotmac_sub_id"):
-        bad_invoice = _invoice()
-        del bad_invoice[field_name]
-        with pytest.raises(OpeningTranslationError, match=field_name):
-            translate_partition(context=CTX, invoices=[bad_invoice], allocations=[], payments=[])
-    for field_name in ("dotmac_sub_id", "splynx_id"):
-        bad_payment = _payment("p1", "5.00")
-        del bad_payment[field_name]
-        with pytest.raises(OpeningTranslationError, match=field_name):
-            translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[bad_payment])
-
-
-def test_duplicate_ids_refuse_so_census_cannot_mislead() -> None:
-    with pytest.raises(OpeningTranslationError, match="duplicate invoice"):
-        translate_partition(context=CTX, invoices=[_invoice(), _invoice()], allocations=[], payments=[])
-
-
-def test_native_rows_unchanged_and_blank_string_is_sub_origin() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice(), _invoice(invoice_id="blank", invoice_number="B", dotmac_sub_id="")],
-        allocations=[_alloc("inv-1", "pay-1", "400.00")],
-        payments=[_payment("pay-1", "400.00"), _payment("pay-free", "50.00")],
-    )
-    assert not result.blockers
-    assert [i.source_invoice_key for i in result.items] == ["inv-1"]
-    assert result.open_ar_minor == 60000
-    assert [lot.source_identity.key for lot in result.cash_lots] == ["pay-free"]
-    assert result.exclusions.invoices == ("blank",)  # legacy IS NOT NULL: blank counts
-
-
-def test_sub_tagged_payment_unallocated_excluded_and_contradiction_blocked() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice()],
-        allocations=[_alloc("inv-1", "pay-c", "10.00")],
-        payments=[_payment("pay-s", "20.00", dotmac_sub_id="s"), _payment("pay-c", "10.00", dotmac_sub_id="s")],
-    )
-    assert result.exclusions.payments == ("pay-s",)
-    reasons = _reasons(result)
-    assert set(reasons) == {"pay-c", "inv-1"}
-    assert reasons["inv-1"] == "discharged by payment under review"
-
-
-def test_negative_cash_residual_is_a_blocker() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice(total_amount=Decimal("1000.00"))],
-        allocations=[_alloc("inv-1", "pay-1", "500.00")],
-        payments=[_payment("pay-1", "400.00")],
-    )
-    assert "negative cash residual" in _reasons(result)["pay-1"]
-    assert result.cash_lots == ()
-
-
-def test_splynx_era_rows_are_blocked_and_reported() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice(invoice_id="spl", invoice_number="SP", splynx_id="123"), _invoice()],
-        allocations=[],
-        payments=[_payment("pay-spl", "5.00", splynx_id="9"), _payment("pay-ok", "5.00")],
-    )
-    reasons = _reasons(result)
-    assert reasons["spl"] == "splynx_era_pending_ruling"
-    assert reasons["pay-spl"] == "splynx_era_pending_ruling"
-    assert [i.source_invoice_key for i in result.items] == ["inv-1"]
-    assert result.census["splynx_era"]["invoices"] == ["spl"]
-    assert result.census["splynx_era"]["payments"] == ["pay-spl"]
-
-
-def test_sub_tagged_customers_on_native_invoices_are_reported() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice(customer_dotmac_sub_id="c-sub")],
+def test_stored_balance_difference_is_an_exact_variance_and_the_ledger_closes() -> None:
+    t = translate_partition(
+        context=context("c"),
+        invoices=[invoice("inv-1", total="100.00", balance_due=Decimal("90.00"))],
         allocations=[],
         payments=[],
     )
-    assert result.census["sub_tagged_customers_on_native_invoices"] == ["cust-1"]
-    assert len(result.items) == 1  # reporting only, no exclusion
+    (v,) = t.variances
+    assert (v.basis, v.reason_code, v.amount_minor) == ("stored_balance", "stored_balance_difference", -1000)
+    manifest = build_complete_manifest(tenant_id=TENANT, capture=capture(), translations=(t,))
+    assert opening_account_import_blockers_v2(_cmd(manifest, t.partition)) == ()
 
 
-def test_wholly_sub_origin_partition_translates_to_nothing_with_census() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice(dotmac_sub_id="x")],
+def test_one_manifest_with_partition_selection_has_no_blockers_for_any_partition() -> None:
+    (t1, t2), manifest = two_partition_manifest()
+    assert len(manifest.controls) == 2 and len(manifest.measures) == 2
+    commands = [_cmd(manifest, t.partition) for t in (t1, t2)]
+    assert all(opening_account_import_blockers_v2(c) == () for c in commands)
+    batch = preview_opening_account_import_batch_v2(commands)
+    assert batch.manifest_blockers == () and all(i.partition_blockers == () for i in batch.items)
+    # one fingerprint across every command
+    assert len({opening_manifest_fingerprint_v2(c.manifest) for c in commands}) == 1
+
+
+def test_measures_and_controls_are_consistent_with_the_items_and_lots() -> None:
+    (t1, _), manifest = two_partition_manifest()
+    control = next(c for c in manifest.controls if c.partition == t1.partition)
+    measures = next(m for m in manifest.measures if m.partition == t1.partition)
+    assert control.open_ar_minor == control.collectible_receivable_minor == 113000
+    assert control.available_cash_credit_minor == 5000 and control.unapplied_customer_credit_minor == 0
+    assert measures.document_residual_minor == measures.stored_balance_minor == 113000
+    assert measures.rebuild_minor == 113000 - 5000
+    assert measures.population_rows == measures.transferred_rows == 5 and measures.non_carryable_rows == 0
+
+
+def test_manifest_refuses_a_blocked_partition_and_a_duplicate() -> None:
+    blocked = translate_partition(
+        context=context("c"),
+        invoices=[invoice("bad", total="1.001")],
         allocations=[],
         payments=[],
     )
-    assert result.items == () and not result.blockers
-    assert result.census["invoices"]["excluded_sub_origin"] == 1
+    with pytest.raises(OpeningTranslationError, match="only carryable"):
+        build_complete_manifest(tenant_id=TENANT, capture=capture(), translations=(blocked,))
+    ok = translate_partition(context=context("c"), invoices=[invoice("a")], allocations=[], payments=[])
+    with pytest.raises(OpeningTranslationError, match="duplicate partition"):
+        build_complete_manifest(tenant_id=TENANT, capture=capture(), translations=(ok, ok))
+    with pytest.raises(OpeningTranslationError, match="no translated partitions"):
+        build_complete_manifest(tenant_id=TENANT, capture=capture(), translations=())
 
 
-def test_exclusions_are_deterministic_regardless_of_input_order() -> None:
-    invoices = [_invoice(invoice_id=f"sub-{n}", invoice_number=f"S{n}", dotmac_sub_id="x") for n in (3, 1, 2)]
-    allocs = [_alloc(f"sub-{n}", f"pay-{n}", "1.00") for n in (3, 1, 2)]
-    pays = [_payment(f"pay-{n}", "1.00", dotmac_sub_id="x") for n in (3, 1, 2)]
-    a = translate_partition(context=CTX, invoices=invoices, allocations=allocs, payments=pays)
-    b = translate_partition(context=CTX, invoices=invoices[::-1], allocations=allocs[::-1], payments=pays[::-1])
-    assert a.exclusions == b.exclusions
-    assert a.exclusions.as_dict() == b.exclusions.as_dict()
-    assert a.census == b.census
-    assert a.exclusions.invoices == ("sub-1", "sub-2", "sub-3")
+def test_command_needs_an_explicit_partition_on_a_complete_manifest_and_refuses_a_stranger() -> None:
+    (t1, _t2), manifest = two_partition_manifest()
+    with pytest.raises(OpeningTranslationError, match="needs the partition"):
+        build_import_command(
+            manifest=manifest,
+            target=_target(t1.partition),
+            migration_authority_ref="x",
+            occurred_at=datetime(2026, 11, 20, tzinfo=UTC),
+        )
+    with pytest.raises(OpeningTranslationError, match="not in the manifest"):
+        _cmd(manifest, partition("stranger"))
+    with pytest.raises(OpeningTranslationError, match="disagrees"):
+        build_import_command(
+            manifest=manifest,
+            target=replace(_target(t1.partition), currency="USD"),
+            migration_authority_ref="x",
+            occurred_at=datetime(2026, 11, 20, tzinfo=UTC),
+            partition=t1.partition,
+        )
 
 
-def test_census_no_receivable_item_for_any_row_with_dotmac_sub_id() -> None:
-    values = ["sub-ext", "0", " ", "", "NULL"]
-    invoices = [_invoice(invoice_id=f"s{n}", invoice_number=f"S{n}", dotmac_sub_id=v) for n, v in enumerate(values)] + [
-        _invoice(invoice_id=f"n{n}", invoice_number=f"N{n}") for n in range(3)
-    ]
-    result = translate_partition(context=CTX, invoices=invoices, allocations=[], payments=[])
-    produced = {i.source_invoice_key for i in result.items}
-    sub_keys = {str(r["invoice_id"]) for r in invoices if r["dotmac_sub_id"] is not None}
-    assert sub_keys and not (produced & sub_keys)
-    assert produced == {"n0", "n1", "n2"}
-    assert set(result.exclusions.invoices) == sub_keys
-    excluded = {d.identity.key for d in result.dispositions if d.disposition == "excluded"}
-    assert excluded == sub_keys
-
-
-def test_required_fields_checked_on_sub_origin_rows_before_classification() -> None:
-    sub_invoice = _invoice(invoice_id="sub-1", invoice_number="S", dotmac_sub_id="x")
-    del sub_invoice["splynx_id"]
-    with pytest.raises(OpeningTranslationError, match="splynx_id"):
-        translate_partition(context=CTX, invoices=[sub_invoice], allocations=[], payments=[])
-    sub_invoice = _invoice(invoice_id="sub-1", invoice_number="S", dotmac_sub_id="x")
-    del sub_invoice["customer_dotmac_sub_id"]
-    with pytest.raises(OpeningTranslationError, match="customer_dotmac_sub_id"):
-        translate_partition(context=CTX, invoices=[sub_invoice], allocations=[], payments=[])
-    sub_payment = _payment("p-sub", "5.00", dotmac_sub_id="x")
-    del sub_payment["splynx_id"]
-    with pytest.raises(OpeningTranslationError, match="splynx_id"):
-        translate_partition(context=CTX, invoices=[_invoice()], allocations=[], payments=[sub_payment])
-
-
-def test_partition_with_a_later_blocked_invoice_is_wholly_not_importable() -> None:
-    from dotmac_billing import OpeningTargetV1
-    from dotmac_kernel.cache import TenantScope
-
-    from erp_v2.importer.billing_opening import preflight_opening_import
-
-    result = translate_partition(
-        context=CTX,
-        invoices=[
-            _invoice(invoice_id="over", invoice_number="O", total_amount=Decimal("100.00")),
-            _invoice(invoice_id="fine", invoice_number="F"),
-        ],
-        allocations=[_alloc("over", "pay-over", "150.00")],
-        payments=[_payment("pay-over", "150.00"), _payment("pay-free", "50.00")],
-    )
-    assert "over" in _reasons(result)
-    assert result.cash_lots  # a lot is translated beside the blocked invoice...
-    tenant_id = uuid.uuid4()
-    manifest = build_manifest(tenant_id=tenant_id, capture=_capture(), translation=result)
-    target = OpeningTargetV1(
-        scope=TenantScope(tenant_id),
-        account_id=PARTITION.account_id,
-        currency="NGN",
-        precision=2,
-        expected_position_fingerprint="fp",
-        posting_watermark="wm",
-    )
-    preflight = preflight_opening_import(
-        translation=result,
-        manifest=manifest,
-        target=target,
-        migration_authority_ref="approval:test",
-        occurred_at=datetime(2026, 11, 8, tzinfo=UTC),
-    )
-    # ...but the whole partition is not importable while any blocker exists.
-    assert preflight.importable is False
-    assert "over" in {b.source_key for b in preflight.translation_blockers}
-
-
-def test_inexact_excluded_amounts_are_listed_not_counted_as_zero() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[
-            _invoice(invoice_id="s1", invoice_number="S1", dotmac_sub_id="x", total_amount=Decimal("10.001")),
-            _invoice(invoice_id="s2", invoice_number="S2", dotmac_sub_id="x", total_amount=Decimal("5.00")),
-            _invoice(),
-        ],
-        allocations=[],
-        payments=[],
-    )
-    assert result.exclusions.totals_minor["invoices_and_credit_notes"] == 500
-    assert result.exclusions.inexact_keys == ("s1",)
-
-
-def test_erp_cash_without_native_invoice_gets_a_named_blocker() -> None:
-    result = translate_partition(
-        context=CTX,
-        invoices=[_invoice(dotmac_sub_id="x")],
-        allocations=[],
-        payments=[_payment("pay-free", "50.00")],
-    )
-    assert result.items == ()
-    assert "exceptions review" in _reasons(result)["partition:cust-1"]
+def test_customer_snapshot_missing_is_a_blocker() -> None:
+    ctx = replace(context("c"), customer_snapshot=lambda _k: None)
+    t = translate_partition(context=ctx, invoices=[invoice("inv-1")], allocations=[], payments=[])
+    assert _reasons(t) == {("inv-1", "customer_snapshot_missing")}

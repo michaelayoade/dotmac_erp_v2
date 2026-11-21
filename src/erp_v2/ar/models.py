@@ -90,6 +90,7 @@ class ArDraft(Base):
     amount: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
     payment_terms_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date(), nullable=True)
     status: Mapped[str] = mapped_column(String(10), nullable=False, default=STATUS_DRAFT)
     prepared_by: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
     issued_by: Mapped[UUID | None] = mapped_column(Uuid(), nullable=True)

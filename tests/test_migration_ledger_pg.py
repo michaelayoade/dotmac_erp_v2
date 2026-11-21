@@ -123,7 +123,7 @@ def opening_inputs(*, two_thousand_sub="-399.00", ias8=True):
     as_of, parsed = opening.parse_tb(tb, SHA)
     sub = {"2000": Decimal(two_thousand_sub), "2040": Decimal("-100"), "1410": Decimal("50"), "1400": Decimal("300")}
     items = (opening.Ias8Item("IAS8-001", "2000", Decimal("1.00"), SHA, "AP overstated at 2025 close"),) if ias8 else ()
-    return opening.OpeningInputs(as_of, parsed, "c" * 64, sub, "d" * 64, items, "e" * 64)
+    return opening.OpeningInputs(as_of, parsed, "c" * 64, sub, "d" * 64, items, "e" * 64, "a" * 64, "b" * 64)
 
 
 def apply_inputs(env, *, dual=False):
@@ -207,10 +207,9 @@ def test_a_repeat_is_a_replay_and_posts_nothing_more(engine):
 def test_the_opening_refuses_unproven_inputs_before_any_write(engine):
     env = world(engine)
     bad = opening_inputs(two_thousand_sub="-390.00")  # the subledger does not tie, even with the IAS 8 item
-    with Session(engine) as db:
-        with pytest.raises(LedgerRefused) as caught:
-            opening.apply_opening(db, env.tenant_id, bad, apply_inputs(env))
-    assert caught.value.code == "opening_control_not_subledger" and count_journals(engine, env) == 0
+    proof = opening.opening_proof(bad)  # as_is_v1: a control difference is REPORTED (E37), never a refusal
+    assert proof["ok"] and [d["account"] for d in proof["control_differences"]] == ["2000"]
+    opening.require_proof(proof)
     unbalanced = opening_inputs()
     unbalanced = opening.OpeningInputs(
         unbalanced.as_of,
@@ -220,6 +219,8 @@ def test_the_opening_refuses_unproven_inputs_before_any_write(engine):
         "d" * 64,
         unbalanced.ias8,
         "e" * 64,
+        "a" * 64,
+        "b" * 64,
     )
     with Session(engine) as db:
         with pytest.raises(LedgerRefused) as caught:
@@ -232,7 +233,15 @@ def test_a_second_trial_balance_is_refused_once_an_opening_exists(engine):
     post_opening(engine, env)
     other = opening_inputs()
     other = opening.OpeningInputs(
-        other.as_of, other.tb, "9" * 64, other.subledger, other.subledger_sha256, other.ias8, other.ias8_sha256
+        other.as_of,
+        other.tb,
+        "9" * 64,
+        other.subledger,
+        other.subledger_sha256,
+        other.ias8,
+        other.ias8_sha256,
+        other.recomputed_tb_sha256,
+        other.import_receipt_sha256,
     )
     with Session(engine) as db:
         with pytest.raises(LedgerRefused) as caught:
@@ -536,13 +545,16 @@ def gate(engine, env):
 
 @pytest.fixture
 def owners_available(monkeypatch):
-    """The owner subledgers not built in v2 yet (1400, 2045, 2110) stand in as zero; the gate REFUSES without them."""
+    """The owner subledgers not built in v2 yet (1400, 2045) stand in as zero; the gate REFUSES without them."""
     from erp_v2.migration_ledger import ledger_check
 
     zero = lambda db, tenant: Decimal(0)  # noqa: E731
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "1400", zero)
     monkeypatch.setitem(ledger_check._SUBLEDGERS, "2045", zero)
-    monkeypatch.setitem(ledger_check._SUBLEDGERS, "2110", zero)
+    # tests of the other reasons: the unbuilt checks (None) become no-ops; the built ones stay (see the unbuilt tests)
+    monkeypatch.setattr(
+        register, "AS_IS_V1_CHECKS", {k: v or (lambda db, tenant: []) for k, v in register.AS_IS_V1_CHECKS.items()}
+    )
 
 
 def cover_all(engine, env, *, except_classes=()):
@@ -572,15 +584,16 @@ def test_the_gate_refuses_with_one_open_item_even_when_the_bridge_is_signed(engi
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     sign(engine, env, version, sha)
     g = gate(engine, env)
-    assert (
-        not g["passed"] and g["open_count"] == 1 and g["reasons"] == ["open_exceptions"] and g["latest_bridge_signed"]
-    )
+    # as_is_v1: an open work-queue item is a REPORT, not a gate
+    assert g["passed"] and g["profile"] == "as_is_v1" and g["reasons"] == [] and g["latest_bridge_signed"]
+    assert g["open_count"] == 1 and g["reports"]["open_count"] == 1 and g["reports"]["open_by_class"] == {"E16a": 1}
     with Session(engine) as db:
         register.resolve(
             db, env.tenant_id, class_code="E16a", legacy_key="held_draft:j1", outcome="voided", evidence_sha256=SHA
         )
         db.commit()
-    assert gate(engine, env)["passed"]
+    g = gate(engine, env)
+    assert g["passed"] and g["reports"]["open_count"] == 0
 
 
 def test_the_gate_needs_a_signed_latest_bridge_even_at_zero_open(engine, owners_available):
@@ -597,9 +610,7 @@ def test_the_gate_needs_a_signed_latest_bridge_even_at_zero_open(engine, owners_
     assert not g["passed"] and g["reasons"] == ["latest_bridge_not_signed"] and g["latest_bridge_version"] == 2
 
 
-def test_the_gate_refuses_an_incomplete_class_coverage_until_every_class_is_loaded_or_declared_na(
-    engine, owners_available
-):
+def test_class_coverage_is_reported_not_gated_and_every_class_can_be_declared_na(engine, owners_available):
     from erp_v2.migration_ledger.classes import CLASSES
 
     env = world(engine)
@@ -607,9 +618,10 @@ def test_the_gate_refuses_an_incomplete_class_coverage_until_every_class_is_load
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     sign(engine, env, version, sha)
     g = gate(engine, env)
-    assert g["reasons"] == ["class_coverage_incomplete"] and g["classes_missing"] == list(CLASSES)
+    assert g["passed"] and g["classes_missing"] == list(CLASSES) == g["reports"]["classes_missing"]
+    assert {"E35", "E36a", "E36b", "E37", "E38"} <= set(CLASSES)
     cover_all(engine, env, except_classes=("E27",))
-    assert gate(engine, env)["classes_missing"] == ["E27"]
+    assert gate(engine, env)["classes_missing"] == ["E27"] and gate(engine, env)["passed"]
     with Session(engine) as db:
         assert (
             refusal_code(
@@ -638,9 +650,9 @@ def test_the_gate_refuses_an_incomplete_class_coverage_until_every_class_is_load
             operator="o",
         )
         assert row.state == "resolved" and row.terminal_outcome == "not_applicable" and row.legacy_key == "class:E27"
-        assert row.detail["plan_sha256"] == "7160002d479d502df384ea98c6b150c9ceadf2f0b3a5b36e00a71ad8b63be608"
+        assert row.detail["plan_sha256"] == "a28adf06752c43cd69481830c1b0e8d02a36f94a3bbe3c2ce35443d46b28de54"
         db.commit()
-    assert gate(engine, env)["passed"]
+    assert gate(engine, env)["passed"] and gate(engine, env)["classes_missing"] == []
     with engine.connect() as c, pytest.raises(DBAPIError, match="never deleted"):
         c.execute(
             sa.text("DELETE FROM erp_migration_exceptions WHERE class_code = 'E27' AND tenant_id = :t"),
@@ -648,7 +660,7 @@ def test_the_gate_refuses_an_incomplete_class_coverage_until_every_class_is_load
         )
 
 
-def test_manual_add_takes_only_a_class_from_the_closed_list_and_opens_the_gate_back_up(engine, owners_available):
+def test_manual_add_takes_only_a_class_from_the_closed_list_and_is_a_report_item(engine, owners_available):
     env = world(engine)
     seed_clean(engine, env)
     cover_all(engine, env)
@@ -684,7 +696,147 @@ def test_manual_add_takes_only_a_class_from_the_closed_list_and_opens_the_gate_b
             db, env.tenant_id, class_code="E26", legacy_key="fallback-account", evidence_sha256=SHA, operator="o"
         )
         db.commit()
-    assert gate(engine, env)["reasons"] == ["open_exceptions"]
+    g = gate(engine, env)  # the new open item is queue work for Finance after the flip, not a gate reason
+    assert g["passed"] and g["reasons"] == [] and g["reports"]["open_by_class"] == {"E26": 1}
+
+
+SPEC_SECTION_4_CHECKS = {
+    "completeness_per_module_currency",
+    "control_ties_per_currency",
+    "prepayment_tie_r1",
+    "holding_ties",
+    "setup_keyed_accounts",
+    "setup_control_and_tax_codes_exist_once",
+    "setup_vat_deferral_pair",
+    "setup_periods",
+    "setup_writer_role_m1",
+    "straddle_reproduced",
+    "e15_subkobo_posted",
+    "post_flip_tools_unused",
+}
+
+
+def test_the_profile_check_names_are_pinned_to_spec_section_4():
+    # removing a name (or adding one) is a visible change to this pinned set, never a silent tuple edit
+    assert set(register.AS_IS_V1_CHECKS) == SPEC_SECTION_4_CHECKS
+    assert callable(register.AS_IS_V1_CHECKS["post_flip_tools_unused"])
+    assert register.profile_checks_pending() == sorted(SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"})
+
+
+def test_the_gate_refuses_profile_checks_unbuilt_for_every_none(engine, owners_available, monkeypatch):
+    env = world(engine)
+    seed_clean(engine, env)
+    cover_all(engine, env)
+    version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    sign(engine, env, version, sha)
+    assert gate(engine, env)["passed"]  # the fixture wired every None to a no-op
+    checks = {**register.AS_IS_V1_CHECKS, "holding_ties": None, "setup_periods": None}
+    monkeypatch.setattr(register, "AS_IS_V1_CHECKS", checks)
+    g = gate(engine, env)
+    assert not g["passed"] and g["reasons"] == ["profile_checks_unbuilt"]
+    assert g["profile_checks_pending"] == ["holding_ties", "setup_periods"]
+    monkeypatch.undo()
+    # the shipped mapping refuses: every owner check is still None
+    assert register.profile_checks_pending() and all(
+        register.AS_IS_V1_CHECKS[k] is None for k in SPEC_SECTION_4_CHECKS - {"post_flip_tools_unused"}
+    )
+
+
+def test_the_gate_refuses_when_a_post_flip_tool_was_used_before_the_flip(engine, owners_available):
+    env = world(engine)
+    with Session(engine) as db:
+        assert register._post_flip_tools_unused(db, env.tenant_id) == []
+    post_opening(engine, env)  # the opening input carries an IAS 8 item: a post-flip tool used before the flip
+    with Session(engine) as db:
+        assert register._post_flip_tools_unused(db, env.tenant_id) == ["post_flip_tool_used_before_flip"]
+    assert "post_flip_tool_used_before_flip" in gate(engine, env)["reasons"]
+
+
+def _held_decision(env, outcome):
+    from erp_v2.held_drafts.models import HeldDraftDecision
+
+    return HeldDraftDecision(
+        tenant_id=env.tenant_id, journal_id=uuid4(), rule_id="R", outcome=outcome, reason_code="already_posted_duplicate",
+        amount=Decimal(1), evidence={"key_sha256": "a" * 64}, evidence_sha256="d" * 64, rules_sha256="e" * 64, plan_sha256="f" * 64,
+        plan_receipt_sha256="1" * 64, manual_journal_id=None, dual_control=False, planned_by="a", applied_by="b",
+    )  # fmt: skip
+
+
+def test_post_flip_tool_guard_counts_held_draft_voids_and_posts_but_not_queued(engine):
+    env = world(engine)
+    with Session(engine) as db:
+        db.add(_held_decision(env, "queued"))  # a queued decision posts nothing: only a register item
+        db.commit()
+        assert register._post_flip_tools_unused(db, env.tenant_id) == []
+        db.add(_held_decision(env, "voided"))
+        db.commit()
+        assert register._post_flip_tools_unused(db, env.tenant_id) == ["post_flip_tool_used_before_flip"]
+
+
+def test_post_flip_tool_guard_counts_an_admission_review(engine):
+    from datetime import UTC, datetime
+
+    from erp_v2.legacy_ap.models import AdmissionReview
+
+    env = world(engine)
+    with Session(engine) as db:
+        assert register._post_flip_tools_unused(db, env.tenant_id) == []
+        db.add(
+            AdmissionReview(
+                tenant_id=env.tenant_id, legacy_invoice_id=uuid4(), decision="admit_residual", waived_checks=[],
+                evidence_sha="a" * 64, decision_file_sha="b" * 64, snapshot_sha256="c" * 64, decided_by="f",
+                decided_at=datetime.now(UTC), operator_ref="o", dual_control=False,
+            )
+        )  # fmt: skip
+        db.commit()
+        assert register._post_flip_tools_unused(db, env.tenant_id) == ["post_flip_tool_used_before_flip"]
+
+
+def test_migration_straddle_journals_are_not_v2_native_in_the_bridge_comparison(engine):
+    """STRADDLE-SPEC (W8): the B-14 reproduction journals (erp.migration / migration_straddle) are planned, not native."""
+    from dotmac_accounting.contracts import CreateJournal, JournalKind, JournalLineInput, SourceIdentity
+
+    env = world(engine)
+
+    def post(owner, kind):
+        with Session(engine) as db:
+            scope = TenantScope(env.tenant_id)
+            j = accounting.create_journal(
+                db, scope=scope,
+                command=CreateJournal(
+                    number=f"S-{uuid4().hex[:12]}", kind=JournalKind.STANDARD, entry_date=date(2026, 1, 15),
+                    posting_date=date(2026, 1, 15), currency_code="USD", exchange_rate=Decimal(1), description="s",
+                    reference="s",
+                    source=SourceIdentity(owner=owner, document_kind=kind, document_id=f"d-{uuid4().hex}",
+                        version="1", fingerprint="f" * 64),
+                    lines=(JournalLineInput(env.accounts["5000"], Decimal(2), Decimal(0), None),
+                           JournalLineInput(env.accounts["1000"], Decimal(0), Decimal(2), None)),
+                ),
+                idempotency_key=f"t:{uuid4()}", idempotency_expires_at=None, recorded_at=NOW,
+            )  # fmt: skip
+            accounting.post_journal(
+                db, scope=scope, journal_id=j.id, approval_reference="t", posted_by="t",
+                idempotency_key=f"p:{uuid4()}", idempotency_expires_at=None, posted_at=NOW,
+            )  # fmt: skip
+            db.commit()
+
+    post("erp.migration", "migration_straddle")
+    post("erp.migration", "migration_subkobo")  # E15 reproduction (T-SUBKOBO items explain its residue)
+    post("erp.migration", "something_else")
+    with Session(engine) as db:
+        total, native = ledger_check.v2_posted(db, env.tenant_id)
+    assert total[("5000", "2026-01")] == Decimal(6)
+    assert native[("5000", "2026-01")] == Decimal(2)  # only the other kind counts as native
+
+
+def test_the_bridge_body_records_the_gate_profile(engine, owners_available):
+    env = world(engine)
+    seed_clean(engine, env)
+    cover_all(engine, env)
+    store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
+    with Session(engine) as db:
+        body = bridge.verified_body(bridge.latest(db, env.tenant_id))
+    assert body["gate_profile"] == "as_is_v1"  # recorded in the bridge body: Michael's signature covers it
 
 
 def test_the_gate_refuses_when_the_ledger_moved_since_signature(engine, owners_available):
@@ -728,12 +880,13 @@ def test_control_accounts_are_tied_to_the_owner_subledgers_and_unavailable_ones_
     with Session(engine) as db:
         state = ledger_check.control_state(db, env.tenant_id)
     # nothing posted: 2000, 2040, 1410 tie at 0 (the owner tables are read); 2030 is 0; the unbuilt owners refuse
-    assert [c for c, v in state.items() if v["ok"]] == ["1410", "2000", "2040", "2030"] or {
-        c for c, v in state.items() if v["ok"]
-    } == {"1410", "2000", "2040", "2030"}
+    assert {c for c, v in state.items() if v["ok"]} == {"1410", "2000", "2040"}
     assert state["1400"]["reason"] == "control_subledger_unavailable:1400"
     assert state["2045"]["reason"] == "control_subledger_unavailable:2045"
-    assert state["2110"]["reason"] == "control_subledger_unavailable:2110"
+    assert set(state) == {"1400", "1410", "2000", "2040", "2045"}  # 2030 and 2110 left the gate (report-only)
+    with Session(engine) as db:
+        reports = ledger_check.report_state(db, env.tenant_id)
+    assert set(reports) == {"2030", "2110"} and reports["2030"]["zero"] is True
     # a GL posting on 2000 with no payables document breaks the tie; a posting on 2030 breaks the zero rule
     post_legacy(engine, env, date(2026, 1, 15), [("2000", "-5.00"), ("1000", "5.00")])
     with Session(engine) as db:
@@ -1199,8 +1352,18 @@ def tb_file_for(tmp_path, rows=None):
     return path, write(path, {"version": 1, "as_of": "2025-12-31", "rows": rows})
 
 
-def seed_cli_legacy(engine):
-    """Legacy documents behind the subledger the CLI RECOMPUTES: 2000 -399, 1400 300, 2040 -100, 1410 0."""
+def seed_cli_legacy(engine, env):
+    """Legacy documents behind the subledger the CLI RECOMPUTES: 2000 -399, 1400 300, 2040 -100, 1410 0; and the
+    legacy ledger at the opening date, which is the trial balance the CLI RECOMPUTES (``tb_rows``)."""
+    legacy_post(
+        engine,
+        uuid4(),
+        date(2025, 12, 30),
+        [
+            (env.accounts[c], n if not n.startswith("-") else "0", n[1:] if n.startswith("-") else "0")
+            for c, n in tb_rows().items()
+        ],
+    )
     inv = uuid4()
     legacy_exec(
         engine,
@@ -1222,6 +1385,16 @@ def seed_cli_legacy(engine):
     )
 
 
+def import_receipt_file(tmp_path, cutoff="2025-12-31", **over):
+    """A FIXTURE importer execute receipt in the shape #74 (B-13, history cutoff) emits: ``history_cutoff`` section
+    with the ISO date. Replace by a real receipt once #74 lands."""
+    body = {"kind": "execute", "dry_run": False, "complete": True, "history_cutoff": {"history_cutoff": cutoff}}
+    body.update(over)
+    path = tmp_path / "import-receipt.json"
+    write(path, body)
+    return path
+
+
 def cli_files(tmp_path, env, ias_items):
     tb_path, tb_sha = tb_file_for(tmp_path)
     ias_path = tmp_path / "ia.json"
@@ -1230,7 +1403,8 @@ def cli_files(tmp_path, env, ias_items):
     write(spec, {"version": 1, "tenant_id": str(env.tenant_id), "tb_sha256": tb_sha, "ias8_sha256": ias_sha,
                  "evidence_ref": "FIN-OPENING-1", "requester_party_id": str(env.parties["requester"]),
                  "approver_party_id": str(env.parties["approver"])})  # fmt: skip
-    return ["--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path)]
+    return ["--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path),
+            "--import-receipt", str(import_receipt_file(tmp_path))]  # fmt: skip
 
 
 def item_row(item_id, code, amount):
@@ -1247,9 +1421,9 @@ def test_opening_cli_recomputes_the_subledger_and_applies_with_private_receipts(
     engine, monkeypatch, tmp_path, legacy_schema
 ):
     env = world(engine)
-    seed_cli_legacy(engine)
-    # TB: 2000 -400 vs sub -399 -> +1; 1410 +50 vs sub 0 -> -50; each difference covered EXACTLY by an itemised item
-    base = cli_files(tmp_path, env, [item_row("IAS8-001", "2000", "1.00"), item_row("IAS8-002", "1410", "-50.00")])
+    seed_cli_legacy(engine, env)
+    # TB: 2000 -400 vs sub -399; 1410 +50 vs sub 0. as_is_v1: these differences are REPORTED (E37), IAS 8 is empty
+    base = cli_files(tmp_path, env, [])
     url = engine.url.render_as_string(hide_password=False)
 
     def dsn():  # the CLI pops both DSNs from the environment
@@ -1264,6 +1438,10 @@ def test_opening_cli_recomputes_the_subledger_and_applies_with_private_receipts(
     assert (os.stat(plan_receipt).st_mode & 0o777) == 0o600 and plan["ready"] and plan["proof"]["ok"]
     assert plan["proof"]["control_accounts"]["2000"]["subledger_net"] == "-399.000000"  # recomputed, not declared
     assert plan["proof"]["control_accounts"]["1400"]["subledger_net"] == "300.000000"
+    assert {d["account"]: d["difference"] for d in plan["proof"]["control_differences"]} == {
+        "1410": "50.000000",
+        "2000": "-1.000000",
+    }  # reported, never a refusal
     assert str(env.tenant_id) not in plan_receipt.read_text() and "postgresql" not in plan_receipt.read_text()
     assert count_journals(engine, env) == 0  # plan wrote nothing
     apply_args = ["apply", *base, "--plan-receipt", str(plan_receipt), "--approved-plan-sha256", plan["plan_sha256"],
@@ -1277,9 +1455,9 @@ def test_opening_cli_recomputes_the_subledger_and_applies_with_private_receipts(
     dsn()
     assert opening_main([*apply_args, "--receipt", str(receipt)]) == 0, receipt.read_text()
     applied = json.loads(receipt.read_text())
-    assert applied["applied"] == {"opening": 1, "ias8": 2, "replayed": 0} and count_journals(engine, env) == 3
-    # the posted ledger now ties to the recomputed subledger on every control account
-    assert [ledger_net(engine, env, c) for c in ("2000", "2040", "1410", "1400")] == [-399, -100, 0, 300]
+    assert applied["applied"] == {"opening": 1, "ias8": 0, "replayed": 0} and count_journals(engine, env) == 1
+    # the opening landed as recorded: the control accounts keep their GL balance (the flip holding covers the diffs)
+    assert [ledger_net(engine, env, c) for c in ("2000", "2040", "1410", "1400")] == [-400, -100, 50, 300]
     # a bound plan cannot be reused with another approved sha
     dsn()
     bad = ["apply", *base, "--plan-receipt", str(plan_receipt), "--approved-plan-sha256", "0" * 64,
@@ -1287,25 +1465,97 @@ def test_opening_cli_recomputes_the_subledger_and_applies_with_private_receipts(
     assert opening_main(bad) == 2
 
 
-def test_opening_cli_refuses_a_difference_not_covered_exactly_by_itemised_ias8(
+def test_opening_cli_refuses_ias8_items_and_a_declared_tb_that_differs_from_the_legacy_ledger(
     engine, monkeypatch, tmp_path, legacy_schema
 ):
     env = world(engine)
-    seed_cli_legacy(engine)
+    seed_cli_legacy(engine, env)
     url = engine.url.render_as_string(hide_password=False)
-    for name, items in (
-        ("none", []),  # the GL - subledger differences are not itemised at all
-        ("short", [item_row("I1", "2000", "0.99"), item_row("I2", "1410", "-50.00")]),  # 0.01 not covered
-    ):
-        sub_dir = tmp_path / name
-        sub_dir.mkdir()
-        base = cli_files(sub_dir, env, items)
+    ias = tmp_path / "ias"
+    ias.mkdir()
+    base = cli_files(ias, env, [item_row("I1", "2000", "1.00")])  # IAS 8 is empty before the flip
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
+    monkeypatch.setenv("LEGACY_DATABASE_URL", url)
+    receipt = ias / "r.json"
+    assert opening_main(["plan", *base, "--receipt", str(receipt), "--operator-ref", "operator-a"]) == 2
+    assert json.loads(receipt.read_text())["refusal"] == "ias8_not_allowed_before_flip"
+    # a declared TB that balances but differs from the legacy ledger is refused
+    other = tmp_path / "other"
+    other.mkdir()
+    rows = [
+        {"account_code": "1000", "debit": "2.00", "credit": "0"},
+        {"account_code": "3100", "debit": "0", "credit": "2.00"},
+    ]
+    tb_path, tb_sha = tb_file_for(other, rows)
+    ias_path = other / "ia.json"
+    ias_sha = write(ias_path, {"version": 1, "items": []})
+    spec = other / "spec.json"
+    write(spec, {"version": 1, "tenant_id": str(env.tenant_id), "tb_sha256": tb_sha, "ias8_sha256": ias_sha,
+                 "evidence_ref": "E", "requester_party_id": str(env.parties["requester"]),
+                 "approver_party_id": str(env.parties["approver"])})  # fmt: skip
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
+    monkeypatch.setenv("LEGACY_DATABASE_URL", url)
+    receipt2 = other / "r.json"
+    code = opening_main(["plan", "--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path),
+                         "--import-receipt", str(import_receipt_file(other)),
+                         "--receipt", str(receipt2), "--operator-ref", "operator-a"])  # fmt: skip
+    assert code == 2 and json.loads(receipt2.read_text())["refusal"] == "opening_tb_differs_from_legacy"
+    assert count_journals(engine, env) == 0
+
+
+def test_opening_cli_gen_tb_writes_the_recomputed_tb_in_the_parse_schema(engine, monkeypatch, tmp_path, legacy_schema):
+    env = world(engine)
+    seed_cli_legacy(engine, env)
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", engine.url.render_as_string(hide_password=False))
+    monkeypatch.setenv("LEGACY_DATABASE_URL", engine.url.render_as_string(hide_password=False))
+    out = tmp_path / "tb.json"
+    rcpt = str(import_receipt_file(tmp_path))
+    assert opening_main(["gen-tb", "--tenant-id", str(env.tenant_id), "--as-of", "2025-12-31", "--receipt", str(out),
+                         "--import-receipt", rcpt, "--operator-ref", "operator-a"]) == 0  # fmt: skip
+    assert (os.stat(out).st_mode & 0o777) == 0o600
+    as_of, tb = opening.parse_tb(json.loads(out.read_text()), "0" * 64)
+    assert as_of == date(2025, 12, 31) and tb == {c: Decimal(n) for c, n in tb_rows().items()}
+
+
+def test_opening_requires_the_import_receipt_and_its_cutoff_equal_to_the_opening_date(
+    engine, monkeypatch, tmp_path, legacy_schema
+):
+    env = world(engine)
+    seed_cli_legacy(engine, env)
+    url = engine.url.render_as_string(hide_password=False)
+
+    def plan(directory, receipt_over=None, cutoff="2025-12-31"):
+        directory.mkdir()
+        base = cli_files(directory, env, [])
+        if receipt_over is not None or cutoff != "2025-12-31":
+            import_receipt_file(directory, cutoff, **(receipt_over or {}))  # overwrites the default fixture
         monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
         monkeypatch.setenv("LEGACY_DATABASE_URL", url)
-        receipt = sub_dir / "r.json"
-        assert opening_main(["plan", *base, "--receipt", str(receipt), "--operator-ref", "operator-a"]) == 3
-        out = json.loads(receipt.read_text())
-        assert out["refusal"] == "opening_control_not_subledger" and not out["ready"]
+        out = directory / "r.json"
+        code = opening_main(["plan", *base, "--receipt", str(out), "--operator-ref", "operator-a"])
+        return code, json.loads(out.read_text())
+
+    code, ok = plan(tmp_path / "ok")
+    assert code == 0 and ok["ready"]
+    code, out = plan(tmp_path / "differs", cutoff="2025-12-30")
+    assert code == 2 and out["refusal"] == "opening_as_of_differs_from_history_cutoff"
+    for name, over, refusal in (
+        ("dry", {"dry_run": True}, "invalid_import_receipt"),
+        ("kind", {"kind": "plan"}, "invalid_import_receipt"),
+        ("incomplete", {"complete": False}, "import_receipt_incomplete"),
+        ("nocutoff", {"history_cutoff": None}, "import_receipt_history_cutoff_missing"),
+    ):
+        code, out = plan(tmp_path / name, receipt_over=over)
+        assert code == 2 and out["refusal"] == refusal, name
+    # the plan sha binds the receipt sha: another (equally valid) receipt gives another plan sha
+    d = tmp_path / "other"
+    code, again = plan(d, receipt_over={"extra": "x"})
+    assert code == 0 and again["plan_sha256"] != ok["plan_sha256"]
+    # a bad --as-of is a named refusal, not a traceback
+    out = tmp_path / "tb.json"
+    code = opening_main(["gen-tb", "--tenant-id", str(env.tenant_id), "--as-of", "2025-13-45", "--receipt", str(out),
+                         "--import-receipt", str(import_receipt_file(tmp_path)), "--operator-ref", "o"])  # fmt: skip
+    assert code == 2 and json.loads(out.read_text())["refusal"] == "invalid_as_of"
     assert count_journals(engine, env) == 0
 
 
@@ -1326,6 +1576,7 @@ def test_opening_cli_refuses_an_untied_tb_before_touching_the_database(engine, m
     monkeypatch.delenv("LEGACY_DATABASE_URL", raising=False)
     receipt = tmp_path / "r.json"
     code = opening_main(["plan", "--spec", str(spec), "--tb", str(tb_path), "--ias8", str(ias_path),
+                         "--import-receipt", str(import_receipt_file(tmp_path)),
                          "--receipt", str(receipt), "--operator-ref", "operator-a"])  # fmt: skip
     out = json.loads(receipt.read_text())
     assert code == 3 and out["refusal"] == "opening_tb_not_zero_sum" and not out["ready"]
@@ -1345,9 +1596,11 @@ def test_gate_cli_exit_codes(engine, monkeypatch, tmp_path, owners_available):
     version, sha = store(engine, env, CLEAN_ITEMS, CLEAN_LEGACY)
     sign(engine, env, version, sha)
     receipt = tmp_path / "g1.json"
-    assert register_main(["gate", "--spec", str(spec), "--receipt", str(receipt), "--operator-ref", "operator-a"]) == 3
-    assert json.loads(receipt.read_text())["reasons"] == ["open_exceptions"]
-    # a resolve without APPLY is refused; with it, the gate passes
+    # as_is_v1: the open item is reported, the gate passes
+    assert register_main(["gate", "--spec", str(spec), "--receipt", str(receipt), "--operator-ref", "operator-a"]) == 0
+    out = json.loads(receipt.read_text())
+    assert out["reasons"] == [] and out["profile"] == "as_is_v1" and out["reports"]["open_count"] == 1
+    # a resolve without APPLY is refused; with it, the report count drops
     assert (
         register_main(
             [

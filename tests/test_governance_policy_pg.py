@@ -418,7 +418,7 @@ def test_downgrade_refuses_while_a_row_was_recorded_with_the_policy_off(engine):
             command.downgrade(_alembic(engine), "e2_0021_payroll_payout_returns")
         with engine.connect() as c:  # still at the head: nothing was relaxed
             assert c.execute(sa.text("SELECT count(*) FROM erp_governance_policies")).scalar() == 0
-            # still at the head (e2_0035, customer screen; stacked on e2_0028..e2_0033): nothing was relaxed
+            # still at the head (e2_0032, AR producer, chains after e2_0031 on main): nothing was relaxed
             assert "e2_0035_customer_finance" in {
                 r[0] for r in c.execute(sa.text("SELECT version_num FROM alembic_version"))
             }

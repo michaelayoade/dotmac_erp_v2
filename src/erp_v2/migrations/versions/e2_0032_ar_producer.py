@@ -20,7 +20,7 @@ tenant before use.
 
 The downgrade refuses while any row exists.
 
-Revision chain: e2_0031_billing_fact_postings (B-15) -> this. (The coordinator re-chains at merge.)
+Revision chain: e2_0031_billing_fact_postings (B-15) -> this.
 """
 
 from __future__ import annotations
@@ -71,6 +71,7 @@ def upgrade() -> None:
         sa.Column("amount", _MONEY, nullable=True),
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column("payment_terms_code", sa.String(80), nullable=True),
+        sa.Column("due_date", sa.Date(), nullable=True),
         sa.Column("status", sa.String(10), nullable=False),
         sa.Column("prepared_by", sa.Uuid(), nullable=False),
         sa.Column("issued_by", sa.Uuid(), nullable=True),
@@ -88,6 +89,7 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "NOT dual_control OR issued_by IS NULL OR prepared_by <> issued_by", name=f"ck_{DRAFTS_TABLE}_dual"
         ),
+        sa.CheckConstraint("due_date IS NULL OR due_date >= document_date", name=f"ck_{DRAFTS_TABLE}_due_date"),
         sa.CheckConstraint("(status = 'issued') = (issued_by IS NOT NULL)", name=f"ck_{DRAFTS_TABLE}_issued_by"),
         sa.CheckConstraint(
             "(billing_document_id IS NULL OR billing_settlement_id IS NULL) "
@@ -122,7 +124,7 @@ def upgrade() -> None:
     op.execute(f"GRANT SELECT, INSERT ON public.{DRAFTS_TABLE} TO app_user")
     op.execute(
         f"GRANT UPDATE (customer_account_id, currency, document_date, original_document_id, bank_account_id, "
-        f"bank_reference, amount, reason, payment_terms_code, status, issued_by, billing_document_id, "
+        f"bank_reference, amount, reason, payment_terms_code, due_date, status, issued_by, billing_document_id, "
         f"billing_settlement_id, updated_at) ON public.{DRAFTS_TABLE} TO app_user"
     )
 

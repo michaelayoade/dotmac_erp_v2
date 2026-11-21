@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
+import account_maintenance_support as accounts_gov
 import pytest
 import sqlalchemy as sa
 import test_b3_supplier_payments_pg as b3
@@ -547,7 +548,7 @@ def test_adjustment_offset_may_not_be_a_control_or_cash_account(engine, offset, 
 def test_adjustment_offset_must_be_open_for_posting(engine):
     env = world(engine)
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == env.accounts["6100"]).values(is_active=False))
+        accounts_gov.retire(db, env.accounts["6100"])
         db.commit()
     refused(lambda: adjustment(env, amount="10"), "offset_not_postable")
     refused(
@@ -569,7 +570,7 @@ def test_adjustment_offset_must_be_open_for_posting(engine):
 def test_missing_1410_account_refuses(engine):
     env = world(engine)
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == env.accounts["1410"]).values(code="1410-OLD"))
+        accounts_gov.recode(db, env.accounts["1410"], "1410-OLD")
         db.commit()
     refused(lambda: advance(env), "staff_loan_account_unavailable")
 

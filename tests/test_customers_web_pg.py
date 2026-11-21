@@ -6,7 +6,6 @@ role wherever it matters, so the W10 grants (SELECT, INSERT, column-limited UPDA
 """
 
 import os
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -64,19 +63,6 @@ def registries():
     install_setting_domains(SettingDomainRegistry.from_manifests(manifests))
     install_setting_value_types(SettingValueTypeRegistry.from_manifests(manifests))
     install_scope_kinds(ScopeKindRegistry.from_manifests(manifests))
-
-
-@pytest.fixture(autouse=True)
-def _reference_runtime_stub(monkeypatch):
-    """customers ``create_account`` lazily imports ``dotmac_kernel.db``, which needs a DSN and which a composed ERP
-    process refuses (the service then refuses ``create_unavailable``). Stand in for the fixed command (it should import
-    ``dotmac_kernel.transactions``) with the same savepoint helper, so the real command logic runs under test.
-    """
-    import sys
-
-    from dotmac_kernel.transactions import conflict_savepoint
-
-    monkeypatch.setitem(sys.modules, "dotmac_kernel.db", SimpleNamespace(conflict_savepoint=conflict_savepoint))
 
 
 def _setting(db, domain, key, value, tenant_id):

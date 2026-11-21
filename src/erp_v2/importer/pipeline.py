@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 import sqlalchemy as sa
@@ -157,6 +158,7 @@ def run_import(
     run_constants: Mapping[str, Any] | None = None,
     dry_run: bool = False,
     commit_per_spec: bool = False,
+    history_cutoff: date | None = None,
 ) -> ImportReceipt:
     """Execute specs in the given order; never skip a named failure.
 
@@ -173,6 +175,8 @@ def run_import(
     each spec so landed tables stay landed and lock growth stays
     bounded - one mega-transaction across ~780k rows exhausted
     the lock table and made all progress disposable (Gate 4).
+
+    `history_cutoff` (B-13) is required by any spec that declares one; the executor refuses without it.
     """
 
     explicit = dict(id_maps or {})
@@ -187,6 +191,7 @@ def run_import(
                 id_maps={**spec_maps, **explicit},
                 run_constants=dict(run_constants or {}),
                 dry_run=dry_run,
+                history_cutoff=history_cutoff,
             )
         )
         if commit_per_spec and not dry_run and spec.source_row_refusal is None:

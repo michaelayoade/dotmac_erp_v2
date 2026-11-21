@@ -105,6 +105,10 @@ def _date(value: str | None, label: str) -> date:
         raise ArRefused("invalid_input", f"Enter {label} as YYYY-MM-DD") from exc
 
 
+def _opt_date(value: str | None, label: str) -> date | None:
+    return _date(value, label) if (value or "").strip() else None
+
+
 def _form_items(form) -> list[tuple[str, str]]:
     return [(k, v) for k, v in form.multi_items() if isinstance(v, str) and k != "csrf_token"]
 
@@ -206,7 +210,7 @@ def _form_context(
         notice=notice,
         enabled=settings.producer_enabled(db, tenant.id),
         terms=cfg.terms,
-        default_terms=cfg.default_terms_code,
+        default_terms=service.default_terms_for_customer(db, tenant.id, customer_id, cfg),
         currency=currency,
         currency_error=currency_error,
         request_id=str(uuid4()),
@@ -246,6 +250,7 @@ async def invoice_create(
             document_date=_date(values.get("document_date"), "the invoice date"),
             lines=lines,
             payment_terms_code=values.get("payment_terms_code") or None,
+            due_date=_opt_date(values.get("due_date"), "the due date"),
         )
     except ArRefused as exc:
         return _page(
@@ -323,6 +328,7 @@ async def draft_save(
             amount=service.parse_decimal(values["amount"], label="amount") if values.get("amount") else draft.amount,
             reason=values.get("reason") or draft.reason,
             payment_terms_code=(values.get("payment_terms_code") or None) if draft.kind == KIND_INVOICE else None,
+            due_date=_opt_date(values.get("due_date"), "the due date") if draft.kind == KIND_INVOICE else None,
         )
     except ArRefused as exc:
         return _draft_page(request, db, tenant, party, draft_id, error=_message(exc))

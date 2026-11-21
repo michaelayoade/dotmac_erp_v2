@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+import account_maintenance_support as accounts_gov
 import pytest
 import sqlalchemy as sa
 import test_posting_bridge_pg as bridge_pg
@@ -544,7 +545,7 @@ def test_mapping_to_an_unknown_or_unusable_account_refuses(engine):
     refusal(engine, env, svc.finalize, run_id, "mapping_ref_form_refused", 2)
     blank_mapping(engine, "liability_account_ref", value=str(env.accounts["2110"]))
     with Session(engine) as db:
-        db.execute(sa.update(Account).where(Account.id == env.accounts["2110"]).values(is_active=False))
+        accounts_gov.retire(db, env.accounts["2110"])
         db.commit()
     refusal(engine, env, svc.finalize, run_id, "mapping_account_unusable", 2)
 

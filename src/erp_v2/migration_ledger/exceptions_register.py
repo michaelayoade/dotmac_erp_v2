@@ -14,8 +14,9 @@
 ``S.json`` is ``{"version": 1, "tenant_id": "<uuid>", "receipts": [{"kind": "held_drafts"|"import_itemised",
 "path": "<file>", "sha256": "<sha of the file>"}], "include_admission_reviews": true}``; every receipt is read
 through its sha and loaded by its adapter. Dry run is the default; every write needs ``--apply`` AND
-``ERP_MIGRATION_LEDGER_APPLY=1``. ``gate`` is read-only: exit 0 only when the open count is 0 AND the latest bridge
-version is signed; exit 3 otherwise (with the reasons).
+``ERP_MIGRATION_LEDGER_APPLY=1``. ``gate`` is read-only (profile ``as_is_v1``): exit 0 only when the latest bridge
+is signed and the ledger ties hold; the open count and class coverage are reported, not gated; exit 3 otherwise
+(with the reasons).
 """
 
 from __future__ import annotations
@@ -58,7 +59,8 @@ def gather(db: Session, tenant, spec) -> tuple[list[register.Fact], set[str], st
             Path(text(e["path"], "invalid_spec_schema", 1024)), sha_text(e["sha256"], "invalid_spec_schema")
         )
         body = strict_json(data, "invalid_receipt_json")
-        facts += register.from_import_itemised(body)
+        adapter = register.from_ar_census if e["kind"] == register.SRC_AR_CENSUS else register.from_import_itemised
+        facts += adapter(body)
         sources.add(e["kind"])
         shas.append(sha)
     facts += register.from_held_decisions(db, tenant)  # B-2 outcomes: the immutable table, never a receipt file

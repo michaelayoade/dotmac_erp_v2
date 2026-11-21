@@ -727,7 +727,8 @@ def test_migration_revision_chain_and_head():
 
     assert migration.revision == "e2_0032_ar_producer"
     assert migration.down_revision == "e2_0031_billing_fact_postings"
-    assert "e2_0035_customer_finance" in EXPECTED_HEADS  # stacked: the customer screen is the e2 head
+    assert "e2_0032_ar_producer" not in EXPECTED_HEADS  # e2_0033 (B-15 rev 2 VAT) chains after it
+    assert "e2_0035_customer_finance" in EXPECTED_HEADS  # the customer screen is the one e2 head
     assert not any(h.startswith("e2_003") and h != "e2_0035_customer_finance" for h in EXPECTED_HEADS)  # one e2 head
 
 
@@ -801,3 +802,32 @@ def test_the_f_d_notice_is_a_structural_sql_filter_with_no_truncation():
 def test_the_deallocate_key_carries_the_allocation_and_the_request():
     a, b, r = uuid4(), uuid4(), uuid4()
     assert service.key_dealloc(a, r) != service.key_dealloc(b, r) != service.key_dealloc(a, uuid4())
+
+
+def test_manual_basis_is_verified_and_names_the_manual_policy():
+    basis = terms.manual_basis(
+        invoice_date=date(2026, 1, 12), terms_code="net_30", terms_version="v1", evidence_ref="e", actor_ref="p"
+    )
+    assert basis.status is DueDateBasisStatus.VERIFIED and basis.derivation_policy == "erp_v2.ar.manual_due_date"
+    assert basis.override_actor == "p" and basis.override_reason
+
+
+def test_the_customer_screen_seams_exist_and_default_to_the_tenant_terms(monkeypatch):
+    cfg = _complete_settings()
+    assert service.default_terms_for_customer(Mock(), uuid4(), uuid4(), cfg) == "net_30"
+    # resolved at create/update and stored; issue reads only the stored code
+    monkeypatch.setattr(service.settings, "load", lambda db_, tenant: cfg)
+    assert service.resolve_terms_code(Mock(), uuid4(), service.KIND_INVOICE, uuid4(), None) == "net_30"
+    assert service.resolve_terms_code(Mock(), uuid4(), service.KIND_INVOICE, uuid4(), "net_60") == "net_60"
+    assert service.resolve_terms_code(Mock(), uuid4(), "credit_note", uuid4(), None) is None
+    assert service._stored_terms_code(SimpleNamespace(payment_terms_code="net_30"), cfg) == "net_30"
+    for bad, refusal in (
+        (None, "payment_terms_missing"),
+        ("", "payment_terms_missing"),
+        ("x", "payment_terms_unknown"),
+    ):
+        with pytest.raises(service.ArRefused) as e:
+            service._stored_terms_code(SimpleNamespace(payment_terms_code=bad), cfg)
+        assert e.value.code == refusal
+    snap = service._customer_document_snapshot(Mock(), uuid4(), SimpleNamespace(display_name="Acme"))
+    assert snap.legal_name == "Acme"

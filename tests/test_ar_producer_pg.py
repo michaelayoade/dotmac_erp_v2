@@ -1,10 +1,8 @@
 # ruff: noqa: S608  (test-only SQL built from generated uuids and constant table names)
 """B-16 AR producer against real PostgreSQL (hosted CI; ERP_TEST_POSTGRES_URL).
 
-Real accounting, numbering, tax, banking, kernel and (when a13 is on the path) billing migrations; real billing
-commands. The e2_0032 object tests (RLS, grants, triggers, downgrade guard) run everywhere; the billing flows need
-the unreleased dotmac-billing a13 command surface and skip when an older release is installed (the composition PR
-bumps the pin; locally a13 source is put on PYTHONPATH).
+Real accounting, numbering, tax, banking, kernel and billing (a13) migrations; real billing commands. The e2_0032
+object tests (RLS, grants, triggers, downgrade guard) and the billing flows all run; none is skipped.
 """
 
 import threading
@@ -52,15 +50,6 @@ from erp_v2.journals.routes import journals_web_feature
 engine = bridge_pg.engine  # disposable-database fixture under its own name
 
 DAY = date(2026, 1, 12)  # in the open January period, on or before NOW (2026-01-15)
-
-
-def _a13() -> bool:
-    import dotmac_billing
-
-    return tuple(int(p) for p in dotmac_billing.__version__.replace("a", ".").split(".")[:4]) >= (0, 1, 0, 13)
-
-
-needs_a13 = pytest.mark.skipif(not _a13(), reason="dotmac-billing a13 (unreleased) is required for the billing flows")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -506,14 +495,14 @@ def test_downgrade_refuses_while_rows_exist(engine):
     with pytest.raises(RuntimeError, match="refusing to drop"):
         command.downgrade(cfg, "e2_0031_billing_fact_postings")
     with engine.connect() as c:
-        versions = {r[0] for r in c.execute(sa.text("SELECT version_num FROM alembic_version"))}
-        assert "e2_0035_customer_finance" in versions
+        assert "e2_0035_customer_finance" in {
+            r[0] for r in c.execute(sa.text("SELECT version_num FROM alembic_version"))
+        }
 
 
-# --- the producer (needs the a13 command surface) --------------------------------------------------------------
+# --- the producer --------------------------------------------------------------
 
 
-@needs_a13
 def test_flag_off_refuses_every_action_and_writes_nothing(engine):
     env = world(engine, enabled=False)
     before = billing_counts(engine, env)
@@ -548,7 +537,6 @@ def test_flag_off_refuses_every_action_and_writes_nothing(engine):
         )
 
 
-@needs_a13
 def test_issue_one_line_invoice_takes_number_from_series_and_records_line_accounts(engine):
     env = world(engine)
     outcome = issue_invoice(engine, env, [line(env=env, vat=True)])
@@ -581,7 +569,6 @@ def test_issue_one_line_invoice_takes_number_from_series_and_records_line_accoun
     assert outstanding(engine, env, document.id) == Decimal("107.5")
 
 
-@needs_a13
 def test_issue_three_line_invoice_rows_equal_the_fact_lines(engine):
     env = world(engine)
     lines = [
@@ -603,7 +590,6 @@ def test_issue_three_line_invoice_rows_equal_the_fact_lines(engine):
         assert document.authoring_mode == "explicit_multiline"
 
 
-@needs_a13
 def test_double_post_and_two_sessions_give_one_issue(engine):
     env = world(engine)
     draft = draft_invoice(engine, env, [line(env=env)])
@@ -627,7 +613,6 @@ def test_double_post_and_two_sessions_give_one_issue(engine):
     assert counts["documents"] == 1 and counts["erp_ar_line_accounts"] == 1
 
 
-@needs_a13
 def test_draft_create_is_idempotent_per_request_and_a_changed_payload_conflicts(engine):
     env = world(engine)
     rid = uuid4()
@@ -650,7 +635,6 @@ def test_draft_create_is_idempotent_per_request_and_a_changed_payload_conflicts(
     )
 
 
-@needs_a13
 def test_receipt_with_two_allocations_and_a_remainder_replay_and_reference_reuse(engine):
     env = world(engine)
     one = issue_invoice(engine, env, [line(unit="100", env=env)]).document_id
@@ -681,7 +665,6 @@ def test_receipt_with_two_allocations_and_a_remainder_replay_and_reference_reuse
         )
 
 
-@needs_a13
 def test_auto_apply_on_issue_uses_unallocated_credit(engine):
     env = world(engine)
     post_receipt(engine, env, "40")  # no allocations: pure customer credit
@@ -694,7 +677,6 @@ def test_auto_apply_on_issue_uses_unallocated_credit(engine):
     assert outstanding(engine, env, other) == Decimal("100") and outstanding(engine, env, later) == Decimal("70")
 
 
-@needs_a13
 def test_apply_credit_deallocate_and_reverse_a_receipt_as_bounced(engine):
     env = world(engine)
     document = issue_invoice(engine, env, [line(unit="100", env=env)]).document_id
@@ -774,7 +756,6 @@ def test_apply_credit_deallocate_and_reverse_a_receipt_as_bounced(engine):
     )
 
 
-@needs_a13
 def test_credit_notes_within_outstanding_over_it_and_without_an_invoice(engine):
     env = world(engine)
     document = issue_invoice(engine, env, [line(unit="100", env=env, vat=True)]).document_id  # 107.50
@@ -830,7 +811,6 @@ def test_credit_notes_within_outstanding_over_it_and_without_an_invoice(engine):
     assert outstanding(engine, env, document) == Decimal("64.5")
 
 
-@needs_a13
 def test_void_rules_and_a_credit_note_can_be_voided(engine):
     env = world(engine)
     document = issue_invoice(engine, env, [line(unit="100", env=env)]).document_id
@@ -866,7 +846,6 @@ def test_void_rules_and_a_credit_note_can_be_voided(engine):
     act(engine, env, "approver", service.void_document, document_id=other, occurred_on=DAY)
 
 
-@needs_a13
 def test_a_migrated_invoice_cannot_be_voided(engine):
     env = world(engine)
     document = issue_invoice(engine, env, [line(unit="100", env=env)]).document_id
@@ -883,7 +862,6 @@ def test_a_migrated_invoice_cannot_be_voided(engine):
     )
 
 
-@needs_a13
 def test_a_mid_chain_billing_refusal_leaves_zero_billing_and_erp_rows(engine):
     env = world(engine)
     draft = draft_invoice(engine, env, [line("A", env=env), line("B", unit="20", env=env)], customer="C-2")
@@ -900,7 +878,6 @@ def test_a_mid_chain_billing_refusal_leaves_zero_billing_and_erp_rows(engine):
     assert act(engine, env, "approver", service.issue_draft, draft_id=draft.id).document_id
 
 
-@needs_a13
 def test_validation_refusals_at_issue(engine):
     env = world(engine)
     for account, code in (
@@ -955,7 +932,6 @@ def test_validation_refusals_at_issue(engine):
     assert refused(engine, env, "approver", service.issue_draft, draft_id=closed.id) == "period_missing"
 
 
-@needs_a13
 def test_dual_control_on_refuses_same_person_off_allows_it(engine):
     env = world(engine, dual=True)
     draft = draft_invoice(engine, env, [line(env=env)], who="solo")
@@ -970,7 +946,6 @@ def test_dual_control_on_refuses_same_person_off_allows_it(engine):
     assert act(engine, off, "preparer", service.post_receipt, draft_id=reciept_draft.id).settlement_id
 
 
-@needs_a13
 def test_runtime_role_issues_and_posts_end_to_end(engine):
     """The NOBYPASSRLS runtime role does a full issue + receipt + void: every grant the producer needs is there."""
     import os
@@ -1029,7 +1004,6 @@ def test_runtime_role_issues_and_posts_end_to_end(engine):
         admin.dispose()
 
 
-@needs_a13
 def test_gate_check_reports_setup_and_pre_flip_state(engine):
     env = world(engine, configured=False)
     with Session(engine) as db:
@@ -1051,7 +1025,6 @@ def test_gate_check_reports_setup_and_pre_flip_state(engine):
     assert "ar_rows_before_flip:erp_ar_line_accounts" in report.reasons
 
 
-@needs_a13
 def test_review_fixes_credit_note_shape_treatment_terms_periods_locks_and_replays(engine):
     from erp_v2.migration_ledger.models import MigrationException
 
@@ -1185,7 +1158,6 @@ def test_review_fixes_credit_note_shape_treatment_terms_periods_locks_and_replay
         assert queries.credit_note_notice(db, env.tenant_id, env.customers["C-2"]) == []
 
 
-@needs_a13
 def test_d9_on_only_the_preparer_may_edit_or_discard_a_draft(engine):
     env = world(engine, dual=True)
     draft = draft_invoice(engine, env, [line(env=env)], who="preparer")
@@ -1207,3 +1179,89 @@ def test_d9_on_only_the_preparer_may_edit_or_discard_a_draft(engine):
         document_date=DAY,
         lines=[line(unit="5", env=off)],
     )
+
+
+def test_a_manual_due_date_overrides_the_terms_and_is_recorded_as_manual(engine):
+    env = world(engine)
+    customer = env.customers["C-1"]
+    base = dict(kind="invoice", customer_account_id=customer, document_date=DAY, lines=[line(env=env)])
+    assert (
+        refused(engine, env, "preparer", service.create_draft, request_id=uuid4(), due_date=date(2026, 1, 11), **base)
+        == "due_date_before_invoice"
+    )
+    draft = act(engine, env, "preparer", service.create_draft, request_id=uuid4(), due_date=date(2026, 3, 1), **base)
+    doc = act(engine, env, "approver", service.issue_draft, draft_id=draft.id).document_id
+    with Session(engine) as db:
+        document = queries.billing_document(db, env.tenant_id, doc)
+        assert document.due_at.astimezone(terms.LAGOS).date() == date(2026, 3, 1)  # not +30 days
+        basis = document.due_date_basis
+        assert basis["derivation_policy"] == terms.MANUAL_POLICY and basis["override_actor"] == str(
+            env.people["preparer"]  # the preparer typed the manual due date (review fix), not the issuing approver
+        )
+        assert queries.draft(db, env.tenant_id, draft.id).due_date == date(2026, 3, 1)
+    # the same day is allowed; an edit that moves the invoice date past the due date is refused
+    same = act(engine, env, "preparer", service.create_draft, request_id=uuid4(), due_date=DAY, **base)
+    assert (
+        refused(
+            engine,
+            env,
+            "preparer",
+            service.update_draft,
+            draft_id=same.id,
+            customer_account_id=customer,
+            document_date=date(2026, 1, 13),
+            lines=[line(env=env)],
+            due_date=DAY,
+        )
+        == "due_date_before_invoice"
+    )
+    # no manual date: the terms-derived basis is unchanged
+    plain = issue_invoice(engine, env, [line(env=env)]).document_id
+    with Session(engine) as db:
+        assert queries.billing_document(db, env.tenant_id, plain).due_date_basis["derivation_policy"] == (
+            "erp_v2.ar.net_days"
+        )
+
+
+def test_guards_fire_for_a_login_member_of_app_user_not_only_app_user_itself(engine):
+    """Prod logs in as a LOGIN member of app_user (erp_v2_runtime): no e2_0032 guard may test current_user."""
+    import os
+
+    env = bridge_pg.seed(engine)
+    with engine.begin() as c:
+        draft = _raw_draft(c, env.tenant_id, status="issued", issued=uuid4())
+    role = f"ar_member_{uuid4().hex[:12]}"
+    admin = sa.create_engine(
+        sa.make_url(os.environ["ERP_TEST_POSTGRES_URL"]), isolation_level="AUTOCOMMIT", hide_parameters=True
+    )
+    with admin.connect() as c:
+        c.exec_driver_sql(f'CREATE ROLE "{role}" LOGIN NOBYPASSRLS')
+        c.exec_driver_sql(f'GRANT app_user TO "{role}"')
+    rt = sa.create_engine(engine.url.set(username=role), hide_parameters=True)
+    try:
+        assert role != "app_user"
+        with Session(rt) as db:
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
+            with pytest.raises(
+                sa.exc.DBAPIError, match="an issued or deleted AR draft is terminal"
+            ):  # terminal-status trigger
+                db.execute(
+                    sa.text("UPDATE erp_ar_drafts SET status = 'draft', issued_by = NULL WHERE id = :i"), {"i": draft}
+                )
+            db.rollback()
+            db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(env.tenant_id)})
+            with pytest.raises(
+                sa.exc.DBAPIError, match="AR draft lines change only while the draft is a draft"
+            ):  # draft-line trigger (header is issued)
+                db.execute(
+                    sa.text(
+                        "INSERT INTO erp_ar_draft_lines (id, tenant_id, draft_id, n) "
+                        "VALUES (gen_random_uuid(), :t, :i, 1)"
+                    ),
+                    {"t": env.tenant_id, "i": draft},
+                )
+    finally:
+        rt.dispose()
+        with admin.connect() as c:
+            c.exec_driver_sql(f'DROP ROLE "{role}"')
+        admin.dispose()
