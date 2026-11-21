@@ -61,7 +61,7 @@ EXPECTED_HEADS: tuple[str, ...] = (
     "cl_0001_collections",  # collections 0.1.0a1
     "cu_0001_customer_accounts",  # customers 0.1.0a2
     "do_0001_documents",  # documents 0.1.0a1
-    "e2_0032_ar_producer",  # assembly e2 head, B-16 AR producer
+    "e2_0033_billing_gl_vat",  # assembly e2 head, B-15 rev 2 VAT (e2_0031 mapper, e2_0032 B-16 AR producer beneath it)
     "dt_0001_durable_timers",  # durable-timers 0.1.0a1
     "ex_0002_claim_liabilities",  # expenses 0.1.0a2
     "fi_0002_selectable_planes",  # files 0.1.0a7

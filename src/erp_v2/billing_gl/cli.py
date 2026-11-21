@@ -46,12 +46,19 @@ def run_once(db, tenant_id: UUID, *, apply: bool, enable_once: bool, now: dateti
 
     from erp_v2.billing_gl.mapper import Mapper
 
-    db.execute(sa.text("SELECT set_config('app.current_tenant', :t, false)"), {"t": str(tenant_id)})
+    def scope_tenant() -> None:  # transaction-local: it must be set again in every transaction the mapper opens
+        db.execute(sa.text("SELECT set_config('app.current_tenant', :t, true)"), {"t": str(tenant_id)})
+
+    def commit_and_rescope() -> None:
+        db.commit()
+        scope_tenant()
+
+    scope_tenant()
     mapper = Mapper(
         db,
         tenant_id,
         now=now or datetime.now(UTC),
-        commit=db.commit if apply else (lambda: None),
+        commit=commit_and_rescope if apply else (lambda: None),
         enable_once=enable_once,
     )
     try:
@@ -86,6 +93,15 @@ def _audit(db, tenant_id: UUID, action: str, details: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args_in = sys.argv[1:] if argv is None else argv
+    if args_in[:1] == ["vat-opening"]:
+        from erp_v2.billing_gl import vat_opening
+
+        return vat_opening.main(args_in[1:])
+    if args_in[:1] == ["vat-extract"]:
+        from erp_v2.billing_gl import vat_extract
+
+        return vat_extract.main(args_in[1:])
     parser = argparse.ArgumentParser(prog="erp_v2.billing_gl")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run")

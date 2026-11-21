@@ -56,6 +56,10 @@ class Rule:
     predecessor: bool = False
     # False when the fact body must NOT be read (no public getter, or none needed).
     needs_fact: bool = True
+    # True when the fact moves cash-basis VAT (rev 2): the mapper supplies ``Env.plan`` with the VAT lines.
+    vat: bool = False
+    # True for an invoice or credit note: the whole journal comes from ``Env.plan`` (revenue, VAT, receivable).
+    document: bool = False
 
 
 def _post(**kw) -> Rule:
@@ -65,14 +69,14 @@ def _post(**kw) -> Rule:
 DISPATCH: Final = MappingProxyType(
     {
         # V1
-        (1, "invoice_issued"): Rule(BLOCK, "invoice_mapping_not_built", needs_fact=False),
-        (1, "credit_note_issued"): Rule(BLOCK, "invoice_mapping_not_built", needs_fact=False),
+        (1, "invoice_issued"): _post(document=True, vat=True),
+        (1, "credit_note_issued"): _post(document=True, vat=True),
         (1, "settlement_accepted"): _post(cash=CASH_SETTLEMENT),
-        (1, "allocation"): _post(),
-        (1, "deallocation"): _post(),
-        (1, "reallocation"): _post(),
+        (1, "allocation"): _post(vat=True),
+        (1, "deallocation"): _post(vat=True),
+        (1, "reallocation"): _post(vat=True),
         (1, "refund"): _post(cash=CASH_SETTLEMENT),
-        (1, "reversal"): _post(cash=CASH_REVERSAL, predecessor=True),
+        (1, "reversal"): _post(cash=CASH_REVERSAL, predecessor=True, vat=True),
         # V2 WHT, V3 non-cash: readable through billing a13's public getters (R9), but no GL treatment is defined
         # for them yet: the fact is read (integrity verified) and BLOCKED by name, never dropped.
         (2, "withholding_accepted"): Rule(BLOCK, "wht_mapping_not_built"),
@@ -84,8 +88,8 @@ DISPATCH: Final = MappingProxyType(
         # V4 opening cash
         (4, "opening_cash_imported"): Rule(SKIP_OPENING),
         (4, "opening_cash_import_reversed"): Rule(SKIP_UNWIND),
-        (4, "opening_cash_applied"): _post(),
-        (4, "cash_credit_draw_reversed"): _post(),
+        (4, "opening_cash_applied"): _post(vat=True),
+        (4, "cash_credit_draw_reversed"): _post(vat=True),
         (4, "opening_cash_refunded"): _post(cash=CASH_OPENING_REFUND),
         (4, "opening_cash_refund_corrected"): _post(cash=CASH_OPENING_REFUND),
         # V5 opening account
@@ -113,6 +117,25 @@ class Effect:
 
 
 @dataclass(frozen=True, slots=True)
+class AllocRow:
+    """One allocation effect: ``delta`` > 0 settles the document, < 0 un-settles it (``offsets_id`` = the original)."""
+
+    id: UUID | None
+    document_id: UUID | None
+    delta: Decimal
+    offsets_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Plan:
+    """VAT/document lines supplied by the mapper, plus what it persists after posting. ``block`` refuses the fact."""
+
+    lines: tuple[Line, ...] = ()
+    persist: object | None = None
+    block: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FactView:
     """What the decision needs from a decoded fact. No approval fields: V6 is never decoded (T3)."""
 
@@ -124,6 +147,11 @@ class FactView:
     occurred_at: datetime
     committed_at: datetime | None = None
     effects: tuple[Effect, ...] = ()
+    minor_units: int = 2
+    # (treatment, tax) of the fact's applied tax snapshots, for the per-treatment cross-check of the line accounts.
+    tax_snapshots: tuple[tuple[str, Decimal], ...] = ()
+    # Per-document settled amounts of an allocation-family fact (rev 2 VAT release).
+    alloc_rows: tuple[AllocRow, ...] = ()
     # Evidence the mapper uses to find the cash account of settlement-family facts.
     settlement_ids: tuple[UUID, ...] = ()
     reverses_fact_id: UUID | None = None
@@ -152,6 +180,10 @@ class Env:
     settlement_sources: tuple[str, ...] = ()
     # Kind of the reversed fact (reversal only), or None.
     reversed_kind: str | None = None
+    # Rev 2: the cash account of an erp_v2.ar receipt is structural; None unless its receipt row did not resolve.
+    cash_block: str | None = None
+    # Rev 2: the mapper's VAT / document plan for this fact (None for kinds without one).
+    plan: Plan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +191,7 @@ class Decision:
     disposition: Disp
     reason: str | None = None
     lines: tuple[Line, ...] = ()
+    persist: object | None = None  # the VAT positions/movements to write once the journal exists
 
 
 def _block(reason: str) -> Decision:
@@ -187,6 +220,8 @@ def _cash_source(rule: Rule, env: Env) -> str | Decision | None:
     """The cash-account key this fact needs, None when it needs no cash line, or a BLOCK."""
     if rule.cash is None:
         return None
+    if env.cash_block:
+        return _block(env.cash_block)
     if rule.cash == CASH_OPENING_REFUND:
         return "opening_refund"
     if rule.cash == CASH_REVERSAL and env.reversed_kind not in SETTLEMENT_FAMILY:
@@ -217,14 +252,52 @@ def decide(rule: Rule, view: FactView, env: Env) -> Decision:
     return builder(rule, view, env)
 
 
-def build_lane_lines(rule: Rule, view: FactView, env: Env) -> Decision:
-    effects = tuple(e for e in view.effects if e.delta != 0)
-    if not effects:
-        return Decision(Disp.NO_GL, "lane_neutral")
+DOCUMENT_KINDS: Final = frozenset({"invoice_issued", "credit_note_issued"})
+
+
+def _functional_check(view: FactView, env: Env) -> Decision | None:
     if env.functional_currency is None:
         return _block("functional_currency_unset")
     if view.currency != env.functional_currency:
         return _block("billing_fx_unsupported")
+    return None
+
+
+def _balanced(lines: list[Line]) -> bool:
+    return len(lines) >= 2 and sum((ln.debit - ln.credit for ln in lines), Decimal(0)) == 0
+
+
+def build_document(rule: Rule, view: FactView, env: Env) -> Decision:
+    """An invoice, a credit note, or the exact void of one: the journal is the mapper's plan, nothing else."""
+    failed = _functional_check(view, env)
+    if failed:
+        return failed
+    plan = env.plan
+    if plan is None or plan.block:
+        return _block(plan.block if plan and plan.block else "invoice_mapping_not_built")
+    lines = list(plan.lines)
+    if not _balanced(lines):
+        return _block("lane_effects_unbalanced")
+    return Decision(Disp.POST, None, tuple(lines), plan.persist)
+
+
+def build_lane_lines(rule: Rule, view: FactView, env: Env) -> Decision:
+    if rule.document or (rule.cash == CASH_REVERSAL and env.reversed_kind in DOCUMENT_KINDS):
+        return build_document(rule, view, env)
+    plan = env.plan if rule.vat else None
+    if plan is not None and plan.block:
+        return _block(plan.block)
+    vat_lines = list(plan.lines) if plan is not None else []
+    effects = tuple(e for e in view.effects if e.delta != 0)
+    if not effects and not vat_lines:
+        return Decision(Disp.NO_GL, "lane_neutral")
+    failed = (
+        _functional_check(view, env)
+        if effects
+        else (_block("functional_currency_unset") if env.functional_currency is None else None)
+    )
+    if failed:
+        return failed
     lines: list[Line] = []
     for effect in effects:
         built = _lane_line(effect, env)
@@ -249,9 +322,10 @@ def build_lane_lines(rule: Rule, view: FactView, env: Env) -> Decision:
         )
     elif net != 0:
         return _block("lane_effects_unbalanced")
-    if len(lines) < 2 or sum((ln.debit - ln.credit for ln in lines), Decimal(0)) != 0:
+    lines += vat_lines
+    if not _balanced(lines):
         return _block("lane_effects_unbalanced")
-    return Decision(Disp.POST, None, tuple(lines))
+    return Decision(Disp.POST, None, tuple(lines), plan.persist if plan is not None else None)
 
 
 # Per-(version, kind) line builders for kinds that need more than the lane rule (rev 2 invoice kinds).

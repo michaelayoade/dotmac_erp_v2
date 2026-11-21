@@ -727,8 +727,9 @@ def test_migration_revision_chain_and_head():
 
     assert migration.revision == "e2_0032_ar_producer"
     assert migration.down_revision == "e2_0031_billing_fact_postings"
-    assert "e2_0032_ar_producer" in EXPECTED_HEADS
-    assert not any(h.startswith("e2_003") and h != "e2_0032_ar_producer" for h in EXPECTED_HEADS)  # one e2 head
+    assert "e2_0032_ar_producer" not in EXPECTED_HEADS  # e2_0033 (B-15 rev 2 VAT) chains after it
+    assert "e2_0033_billing_gl_vat" in EXPECTED_HEADS
+    assert not any(h.startswith("e2_003") and h != "e2_0033_billing_gl_vat" for h in EXPECTED_HEADS)  # one e2 head
 
 
 def test_the_gate_check_module_is_read_only():
