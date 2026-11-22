@@ -1,0 +1,198 @@
+# ERP v2 deploy unit - schema dotmac.deploy_unit/1 (DRAFT, INERT).
+#
+# Sidecar to deploy/product.toml (design rev3 section 2.2). It holds NAMES,
+# types and bounds only: no value, no secret, no host address. Typed values and
+# secret references live in Control desired state, entered in the Control UI.
+# Nothing reads this file until Control a18 and the deploy agent exist, so
+# merging it changes no deployment.
+
+schema = "dotmac.deploy_unit/1"
+product = "dotmac-erp-v2"
+spec = "deploy/product.toml"
+# Binding by digest is the release record's job (product CI): it records the
+# digests of product.toml, this file and the params schema next to the image
+# digest. They are not stored here, because CI rewrites the image binding in
+# product.toml and a digest committed beside the sentinel would never match.
+
+# Section 2.7 (D-1): every private image is transferred, never pulled. This
+# table is written out only so the default is visible; an absent table means
+# the same. "pull" is accepted only for a repository on Control's
+# public_pull_repositories allowlist, which this file cannot widen.
+[image]
+source = "transfer"
+
+# ---------------------------------------------------------------- params
+# Non-secret typed values only. `material` ties a param to a Foundation
+# runtime-material name in product.toml; Control renders them into the
+# generated params.env. A secret-shaped value is refused at preview.
+
+[params.platform_root_domain]
+type = "hostname"
+required_in = ["production"]
+material = "PLATFORM_ROOT_DOMAIN"
+max_length = 253
+
+[params.trusted_hosts]
+type = "string"
+required_in = ["production"]
+material = "TRUSTED_HOSTS"
+# Comma-separated host names, no spaces.
+pattern = "^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$"
+max_length = 512
+
+# A serving process never seeds: fixed false.
+[params.seed_on_startup]
+type = "bool"
+default = false
+choices = [false]
+required_in = ["production"]
+material = "SEED_ON_STARTUP"
+
+# Where the existing legacy env file sits on the target. Entered in the UI,
+# never a literal here; the policy that allows it is Control's (section 2.8).
+[params.legacy_env_path]
+type = "path"
+pattern = "^/etc/dotmac/legacy/[A-Za-z0-9._-]+\\.env$"
+max_length = 255
+
+# Image identity for the planned release (Control pins and cross-checks both).
+[params.image_repository]
+type = "image_repository"
+required_in = ["production"]
+
+[params.image_digest]
+type = "image_digest"
+required_in = ["production"]
+
+# Bounded hold point for the companion's genesis window (packet C13).
+[params.a5_hold_timeout_seconds]
+type = "duration_seconds"
+default = 1800
+min = 60
+max = 3600
+required_in = ["production"]
+
+# ------------------------------------------------------- legacy env file
+# M11 bridge, existing app only (ERP flip). NAMES ONLY, never values, and only
+# secret-class names (invariant L2). Every other control (sha fixed at enable,
+# expiry, ceiling, relocation, retirement) is a Control policy, not a field
+# here. Names may only shrink (L3). Retirement moves them to [[bindings]].
+[legacy_env_file]
+names = [
+  "DATABASE_URL",
+  "PLATFORM_DATABASE_URL",
+  "JWT_SECRET",
+  "SESSION_HASH_SECRET",
+  "CSRF_SECRET",
+]
+path_param = "legacy_env_path"
+
+# -------------------------------------------------------------- bindings
+# Pre-staged exit from the legacy bridge. state = "pre_staged" means the
+# binding is declared and reviewable but is NOT yet a delivery source: the
+# legacy file stays the only source for the names above until the first
+# post-cutover deploy retires the bridge (section 2.8 L8). The value of each
+# binding is a secret_ref of the form bao://<env>/<product>/kv/<role>/<binding>,
+# held in Control, never here.
+[[bindings]]
+name = "DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "PLATFORM_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "JWT_SECRET"
+state = "pre_staged"
+kind = "key"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "SESSION_HASH_SECRET"
+state = "pre_staged"
+kind = "key"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "CSRF_SECRET"
+state = "pre_staged"
+kind = "key"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+# Owner and backup credentials: roles that never run in the serving container.
+[[bindings]]
+name = "MIGRATION_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["migrate"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = true
+
+[[bindings]]
+name = "BACKUP_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["backup"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+# ------------------------------------------------------------------ jobs
+# Operator-triggered one-shots of the flip. Genesis is the product.toml
+# migration step, not a job. A job runs only when the runbook step names it;
+# its arguments come from the flip runbook (docs/rehearsal.md), not from here.
+[[jobs]]
+name = "import"
+command = ["python", "-m", "erp_v2.importer", "execute"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+# ------------------------------------------------------------ hold point
+# The companion's genesis grant window is opened and closed by an operator op
+# outside the agent. The agent waits at this point, bounded by the param.
+[[hold_points]]
+name = "companion-genesis-window"
+member = "companion"
+before = "migrate"
+timeout_param = "a5_hold_timeout_seconds"
+on_timeout = "abandon_member_record_deviation"
+released_by = "operator"
+
+# ------------------------------------------------------------- companion
+# Deployment set: ERP v2 is the primary. The companion is released only after
+# the primary's signed observation is healthy; if it fails the primary stays up
+# and a deviation is recorded.
+[[companions]]
+product = "dotmac-integrator-companion"
+descriptor = "deploy/companion/deploy-unit.toml"
+order = "after_primary_ready"
+required_at_switch = false
+host = "same"
+
+# ---------------------------------------------------------------- health
+# Gate order the runner must pass, mapped onto Foundation probes and hooks. No
+# new gate engine.
+[health]
+gates = ["migrate", "heads", "live", "ready"]

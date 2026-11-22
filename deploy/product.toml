@@ -1,0 +1,188 @@
+# ERP v2 deployment descriptor - ProductDeploymentSpec.v3 (DRAFT, INERT).
+#
+# Work package WP4 of the build-once generic deploy design. Nothing consumes
+# this file until Control a18 and the deploy agent exist: merging it changes no
+# deployment. The sidecar deploy/deploy-unit.toml carries the typed params,
+# bindings, jobs, hold point and companion; this file stays a plain Foundation
+# spec and holds NAMES only, never values.
+#
+# UNBOUND SENTINELS, deliberately (as in the sub_thin descriptor): the image
+# digest, source revision and manifest digest are supplied by the product CI
+# release record. Inventing a digest here would be false provenance.
+
+schema = "ProductDeploymentSpec.v3"
+product = "dotmac-erp-v2"
+environment = "production"
+
+[assembly]
+manifest_path = "deploy/product-manifest.json"
+manifest_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[image]
+reference = "ghcr.io/michaelayoade/dotmac_erp_v2@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+source_revision = "0000000000000000000000000000000000000000"
+
+[runtime_materials]
+# Names only. Secret-class values arrive from the M11 legacy file (existing
+# app, time-boxed) and then from [[bindings]]; non-secret values are typed
+# params in deploy/deploy-unit.toml. MIGRATION_DATABASE_URL is the owner
+# credential and never enters a serving container (see roles.materials).
+names = [
+  "DATABASE_URL",
+  "PLATFORM_DATABASE_URL",
+  "PLATFORM_ROOT_DOMAIN",
+  "TRUSTED_HOSTS",
+  "SEED_ON_STARTUP",
+  "JWT_SECRET",
+  "SESSION_HASH_SECRET",
+  "CSRF_SECRET",
+  "MIGRATION_DATABASE_URL",
+  "BACKUP_DATABASE_URL",
+]
+
+[[roles]]
+code = "app"
+# Product-owned launcher (src/erp_v2/runtime.py): runs the materials gate and
+# the role-posture check before it serves.
+command = ["python", "-m", "erp_v2.runtime", "--port", "8000"]
+replicas = 1
+stop_grace_seconds = 30
+materials = [
+  "DATABASE_URL",
+  "PLATFORM_DATABASE_URL",
+  "PLATFORM_ROOT_DOMAIN",
+  "TRUSTED_HOSTS",
+  "SEED_ON_STARTUP",
+  "JWT_SECRET",
+  "SESSION_HASH_SECRET",
+  "CSRF_SECRET",
+]
+
+# Fixed literals: a missing ENVIRONMENT would skip the kernel's production
+# checks, and the candidate compose pins the same values.
+[roles.environment]
+ENVIRONMENT = "production"
+ERP_WEB_ENABLED = "true"
+CSRF_ENABLED = "true"
+
+[roles.resources]
+cpus = "1.0"
+memory = "1g"
+pids = 256
+
+[roles.security]
+user = "10001:10001"
+read_only_root = true
+no_new_privileges = true
+cap_drop = ["ALL"]
+tmpfs = ["/tmp"]
+
+[roles.health.live]
+path = "/health"
+port = 8000
+interval_seconds = 10
+timeout_seconds = 3
+retries = 3
+start_period_seconds = 15
+
+[roles.health.ready]
+path = "/health/ready"
+port = 8000
+interval_seconds = 10
+timeout_seconds = 5
+retries = 6
+start_period_seconds = 15
+
+# Loopback only; the on-host edge proxies to this port at the traffic switch.
+[[roles.ports]]
+container = 8000
+host = 8013
+protocol = "tcp"
+exposure = "loopback"
+address_family = "ipv4"
+
+[migration]
+command = ["python", "-m", "erp_v2.migrate", "upgrade", "heads"]
+heads_command = ["python", "-m", "erp_v2.migrate", "current"]
+owner_material = "MIGRATION_DATABASE_URL"
+# Equals erp_v2.migrate.EXPECTED_STAMPED_HEADS (tests/test_deploy_unit.py
+# keeps them equal).
+expected_heads = [
+  "ac_0004_account_maintenance",
+  "ao_0001_ai_operations",
+  "ap_0003_withdrawals",
+  "as_0001_assets",
+  "ay_0001_analytics",
+  "bi_0019_opening_dual_control",
+  "cg_0002_approval_withdrawals",
+  "cl_0001_collections",
+  "cu_0001_customer_accounts",
+  "do_0001_documents",
+  "dt_0001_durable_timers",
+  "e2_0035_customer_finance",
+  "ex_0002_claim_liabilities",
+  "fi_0002_selectable_planes",
+  "fm_0001_forms",
+  "fn_0001_asset_accounting",
+  "ib_0003_transport_refs",
+  "im_0001_import_runs",
+  "iv_0001_inventory",
+  "nu_0001_numbering",
+  "pa_0006_tax_release_hist_credit",
+  "pc_0001_procurement",
+  "pj_0001_projects",
+  "pm_0006_cash_qualification",
+  "pt_0001_party_context",
+  "py_0004_liability_adjustments",
+  "sa_0001_sales",
+  "tk_0001_tickets",
+  "tx_0005_tax_dependencies",
+  "wr_0001_runtime",
+]
+compatibility = "maintenance_required"
+lock_timeout_seconds = 300
+lock_retries = 4
+
+[backup]
+[[backup.datasets]]
+code = "primary"
+kind = "postgres"
+material = "BACKUP_DATABASE_URL"
+retention_days = 30
+checksum = "sha256"
+encryption = "age"
+restore_proof_max_age_days = 30
+
+[telemetry]
+logs = false
+metrics = false
+traces = false
+app_direct_shipping = false
+deployment_annotations = false
+
+[rollout]
+stability_window_seconds = 120
+rollback_images_retained = 2
+
+# The shared database server is attached to the internal "db" network by a
+# separate approved host step (companion packet W6); this file does not
+# create that attachment.
+[compose_topology]
+roles_depend_on_migrate = false
+
+[[compose_topology.networks]]
+code = "front"
+loopback_default = true
+
+[[compose_topology.networks]]
+code = "db"
+internal = true
+
+[[compose_topology.placements]]
+code = "app"
+networks = ["front", "db"]
+
+[[compose_topology.placements]]
+code = "migrate"
+networks = ["db"]
+profiles = ["ops"]
