@@ -9,6 +9,8 @@
 schema = "dotmac.deploy_unit/1"
 product = "dotmac-erp-v2"
 spec = "deploy/product.toml"
+# The <product> segment of the approved OpenBao layout <env>/<product>.
+secrets_namespace = "erp"
 # Binding by digest is the release record's job (product CI): it records the
 # digests of product.toml, this file and the params schema next to the image
 # digest. They are not stored here, because CI rewrites the image binding in

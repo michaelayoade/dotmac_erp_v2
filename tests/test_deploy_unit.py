@@ -25,6 +25,8 @@ UNIT_PATH = ROOT / "deploy" / "deploy-unit.toml"
 SPEC_PATH = ROOT / "deploy" / "product.toml"
 
 SCHEMA = "dotmac.deploy_unit/1"
+NAMESPACE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+EXPECTED_NAMESPACE = "erp"
 PARAM_TYPES = frozenset(
     {
         "string",
@@ -56,8 +58,9 @@ HEALTH_GATES = frozenset(
 )
 BINDING_STATES = frozenset({"pre_staged", "active"})
 MATERIAL_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
-# Control is default-deny: legacy_env_file_allowed_products defaults to ERP v2
-# only, and a descriptor under deploy/companion/ is always refused.
+# Control is default-deny: legacy_env_file_allowed_targets is empty until Michael
+# enables a target (ERP v2 is the only intended one), and a descriptor under
+# deploy/companion/ is always refused.
 LEGACY_ALLOWED_DEFAULT = frozenset({"dotmac-erp-v2"})
 REFUSED_BY_DEFAULT = frozenset({"dotmac-sub", "dotmac-integrator-companion"})
 SECRET_NAME_HINT = re.compile(r"(SECRET|TOKEN|PASSWORD|KEY|DATABASE_URL|_DSN)$")
@@ -108,6 +111,9 @@ def check_unit(
     product = unit.get("product", "")
     if not product:
         problems.append("product")
+    namespace = unit.get("secrets_namespace")
+    if not isinstance(namespace, str) or NAMESPACE.fullmatch(namespace) is None:
+        problems.append("secrets-namespace")
     if unit.get("spec") != "deploy/product.toml" and not companion_path:
         problems.append("spec-path")
     if "spec_digest" in unit:
@@ -471,3 +477,27 @@ def test_foundation_validate_accepts_product_toml() -> None:
     # is also run from a Starter source checkout when the descriptor changes.
     cli = pytest.importorskip("dotmac_deployment_foundation.cli")
     assert cli.main(["-f", str(SPEC_PATH), "validate"]) == 0
+
+
+def test_secrets_namespace_matches_the_segment_grammar() -> None:
+    unit = _unit()
+    assert unit["secrets_namespace"] == EXPECTED_NAMESPACE
+    assert NAMESPACE.fullmatch(unit["secrets_namespace"])
+    for bad in ("", "Erp", "-x", "a/b", "a b", "x" * 65, "a\n", "staging/erp"):
+        broken = copy.deepcopy(unit)
+        broken["secrets_namespace"] = bad
+        assert "secrets-namespace" in _check(broken), repr(bad)
+    missing = copy.deepcopy(unit)
+    del missing["secrets_namespace"]
+    assert "secrets-namespace" in _check(missing)
+
+
+def test_authored_openbao_config_uses_the_descriptor_namespace() -> None:
+    # No app-authored OpenBao config exists under deploy/ yet (D2 / I3), so this
+    # holds vacuously until one lands; then every bao:// reference in it must use
+    # the descriptor's namespace as its <product> segment.
+    namespace = _unit()["secrets_namespace"]
+    for path in sorted(ROOT.joinpath("deploy").rglob("*")):
+        if path.is_file() and "openbao" in path.parts:
+            for match in re.finditer(r"bao://[^/\s]+/([^/\s]+)/", path.read_text()):
+                assert match.group(1) == namespace, path.name
