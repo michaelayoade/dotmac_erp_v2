@@ -129,6 +129,27 @@ def posted_reclass(db: Session, tenant: UUID) -> JournalEntry | None:
     return rows[0] if rows else None
 
 
+def is_reclass_journal(owner: str | None, kind: str | None) -> bool:
+    """Read-only: is a journal with this owner and document kind the claim-family reclass? (Readers use this instead
+    of naming the kind, so the builder-only rule for the kind stays true.)"""
+    return owner == OWNER and kind == KIND_CLAIM_RECLASS
+
+
+def reclass_journal_ids(db: Session, tenant: UUID) -> list[str]:
+    """Read-only: every claim-family reclass journal id of the tenant. Unlike ``posted_reclass`` it never refuses on
+    duplicates, so a reader can report them."""
+    return sorted(
+        str(i)
+        for i in db.scalars(
+            sa.select(JournalEntry.id).where(
+                JournalEntry.tenant_id == tenant,
+                JournalEntry.source_owner == OWNER,
+                JournalEntry.source_document_kind == KIND_CLAIM_RECLASS,
+            )
+        )
+    )
+
+
 def admitted_from_receipts(db: Session, tenant: UUID) -> tuple[list[Admitted], str | None]:
     """Every admitted claim read from the owner rows (receipt + liability), and the one snapshot sha they share."""
     code_of = {str(i): c for i, c in db.execute(sa.select(Account.id, Account.code).where(Account.tenant_id == tenant))}

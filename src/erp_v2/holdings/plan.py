@@ -40,6 +40,7 @@ from erp_v2.migration_ledger.common import canonical_sha, day, fmt, sha_text, st
 ORDER: Final = ("1400", "2000", "2040", "2045", "1410", PREPAYMENT)
 OPENING_OWNER: Final = "erp.opening"
 SPEC_KEYS: Final = {"version", "tenant_id", "window_id", "capture_date", "evidence_ref", "params", "receipts"}
+MANIFEST_RECEIPT: Final = "gl_attribution_manifest"
 OwnerReader = Callable[[Session, UUID, str, str], Mapping[tuple[Party, str], Decimal]]
 
 
@@ -61,6 +62,7 @@ class RunSpec:
     straddle: ReceiptRef | None = None
     subkobo: ReceiptRef | None = None
     import_receipt: ReceiptRef | None = None
+    gl_attribution_manifest: ReceiptRef | None = None  # required when any gl_attribution is named
 
 
 def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
@@ -76,6 +78,7 @@ def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
         "straddle",
         "subkobo",
         "import_receipt",
+        MANIFEST_RECEIPT,
     }:
         refuse("invalid_spec_schema")
     params = body["params"]
@@ -92,6 +95,8 @@ def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
     attributions = receipts.get("gl_attribution", {})
     if not isinstance(attributions, dict) or not set(attributions) <= set(HOLDING_CODES) - {"1400", PREPAYMENT}:
         refuse("invalid_spec_schema")
+    if attributions and MANIFEST_RECEIPT not in receipts:
+        refuse("gl_attribution_manifest_required")
     return (
         RunSpec(
             uuid_text(body["tenant_id"], "invalid_tenant_id"),
@@ -104,6 +109,7 @@ def parse_spec(raw: bytes) -> tuple[RunSpec, str]:
             ref(receipts["straddle"]) if "straddle" in receipts else None,
             ref(receipts["subkobo"]) if "subkobo" in receipts else None,
             ref(receipts["import_receipt"]) if "import_receipt" in receipts else None,
+            ref(receipts[MANIFEST_RECEIPT]) if MANIFEST_RECEIPT in receipts else None,
         ),
         sha,
     )
@@ -195,6 +201,12 @@ def check_held_in_register(db: Session, tenant: UUID, attribution: GlAttribution
                 refuse("held_amount_differs_from_register", e.source_key)
 
 
+def check_manifest_fresh(receipts: Receipts, snap: Snapshot) -> None:
+    """The attribution receipts attribute the ledger AS PRODUCED: any posting since makes them stale."""
+    if receipts.manifest_v2_posted_sha256 is not None and receipts.manifest_v2_posted_sha256 != snap.ledger_sha:
+        refuse("attribution_manifest_stale", "the ledger moved since the attribution receipts were produced")
+
+
 # --- snapshot -----------------------------------------------------------------------------------------------------
 
 
@@ -245,6 +257,7 @@ class Receipts:
     census_sha: str | None
     gl_attribution: dict[str, GlAttribution]
     shas: dict[str, str]
+    manifest_v2_posted_sha256: str | None = None  # the GL attribution manifest's ledger sha (None: no manifest)
 
 
 def _minor_dec(value: int) -> Decimal:

@@ -69,6 +69,7 @@ def run_plan(
     receipts = receipts_loader(spec)
     with read_only_session(engine) as db:
         snap = planning.read_snapshot(db, spec, billing, owner_readers=owner_readers)
+        planning.check_manifest_fresh(receipts, snap)  # the attribution receipts describe the ledger as produced
         if receipts.census is not None:
             planning.anchor_census(db, spec.tenant_id, receipts.census, spec.window_id)  # F1
             planning.check_held_in_register(  # F6

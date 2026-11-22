@@ -6,11 +6,13 @@ Billing R1 (a13) and the owner subledgers are injected fakes: a12 has no R1 and 
 Hosted CI only (ERP_TEST_POSTGRES_URL), like test_migration_ledger_pg.
 """
 
+import hashlib
 import json
 import os
 import stat
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -154,7 +156,7 @@ def write(path, body):
     return path
 
 
-def make_spec(tmp_path, *, window=WINDOW, params=None):
+def make_spec(tmp_path, *, window=WINDOW, params=None, tenant=None):
     census = write(tmp_path / "census.json", {"census_sha256": DIGEST, "gl_attribution": {
         "parties": [
             {"customer": "C1", "currency": "NGN", "gl_minor": 100000, "carried_minor": 90000, "cash_lot_minor": 20000},
@@ -182,12 +184,43 @@ def make_spec(tmp_path, *, window=WINDOW, params=None):
 
         return {"path": str(p), "sha256": hashlib.sha256(raw).hexdigest()}
 
+    manifest = write(
+        tmp_path / "gl-attribution-manifest.json", attribution_manifest(["2000", "1410"], [ap, loans], tenant=tenant)
+    )
     spec = {
         "version": 1, "tenant_id": None, "window_id": window, "capture_date": "2026-01-20",
         "evidence_ref": "EVID-1", "params": params or {},
-        "receipts": {"census": ref(census), "gl_attribution": {"2000": ref(ap), "1410": ref(loans)}},
+        "receipts": {
+            "census": ref(census), "gl_attribution": {"2000": ref(ap), "1410": ref(loans)},
+            "gl_attribution_manifest": ref(manifest),
+        },
     }  # fmt: skip
     return spec
+
+
+def attribution_manifest(codes, files, ledger_sha="c" * 64, tenant=None):
+    return {
+        "kind": "gl-attribution-manifest", "version": 1, "v2_posted_sha256": ledger_sha,
+        "tenant_scope": hashlib.sha256(str(tenant).encode()).hexdigest(), "capture_date": "2026-01-20",
+        "codes": {c: {"receipt_sha256": hashlib.sha256(f.read_bytes()).hexdigest()} for c, f in zip(codes, files, strict=True)},
+    }  # fmt: skip
+
+
+def restamp(engine, env):
+    """The attribution manifest describes the ledger as produced (the runbook runs the producer after T1): re-stamp it
+    with the current ledger sha, as a fresh producer run would."""
+    import hashlib
+
+    body = json.loads(env.spec)
+    ref = body["receipts"]["gl_attribution_manifest"]
+    path = Path(ref["path"])
+    manifest = json.loads(path.read_bytes())
+    with Session(engine) as db:
+        manifest["v2_posted_sha256"] = positions.v2_posted_sha(db, env.tenant_id)
+        db.rollback()
+    path.write_text(json.dumps(manifest))
+    ref["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    env.spec = json.dumps(body).encode()
 
 
 def spec_bytes(env, spec):
@@ -230,7 +263,7 @@ def flip_world(engine, tmp_path, *, dual=False, window=WINDOW, params=None, regi
     seed_gl(engine, env, "2000", D("-1100"))
     seed_gl(engine, env, "1400", D("1530"))
     seed_gl(engine, env, "1410", D("80"))
-    env.spec = spec_bytes(env, make_spec(tmp_path, window=window, params=params))
+    env.spec = spec_bytes(env, make_spec(tmp_path, window=window, params=params, tenant=env.tenant_id))
     env.readers, env.sub = readers()
     return env
 
@@ -245,6 +278,7 @@ def t1(engine, env, bill=None, **kw):
 
 
 def holding_plan(engine, env, bill=None, planned_by=OP_A):
+    restamp(engine, env)
     return applying.run_plan(
         engine, env.spec, cli.load_receipts, bill or billing(), planned_by=planned_by, owner_readers=env.readers
     )
@@ -333,7 +367,7 @@ def test_a_zero_cash_lot_posts_nothing(engine, tmp_path):
     env = world(engine)
     seed_admissions(engine, env)
     seed_gl(engine, env, "1400", D("1500"))
-    spec = make_spec(tmp_path)
+    spec = make_spec(tmp_path, tenant=env.tenant_id)
     census = json.loads((tmp_path / "census.json").read_text())
     for p in census["gl_attribution"]["parties"]:
         p["cash_lot_minor"] = 0
@@ -964,6 +998,8 @@ def test_the_cli_plans_dry_by_default_applies_only_with_the_switch_and_writes_pr
         == 0
     )
     assert net(engine, env, "2105") == D("-200")
+    restamp(engine, env)  # the producer runs after T1: the manifest carries the ledger as it now stands
+    spec_path.write_bytes(env.spec)
     env_dsn()
     plan_receipt = tmp_path / "plan.json"
     assert cli.main(["plan", "--spec", str(spec_path), "--receipt", str(plan_receipt), "--operator-ref", OP_A]) == 0
@@ -1042,7 +1078,7 @@ def test_the_cli_refuses_serving_dsns_and_a_missing_receipt_path_is_not_overwrit
 def test_f1_t1_refuses_when_the_admission_rows_disagree_with_the_census_or_billing(engine, tmp_path):
     env = world(engine)
     seed_gl(engine, env, "1400", D("1530"))
-    env.spec = spec_bytes(env, make_spec(tmp_path))
+    env.spec = spec_bytes(env, make_spec(tmp_path, tenant=env.tenant_id))
     with pytest.raises(HoldingRefused) as e:
         t1_mod.run_t1_plan(engine, env.spec, cli.load_receipts, billing(), planned_by=OP_A)
     assert e.value.code == "ar_admissions_missing"
@@ -1065,7 +1101,7 @@ def test_f1_the_admitted_partition_set_must_equal_the_census_carrying_parties(en
     env = world(engine)
     seed_gl(engine, env, "1400", D("1530"))
     seed_admissions(engine, env, parties=(("C1", "NGN"),))  # C2 carries items in the census but was not admitted
-    env.spec = spec_bytes(env, make_spec(tmp_path))
+    env.spec = spec_bytes(env, make_spec(tmp_path, tenant=env.tenant_id))
     with pytest.raises(HoldingRefused) as e:
         t1_mod.run_t1_plan(engine, env.spec, cli.load_receipts, billing(), planned_by=OP_A)
     assert e.value.code == "admissions_differ_from_census"
@@ -1816,7 +1852,7 @@ def test_n3_persisted_holding_config_closes_the_window_and_an_admission_of_anoth
             )
         )
         db.commit()
-    env2.spec = spec_bytes(env2, make_spec(tmp_path))
+    env2.spec = spec_bytes(env2, make_spec(tmp_path, tenant=env2.tenant_id))
     seed_gl(engine, env2, "1400", D("1530"))
     t1(engine, env2)  # the extra admission row belongs to ANOTHER window and does not break the anchor
 
