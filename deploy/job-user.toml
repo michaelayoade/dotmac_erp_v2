@@ -1,0 +1,16 @@
+# The ERP product constant for the operator-job user (P-SEC C-29, R6-3).
+#
+# Import and the other flip jobs run as the SEPARATE user `dotmac-erp-import`, never
+# as the serving ERP user (10001:10001, deploy/product.toml). The numeric uid/gid is
+# pinned here once; the Dockerfile (user and /job/out ownership at 0700) and the
+# job's container user in the operator spec use exactly this value, and a test fails
+# on any drift between them.
+#
+# Choice of 10040: the serving user is 10001; the block 10001..10039 is left to the
+# serving app and the companion (whose descriptor lives outside this repository), and
+# 10040..10049 is reserved for ERP operator-job users. The companion's own uid is
+# not visible here, so confirm it is outside 10040..10049 when the companion pins it.
+[import_job_user]
+name = "dotmac-erp-import"
+uid = 10040
+gid = 10040

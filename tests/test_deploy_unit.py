@@ -954,24 +954,31 @@ def test_per_mode_materials_are_the_hand_reviewed_ones() -> None:
         assert (jobs[name].get("role") == "import") is bool(expected), name
 
 
-def test_the_image_ships_job_in_and_an_import_owned_job_out() -> None:
-    """Foundation's per-dispatch output volume inherits /job/out from the image: owned
-    by the SEPARATE import uid (C-29) at 0700, with /job/in present. The job's
-    container user names that uid and is never the serving ERP uid."""
-    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+def test_the_import_uid_is_one_pinned_constant_used_everywhere() -> None:
+    """R6-3: `dotmac-erp-import` has ONE fixed numeric uid (deploy/job-user.toml), not
+    the serving uid, outside the block left to the serving app and companion; the job
+    spec's container user and the image's /job/out ownership use exactly it."""
+    pinned = tomllib.loads((ROOT / "deploy" / "job-user.toml").read_text())["import_job_user"]
+    assert pinned["name"] == "dotmac-erp-import"
+    uid, gid = pinned["uid"], pinned["gid"]
+    assert isinstance(uid, int) and isinstance(gid, int) and uid == gid
     serving = _spec()["roles"][0]["security"]["user"]
-    fixture = json.loads(
-        (ROOT / "tests" / "fixtures" / "operator_commands.provisional.json").read_text(encoding="utf-8")
-    )
-    job_user = fixture["user"]  # PROVISIONAL: moves to the spec's operator table
-    assert re.fullmatch(r"[0-9]+:[0-9]+", job_user) and not job_user.startswith("0:")
-    assert job_user != serving, "import jobs never run as the serving uid"
-    uid, gid = job_user.split(":")
-    assert fixture["user_name"] == "dotmac-erp-import"
-    assert f"groupadd --gid {gid} dotmac-erp-import" in dockerfile
+    assert f"{uid}:{gid}" != serving
+    assert 10040 <= uid <= 10049, "ERP operator-job users own 10040..10049"
+    # Every uid the ERP product spec uses is outside that block.
+    for role in _spec()["roles"]:
+        used = int(role["security"]["user"].split(":")[0])
+        assert not 10040 <= used <= 10049, role["code"]
+    # The job's container user (provisional operator fixture) is exactly it.
+    fixture = json.loads((ROOT / "tests" / "fixtures" / "operator_commands.provisional.json").read_text())
+    assert fixture["user"] == f"{uid}:{gid}"
+    assert fixture["user_name"] == pinned["name"]
+    # The image creates it and gives /job/out to it at 0700.
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert f"groupadd --gid {gid} {pinned['name']}" in dockerfile
     assert f"useradd --uid {uid} --gid {gid}" in dockerfile
     assert "mkdir -p /job/in /job/out" in dockerfile
-    assert f"chown {job_user} /job/out" in dockerfile
+    assert f"chown {uid}:{gid} /job/out" in dockerfile
     assert f"chown {serving} /job/out" not in dockerfile
     assert "chmod 0700 /job/out" in dockerfile
     assert "chmod 0755 /job/in" in dockerfile
