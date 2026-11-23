@@ -74,6 +74,45 @@ min = 60
 max = 3600
 required_in = ["production"]
 
+# ------------------------------------------- import-job params (job-scoped)
+# Typed inputs of the dispatched `import` job ONLY (jobs = ["import"]). Control
+# renders them into that job's env and never into the serving app's params.env;
+# the scope is covered by the plan digest. Types follow what the importer reads
+# (src/erp_v2/importer/cli.py):
+#   * ERP_IMPORT_APPROVED / ERP_IMPORT_APPLY_OK are compared to the STRING "1"
+#     (`os.environ.get(...) != "1"`), so a bool (rendered true/false) would never
+#     approve: they are enums of "0"/"1", default "0".
+#   * ERP_ENROLMENT_ACTOR_ID is parsed with uuid.UUID(...): a canonical dashed UUID.
+#   * ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF is only stripped and required non-empty;
+#     it is stored in a String(240) column (net_payable_account_ref).
+[params.import_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_IMPORT_APPROVED"
+jobs = ["import"]
+
+[params.import_apply_ok]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_IMPORT_APPLY_OK"
+jobs = ["import"]
+
+[params.enrolment_actor_id]
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+material = "ERP_ENROLMENT_ACTOR_ID"
+jobs = ["import"]
+
+[params.payroll_net_payable_account_ref]
+type = "string"
+min_length = 1
+max_length = 240
+material = "ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF"
+jobs = ["import"]
+
 # ------------------------------------------------------- legacy env file
 # M11 bridge, existing app only (ERP flip). NAMES ONLY, never values, and only
 # secret-class names (invariant L2). Every other control (sha fixed at enable,
@@ -146,7 +185,7 @@ single_use = false
 name = "MIGRATION_DATABASE_URL"
 state = "pre_staged"
 kind = "pg_login_dsn"
-roles = ["migrate"]
+roles = ["migrate", "import"]
 writer = "ceremony"
 rotation = "copy_only"
 single_use = true
@@ -160,15 +199,30 @@ writer = "ceremony"
 rotation = "copy_only"
 single_use = false
 
+# The legacy source DSN, read by the dispatched `import` job and by nothing else
+# (import-only OpenBao): never a legacy_env_file name, never an app material.
+# single_use is PROVISIONAL (P-SEC rev4 sets the final answer); a role's secret_id
+# is single-use if ANY binding in the role is, so `import` is single-use through
+# MIGRATION_DATABASE_URL regardless of this value.
+[[bindings]]
+name = "LEGACY_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["import"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
 # ------------------------------------------------------------------ jobs
 # Operator-triggered one-shots of the flip. Genesis is the product.toml
 # migration step, not a job. A job runs only when the runbook step names it;
 # its arguments come from the flip runbook (docs/rehearsal.md), not from here.
 [[jobs]]
 name = "import"
+role = "import"
 command = ["python", "-m", "erp_v2.importer", "execute"]
 trigger = "operator"
-materials = ["MIGRATION_DATABASE_URL"]
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
 # ------------------------------------------------------------ hold point

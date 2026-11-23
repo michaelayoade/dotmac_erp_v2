@@ -57,6 +57,10 @@ HEALTH_GATES = frozenset(
     }
 )
 BINDING_STATES = frozenset({"pre_staged", "active"})
+# Import-only OpenBao: these belong to a DISPATCHED job and to nothing else. They
+# are never a legacy_env_file name and never a material of the serving app (an
+# unscoped param); they reach the job only through its role's mint.
+JOB_ONLY_MATERIALS = frozenset({"MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"})
 MATERIAL_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 # Control is default-deny: legacy_env_file_allowed_targets is empty until Michael
 # enables a target (ERP v2 is the only intended one), and a descriptor under
@@ -137,13 +141,23 @@ def check_unit(
         if material is not None:
             if not MATERIAL_NAME.match(material):
                 problems.append(f"param-material-name:{name}")
-            if materials and material not in materials:
+            scoped = param.get("jobs", [])
+            # A job-scoped param reaches only its job's env, never Foundation, so
+            # it is not a product.toml runtime material.
+            if materials and material not in materials and not scoped:
                 problems.append(f"param-material-unknown:{name}")
+            if material in JOB_ONLY_MATERIALS and not scoped:
+                problems.append(f"param-job-only-material:{name}")
             if material in seen_materials:
                 problems.append(f"param-material-duplicate:{name}")
             seen_materials[material] = name
             if SECRET_NAME_HINT.search(material):
                 problems.append(f"param-material-secret-class:{name}")
+        scope = param.get("jobs", [])
+        if scope and (not isinstance(scope, list) or not set(scope) <= {j.get("name") for j in unit.get("jobs", [])}):
+            problems.append(f"param-job-unknown:{name}")
+        if scope and material is None:
+            problems.append(f"param-job-material:{name}")
         for key in ("default", "pattern"):
             value = param.get(key)
             if isinstance(value, str) and key == "default" and _bad_value(value):
@@ -195,6 +209,8 @@ def check_unit(
                 problems.append(f"legacy-collides-with-param:{name}")
             if name in active_binding_names:
                 problems.append(f"legacy-collides-with-binding:{name}")
+            if name in JOB_ONLY_MATERIALS:
+                problems.append(f"legacy-job-credential:{name}")
         if set(legacy) - {"names", "path_param"}:
             problems.append("legacy-extra-keys")
         path_param = params.get(legacy.get("path_param", ""), {})
@@ -222,9 +238,12 @@ def check_unit(
             "duration_seconds",
         }:
             problems.append(f"param-bounds-type:{name}")
+    binding_roles = {r for b in bindings for r in b.get("roles", [])}
     for job in unit.get("jobs", []):
         if job.get("trigger") != "operator":
             problems.append(f"job-trigger:{job.get('name')}")
+        if job.get("role") is not None and job["role"] not in binding_roles:
+            problems.append(f"job-role-unknown:{job.get('name')}")
         known = {p["material"] for p in params.values() if "material" in p}
         for material in job.get("materials", []):
             if material not in known | binding_names:
@@ -395,7 +414,8 @@ def test_params_are_typed_and_refuse_unsafe_values() -> None:
 def test_param_materials_exist_in_product_spec() -> None:
     materials = set(_spec()["runtime_materials"]["names"])
     for name, param in _unit()["params"].items():
-        if "material" in param:
+        # Job-scoped params reach only their job's env, never Foundation.
+        if "material" in param and not param.get("jobs"):
             assert param["material"] in materials, name
 
 
@@ -436,7 +456,10 @@ def test_jobs_are_operator_triggered_names_only() -> None:
     materials = set(_spec()["runtime_materials"]["names"])
     for job in unit["jobs"]:
         assert job["trigger"] == "operator"
-        assert set(job["materials"]) <= materials
+        # Job materials are product materials, or credentials of the job's own
+        # role (a binding), which Foundation never sees.
+        role_bound = {b["name"] for b in unit["bindings"] if job.get("role") in b["roles"]}
+        assert set(job["materials"]) <= materials | role_bound
         assert all(MATERIAL_NAME.match(m) for m in job["materials"])
         assert not any(_bad_value(arg) for arg in job["command"])
 
@@ -501,3 +524,103 @@ def test_authored_openbao_config_uses_the_descriptor_namespace() -> None:
         if path.is_file() and "openbao" in path.parts:
             for match in re.finditer(r"bao://[^/\s]+/([^/\s]+)/", path.read_text()):
                 assert match.group(1) == namespace, path.name
+
+
+# ── Import-only OpenBao (Michael's ruling): the import job's own role ─────────
+
+
+def test_the_import_job_has_its_own_role_and_two_dsn_materials() -> None:
+    unit = _unit()
+    (job,) = [j for j in unit["jobs"] if j["name"] == "import"]
+    assert job["role"] == "import"
+    assert job["materials"] == ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+    by_name = {b["name"]: b for b in unit["bindings"]}
+    assert by_name["MIGRATION_DATABASE_URL"]["roles"] == ["migrate", "import"]
+    legacy = by_name["LEGACY_DATABASE_URL"]
+    assert legacy["state"] == "pre_staged"
+    assert legacy["kind"] == "pg_login_dsn"
+    assert legacy["roles"] == ["import"]
+    assert legacy["writer"] == "ceremony"
+    assert legacy["rotation"] == "copy_only"
+    # PROVISIONAL: P-SEC rev4 sets the final value. A role's secret_id is
+    # single-use if ANY binding in it is, so `import` is single-use through
+    # MIGRATION_DATABASE_URL whatever this says.
+    assert legacy["single_use"] is False
+    assert by_name["MIGRATION_DATABASE_URL"]["single_use"] is True
+    # The serving app never gets either credential.
+    for name in ("MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"):
+        assert "app" not in by_name[name]["roles"], name
+    unknown = copy.deepcopy(unit)
+    unknown["jobs"][0]["role"] = "ghost"
+    assert "job-role-unknown:import" in _check(unknown)
+
+
+def test_job_credentials_are_never_legacy_names_or_app_materials() -> None:
+    unit = _unit()
+    names = set(unit["legacy_env_file"]["names"])
+    assert names.isdisjoint(JOB_ONLY_MATERIALS)
+    for name in sorted(JOB_ONLY_MATERIALS):
+        leaky = copy.deepcopy(unit)
+        leaky["legacy_env_file"]["names"] = [*names, name]
+        assert f"legacy-job-credential:{name}" in _check(leaky), name
+        app = copy.deepcopy(unit)
+        app["params"]["leak"] = {"type": "string", "material": name}
+        assert "param-job-only-material:leak" in _check(app), name
+        # Scoped to the job it is the job's own, not the app's.
+        scoped = copy.deepcopy(unit)
+        scoped["params"]["mine"] = {"type": "path", "material": name, "jobs": ["import"]}
+        assert not any("param-job-only-material" in p for p in _check(scoped)), name
+    # Nor is either a product (Foundation) runtime material of the serving app.
+    (app_role,) = [r for r in _spec()["roles"] if r["code"] == "app"]
+    assert "LEGACY_DATABASE_URL" not in app_role["materials"]
+    assert "LEGACY_DATABASE_URL" not in _spec()["runtime_materials"]["names"]
+
+
+def test_import_params_are_job_scoped_and_typed_as_the_importer_reads_them() -> None:
+    unit = _unit()
+    params = unit["params"]
+    scoped = {n: p for n, p in params.items() if p.get("jobs")}
+    assert {p["material"] for p in scoped.values()} == {
+        "ERP_IMPORT_APPROVED",
+        "ERP_IMPORT_APPLY_OK",
+        "ERP_ENROLMENT_ACTOR_ID",
+        "ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF",
+    }
+    assert all(p["jobs"] == ["import"] for p in scoped.values())
+    # The importer compares the two gates to the STRING "1": a bool would render
+    # true/false and never approve, so they are enums of "0"/"1", default "0".
+    cli = (ROOT / "src" / "erp_v2" / "importer" / "cli.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("ERP_IMPORT_APPROVED") != "1"' in cli
+    assert 'os.environ.get("ERP_IMPORT_APPLY_OK") != "1"' in cli
+    for name in ("import_approved", "import_apply_ok"):
+        assert params[name]["type"] == "enum"
+        assert params[name]["choices"] == ["0", "1"]
+        assert params[name]["default"] == "0"
+    # The actor id is parsed with uuid.UUID(...): a canonical dashed UUID.
+    assert "_uuid.UUID(actor)" in cli
+    actor = params["enrolment_actor_id"]
+    assert actor["type"] == "string"
+    pattern = re.compile(actor["pattern"])
+    assert pattern.fullmatch("11111111-2222-3333-4444-555555555555")
+    for bad in ("", "not-a-uuid", "11111111222233334444555555555555", "x" * 36):
+        assert not pattern.fullmatch(bad), bad
+    assert "default" not in actor  # optional: only void journals need it
+    # The payable account ref is only stripped and required non-empty by the code
+    # and stored in a String(240) column: bounded, no invented character set.
+    payable = params["payroll_net_payable_account_ref"]
+    assert (payable["type"], payable["min_length"], payable["max_length"]) == (
+        "string",
+        1,
+        240,
+    )
+    assert "pattern" not in payable
+    assert 'os.environ.get("ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF") or None' in cli
+    # Scoped params never carry a secret-class material (the contract rule).
+    for param in scoped.values():
+        assert not SECRET_NAME_HINT.search(param["material"]), param["material"]
+    broken = copy.deepcopy(unit)
+    broken["params"]["import_approved"]["jobs"] = ["nope"]
+    assert "param-job-unknown:import_approved" in _check(broken)
+    unmaterial = copy.deepcopy(unit)
+    del unmaterial["params"]["import_approved"]["material"]
+    assert "param-job-material:import_approved" in _check(unmaterial)
