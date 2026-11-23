@@ -51,7 +51,7 @@ from uuid import UUID
 
 from dotmac_accounting.contracts import AccountClass, AccountKind, JournalStatus
 from dotmac_accounting.models import Account, AccountCategory, JournalEntry
-from dotmac_kernel.audit import write_audit_event
+from dotmac_kernel.audit import AuditEvent, write_audit_event
 from dotmac_kernel.cache import TenantScope
 from dotmac_kernel.idempotency import IdempotencyConflict
 from dotmac_kernel.models import Party, Tenant
@@ -161,6 +161,25 @@ def _audit(db: Session, *, tenant: Tenant, party: Party, run_id: UUID, action: s
         is_success=success,
         details=details,
     )
+
+
+def _recorded_separation(db: Session, *, tenant_id: UUID, run_id: UUID, actions: tuple[str, ...]) -> bool:
+    """True when an earlier successful step of this run recorded ``separation_enforced`` ON (D-9 stamp-or-policy).
+
+    dotmac-payroll has no stamp column, so ERP's own audit events are the run's stamp. A later step enforces
+    separation when the live policy is ON or any earlier step of the run recorded ON: turning the policy OFF
+    between steps never relaxes a run that was governed while ON (never looser than either value).
+    """
+    events = db.scalars(
+        select(AuditEvent).where(
+            AuditEvent.tenant_id == tenant_id,
+            AuditEvent.entity_type == "payroll_run",
+            AuditEvent.entity_id == str(run_id),
+            AuditEvent.action.in_(actions),
+            AuditEvent.is_success.is_(True),
+        )
+    )
+    return any((event.details or {}).get("separation_enforced") is True for event in events)
 
 
 # --- guards ------------------------------------------------------------------------------------
@@ -650,6 +669,7 @@ def batch_calculate(
                         "skipped_existing": outcome.skipped_existing,
                         "input_sha256": outcome.input_sha256,
                         "input_rows": outcome.input_rows,
+                        "separation_enforced": governance.separation_of_duties(db, tenant.id),
                     },
                 )
             return outcome
@@ -686,7 +706,9 @@ def _guarded_approve(db: Session, *, tenant: Tenant, party: Party, run_id: UUID,
         return ApproveOutcome(run.id, True)
     if run.status != "draft":
         raise RunRefused("not_draft", "Only a draft payroll run can be approved")
-    separation = governance.separation_of_duties(db, tenant.id)
+    separation = governance.separation_of_duties(db, tenant.id) or _recorded_separation(
+        db, tenant_id=tenant.id, run_id=run.id, actions=(AUDIT_BATCH_CALCULATED,)
+    )
     if separation and run.created_by_id == party.id:
         raise RunRefused("sod_creator_is_approver", "You created this run; another person must approve it")
     check_currency(db, run)
@@ -817,7 +839,9 @@ def _guarded_finalize(db: Session, *, tenant: Tenant, party: Party, run_id: UUID
         return FinalizeOutcome(run.id, journal.id, journal.number, _net_total(db, run), True)
     if run.status != "approved" or run.approved_by_id is None:
         raise RunRefused("not_approved", "Only an approved payroll run can be finalized")
-    strict = governance.separation_of_duties(db, tenant.id)
+    strict = governance.separation_of_duties(db, tenant.id) or _recorded_separation(
+        db, tenant_id=tenant.id, run_id=run.id, actions=(AUDIT_BATCH_CALCULATED, AUDIT_APPROVED)
+    )
     if strict and party.id == run.approved_by_id:
         raise RunRefused("sod_approver_is_finalizer", "You approved this run; another person must finalize it")
     if strict and party.id == run.created_by_id:

@@ -2,12 +2,18 @@
 
 dotmac-payroll a7 and dotmac-payables a7 default ``separation_of_duties`` to False. A call site that forgets the
 keyword would silently run with separation OFF whatever the tenant policy says, so every call must pass it
-explicitly and source it from the tenant governance policy (``governance.separation_of_duties`` or
-``governance.dual_control``). This scans ``src/erp_v2`` with the AST and fails on any call without it.
+explicitly and source it from the tenant governance policy. This scans ``src/erp_v2`` with the AST.
 
-Payroll calls must carry the explicit ``separation_of_duties=<name or call>`` keyword. Payables calls go through
-``**separation.payables_kwargs(db, tenant_id)``, which supplies exactly that keyword once payables a7 is the
-pinned version (and nothing before, so a6 keeps working); the keyword form is accepted too.
+Rules (each has a negative case below):
+
+* Every reference to a governed function name (attribute, bare name, ``import x as y`` / ``from m import name``,
+  string constant for ``getattr``/``partial``) must be the ``func`` of a checked call. Aliases, ``getattr``,
+  ``functools.partial`` and renamed imports therefore fail.
+* The call passes ``separation_of_duties=<expr>``. ``<expr>`` is a call to ``governance.separation_of_duties`` or
+  ``governance.dual_control``, or an ``or`` of operands that contains one (never ``and``, ``not`` or a constant);
+  or a Name assigned exactly once in the enclosing function from such an expression.
+* Payables calls may instead spread ``**separation.payables_kwargs(...)`` where ``separation`` is the real
+  ``erp_v2.supplier_payments.separation`` module imported in that file (verified at runtime below).
 """
 
 from __future__ import annotations
@@ -29,7 +35,10 @@ PAYABLES = {
 GOVERNED = PAYROLL | PAYABLES
 KEYWORD = "separation_of_duties"
 POLICY_READERS = {"separation_of_duties", "dual_control"}
-SHIM = "payables_kwargs"
+SHIM_MODULE = "erp_v2.supplier_payments"
+# The one file allowed to name the governed payables functions as strings: the a7 signature probe (to be deleted
+# at the payables a7 pin, when the keyword is passed explicitly everywhere).
+SIGNATURE_PROBE = "supplier_payments/separation.py"
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -41,25 +50,93 @@ def _called_name(call: ast.Call) -> str | None:
     return None
 
 
-def _reads_policy(node: ast.AST) -> bool:
-    return any(
-        isinstance(n, ast.Call) and _called_name(n) in POLICY_READERS and not isinstance(n.func, ast.Name)
-        for n in ast.walk(node)
+def _is_policy_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in POLICY_READERS
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "governance"
     )
 
 
-def _enclosing_function(tree: ast.AST, target: ast.AST) -> ast.AST:
+def _policy_expression(node: ast.AST) -> bool:
+    """A policy call, or an ``or`` containing one; no inversion, ``and`` or constant anywhere in it."""
+    if any(isinstance(n, ast.UnaryOp | ast.IfExp | ast.Compare | ast.Lambda) for n in ast.walk(node)):
+        return False
+    if _is_policy_call(node):
+        return True
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        if any(isinstance(v, ast.Constant) for v in node.values):
+            return False
+        return any(_policy_expression(v) for v in node.values)
+    return False
+
+
+def _functions(tree: ast.AST) -> list[ast.AST]:
+    return [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+
+
+def _innermost(tree: ast.AST, target: ast.AST) -> ast.AST:
     best = tree
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            if any(child is target for child in ast.walk(node)):
-                best = node  # ast.walk is breadth first: the last match is the innermost
+    for function in _functions(tree):
+        if any(child is target for child in ast.walk(function)):
+            best = function
     return best
+
+
+def _bindings(function: ast.AST, name: str) -> list[ast.AST]:
+    """Every statement in the function that binds ``name`` (assignment, augmented, annotated, loop, with, walrus)."""
+    found: list[ast.AST] = []
+    for n in ast.walk(function):
+        if isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for target in n.targets for t in ast.walk(target)
+        ):
+            found.append(n)
+        elif isinstance(n, ast.AugAssign | ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == name:
+            found.append(n)
+        elif isinstance(n, ast.NamedExpr) and n.target.id == name:
+            found.append(n)
+        elif isinstance(n, ast.For | ast.AsyncFor) and any(
+            isinstance(t, ast.Name) and t.id == name for t in ast.walk(n.target)
+        ):
+            found.append(n)
+        elif isinstance(n, ast.With | ast.AsyncWith) and any(
+            isinstance(t, ast.Name) and t.id == name
+            for item in n.items
+            if item.optional_vars is not None
+            for t in ast.walk(item.optional_vars)
+        ):
+            found.append(n)
+    return found
+
+
+def _has_real_shim_import(tree: ast.AST) -> bool:
+    return any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == SHIM_MODULE
+        and any(a.name == "separation" and a.asname is None for a in n.names)
+        for n in ast.walk(tree)
+    )
+
+
+def _is_shim_spread(keyword: ast.keyword, tree: ast.AST) -> bool:
+    value = keyword.value
+    return (
+        keyword.arg is None
+        and isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "payables_kwargs"
+        and isinstance(value.func.value, ast.Name)
+        and value.func.value.id == "separation"
+        and _has_real_shim_import(tree)
+    )
 
 
 def _violations(source: str, filename: str = "<src>") -> tuple[list[str], int]:
     tree = ast.parse(source, filename)
     problems: list[str] = []
+    checked_funcs: set[int] = set()
     sites = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -68,32 +145,45 @@ def _violations(source: str, filename: str = "<src>") -> tuple[list[str], int]:
         if name not in GOVERNED:
             continue
         sites += 1
+        checked_funcs.add(id(node.func))
         where = f"{filename}:{node.lineno} {name}"
-        explicit = [k for k in node.keywords if k.arg == KEYWORD]
-        shim = [
-            k
-            for k in node.keywords
-            if k.arg is None and isinstance(k.value, ast.Call) and _called_name(k.value) == SHIM and name in PAYABLES
-        ]
-        if shim:
+        if name in PAYABLES and any(_is_shim_spread(k, tree) for k in node.keywords):
             continue
-        if not explicit:
-            problems.append(f"{where}: no separation_of_duties= keyword")
+        explicit = [k for k in node.keywords if k.arg == KEYWORD]
+        if len(explicit) != 1:
+            problems.append(f"{where}: no single separation_of_duties= keyword")
             continue
         value = explicit[0].value
-        if isinstance(value, ast.Constant):
-            problems.append(f"{where}: separation_of_duties is a literal, not the tenant policy")
-        elif isinstance(value, ast.Name):
-            function = _enclosing_function(tree, node)
-            assigned = [
-                n.value
-                for n in ast.walk(function)
-                if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == value.id for t in n.targets)
-            ]
-            if not any(_reads_policy(v) for v in assigned):
-                problems.append(f"{where}: {value.id} is not assigned from the governance policy")
-        elif not _reads_policy(value):
+        if isinstance(value, ast.Name):
+            function = _innermost(tree, node)
+            bound = _bindings(function, value.id)
+            if len(bound) != 1 or not isinstance(bound[0], ast.Assign) or not _policy_expression(bound[0].value):
+                problems.append(f"{where}: {value.id} is not assigned exactly once from the governance policy")
+        elif not _policy_expression(value):
             problems.append(f"{where}: separation_of_duties is not read from the governance policy")
+    # Any other reference to a governed function (alias, import as, getattr/partial string) evades the call check.
+    for node in ast.walk(tree):
+        reference = None
+        if isinstance(node, ast.Attribute) and node.attr in GOVERNED:
+            reference = node.attr
+        elif isinstance(node, ast.Name) and node.id in GOVERNED:
+            reference = node.id
+        elif isinstance(node, ast.alias) and node.name.split(".")[-1] in GOVERNED:
+            reference = node.name
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in GOVERNED
+            and not filename.endswith(SIGNATURE_PROBE)
+        ):
+            reference = node.value
+        if reference is None:
+            continue
+        if isinstance(node, ast.Attribute | ast.Name) and any(
+            isinstance(c, ast.Call) and c.func is node and id(c.func) in checked_funcs for c in ast.walk(tree)
+        ):
+            continue
+        problems.append(f"{filename}:{getattr(node, 'lineno', 0)} {reference}: referenced other than as a checked call")
     return problems, sites
 
 
@@ -123,6 +213,17 @@ def test_the_scan_sees_every_known_call_site() -> None:
     }
 
 
+def test_the_accepted_shim_is_the_real_module_function() -> None:
+    import inspect
+
+    from erp_v2.supplier_payments import separation
+    from erp_v2.supplier_payments import service as payments_service
+
+    assert payments_service.separation is separation
+    assert inspect.getmodule(separation.payables_kwargs) is separation
+    assert separation.payables_kwargs.__qualname__ == "payables_kwargs"
+
+
 @pytest.mark.parametrize(
     "snippet",
     [
@@ -135,6 +236,27 @@ def test_the_scan_sees_every_known_call_site() -> None:
         "payables.create_supplier_payment(db, **{'separation_of_duties': True})",
         "payables.record_supplier_payment(db, **other.kwargs(db, t))",
         "from x import approve_payroll_run\napprove_payroll_run(db)",
+        # aliases, getattr, partial, import-as
+        "f = payroll.approve_payroll_run\nf(db)",
+        "f = getattr(payroll, 'finalize_payroll_run')\nf(db)",
+        "import functools\nfunctools.partial(payroll.reverse_liability_settlement, db)()",
+        "from dotmac_payroll.service import approve_payroll_run as go",
+        "import dotmac_payroll.service.approve_payroll_run as go",
+        # shim spoofing
+        "payables.record_supplier_payment(db, **evil.payables_kwargs(db, t))",
+        "separation = Fake()\npayables.record_supplier_payment(db, **separation.payables_kwargs(db, t))",
+        # inversions, constants, reassignment
+        "def f(db, t):\n    payroll.approve_payroll_run(db, separation_of_duties=not governance.dual_control(db, t))",
+        "def f(db, t):\n    payroll.approve_payroll_run(\n"
+        "        db, separation_of_duties=governance.dual_control(db, t) and False)",
+        "def f(db, t):\n    payroll.approve_payroll_run(\n"
+        "        db, separation_of_duties=governance.dual_control(db, t) or False)",
+        "def f(db, t):\n    s = governance.separation_of_duties(db, t)\n    s = False\n"
+        "    payroll.approve_payroll_run(db, separation_of_duties=s)",
+        "def f(db, t):\n    s = governance.separation_of_duties(db, t)\n    s &= False\n"
+        "    payroll.approve_payroll_run(db, separation_of_duties=s)",
+        "def f(db, t):\n    s = other.separation_of_duties(db, t)\n"
+        "    payroll.approve_payroll_run(db, separation_of_duties=s)",
     ],
 )
 def test_the_scan_fails_a_call_without_the_policy(snippet: str) -> None:
@@ -149,6 +271,9 @@ def test_the_scan_fails_a_call_without_the_policy(snippet: str) -> None:
         "def f(db, t):\n    payroll.finalize_payroll_run(db, separation_of_duties=governance.dual_control(db, t))",
         "def f(db, t):\n    s = governance.separation_of_duties(db, t) or line.flag\n"
         "    payroll.reverse_liability_settlement(db, separation_of_duties=s)",
+        "def f(db, t):\n    s = governance.separation_of_duties(db, t) or _recorded(db, t)\n"
+        "    payroll.approve_payroll_run(db, separation_of_duties=s)",
+        "from erp_v2.supplier_payments import separation\n"
         "payables.record_supplier_payment(db, **separation.payables_kwargs(db, t))",
         "payables.approve_supplier_payment(db, separation_of_duties=governance.separation_of_duties(db, t))",
     ],
@@ -158,4 +283,8 @@ def test_the_scan_accepts_a_call_sourced_from_the_policy(snippet: str) -> None:
 
 
 def test_a_payroll_call_cannot_hide_behind_the_payables_shim() -> None:
-    assert _violations("payroll.approve_payroll_run(db, **separation.payables_kwargs(db, t))")[0]
+    snippet = (
+        "from erp_v2.supplier_payments import separation\n"
+        "payroll.approve_payroll_run(db, **separation.payables_kwargs(db, t))"
+    )
+    assert _violations(snippet)[0]

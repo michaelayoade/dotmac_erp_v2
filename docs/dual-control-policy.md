@@ -78,5 +78,16 @@ dotmac-payroll 0.1.0a7 and dotmac-payables 0.1.0a7 take a keyword-only `separati
    lists payables rows stamped relaxed and payroll events recorded relaxed that were created while the policy was ON
    (the ON windows come from the `erp.governance.dual_control_set` audit events).
 
-Payables a7 is not published yet. When it is: change `dotmac-payables==0.1.0a6` to `==0.1.0a7` in `pyproject.toml`,
-refresh `uv.lock`, and `tests/test_payables_a7_separation_pg.py` stops skipping. No code change is needed.
+Payables a7 is not published yet. At the pin: change `dotmac-payables==0.1.0a6` to `==0.1.0a7`, refresh `uv.lock`
+(the manual `lock` workflow runs once, after a7 publishes), delete the signature-sniffing shim and pass
+`separation_of_duties=governance.separation_of_duties(...)` explicitly, make the stamp read-back unconditional, and take a
+read-only count of payments that pa_0007 stamps true (with the policy OFF those rows write flag events on later steps and
+still need two people; replaying an old prepare raises Conflict). `tests/test_payables_a7_separation_pg.py` stops skipping.
+
+Payroll stamp-or-policy: a later step enforces separation when the live policy is ON **or** an earlier step of the run
+recorded `separation_enforced` ON (batch calculated, approved), so turning the policy OFF between steps never relaxes a
+run governed while ON. Settlement reversal is stricter than ERP's returner guard: tenant policy OR the line's own stamp.
+
+The saved check refuses (exit 2, `policy_timeline_inconsistent`) when the policy row disagrees with the
+`dual_control_set` audit timeline (for example the policy is ON with no event), counts in-window payroll events that
+lack the stamp as findings, runs in a READ ONLY transaction and uses the database clock only.

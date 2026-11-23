@@ -560,12 +560,10 @@ def test_policy_off_a_batch_person_may_record_the_return(engine, who):
     _run, batch_id = recorded(engine, env)
     line = line_of(engine, env, batch_id)
     assert line.dual_control is False
-    try:
-        out = give_back(engine, env, batch_id, line, who=who)
-    except svc.PayoutRefused as exc:  # payroll a5's own reversal rules may still apply to the recorder
-        assert not exc.code.startswith("sod_"), exc.code
-    else:
-        assert out.replayed is False
+    out = give_back(engine, env, batch_id, line, who=who)  # payroll a7 takes the policy (OFF) from ERP: no refusal
+    assert out.replayed is False
+    (event,) = [a for a in audits(engine, env, svc.AUDIT_LINE_RETURNED)]
+    assert event.details["separation_enforced"] is False
 
 
 def test_policy_off_the_returner_guard_trigger_is_gated_on_the_line_stamp(engine):
@@ -594,3 +592,47 @@ def test_policy_off_the_returner_guard_trigger_is_gated_on_the_line_stamp(engine
         db.execute(sa.update(PayrollPayoutLine).where(PayrollPayoutLine.id == two.id).values(**values))
         db.flush()  # stamp false: the same person is accepted by the trigger
         db.rollback()
+
+
+# --- stricter wins on the settlement reversal (D-9): tenant policy OR the line's own stamp -----------------------
+# This is deliberately stricter than ERP's returner guard (row stamp only): policy ON + line stamped OFF passes the
+# ERP guard but dotmac-payroll a7 refuses the person who recorded the settlement.
+
+
+def test_policy_on_with_a_line_stamped_off_payroll_still_refuses_the_recorder(engine):
+    env = world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
+    _run, batch_id = recorded(engine, env)
+    line = line_of(engine, env, batch_id)
+    assert line.dual_control is False
+    set_dual_control_engine(engine, env.tenant_id, True)
+    with pytest.raises(svc.PayoutRefused) as exc:
+        give_back(engine, env, batch_id, line, who="recorder")
+    assert not exc.value.code.startswith("sod_"), exc.value.code  # ERP's guard allows; the owner refuses
+    assert audits(engine, env, svc.AUDIT_LINE_RETURNED) == []
+    out = give_back(engine, env, batch_id, line, who="canceller")  # someone else may
+    assert out.replayed is False
+    (event,) = audits(engine, env, svc.AUDIT_LINE_RETURNED)
+    assert event.details["separation_enforced"] is True
+
+
+def test_policy_off_with_a_line_stamped_on_passes_true_to_payroll(engine, monkeypatch):
+    from dotmac_payroll import service as payroll_service
+
+    env = world(engine)  # the seed turns the policy ON: the line is stamped ON
+    _run, batch_id = recorded(engine, env)
+    line = line_of(engine, env, batch_id)
+    assert line.dual_control is True
+    set_dual_control_engine(engine, env.tenant_id, False)
+    seen = []
+    real = payroll_service.reverse_liability_settlement
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["separation_of_duties"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(payroll_service, "reverse_liability_settlement", spy)
+    give_back(engine, env, batch_id, line, who="canceller")
+    assert seen == [True]
+    (event,) = audits(engine, env, svc.AUDIT_LINE_RETURNED)
+    assert event.details["separation_enforced"] is True

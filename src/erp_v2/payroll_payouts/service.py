@@ -1141,7 +1141,9 @@ def _return_line(
         .where(BankAccount.tenant_id == tenant.id, BankAccount.id == batch.bank_account_id)
         .with_for_update(read=True)
     )
-    # Stricter of the tenant policy and the line's own stamp (row-stamped governance; never looser than either).
+    # Stricter of the tenant policy and the line's own stamp (never looser than either). This is deliberately
+    # stricter than ERP's own returner guard above, which reads the line stamp only: policy ON with a line stamped
+    # OFF passes that guard, but dotmac-payroll a7 then refuses the person who recorded the settlement.
     separation = governance.separation_of_duties(db, tenant.id) or bool(line.dual_control)
     reversal = payroll.reverse_liability_settlement(
         db,
