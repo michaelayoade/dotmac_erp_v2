@@ -74,30 +74,107 @@ min = 60
 max = 3600
 required_in = ["production"]
 
-# ------------------------------------------- import-job params (job-scoped)
-# Typed inputs of the dispatched `import` job ONLY (jobs = ["import"]). Control
-# renders them into that job's env and never into the serving app's params.env;
-# the scope is covered by the plan digest. Types follow what the importer reads
-# (src/erp_v2/importer/cli.py):
-#   * ERP_IMPORT_APPROVED / ERP_IMPORT_APPLY_OK are compared to the STRING "1"
-#     (`os.environ.get(...) != "1"`), so a bool (rendered true/false) would never
-#     approve: they are enums of "0"/"1", default "0".
-#   * ERP_ENROLMENT_ACTOR_ID is parsed with uuid.UUID(...): a canonical dashed UUID.
-#   * ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF is only stripped and required non-empty;
-#     it is stored in a String(240) column (net_payable_account_ref).
+# ---------------------------------------------- operator-job params (job-scoped)
+# Typed inputs of the dispatched operator jobs ONLY (each carries `jobs = [...]`).
+# Control renders them into those jobs' env and never into the serving app's
+# params.env; the scope is covered by the plan digest. Types follow what the code
+# reads: every apply/approval gate is compared to the STRING "1", so a bool
+# (rendered true/false) would never approve: they are enums of "0"/"1", default
+# "0". ERP_ENROLMENT_ACTOR_ID goes through uuid.UUID (canonical dashed UUID).
+# ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF is only stripped and required non-empty
+# (String(240) column), so it is bounded, with no invented character set.
+# ERP_SELLER_COUNTRY defaults to NG in the code.
+
 [params.import_approved]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_IMPORT_APPROVED"
-jobs = ["import"]
+jobs = ["import", "payables_history", "claims_opening", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
 
 [params.import_apply_ok]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_IMPORT_APPLY_OK"
-jobs = ["import"]
+jobs = ["import", "payables_history", "claims_opening", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
+
+[params.identity_import_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_IDENTITY_IMPORT_APPROVED"
+jobs = ["identity_import"]
+
+[params.ar_opening_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_AR_OPENING_APPLY"
+jobs = ["ar_opening"]
+
+[params.held_drafts_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_HELD_DRAFTS_APPLY"
+jobs = ["held_drafts"]
+
+[params.holding_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_HOLDING_APPLY"
+jobs = ["holdings"]
+
+[params.governance_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_GOVERNANCE_APPLY"
+jobs = ["governance"]
+
+[params.access_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_ACCESS_APPLY"
+jobs = ["access"]
+
+[params.cash_gl_setup_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_CASH_GL_SETUP_APPROVED"
+jobs = ["cash_gl_setup"]
+
+[params.payroll_account_setup_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_PAYROLL_ACCOUNT_SETUP_APPROVED"
+jobs = ["payroll_accounts"]
+
+[params.tax_seed_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_TAX_SEED_APPROVED"
+jobs = ["tax_seed"]
+
+[params.billing_gl_vat_opening_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_BILLING_GL_VAT_OPENING_APPLY"
+jobs = ["billing_gl_vat_opening"]
+
+[params.migration_ledger_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_MIGRATION_LEDGER_APPLY"
+jobs = ["ledger_opening", "ledger_attribution", "ledger_bridge", "ledger_exceptions"]
 
 [params.enrolment_actor_id]
 type = "string"
@@ -111,6 +188,28 @@ type = "string"
 min_length = 1
 max_length = 240
 material = "ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF"
+jobs = ["import"]
+
+[params.seller_legal_name]
+type = "string"
+min_length = 1
+max_length = 240
+material = "ERP_SELLER_LEGAL_NAME"
+jobs = ["import", "ar_opening"]
+
+[params.seller_address_line]
+type = "string"
+min_length = 1
+max_length = 240
+material = "ERP_SELLER_ADDRESS_LINE"
+jobs = ["import", "ar_opening"]
+
+[params.seller_country]
+type = "string"
+pattern = "^[A-Z]{2}$"
+max_length = 2
+default = "NG"
+material = "ERP_SELLER_COUNTRY"
 jobs = ["import"]
 
 # ------------------------------------------------------- legacy env file
@@ -201,9 +300,11 @@ single_use = false
 
 # The legacy source DSN, read by the dispatched `import` job and by nothing else
 # (import-only OpenBao): never a legacy_env_file name, never an app material.
-# single_use is PROVISIONAL (P-SEC rev4 sets the final answer); a role's secret_id
-# is single-use if ANY binding in the role is, so `import` is single-use through
-# MIGRATION_DATABASE_URL regardless of this value.
+# single_use = true on both import bindings (P-SEC rev4 s3.14): one secret_id per
+# dispatched run, minted only at job dispatch and purged when the job exits. Both
+# stay pre_staged here (this unit is inert); the flip release must set BOTH to
+# state = "active", or Control's propose refuses every import job (C-3).
+# There is no sealed or boot fallback: if OpenBao is down the job fails closed.
 [[bindings]]
 name = "LEGACY_DATABASE_URL"
 state = "pre_staged"
@@ -211,18 +312,200 @@ kind = "pg_login_dsn"
 roles = ["import"]
 writer = "ceremony"
 rotation = "copy_only"
-single_use = false
+single_use = true
 
 # ------------------------------------------------------------------ jobs
 # Operator-triggered one-shots of the flip. Genesis is the product.toml
 # migration step, not a job. A job runs only when the runbook step names it;
 # its arguments come from the flip runbook (docs/rehearsal.md), not from here.
+# Every flip command that reads MIGRATION_DATABASE_URL or LEGACY_DATABASE_URL is a
+# job with role = "import" (dispatch-time credentials only). Each lists the DSNs
+# it reads and, through scoped params, only the gates/inputs it reads.
+# billing_gl vat-opening/vat-extract use their own modules: the package
+# __main__ is the serving runner, which refuses operator DSNs.
+
 [[jobs]]
 name = "import"
 role = "import"
 command = ["python", "-m", "erp_v2.importer", "execute"]
 trigger = "operator"
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "payables_history"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.payables_history_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "identity_import"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.identity_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "ar_opening"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "claims_opening"
+role = "import"
+command = ["python", "-m", "erp_v2.claims_opening"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "legacy_ap_recognize"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.recognize_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "legacy_ap_settled"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.settled_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "legacy_ap_review"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.review_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "legacy_ap_cohort"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.cohort_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "payees_bulk"
+role = "import"
+command = ["python", "-m", "erp_v2.payees.bulk_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "held_drafts"
+role = "import"
+command = ["python", "-m", "erp_v2.held_drafts.cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "holdings"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "governance"
+role = "import"
+command = ["python", "-m", "erp_v2.governance.cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "access"
+role = "import"
+command = ["python", "-m", "erp_v2.access_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "cash_gl_setup"
+role = "import"
+command = ["python", "-m", "erp_v2.cash_gl.setup_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "payroll_accounts"
+role = "import"
+command = ["python", "-m", "erp_v2.payroll_accounts"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "tax_seed"
+role = "import"
+command = ["python", "-m", "erp_v2.tax_seed"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "billing_gl_vat_opening"
+role = "import"
+command = ["python", "-m", "erp_v2.billing_gl.vat_opening"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "billing_gl_vat_extract"
+role = "import"
+command = ["python", "-m", "erp_v2.billing_gl.vat_extract"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "ledger_opening"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.opening_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "ledger_attribution"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.attribution_cli"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "ledger_bridge"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.bridge_report"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs]]
+name = "ledger_exceptions"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register"]
+trigger = "operator"
+materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
 # ------------------------------------------------------------ hold point

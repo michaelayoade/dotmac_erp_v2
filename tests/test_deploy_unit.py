@@ -533,6 +533,8 @@ def test_the_import_job_has_its_own_role_and_two_dsn_materials() -> None:
     unit = _unit()
     (job,) = [j for j in unit["jobs"] if j["name"] == "import"]
     assert job["role"] == "import"
+    # pre_staged delivers nothing: the flip release must set BOTH to "active".
+    assert {b["state"] for b in unit["bindings"] if "import" in b["roles"]} == {"pre_staged"}
     assert job["materials"] == ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
     by_name = {b["name"]: b for b in unit["bindings"]}
     assert by_name["MIGRATION_DATABASE_URL"]["roles"] == ["migrate", "import"]
@@ -542,10 +544,8 @@ def test_the_import_job_has_its_own_role_and_two_dsn_materials() -> None:
     assert legacy["roles"] == ["import"]
     assert legacy["writer"] == "ceremony"
     assert legacy["rotation"] == "copy_only"
-    # PROVISIONAL: P-SEC rev4 sets the final value. A role's secret_id is
-    # single-use if ANY binding in it is, so `import` is single-use through
-    # MIGRATION_DATABASE_URL whatever this says.
-    assert legacy["single_use"] is False
+    # P-SEC rev4: both import bindings are single-use (one secret_id per run).
+    assert legacy["single_use"] is True
     assert by_name["MIGRATION_DATABASE_URL"]["single_use"] is True
     # The serving app never gets either credential.
     for name in ("MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"):
@@ -580,13 +580,15 @@ def test_import_params_are_job_scoped_and_typed_as_the_importer_reads_them() -> 
     unit = _unit()
     params = unit["params"]
     scoped = {n: p for n, p in params.items() if p.get("jobs")}
-    assert {p["material"] for p in scoped.values()} == {
+    assert {
         "ERP_IMPORT_APPROVED",
         "ERP_IMPORT_APPLY_OK",
         "ERP_ENROLMENT_ACTOR_ID",
         "ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF",
-    }
-    assert all(p["jobs"] == ["import"] for p in scoped.values())
+    } <= {p["material"] for p in scoped.values()}
+    assert all("import" in params[n]["jobs"] for n in ("import_approved", "import_apply_ok"))
+    assert params["enrolment_actor_id"]["jobs"] == ["import"]
+    assert params["payroll_net_payable_account_ref"]["jobs"] == ["import"]
     # The importer compares the two gates to the STRING "1": a bool would render
     # true/false and never approve, so they are enums of "0"/"1", default "0".
     cli = (ROOT / "src" / "erp_v2" / "importer" / "cli.py").read_text(encoding="utf-8")
@@ -624,3 +626,52 @@ def test_import_params_are_job_scoped_and_typed_as_the_importer_reads_them() -> 
     unmaterial = copy.deepcopy(unit)
     del unmaterial["params"]["import_approved"]["material"]
     assert "param-job-material:import_approved" in _check(unmaterial)
+
+
+def test_every_command_that_reads_an_operator_dsn_is_an_import_role_job() -> None:
+    """Q-F2: no flip command reading MIGRATION/LEGACY_DATABASE_URL is left outside
+    the import role; each job carries its module command and only the DSNs it reads."""
+    unit = _unit()
+    jobs = {j["name"]: j for j in unit["jobs"]}
+    assert all(j["role"] == "import" and j["trigger"] == "operator" for j in jobs.values())
+    modules = {}
+    for job in jobs.values():
+        cmd = job["command"]
+        assert cmd[:2] == ["python", "-m"], job["name"]
+        modules[cmd[2]] = job
+    src = ROOT / "src"
+    needle = re.compile(r"os\.environ\.pop\(\"(MIGRATION|LEGACY)_DATABASE_URL\"")
+    readers: dict[str, set[str]] = {}
+    for path in sorted(src.rglob("*.py")):
+        if path.name == "__main__.py" or path.name == "cli_common.py":
+            continue
+        found = set(needle.findall(path.read_text(encoding="utf-8")))
+        if found:
+            readers[".".join(path.relative_to(src).with_suffix("").parts)] = found
+    # Not jobs: schema upgrade (its own migrate role/credential), the shared
+    # ledger helper is used by the ledger jobs, and importer.cli is `import`.
+    exempt = {"erp_v2.migrate", "erp_v2.migrations.env", "erp_v2.database"}
+    for module, found in readers.items():
+        if module in exempt:
+            continue
+        # Packages whose __main__ is the CLI are run as the package.
+        module = {
+            "erp_v2.importer.cli": "erp_v2.importer",
+            "erp_v2.claims_opening.cli": "erp_v2.claims_opening",
+        }.get(module, module)
+        assert module in modules, f"{module} reads an operator DSN but is not a job"
+        want = {"MIGRATION_DATABASE_URL"} | ({"LEGACY_DATABASE_URL"} if "LEGACY" in found else set())
+        assert want <= set(modules[module]["materials"]), module
+    assert len(jobs) >= 14
+
+
+def test_job_scoped_gates_are_declared_only_for_jobs_that_read_them() -> None:
+    unit = _unit()
+    jobs = {j["name"] for j in unit["jobs"]}
+    for name, param in unit["params"].items():
+        for job in param.get("jobs", []):
+            assert job in jobs, (name, job)
+    # The apply gate of a job is enum 0/1 default 0: dry-run unless asked.
+    for name, param in unit["params"].items():
+        if param.get("jobs") and param["type"] == "enum":
+            assert param["choices"] == ["0", "1"] and param["default"] == "0", name
