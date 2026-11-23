@@ -8,6 +8,14 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same ref supersedes queued runs; without this
+# a stacked-PR session filled the account queue for ~90 minutes on
+# 2026-11-10 (6 queued runs, 0 started). Never cancel main pushes:
+# post-merge main CI is the binding gate.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions:
   contents: read
 
