@@ -20,7 +20,7 @@ import json
 import os
 import sys
 import uuid as _uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import timezone as _timezone
@@ -28,7 +28,15 @@ from decimal import Decimal as _Decimal
 from pathlib import Path
 
 import sqlalchemy as sa
+from sqlalchemy.pool import NullPool
 
+from erp_v2.importer.destination_guard import (
+    GuardReport,
+    ImportDestinationNotEmpty,
+    ImportLockHeld,
+    inspect_destination,
+    take_import_lock,
+)
 from erp_v2.importer.e2 import E2_PAIRINGS, FLEET_PAIRINGS, LEASE_PAIRINGS, PUBLIC_SECTOR_PAIRINGS
 from erp_v2.importer.enrolment import EnrolmentMaps, required_maps, unbuilt_maps
 from erp_v2.importer.history_cutoff import (
@@ -565,6 +573,26 @@ def cmd_census(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_destination_guard(
+    args: argparse.Namespace, manifest, receipt: dict[str, object], specs: Sequence[TransformSpec]
+) -> None:
+    """F23: when a destination DSN env is set, report (read-only, no lock) whether the destination is non-empty."""
+
+    dsn = _take_env(getattr(args, "dest_url_env", None))
+    if not dsn:
+        receipt["destination_guard"] = {"checked": False, "reason": "no destination DSN env set"}
+        return
+    tenant = _uuid.UUID(str(manifest.tenant_extent[0])).hex if len(manifest.tenant_extent) == 1 else None
+    engine = sa.create_engine(dsn)
+    try:
+        with engine.connect() as connection:
+            report = inspect_destination(connection, specs, _destination_tables(), tenant)
+            connection.rollback()
+    finally:
+        engine.dispose()
+    receipt["destination_guard"] = {"checked": True, **report.as_dict()}
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     manifest = _load_manifest(args)
     receipt: dict[str, object] = {
@@ -576,6 +604,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     if not dsn:
         receipt["mode"] = "pairings-only (no source DSN env set)"
         receipt["pairings"] = _census_receipt()
+        _plan_destination_guard(args, manifest, receipt, ())
         _write_receipt(Path(args.receipt), receipt)
         return 0
     engine = sa.create_engine(dsn)
@@ -589,6 +618,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     receipt["sources_missing_on_snapshot"] = resolution["missing"] + resolution["ambiguous"]
     receipt["generated_destinations"] = len(generated)
     receipt["specs"] = _spec_report(specs)
+    _plan_destination_guard(args, manifest, receipt, specs)
     _write_receipt(Path(args.receipt), receipt)
     return 0
 
@@ -874,6 +904,30 @@ def _history_cutoff_side_file(reports, receipt_path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _guard_destination(
+    dest_conn: sa.Connection,
+    specs: Sequence[TransformSpec],
+    dest_tables: Mapping[str, sa.Table],
+    tenant_hex: object,
+    *,
+    enforce: bool,
+) -> GuardReport:
+    """Take the importer lock and count tenant rows in the target and ledger-receipt tables (read-only).
+
+    `enforce` (apply): a non-empty destination or a held lock is a named refusal (exit 2, nothing written).
+    There is no override; a re-flip uses a fresh genesis.
+    """
+
+    try:
+        take_import_lock(dest_conn, str(tenant_hex) if tenant_hex else None)
+        report = inspect_destination(dest_conn, specs, dest_tables, str(tenant_hex) if tenant_hex else None)
+        if enforce:
+            report.raise_if_not_empty()
+    except (ImportDestinationNotEmpty, ImportLockHeld) as exc:
+        raise CliRefusal(str(exc)) from exc
+    return report
+
+
 def cmd_execute(args: argparse.Namespace) -> int:
     manifest = _load_manifest(args)
     if os.environ.get("ERP_IMPORT_APPROVED") != "1":
@@ -885,7 +939,8 @@ def cmd_execute(args: argparse.Namespace) -> int:
     if args.apply and os.environ.get("ERP_IMPORT_APPLY_OK") != "1":
         raise CliRefusal("--apply additionally requires ERP_IMPORT_APPLY_OK=1")
     source_engine = sa.create_engine(source_dsn)
-    dest_engine = sa.create_engine(dest_dsn)
+    # NullPool: the importer's session-level advisory lock dies with the connection, never lingering in a pool.
+    dest_engine = sa.create_engine(dest_dsn, poolclass=NullPool)
     present, source_columns, resolution, source_schemas = _resolve_sources(source_engine, _ALL_PAIRINGS)
     dest_tables = _destination_tables()
     specs, _generated = build_specs(present, source_columns, dest_tables)
@@ -927,6 +982,11 @@ def cmd_execute(args: argparse.Namespace) -> int:
     # rollback on dry-run.
     with source_engine.connect() as source_conn, dest_engine.connect() as dest_conn:
         _set_search_path(source_conn, source_schemas)
+        # F23: lock, then refuse a non-empty destination BEFORE any write (same transaction as the pre-mints and the
+        # first spec; apply commits per spec afterwards). Dry-run reports the same finding without refusing.
+        destination_guard = _guard_destination(
+            dest_conn, executable, dest_tables, run_constants.get("tenant_id"), enforce=bool(args.apply)
+        )
         enrolment = EnrolmentMaps(
             source_conn,
             dest_conn,
@@ -1002,6 +1062,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         and not transforms_incomplete
         and cutoff_side_error is None
         and not resolution.get("refusal_sources_incomplete")
+        and not destination_guard.not_empty
     )
     payload: dict[str, object] = {
         "kind": "execute",
@@ -1021,6 +1082,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             for e in (*result.exceptions, *transition_exceptions)
         ],
         "sub_origin": sub_origin,
+        "destination_guard": destination_guard.as_dict(),
         # Top level, an ISO date or null: B-9r requires it and refuses a mismatch with the opening as-of date.
         "history_cutoff": cutoff_section.get("history_cutoff"),
         "history_cutoff_census": {
@@ -1109,6 +1171,8 @@ def build_parser() -> argparse.ArgumentParser:
         cmd = sub.add_parser(name)
         cmd.add_argument("--receipt", required=True, help="receipt JSON output path")
         cmd.set_defaults(func=fn)
+        if name == "plan":
+            cmd.add_argument("--dest-url-env", default="MIGRATION_DATABASE_URL", help="optional: report F23 emptiness")
         if name != "census":
             cmd.add_argument("--manifest", help="snapshot manifest JSON path")
             cmd.add_argument("--source-url-env", default="LEGACY_DATABASE_URL", help="env var holding the source DSN")
