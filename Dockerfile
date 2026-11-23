@@ -37,6 +37,19 @@ RUN --mount=type=secret,id=forgejo_token \
     UV_INDEX_FORGEJO_PASSWORD="$(cat /run/secrets/forgejo_token)" \
     uv sync --locked --no-dev
 
+# Operator one-shots (target_api v2 run_job) read /job/in and write /job/out, as the
+# SEPARATE uid `dotmac-erp-import` (P-SEC C-29), never the serving ERP uid 10001. Pinned in deploy/job-user.toml. The
+# image ships both directories so Foundation's per-dispatch volumes inherit them:
+# /job/out is owned by that uid at 0700; /job/in exists, world readable and
+# root-owned (inputs are mounted read-only over it).
+RUN groupadd --gid 10040 dotmac-erp-import \
+    && useradd --uid 10040 --gid 10040 --no-create-home \
+        --shell /usr/sbin/nologin dotmac-erp-import \
+    && mkdir -p /job/in /job/out \
+    && chown 10040:10040 /job/out \
+    && chmod 0700 /job/out \
+    && chmod 0755 /job/in
+
 # Runtime imports the app only; importer/migrate run as one-off
 # commands from this same image with their own env (never bake
 # MIGRATION_/LEGACY_ DSNs into the serving container).

@@ -1,0 +1,3810 @@
+# ERP v2 deploy unit - schema dotmac.deploy_unit/1 (DRAFT, INERT).
+#
+# Sidecar to deploy/product.toml (design rev3 section 2.2). It holds NAMES,
+# types and bounds only: no value, no secret, no host address. Typed values and
+# secret references live in Control desired state, entered in the Control UI.
+# Nothing reads this file until Control a18 and the deploy agent exist, so
+# merging it changes no deployment.
+
+schema = "dotmac.deploy_unit/1"
+product = "dotmac-erp-v2"
+spec = "deploy/product.toml"
+# The <product> segment of the approved OpenBao layout <env>/<product>.
+secrets_namespace = "erp"
+# Binding by digest is the release record's job (product CI): it records the
+# digests of product.toml, this file and the params schema next to the image
+# digest. They are not stored here, because CI rewrites the image binding in
+# product.toml and a digest committed beside the sentinel would never match.
+
+# Section 2.7 (D-1): every private image is transferred, never pulled. This
+# table is written out only so the default is visible; an absent table means
+# the same. "pull" is accepted only for a repository on Control's
+# public_pull_repositories allowlist, which this file cannot widen.
+[image]
+source = "transfer"
+
+# ---------------------------------------------------------------- params
+# Non-secret typed values only. `material` ties a param to a Foundation
+# runtime-material name in product.toml; Control renders them into the
+# generated params.env. A secret-shaped value is refused at preview.
+
+[params.platform_root_domain]
+type = "hostname"
+required_in = ["production"]
+material = "PLATFORM_ROOT_DOMAIN"
+max_length = 253
+
+[params.trusted_hosts]
+type = "string"
+required_in = ["production"]
+material = "TRUSTED_HOSTS"
+# Comma-separated host names, no spaces.
+pattern = "^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$"
+max_length = 512
+
+# A serving process never seeds: fixed false.
+[params.seed_on_startup]
+type = "bool"
+default = false
+choices = [false]
+required_in = ["production"]
+material = "SEED_ON_STARTUP"
+
+# Where the existing legacy env file sits on the target. Entered in the UI,
+# never a literal here; the policy that allows it is Control's (section 2.8).
+[params.legacy_env_path]
+type = "path"
+pattern = "^/etc/dotmac/legacy/[A-Za-z0-9._-]+\\.env$"
+max_length = 255
+
+# Image identity for the planned release (Control pins and cross-checks both).
+[params.image_repository]
+type = "image_repository"
+required_in = ["production"]
+
+[params.image_digest]
+type = "image_digest"
+required_in = ["production"]
+
+# Bounded hold point for the companion's genesis window (packet C13).
+[params.a5_hold_timeout_seconds]
+type = "duration_seconds"
+default = 1800
+min = 60
+max = 3600
+required_in = ["production"]
+
+# ---------------------------------------------- operator-job params (job-scoped)
+# Typed inputs of the dispatched operator jobs ONLY (each carries `jobs = [...]`).
+# They are PER-DISPATCH values entered at propose (default "0" for every gate),
+# carried only in that run_job plan's dispatched_job.params; they are never stored
+# desired state and never reach the serving app's params.env. Types follow what the
+# code reads: every apply/approval gate is compared to the STRING "1", so a bool
+# (rendered true/false) would never approve: they are enums of "0"/"1".
+# ERP_ENROLMENT_ACTOR_ID goes through uuid.UUID (canonical dashed UUID).
+# ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF is only stripped and required non-empty
+# (String(240) column), so it is bounded, with no invented character set.
+# ERP_SELLER_COUNTRY defaults to NG in the code.
+
+[params.import_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_IMPORT_APPROVED"
+jobs = ["import_execute", "payables_history", "claims_opening_apply", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
+
+[params.import_apply_ok]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_IMPORT_APPLY_OK"
+jobs = ["import_execute", "payables_history", "claims_opening_apply", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
+
+[params.identity_import_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_IDENTITY_IMPORT_APPROVED"
+jobs = ["identity_import"]
+
+[params.ar_opening_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_AR_OPENING_APPLY"
+jobs = ["ar_opening_mint", "ar_opening_apply", "ar_opening_plan", "ar_opening_census"]
+
+[params.held_drafts_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_HELD_DRAFTS_APPLY"
+jobs = ["held_drafts_plan", "held_drafts_apply"]
+
+[params.holding_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_HOLDING_APPLY"
+jobs = ["holdings_plan", "holdings_apply", "holdings_verify", "holdings_t1_plan", "holdings_t1_apply", "holdings_straddle_plan", "holdings_straddle_verify", "holdings_straddle_apply", "holdings_subkobo_plan", "holdings_subkobo_verify", "holdings_subkobo_apply", "holdings_release", "holdings_writeoff_plan", "holdings_writeoff_apply"]
+
+[params.governance_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_GOVERNANCE_APPLY"
+jobs = ["governance_plan", "governance_apply"]
+
+[params.access_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_ACCESS_APPLY"
+jobs = ["access_plan", "access_apply", "access_revoke_plan", "access_revoke_apply"]
+
+[params.cash_gl_setup_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_CASH_GL_SETUP_APPROVED"
+jobs = ["cash_gl_setup"]
+
+[params.payroll_account_setup_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_PAYROLL_ACCOUNT_SETUP_APPROVED"
+jobs = ["payroll_accounts"]
+
+[params.tax_seed_approved]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_TAX_SEED_APPROVED"
+jobs = ["tax_seed"]
+
+[params.billing_gl_vat_opening_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_BILLING_GL_VAT_OPENING_APPLY"
+jobs = ["billing_gl_vat_opening_plan", "billing_gl_vat_opening_apply"]
+
+[params.migration_ledger_apply]
+type = "enum"
+choices = ["0", "1"]
+default = "0"
+material = "ERP_MIGRATION_LEDGER_APPLY"
+jobs = ["ledger_opening_plan", "ledger_opening_apply", "ledger_opening_gen_tb", "ledger_attribution", "ledger_bridge_build", "ledger_bridge_sign", "ledger_bridge_rounding", "ledger_exceptions_load", "ledger_exceptions_resolve", "ledger_exceptions_gate", "ledger_exceptions_add", "ledger_exceptions_declare_na"]
+
+[params.enrolment_actor_id]
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+material = "ERP_ENROLMENT_ACTOR_ID"
+jobs = ["import_execute"]
+
+[params.payroll_net_payable_account_ref]
+type = "string"
+min_length = 1
+max_length = 240
+material = "ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF"
+jobs = ["import_execute"]
+
+[params.seller_legal_name]
+type = "string"
+min_length = 1
+max_length = 240
+material = "ERP_SELLER_LEGAL_NAME"
+jobs = ["import_billing_plan", "ar_opening_census", "ar_opening_mint", "ar_opening_plan", "ar_opening_apply"]
+
+[params.seller_address_line]
+type = "string"
+min_length = 1
+max_length = 240
+material = "ERP_SELLER_ADDRESS_LINE"
+jobs = ["import_billing_plan", "ar_opening_census", "ar_opening_mint", "ar_opening_plan", "ar_opening_apply"]
+
+[params.seller_country]
+type = "string"
+pattern = "^[A-Z]{2}$"
+max_length = 2
+default = "NG"
+material = "ERP_SELLER_COUNTRY"
+jobs = ["import_billing_plan"]
+
+# ------------------------------------------------------- legacy env file
+# M11 bridge, existing app only (ERP flip). NAMES ONLY, never values, and only
+# secret-class names (invariant L2). Every other control (sha fixed at enable,
+# expiry, ceiling, relocation, retirement) is a Control policy, not a field
+# here. Names may only shrink (L3). Retirement moves them to [[bindings]].
+[legacy_env_file]
+names = [
+  "DATABASE_URL",
+  "PLATFORM_DATABASE_URL",
+  "JWT_SECRET",
+  "SESSION_HASH_SECRET",
+  "CSRF_SECRET",
+]
+path_param = "legacy_env_path"
+
+# -------------------------------------------------------------- bindings
+# Pre-staged exit from the legacy bridge. state = "pre_staged" means the
+# binding is declared and reviewable but is NOT yet a delivery source: the
+# legacy file stays the only source for the names above until the first
+# post-cutover deploy retires the bridge (section 2.8 L8). The value of each
+# binding is a secret_ref of the form bao://<env>/<product>/kv/<role>/<binding>,
+# held in Control, never here.
+[[bindings]]
+name = "DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "PLATFORM_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "JWT_SECRET"
+state = "pre_staged"
+kind = "key"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "SESSION_HASH_SECRET"
+state = "pre_staged"
+kind = "key"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+[[bindings]]
+name = "CSRF_SECRET"
+state = "pre_staged"
+kind = "key"
+roles = ["app"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+# Owner and backup credentials: roles that never run in the serving container.
+[[bindings]]
+name = "MIGRATION_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["migrate", "import"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = true
+
+[[bindings]]
+name = "BACKUP_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["backup"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = false
+
+# The legacy source DSN, read by the dispatched `import` job and by nothing else
+# (import-only OpenBao): never a legacy_env_file name, never an app material.
+# single_use = true on both import bindings (P-SEC rev4 s3.14): one secret_id per
+# dispatched run, minted only at job dispatch and purged when the job exits. Both
+# stay pre_staged here (this unit is inert); the flip release must set BOTH to
+# state = "active", or Control's propose refuses every import job (C-3).
+# There is no sealed or boot fallback: if OpenBao is down the job fails closed.
+[[bindings]]
+name = "LEGACY_DATABASE_URL"
+state = "pre_staged"
+kind = "pg_login_dsn"
+roles = ["import"]
+writer = "ceremony"
+rotation = "copy_only"
+single_use = true
+
+# ------------------------------------------------------------------ jobs
+# Operator-triggered one-shots of the flip. Genesis is the product.toml
+# migration step, not a job. A job runs only when the runbook step names it;
+# its arguments come from the flip runbook (docs/rehearsal.md), not from here.
+# Every flip command that reads MIGRATION_DATABASE_URL or LEGACY_DATABASE_URL is a
+# job with role = "import" (dispatch-time credentials only), one job per mode so a
+# dispatch approval names exactly one command and its full, closed argv:
+# `command` plus the declared [[jobs.args]] (typed, bounded, secret-checked;
+# values are entered at propose). A path argument is an `input` (/job/in/<name>,
+# its sha256 entered at propose and signed) or an `output` (/job/out/<name>);
+# apply-mode flags and `apply_command` mark a plan apply-class. The importer's --source-url-env/--dest-url-env and any flag not listed
+# here can never be passed. A job's gates and inputs are the job-scoped params
+# above (per-dispatch, default "0"). `timeout_seconds` follows docs/deployment.md
+# (importer execute measured 22m56s, so 2400 s (P-SEC C-21); a lease is timeout + 120 and must
+# fit the target's role_job_lease_ceiling_seconds; jobs at 780 s fit the default
+# 900 s ceiling). billing_gl vat-opening/vat-extract use their own modules: the
+# package __main__ is the serving runner, which refuses operator DSNs.
+# import_census reads no database and so has no role.
+
+[[jobs]]
+name = "import_census"
+command = ["python", "-m", "erp_v2.importer", "census"]
+trigger = "operator"
+timeout_seconds = 780
+materials = []
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs]]
+name = "import_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.importer", "plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs]]
+name = "import_execute"
+role = "import"
+command = ["python", "-m", "erp_v2.importer", "execute"]
+trigger = "operator"
+timeout_seconds = 2400
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--history-cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--mint"
+type = "bool"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--tax-rule-policy-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--tax-band-binding-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--minor-units"
+type = "int"
+
+[[jobs.args]]
+flag = "--source-owner"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-version"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "import_billing_plan"
+command = ["python", "-m", "erp_v2.importer", "billing-plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = []
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--invoices-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--allocations-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--payments-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--source-account-key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--account-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--precision"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "import_billing_preflight"
+command = ["python", "-m", "erp_v2.importer", "billing-preflight"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = []
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--invoices-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--allocations-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--payments-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--source-account-key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--account-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--precision"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--expected-position-fingerprint"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--posting-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--economic-cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--recorded-cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--isolation"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "payables_history"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.payables_history_cli"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--cohort"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--reviewed-plan"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--transform-manifest-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--transform-manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs]]
+name = "identity_import"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.identity_cli"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--approved-allowlist-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--approved-manifest-sha256"
+type = "sha256"
+
+[[jobs]]
+name = "ar_opening_census"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "census"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ar_opening_mint"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "mint"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ar_opening_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ar_opening_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "apply"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approved-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "claims_opening_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.claims_opening", "plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--window-id"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--plan-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--attribution-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--fragment-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--apply-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs]]
+name = "claims_opening_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.claims_opening", "apply"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--window-id"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--plan-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--attribution-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--fragment-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--apply-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs]]
+name = "claims_opening_verify"
+role = "import"
+command = ["python", "-m", "erp_v2.claims_opening", "verify"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--window-id"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--plan-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--attribution-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--fragment-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--apply-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs]]
+name = "legacy_ap_recognize"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.recognize_cli"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--list"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--list-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--approver-party-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--transform-manifest-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--transform-manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs]]
+name = "legacy_ap_settled"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.settled_cli"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--list"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--list-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--approver-party-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--transform-manifest-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--transform-manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--unpaid-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--unpaid-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--b1b-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--b1b-receipt-sha256"
+type = "sha256"
+
+[[jobs]]
+name = "legacy_ap_review"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.review_cli"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--decisions"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--decision-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "legacy_ap_cohort"
+role = "import"
+command = ["python", "-m", "erp_v2.legacy_ap.cohort_cli"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--cohort"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--cohort-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "payees_bulk"
+role = "import"
+command = ["python", "-m", "erp_v2.payees.bulk_cli"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--file-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--bank-reference"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--bank-reference-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--expect"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--approve"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "held_drafts_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.held_drafts.cli", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs]]
+name = "held_drafts_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.held_drafts.cli", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--approved-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs]]
+name = "holdings_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.holdings.cli", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_verify"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "verify"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_t1_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "t1", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_t1_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.holdings.cli", "t1", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_straddle_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "straddle", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_straddle_verify"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "straddle", "verify"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_straddle_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.holdings.cli", "straddle", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_subkobo_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "subkobo", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_subkobo_verify"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "subkobo", "verify"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_subkobo_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.holdings.cli", "subkobo", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_release"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "release"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--exception"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--owner-command"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs]]
+name = "holdings_writeoff_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "writeoff", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--exception"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--offset-account"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--evidence-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_writeoff_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.holdings.cli", "writeoff", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--exception"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--offset-account"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--evidence-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "governance_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.governance.cli", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "governance_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.governance.cli", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--approved-spec-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.access_cli", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.access_cli", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--approved-allowlist-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_revoke_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.access_cli", "revoke-plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_revoke_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.access_cli", "revoke-apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--approved-allowlist-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "cash_gl_setup"
+role = "import"
+command = ["python", "-m", "erp_v2.cash_gl.setup_cli"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--approved-spec-sha256"
+type = "sha256"
+
+[[jobs]]
+name = "payroll_accounts"
+role = "import"
+command = ["python", "-m", "erp_v2.payroll_accounts"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--approved-spec-sha256"
+type = "sha256"
+
+[[jobs]]
+name = "tax_seed"
+role = "import"
+command = ["python", "-m", "erp_v2.tax_seed"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--seed-spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs.args]]
+flag = "--approved-seed-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--approved-manifest-sha256"
+type = "sha256"
+
+[[jobs]]
+name = "billing_gl_vat_opening_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.billing_gl.vat_opening", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--input"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "billing_gl_vat_opening_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.billing_gl.vat_opening", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--input"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--approved-plan-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "billing_gl_vat_extract"
+role = "import"
+command = ["python", "-m", "erp_v2.billing_gl.vat_extract"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--organization-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--overrides"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--treatment-map"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--acknowledge-residue"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ledger_opening_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.opening_cli", "plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+
+[[jobs.args]]
+flag = "--as-of"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs]]
+name = "ledger_opening_apply"
+role = "import"
+apply_command = true
+command = ["python", "-m", "erp_v2.migration_ledger.opening_cli", "apply"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+
+[[jobs.args]]
+flag = "--as-of"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--approved-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "ledger_opening_gen_tb"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.opening_cli", "gen-tb"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+
+[[jobs.args]]
+flag = "--as-of"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs]]
+name = "ledger_attribution"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.attribution_cli"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--p-attr-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--p-attr-receipt-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--unpaid-plan"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--unpaid-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--settled-plan"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--settled-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--s8-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--s8-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--s8-fragment"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--s8-fragment-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--out-dir"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs]]
+name = "ledger_bridge_build"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.bridge_report", "build"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--inputs"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--itemised-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--subkobo-side-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--straddlers-side-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--version"
+type = "int"
+
+[[jobs.args]]
+flag = "--expect-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--signed-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approval-reference"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ledger_bridge_sign"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.bridge_report", "sign"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--inputs"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--itemised-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--subkobo-side-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--straddlers-side-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--approved-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--version"
+type = "int"
+
+[[jobs.args]]
+flag = "--expect-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--signed-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approval-reference"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "ledger_bridge_rounding"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.bridge_report", "rounding"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--inputs"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--itemised-out"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--subkobo-side-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--straddlers-side-file"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-receipt"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+
+[[jobs.args]]
+flag = "--import-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--version"
+type = "int"
+
+[[jobs.args]]
+flag = "--expect-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--signed-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approval-reference"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ledger_exceptions_load"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "load"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "ledger_exceptions_resolve"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "resolve"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "ledger_exceptions_gate"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "gate"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ledger_exceptions_add"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "add"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+[[jobs]]
+name = "ledger_exceptions_declare_na"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "declare-na"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+apply_mode = true
+
+
+# ------------------------------------------------------------ hold point
+# The companion's genesis grant window is opened and closed by an operator op
+# outside the agent. The agent waits at this point, bounded by the param.
+[[hold_points]]
+name = "companion-genesis-window"
+member = "companion"
+before = "migrate"
+timeout_param = "a5_hold_timeout_seconds"
+on_timeout = "abandon_member_record_deviation"
+released_by = "operator"
+
+# ------------------------------------------------------------- companion
+# Deployment set: ERP v2 is the primary. The companion is released only after
+# the primary's signed observation is healthy; if it fails the primary stays up
+# and a deviation is recorded.
+[[companions]]
+product = "dotmac-integrator-companion"
+descriptor = "deploy/companion/deploy-unit.toml"
+order = "after_primary_ready"
+required_at_switch = false
+host = "same"
+
+# ---------------------------------------------------------------- health
+# Gate order the runner must pass, mapped onto Foundation probes and hooks. No
+# new gate engine.
+[health]
+gates = ["migrate", "heads", "live", "ready"]
