@@ -134,6 +134,7 @@ def test_audit_action_values_and_permission_codes_are_unchanged():
         "erp.finance.supplier_payment.reversed_posted",
         "erp.finance.supplier_payment.refused",
         "erp.treasury.disbursement_file.generated",
+        "erp.finance.supplier_payment.sod_stamp_flagged",  # D-9 stamp read-back (additive; payables a7)
     )
     assert (b1.AUDIT_APPROVED_POSTED, b1.AUDIT_APPROVAL_REFUSED) == (
         "erp.finance.supplier_invoice.approved_posted",

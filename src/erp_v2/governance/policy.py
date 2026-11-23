@@ -58,6 +58,16 @@ def dual_control(db: Session, tenant_id: UUID) -> bool:
     return bool(value)
 
 
+def separation_of_duties(db: Session, tenant_id: UUID) -> bool:
+    """The value ERP passes as ``separation_of_duties=`` to dotmac-payroll and dotmac-payables (D-9).
+
+    The same tenant policy as ``dual_control``: OFF unless the operator CLI turned it ON, and a failed read
+    refuses (never reads as OFF). Every ERP call into those Starter functions must source the keyword from here
+    (``tests/test_separation_call_sites.py`` fails any call that does not).
+    """
+    return dual_control(db, tenant_id)
+
+
 AUDIT_DUAL_CONTROL_SET: Final = "erp.governance.dual_control_set"
 
 governance_feature: Final = FeatureManifest(name="erp_governance", audit_actions=(AUDIT_DUAL_CONTROL_SET,))

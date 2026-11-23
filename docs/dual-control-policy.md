@@ -58,9 +58,25 @@ The policy read refuses (`GovernancePolicyError`) rather than reading OFF when, 
 tenant setting is missing or differs from the tenant asked for (roles that bypass RLS, such as the operator CLI,
 only refuse on a differing setting).
 
-## Not covered here
+## Starter's own separation checks (payroll a7 pinned; payables a7 prepared)
 
-Starter's own checks (payables a5 approve/record/reverse, payroll a5 creator/approver/finalizer/reverser,
-`ck_supplier_payments_sod`) are untouched and ride in the payables a6 and payroll a6 releases. Until those are
-pinned the owner still refuses, for example, an approver who prepared the same supplier payment, so a single person
-cannot yet complete B3, B4 or B5 end to end even with the policy off; the ERP-side codes no longer fire.
+dotmac-payroll 0.1.0a7 and dotmac-payables 0.1.0a7 take a keyword-only `separation_of_duties: bool = False`
+(non-bool refused). ERP passes the tenant policy; the default is OFF.
+
+1. **Every call passes it explicitly.** `tests/test_separation_call_sites.py` scans `src/erp_v2` with the AST and fails
+   on any call to `approve_payroll_run`, `finalize_payroll_run`, `reverse_liability_settlement` or the four
+   `*_supplier_payment` functions that does not pass `separation_of_duties=` sourced from
+   `governance.separation_of_duties` (payables calls go through `**separation.payables_kwargs(db, tenant_id)`).
+2. **Payables stamp read-back** (`supplier_payments/separation.py`, `service._read_back_stamp`): after every payables
+   write the row's `separation_enforced` stamp is compared with the policy. At preparation a mismatch refuses
+   (`sod_stamp_mismatch`, nothing saved); at a later step it is flagged (`erp.finance.supplier_payment.sod_stamp_flagged`)
+   and payables still enforces the stricter value. Inert until payables a7 is pinned.
+3. **Payroll stamp-or-policy**: payroll has no stamp column, so ERP records the value it passed as
+   `separation_enforced` in the details of its own run events (`erp.payroll.run.approved`,
+   `erp.payroll.run.finalized_posted`, `erp.payroll.payout.line_returned`).
+4. **Saved check**: `python -m erp_v2.governance.sod_verification --tenant-id <uuid>` (read-only, exit 3 on findings)
+   lists payables rows stamped relaxed and payroll events recorded relaxed that were created while the policy was ON
+   (the ON windows come from the `erp.governance.dual_control_set` audit events).
+
+Payables a7 is not published yet. When it is: change `dotmac-payables==0.1.0a6` to `==0.1.0a7` in `pyproject.toml`,
+refresh `uv.lock`, and `tests/test_payables_a7_separation_pg.py` stops skipping. No code change is needed.

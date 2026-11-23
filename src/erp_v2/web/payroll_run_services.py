@@ -686,7 +686,8 @@ def _guarded_approve(db: Session, *, tenant: Tenant, party: Party, run_id: UUID,
         return ApproveOutcome(run.id, True)
     if run.status != "draft":
         raise RunRefused("not_draft", "Only a draft payroll run can be approved")
-    if governance.dual_control(db, tenant.id) and run.created_by_id == party.id:
+    separation = governance.separation_of_duties(db, tenant.id)
+    if separation and run.created_by_id == party.id:
         raise RunRefused("sod_creator_is_approver", "You created this run; another person must approve it")
     check_currency(db, run)
     check_no_overlap(db, run)
@@ -694,7 +695,14 @@ def _guarded_approve(db: Session, *, tenant: Tenant, party: Party, run_id: UUID,
     check_roster_complete(db, run)
     check_mappings(db, run)
     check_loan_recovery(db, run)
-    payroll.approve_payroll_run(db, tenant_id=tenant.id, run_id=run.id, approved_by_id=party.id, approved_at=now)
+    payroll.approve_payroll_run(
+        db,
+        tenant_id=tenant.id,
+        run_id=run.id,
+        approved_by_id=party.id,
+        approved_at=now,
+        separation_of_duties=separation,
+    )
     _audit(
         db,
         tenant=tenant,
@@ -702,7 +710,7 @@ def _guarded_approve(db: Session, *, tenant: Tenant, party: Party, run_id: UUID,
         run_id=run.id,
         action=AUDIT_APPROVED,
         success=True,
-        details={"created_by": str(run.created_by_id)},
+        details={"created_by": str(run.created_by_id), "separation_enforced": separation},
     )
     return ApproveOutcome(run.id, False)
 
@@ -809,7 +817,7 @@ def _guarded_finalize(db: Session, *, tenant: Tenant, party: Party, run_id: UUID
         return FinalizeOutcome(run.id, journal.id, journal.number, _net_total(db, run), True)
     if run.status != "approved" or run.approved_by_id is None:
         raise RunRefused("not_approved", "Only an approved payroll run can be finalized")
-    strict = governance.dual_control(db, tenant.id)
+    strict = governance.separation_of_duties(db, tenant.id)
     if strict and party.id == run.approved_by_id:
         raise RunRefused("sod_approver_is_finalizer", "You approved this run; another person must finalize it")
     if strict and party.id == run.created_by_id:
@@ -820,7 +828,14 @@ def _guarded_finalize(db: Session, *, tenant: Tenant, party: Party, run_id: UUID
     check_roster_complete(db, run)
     payable_id = check_mappings(db, run)
     check_loan_recovery(db, run)
-    payroll.finalize_payroll_run(db, tenant_id=tenant.id, run_id=run.id, finalized_by_id=party.id, finalized_at=now)
+    payroll.finalize_payroll_run(
+        db,
+        tenant_id=tenant.id,
+        run_id=run.id,
+        finalized_by_id=party.id,
+        finalized_at=now,
+        separation_of_duties=strict,
+    )
     consequence = build_run_accounting_consequence(db, tenant_id=tenant.id, run_id=run.id)
     net_total = _net_total(db, run)
     refs_2040 = {PAYROLL_PAYABLE_CODE, str(payable_id)}
@@ -849,6 +864,7 @@ def _guarded_finalize(db: Session, *, tenant: Tenant, party: Party, run_id: UUID
             "consequence_fingerprint": consequence.fingerprint,
             "approved_by": str(run.approved_by_id),
             "created_by": str(run.created_by_id),
+            "separation_enforced": strict,
         },
     )
     return FinalizeOutcome(run.id, posted.journal_id, posted.journal_number, net_total, posted.replayed)

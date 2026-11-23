@@ -1141,6 +1141,8 @@ def _return_line(
         .where(BankAccount.tenant_id == tenant.id, BankAccount.id == batch.bank_account_id)
         .with_for_update(read=True)
     )
+    # Stricter of the tenant policy and the line's own stamp (row-stamped governance; never looser than either).
+    separation = governance.separation_of_duties(db, tenant.id) or bool(line.dual_control)
     reversal = payroll.reverse_liability_settlement(
         db,
         tenant_id=tenant.id,
@@ -1149,6 +1151,7 @@ def _return_line(
         reason=why,
         reversed_by_id=party.id,
         reversed_at=now,
+        separation_of_duties=separation,
     )
     consequence = build_settlement_reversal_consequence(
         db,
@@ -1196,6 +1199,7 @@ def _return_line(
             "liability_id": str(line.liability_id),
             "settlement_id": str(settlement.id),
             "reversal_id": str(reversal.id),
+            "separation_enforced": separation,
             "amount": str(line.amount),
             "return_reference": reference,
             "reason": why,
