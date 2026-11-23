@@ -323,11 +323,12 @@ single_use = true
 # job with role = "import" (dispatch-time credentials only), one job per mode so a
 # dispatch approval names exactly one command and its full, closed argv:
 # `command` plus the declared [[jobs.args]] (typed, bounded, secret-checked;
-# values are entered at propose). Path arguments are restricted to the job's own
-# work dir. The importer's --source-url-env/--dest-url-env and any flag not listed
+# values are entered at propose). A path argument is an `input` (/job/in/<name>,
+# its sha256 entered at propose and signed) or an `output` (/job/out/<name>);
+# apply-mode flags and `apply_command` mark a plan apply-class. The importer's --source-url-env/--dest-url-env and any flag not listed
 # here can never be passed. A job's gates and inputs are the job-scoped params
 # above (per-dispatch, default "0"). `timeout_seconds` follows docs/deployment.md
-# (importer execute measured 22m56s, so 3000 s; a lease is timeout + 120 and must
+# (importer execute measured 22m56s, so 2400 s (P-SEC C-21); a lease is timeout + 120 and must
 # fit the target's role_job_lease_ceiling_seconds; jobs at 780 s fit the default
 # 900 s ceiling). billing_gl vat-opening/vat-extract use their own modules: the
 # package __main__ is the serving runner, which refuses operator DSNs.
@@ -344,8 +345,9 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_census/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs]]
 name = "import_plan"
@@ -359,41 +361,46 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs]]
 name = "import_execute"
 role = "import"
 command = ["python", "-m", "erp_v2.importer", "execute"]
 trigger = "operator"
-timeout_seconds = 3000
+timeout_seconds = 2400
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--history-cutoff"
@@ -408,20 +415,23 @@ type = "bool"
 [[jobs.args]]
 flag = "--import-params-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--tax-rule-policy-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--tax-band-binding-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--minor-units"
@@ -450,34 +460,39 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--invoices-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--allocations-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--payments-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--source-account-key"
@@ -510,34 +525,39 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--invoices-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--allocations-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--payments-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--source-account-key"
@@ -626,40 +646,46 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--cohort"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--reviewed-plan"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--reviewed-plan-sha256"
@@ -672,14 +698,16 @@ type = "sha256"
 [[jobs.args]]
 flag = "--import-params-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--transform-manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs]]
 name = "identity_import"
@@ -693,34 +721,39 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--allowlist"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--approved-allowlist-sha256"
@@ -742,22 +775,25 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_census/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_census/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_census/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -827,22 +863,25 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_mint/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_mint/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_mint/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -912,22 +951,25 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -988,6 +1030,7 @@ max_length = 200
 [[jobs]]
 name = "ar_opening_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "apply"]
 trigger = "operator"
 timeout_seconds = 1800
@@ -997,22 +1040,25 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1114,8 +1160,9 @@ required = true
 [[jobs.args]]
 flag = "--snapshot-manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--snapshot-sha256"
@@ -1124,8 +1171,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--cutoff-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--cutoff-receipt-sha256"
@@ -1134,37 +1182,43 @@ type = "sha256"
 [[jobs.args]]
 flag = "--plan-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--attribution-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--fragment-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--apply-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs]]
 name = "claims_opening_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.claims_opening", "apply"]
 trigger = "operator"
 timeout_seconds = 1800
@@ -1202,8 +1256,9 @@ required = true
 [[jobs.args]]
 flag = "--snapshot-manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--snapshot-sha256"
@@ -1212,8 +1267,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--cutoff-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--cutoff-receipt-sha256"
@@ -1226,33 +1282,38 @@ type = "sha256"
 [[jobs.args]]
 flag = "--plan-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--attribution-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--fragment-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--apply-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs]]
 name = "claims_opening_verify"
@@ -1294,8 +1355,9 @@ required = true
 [[jobs.args]]
 flag = "--snapshot-manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--snapshot-sha256"
@@ -1304,8 +1366,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--cutoff-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--cutoff-receipt-sha256"
@@ -1314,33 +1377,38 @@ type = "sha256"
 [[jobs.args]]
 flag = "--plan-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--attribution-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--fragment-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--apply-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs]]
 name = "legacy_ap_recognize"
@@ -1354,36 +1422,41 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--list"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--plan-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1401,6 +1474,7 @@ required = true
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--reviewed-plan-sha256"
@@ -1413,14 +1487,16 @@ type = "sha256"
 [[jobs.args]]
 flag = "--import-params-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--transform-manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs]]
 name = "legacy_ap_settled"
@@ -1434,36 +1510,41 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--list"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--plan-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1481,6 +1562,7 @@ required = true
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--reviewed-plan-sha256"
@@ -1493,20 +1575,23 @@ type = "sha256"
 [[jobs.args]]
 flag = "--import-params-json"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--transform-manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--unpaid-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--unpaid-receipt-sha256"
@@ -1515,8 +1600,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--b1b-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--b1b-receipt-sha256"
@@ -1534,8 +1620,9 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--decisions"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_review/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1551,8 +1638,9 @@ required = true
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_review/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1564,6 +1652,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "legacy_ap_cohort"
@@ -1584,8 +1673,9 @@ required = true
 [[jobs.args]]
 flag = "--cohort"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_cohort/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1596,8 +1686,9 @@ required = true
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_cohort/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1609,6 +1700,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "payees_bulk"
@@ -1622,8 +1714,9 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payees_bulk/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1634,8 +1727,9 @@ required = true
 [[jobs.args]]
 flag = "--bank-reference"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payees_bulk/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--bank-reference-sha256"
@@ -1644,8 +1738,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payees_bulk/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1663,10 +1758,12 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--approve"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "held_drafts_plan"
@@ -1680,15 +1777,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1701,6 +1800,7 @@ required = true
 [[jobs]]
 name = "held_drafts_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.held_drafts.cli", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -1710,22 +1810,25 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--plan-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--approved-plan-sha256"
@@ -1750,15 +1853,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1770,6 +1875,7 @@ max_length = 200
 [[jobs]]
 name = "holdings_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.holdings.cli", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -1779,15 +1885,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1799,12 +1907,14 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--plan-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1824,15 +1934,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1853,15 +1965,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1873,6 +1987,7 @@ max_length = 200
 [[jobs]]
 name = "holdings_t1_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.holdings.cli", "t1", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -1882,15 +1997,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1902,12 +2019,14 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--plan-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1927,15 +2046,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1956,15 +2077,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -1976,6 +2099,7 @@ max_length = 200
 [[jobs]]
 name = "holdings_straddle_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.holdings.cli", "straddle", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -1985,15 +2109,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2005,12 +2131,14 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--plan-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2030,15 +2158,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2059,15 +2189,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_verify/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2079,6 +2211,7 @@ max_length = 200
 [[jobs]]
 name = "holdings_subkobo_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.holdings.cli", "subkobo", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -2088,15 +2221,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2108,12 +2243,14 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--plan-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2133,15 +2270,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_release/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_release/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2153,6 +2292,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--exception"
@@ -2164,8 +2304,9 @@ required = true
 [[jobs.args]]
 flag = "--owner-command"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_release/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs]]
@@ -2180,15 +2321,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2219,6 +2362,7 @@ required = true
 [[jobs]]
 name = "holdings_writeoff_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.holdings.cli", "writeoff", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -2228,15 +2372,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2248,12 +2394,14 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--plan-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2292,15 +2440,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2312,6 +2462,7 @@ max_length = 200
 [[jobs]]
 name = "governance_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.governance.cli", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -2321,15 +2472,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2354,15 +2507,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--allowlist"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2374,6 +2529,7 @@ max_length = 200
 [[jobs]]
 name = "access_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.access_cli", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -2383,15 +2539,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--allowlist"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2416,15 +2574,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--allowlist"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2436,6 +2596,7 @@ max_length = 200
 [[jobs]]
 name = "access_revoke_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.access_cli", "revoke-apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -2445,15 +2606,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--allowlist"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2478,20 +2641,23 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/cash_gl_setup/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/cash_gl_setup/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--approved-spec-sha256"
@@ -2509,20 +2675,23 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payroll_accounts/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/payroll_accounts/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--approved-spec-sha256"
@@ -2540,34 +2709,39 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--snapshot-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--seed-spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs.args]]
 flag = "--approved-seed-sha256"
@@ -2589,15 +2763,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--input"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2609,6 +2785,7 @@ max_length = 200
 [[jobs]]
 name = "billing_gl_vat_opening_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.billing_gl.vat_opening", "apply"]
 trigger = "operator"
 timeout_seconds = 780
@@ -2618,15 +2795,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--input"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2677,28 +2856,32 @@ required = true
 [[jobs.args]]
 flag = "--out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--overrides"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--treatment-map"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--acknowledge-residue"
@@ -2724,8 +2907,9 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_plan/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2750,6 +2934,7 @@ required = true
 [[jobs]]
 name = "ledger_opening_apply"
 role = "import"
+apply_command = true
 command = ["python", "-m", "erp_v2.migration_ledger.opening_cli", "apply"]
 trigger = "operator"
 timeout_seconds = 1800
@@ -2759,8 +2944,9 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2778,8 +2964,9 @@ max_length = 40
 [[jobs.args]]
 flag = "--plan-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_apply/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--approved-plan-sha256"
@@ -2795,6 +2982,7 @@ required = true
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "ledger_opening_gen_tb"
@@ -2808,8 +2996,9 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_gen_tb/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2857,8 +3046,9 @@ required = true
 [[jobs.args]]
 flag = "--snapshot-manifest"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2869,8 +3059,9 @@ required = true
 [[jobs.args]]
 flag = "--cutoff-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2881,8 +3072,9 @@ required = true
 [[jobs.args]]
 flag = "--p-attr-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2893,8 +3085,9 @@ required = true
 [[jobs.args]]
 flag = "--import-itemised"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-itemised-sha256"
@@ -2903,8 +3096,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--unpaid-plan"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--unpaid-plan-sha256"
@@ -2913,8 +3107,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--settled-plan"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--settled-plan-sha256"
@@ -2923,8 +3118,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--s8-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--s8-receipt-sha256"
@@ -2933,8 +3129,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--s8-fragment"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--s8-fragment-sha256"
@@ -2943,8 +3140,9 @@ type = "sha256"
 [[jobs.args]]
 flag = "--out-dir"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs]]
@@ -2959,15 +3157,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -2980,20 +3180,23 @@ required = true
 [[jobs.args]]
 flag = "--inputs"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--itemised-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-itemised"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-itemised-sha256"
@@ -3002,20 +3205,23 @@ type = "sha256"
 [[jobs.args]]
 flag = "--subkobo-side-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--straddlers-side-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-receipt-sha256"
@@ -3053,15 +3259,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -3074,20 +3282,23 @@ required = true
 [[jobs.args]]
 flag = "--inputs"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--itemised-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-itemised"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-itemised-sha256"
@@ -3096,20 +3307,23 @@ type = "sha256"
 [[jobs.args]]
 flag = "--subkobo-side-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--straddlers-side-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-receipt-sha256"
@@ -3142,6 +3356,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "ledger_bridge_rounding"
@@ -3155,15 +3370,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -3176,20 +3393,23 @@ required = true
 [[jobs.args]]
 flag = "--inputs"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--itemised-out"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-itemised"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-itemised-sha256"
@@ -3198,20 +3418,23 @@ type = "sha256"
 [[jobs.args]]
 flag = "--subkobo-side-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--straddlers-side-file"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 
 [[jobs.args]]
 flag = "--import-receipt-sha256"
@@ -3249,15 +3472,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_load/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_load/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -3298,6 +3523,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "ledger_exceptions_resolve"
@@ -3311,15 +3537,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_resolve/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_resolve/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -3360,6 +3588,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "ledger_exceptions_gate"
@@ -3373,15 +3602,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_gate/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_gate/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -3431,15 +3662,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_add/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_add/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -3480,6 +3713,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 [[jobs]]
 name = "ledger_exceptions_declare_na"
@@ -3493,15 +3727,17 @@ runbook = "docs/rehearsal.md"
 [[jobs.args]]
 flag = "--spec"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_declare_na/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "input"
+pattern = "^/job/in/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
 flag = "--receipt"
 type = "path"
-pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_declare_na/[A-Za-z0-9._-]+$"
-max_length = 240
+io = "output"
+pattern = "^/job/out/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+max_length = 160
 required = true
 
 [[jobs.args]]
@@ -3542,6 +3778,7 @@ max_length = 200
 [[jobs.args]]
 flag = "--apply"
 type = "bool"
+apply_mode = true
 
 
 # ------------------------------------------------------------ hold point

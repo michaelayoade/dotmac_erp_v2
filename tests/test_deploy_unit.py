@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -59,7 +60,7 @@ HEALTH_GATES = frozenset(
 BINDING_STATES = frozenset({"pre_staged", "active"})
 # H2: file arguments of a job are restricted to that job's own work dir, and the
 # importer's env-name overrides can never be passed.
-WORK_DIR = "/var/lib/dotmac/erp-v2/job-work"
+JOB_IN, JOB_OUT = "/job/in", "/job/out"
 NEVER_FLAGS = frozenset({"--source-url-env", "--dest-url-env"})
 # Import-only OpenBao: these belong to a DISPATCHED job and to nothing else. They
 # are never a legacy_env_file name and never a material of the serving app (an
@@ -260,10 +261,10 @@ def check_unit(
                 problems.append(f"job-arg-flag:{job.get('name')}:{flag}")
             if arg.get("type") not in {"string", "path", "enum", "bool", "int", "sha256"}:
                 problems.append(f"job-arg-type:{job.get('name')}:{flag}")
-            if arg.get("type") == "path" and not str(arg.get("pattern", "")).startswith(
-                f"^{WORK_DIR}/{job.get('name')}/"
-            ):
-                problems.append(f"job-arg-path-outside-workdir:{job.get('name')}:{flag}")
+            if arg.get("type") == "path":
+                root = {"input": JOB_IN, "output": JOB_OUT}.get(arg.get("io"))
+                if root is None or not str(arg.get("pattern", "")).startswith(f"^{root}/"):
+                    problems.append(f"job-arg-path-outside-workdir:{job.get('name')}:{flag}")
         known = {p["material"] for p in params.values() if "material" in p}
         for material in job.get("materials", []):
             if material not in known | binding_names:
@@ -872,7 +873,8 @@ def test_job_arguments_are_declared_flags_of_the_job_module_and_closed() -> None
             assert arg["flag"] in known, (job["name"], arg["flag"])
             assert arg["flag"] not in NEVER_FLAGS
             if arg["type"] == "path":
-                assert arg["pattern"].startswith(f"^{WORK_DIR}/{job['name']}/")
+                root = {"input": JOB_IN, "output": JOB_OUT}[arg["io"]]
+                assert arg["pattern"].startswith(f"^{root}/")
                 assert ".." not in arg["pattern"]
         # A plan or dry-run job cannot carry the apply flag.
         if job["name"].endswith(("_plan", "_census", "_verify", "_rounding")):
@@ -950,3 +952,39 @@ def test_per_mode_materials_are_the_hand_reviewed_ones() -> None:
         assert sorted(jobs[name]["materials"]) == sorted(expected), name
         # No DSN, no role: nothing is minted for a command that reads no database.
         assert (jobs[name].get("role") == "import") is bool(expected), name
+
+
+def test_the_image_ships_job_in_and_a_job_owned_job_out() -> None:
+    """Foundation's per-dispatch output volume inherits /job/out from the image:
+    owned by the job uid at 0700, with /job/in present."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    uid = _spec()["roles"][0]["security"]["user"]
+    assert re.fullmatch(r"[0-9]+:[0-9]+", uid) and not uid.startswith("0:")
+    assert "mkdir -p /job/in /job/out" in dockerfile
+    assert f"chown {uid} /job/out" in dockerfile
+    assert "chmod 0700 /job/out" in dockerfile
+    assert "chmod 0755 /job/in" in dockerfile
+    # The descriptor's paths are exactly these two directories.
+    for job in _unit()["jobs"]:
+        for arg in job.get("args", []):
+            if arg["type"] == "path":
+                assert arg["pattern"].startswith("^/job/out/" if arg["io"] == "output" else "^/job/in/")
+
+
+def test_each_job_command_equals_its_operator_command_both_ways() -> None:
+    """PROVISIONAL: compared with a fixture copy until Foundation's product.toml
+    carries the closed `operator.commands` map. The two-way equality is the check:
+    no job without an operator command, no operator command without a job, and
+    the argv prefix is identical."""
+    fixture = json.loads(
+        (ROOT / "tests" / "fixtures" / "operator_commands.provisional.json").read_text(encoding="utf-8")
+    )
+    operator = fixture["commands"]
+    jobs = {j["name"]: j["command"] for j in _unit()["jobs"]}
+    assert set(jobs) == set(operator), (
+        sorted(set(jobs) ^ set(operator)),
+        "a job and an operator command must match one-to-one",
+    )
+    for name, command in jobs.items():
+        assert operator[name] == command, name
+    assert "provisional" in fixture

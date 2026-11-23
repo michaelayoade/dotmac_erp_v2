@@ -37,6 +37,15 @@ RUN --mount=type=secret,id=forgejo_token \
     UV_INDEX_FORGEJO_PASSWORD="$(cat /run/secrets/forgejo_token)" \
     uv sync --locked --no-dev
 
+# Operator one-shots (target_api v2 run_job) read /job/in and write /job/out. The
+# image ships both so Foundation's per-dispatch volumes inherit them: /job/out is
+# owned by the job uid (the roles' non-root user) at 0700; /job/in exists, world
+# readable, root-owned (inputs are mounted read-only over it).
+RUN mkdir -p /job/in /job/out \
+    && chown 10001:10001 /job/out \
+    && chmod 0700 /job/out \
+    && chmod 0755 /job/in
+
 # Runtime imports the app only; importer/migrate run as one-off
 # commands from this same image with their own env (never bake
 # MIGRATION_/LEGACY_ DSNs into the serving container).

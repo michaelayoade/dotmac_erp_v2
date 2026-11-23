@@ -1,0 +1,357 @@
+{
+  "commands": {
+    "access_apply": [
+      "python",
+      "-m",
+      "erp_v2.access_cli",
+      "apply"
+    ],
+    "access_plan": [
+      "python",
+      "-m",
+      "erp_v2.access_cli",
+      "plan"
+    ],
+    "access_revoke_apply": [
+      "python",
+      "-m",
+      "erp_v2.access_cli",
+      "revoke-apply"
+    ],
+    "access_revoke_plan": [
+      "python",
+      "-m",
+      "erp_v2.access_cli",
+      "revoke-plan"
+    ],
+    "ar_opening_apply": [
+      "python",
+      "-m",
+      "erp_v2.importer.ar_opening_cli",
+      "apply"
+    ],
+    "ar_opening_census": [
+      "python",
+      "-m",
+      "erp_v2.importer.ar_opening_cli",
+      "census"
+    ],
+    "ar_opening_mint": [
+      "python",
+      "-m",
+      "erp_v2.importer.ar_opening_cli",
+      "mint"
+    ],
+    "ar_opening_plan": [
+      "python",
+      "-m",
+      "erp_v2.importer.ar_opening_cli",
+      "plan"
+    ],
+    "billing_gl_vat_extract": [
+      "python",
+      "-m",
+      "erp_v2.billing_gl.vat_extract"
+    ],
+    "billing_gl_vat_opening_apply": [
+      "python",
+      "-m",
+      "erp_v2.billing_gl.vat_opening",
+      "apply"
+    ],
+    "billing_gl_vat_opening_plan": [
+      "python",
+      "-m",
+      "erp_v2.billing_gl.vat_opening",
+      "plan"
+    ],
+    "cash_gl_setup": [
+      "python",
+      "-m",
+      "erp_v2.cash_gl.setup_cli"
+    ],
+    "claims_opening_apply": [
+      "python",
+      "-m",
+      "erp_v2.claims_opening",
+      "apply"
+    ],
+    "claims_opening_plan": [
+      "python",
+      "-m",
+      "erp_v2.claims_opening",
+      "plan"
+    ],
+    "claims_opening_verify": [
+      "python",
+      "-m",
+      "erp_v2.claims_opening",
+      "verify"
+    ],
+    "governance_apply": [
+      "python",
+      "-m",
+      "erp_v2.governance.cli",
+      "apply"
+    ],
+    "governance_plan": [
+      "python",
+      "-m",
+      "erp_v2.governance.cli",
+      "plan"
+    ],
+    "held_drafts_apply": [
+      "python",
+      "-m",
+      "erp_v2.held_drafts.cli",
+      "apply"
+    ],
+    "held_drafts_plan": [
+      "python",
+      "-m",
+      "erp_v2.held_drafts.cli",
+      "plan"
+    ],
+    "holdings_apply": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "apply"
+    ],
+    "holdings_plan": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "plan"
+    ],
+    "holdings_release": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "release"
+    ],
+    "holdings_straddle_apply": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "straddle",
+      "apply"
+    ],
+    "holdings_straddle_plan": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "straddle",
+      "plan"
+    ],
+    "holdings_straddle_verify": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "straddle",
+      "verify"
+    ],
+    "holdings_subkobo_apply": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "subkobo",
+      "apply"
+    ],
+    "holdings_subkobo_plan": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "subkobo",
+      "plan"
+    ],
+    "holdings_subkobo_verify": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "subkobo",
+      "verify"
+    ],
+    "holdings_t1_apply": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "t1",
+      "apply"
+    ],
+    "holdings_t1_plan": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "t1",
+      "plan"
+    ],
+    "holdings_verify": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "verify"
+    ],
+    "holdings_writeoff_apply": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "writeoff",
+      "apply"
+    ],
+    "holdings_writeoff_plan": [
+      "python",
+      "-m",
+      "erp_v2.holdings.cli",
+      "writeoff",
+      "plan"
+    ],
+    "identity_import": [
+      "python",
+      "-m",
+      "erp_v2.importer.identity_cli"
+    ],
+    "import_billing_plan": [
+      "python",
+      "-m",
+      "erp_v2.importer",
+      "billing-plan"
+    ],
+    "import_billing_preflight": [
+      "python",
+      "-m",
+      "erp_v2.importer",
+      "billing-preflight"
+    ],
+    "import_census": [
+      "python",
+      "-m",
+      "erp_v2.importer",
+      "census"
+    ],
+    "import_execute": [
+      "python",
+      "-m",
+      "erp_v2.importer",
+      "execute"
+    ],
+    "import_plan": [
+      "python",
+      "-m",
+      "erp_v2.importer",
+      "plan"
+    ],
+    "ledger_attribution": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.attribution_cli"
+    ],
+    "ledger_bridge_build": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.bridge_report",
+      "build"
+    ],
+    "ledger_bridge_rounding": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.bridge_report",
+      "rounding"
+    ],
+    "ledger_bridge_sign": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.bridge_report",
+      "sign"
+    ],
+    "ledger_exceptions_add": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.exceptions_register",
+      "add"
+    ],
+    "ledger_exceptions_declare_na": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.exceptions_register",
+      "declare-na"
+    ],
+    "ledger_exceptions_gate": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.exceptions_register",
+      "gate"
+    ],
+    "ledger_exceptions_load": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.exceptions_register",
+      "load"
+    ],
+    "ledger_exceptions_resolve": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.exceptions_register",
+      "resolve"
+    ],
+    "ledger_opening_apply": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.opening_cli",
+      "apply"
+    ],
+    "ledger_opening_gen_tb": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.opening_cli",
+      "gen-tb"
+    ],
+    "ledger_opening_plan": [
+      "python",
+      "-m",
+      "erp_v2.migration_ledger.opening_cli",
+      "plan"
+    ],
+    "legacy_ap_cohort": [
+      "python",
+      "-m",
+      "erp_v2.legacy_ap.cohort_cli"
+    ],
+    "legacy_ap_recognize": [
+      "python",
+      "-m",
+      "erp_v2.legacy_ap.recognize_cli"
+    ],
+    "legacy_ap_review": [
+      "python",
+      "-m",
+      "erp_v2.legacy_ap.review_cli"
+    ],
+    "legacy_ap_settled": [
+      "python",
+      "-m",
+      "erp_v2.legacy_ap.settled_cli"
+    ],
+    "payables_history": [
+      "python",
+      "-m",
+      "erp_v2.importer.payables_history_cli"
+    ],
+    "payees_bulk": [
+      "python",
+      "-m",
+      "erp_v2.payees.bulk_cli"
+    ],
+    "payroll_accounts": [
+      "python",
+      "-m",
+      "erp_v2.payroll_accounts"
+    ],
+    "tax_seed": [
+      "python",
+      "-m",
+      "erp_v2.tax_seed"
+    ]
+  },
+  "provisional": "copy of the descriptor commands until Foundation's product.toml carries the closed `operator.commands` map; replace with that map when the spec lands"
+}
