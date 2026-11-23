@@ -353,7 +353,9 @@
       "erp_v2.tax_seed"
     ]
   },
-  "provisional": "copy of the descriptor commands until Foundation's product.toml carries the closed `operator.commands` map; replace with that map when the spec lands; `user` is the job container user it will carry (P-SEC C-29)",
-  "user": "10040:10040",
+  "provisional": "copy of the descriptor commands until Foundation's product.toml carries the closed `operator.commands` map; replace with that map when the spec lands; `security.user` is the job container user the operator spec will carry (P-SEC C-29)",
+  "security": {
+    "user": "10040:10040"
+  },
   "user_name": "dotmac-erp-import"
 }

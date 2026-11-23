@@ -971,7 +971,7 @@ def test_the_import_uid_is_one_pinned_constant_used_everywhere() -> None:
         assert not 10040 <= used <= 10049, role["code"]
     # The job's container user (provisional operator fixture) is exactly it.
     fixture = json.loads((ROOT / "tests" / "fixtures" / "operator_commands.provisional.json").read_text())
-    assert fixture["user"] == f"{uid}:{gid}"
+    assert fixture["security"]["user"] == f"{uid}:{gid}"
     assert fixture["user_name"] == pinned["name"]
     # The image creates it and gives /job/out to it at 0700.
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -1006,3 +1006,16 @@ def test_each_job_command_equals_its_operator_command_both_ways() -> None:
     for name, command in jobs.items():
         assert operator[name] == command, name
     assert "provisional" in fixture
+
+
+def test_job_user_constant_dockerfile_and_job_spec_user_are_the_same_value() -> None:
+    """P-SEC rev7: deploy/job-user.toml, the Dockerfile's /job/out chown and the job's
+    `security.user` (provisional fixture, until Foundation's operator table exists) are
+    one value, 10040:10040, and none of them is the serving user."""
+    pinned = tomllib.loads((ROOT / "deploy" / "job-user.toml").read_text())["import_job_user"]
+    value = f"{pinned['uid']}:{pinned['gid']}"
+    fixture = json.loads((ROOT / "tests" / "fixtures" / "operator_commands.provisional.json").read_text())
+    chown = re.search(r"chown (\d+:\d+) /job/out", (ROOT / "Dockerfile").read_text(encoding="utf-8"))
+    assert chown is not None
+    assert {chown.group(1), fixture["security"]["user"], value} == {"10040:10040"}
+    assert value != _spec()["roles"][0]["security"]["user"]
