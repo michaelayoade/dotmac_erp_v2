@@ -26,13 +26,16 @@ from datetime import datetime as _datetime
 from datetime import timezone as _timezone
 from decimal import Decimal as _Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import sqlalchemy as sa
 from sqlalchemy.pool import NullPool
 
 from erp_v2.importer.destination_guard import (
+    INCOMPLETE_CODE,
     GuardReport,
     ImportDestinationNotEmpty,
+    ImportGuardRefused,
     ImportLockHeld,
     inspect_destination,
     take_import_lock,
@@ -574,23 +577,39 @@ def cmd_census(args: argparse.Namespace) -> int:
 
 
 def _plan_destination_guard(
-    args: argparse.Namespace, manifest, receipt: dict[str, object], specs: Sequence[TransformSpec]
-) -> None:
+    args: argparse.Namespace, manifest, receipt: dict[str, object], specs: Sequence[object]
+) -> bool:
     """F23: when a destination DSN env is set, report (read-only, no lock) whether the destination is non-empty."""
 
     dsn = _take_env(getattr(args, "dest_url_env", None))
     if not dsn:
         receipt["destination_guard"] = {"checked": False, "reason": "no destination DSN env set"}
-        return
+        return True
     tenant = _uuid.UUID(str(manifest.tenant_extent[0])).hex if len(manifest.tenant_extent) == 1 else None
     engine = sa.create_engine(dsn)
     try:
         with engine.connect() as connection:
             report = inspect_destination(connection, specs, _destination_tables(), tenant)
             connection.rollback()
+            if report.tables_checked == 0:
+                raise ImportGuardRefused(INCOMPLETE_CODE, "no tables were checked")
+    except ImportGuardRefused as exc:
+        receipt["destination_guard"] = {"checked": False, "refusal": exc.code, "message": str(exc)}
+        return False
     finally:
         engine.dispose()
     receipt["destination_guard"] = {"checked": True, **report.as_dict()}
+    return True
+
+
+def _pairing_stand_ins(pairings: Sequence[Pairing]) -> tuple[SimpleNamespace, ...]:
+    """Pairings-only plan (no source DSN): the importable destinations, from the pairings themselves."""
+
+    return tuple(
+        SimpleNamespace(destination_table=p.destination, source_row_refusal=None)
+        for p in pairings
+        if p.source is not None
+    )
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -604,9 +623,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     if not dsn:
         receipt["mode"] = "pairings-only (no source DSN env set)"
         receipt["pairings"] = _census_receipt()
-        _plan_destination_guard(args, manifest, receipt, ())
+        ok = _plan_destination_guard(args, manifest, receipt, _pairing_stand_ins(_ALL_PAIRINGS))
         _write_receipt(Path(args.receipt), receipt)
-        return 0
+        return 0 if ok else 3
     engine = sa.create_engine(dsn)
     with engine.connect() as connection:
         connection.execute(sa.text("SELECT 1"))
@@ -618,9 +637,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     receipt["sources_missing_on_snapshot"] = resolution["missing"] + resolution["ambiguous"]
     receipt["generated_destinations"] = len(generated)
     receipt["specs"] = _spec_report(specs)
-    _plan_destination_guard(args, manifest, receipt, specs)
+    ok = _plan_destination_guard(args, manifest, receipt, specs)
     _write_receipt(Path(args.receipt), receipt)
-    return 0
+    return 0 if ok else 3
 
 
 def _mint_dict(result: MintResult) -> dict[str, object]:
@@ -923,7 +942,7 @@ def _guard_destination(
         report = inspect_destination(dest_conn, specs, dest_tables, str(tenant_hex) if tenant_hex else None)
         if enforce:
             report.raise_if_not_empty()
-    except (ImportDestinationNotEmpty, ImportLockHeld) as exc:
+    except (ImportDestinationNotEmpty, ImportLockHeld, ImportGuardRefused) as exc:
         raise CliRefusal(str(exc)) from exc
     return report
 

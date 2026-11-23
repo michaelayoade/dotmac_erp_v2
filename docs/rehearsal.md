@@ -57,6 +57,13 @@ store). Exit codes: 0 ok, 2 refusal (named), 3 incomplete receipt.
    missing columns, `enrolment_maps_required` vs
    `enrolment_maps_without_builder` (must be empty).
 
+> **F23 destination guard.** `execute` (and `plan` when `MIGRATION_DATABASE_URL` is set) refuses with
+> `import_destination_not_empty` when the tenant already holds rows in the importer's target tables or the migration
+> ledger receipt tables; there is no override, a re-flip uses a fresh genesis. Other refusals:
+> `import_guard_rls_blind` (the DSN role must be superuser or BYPASSRLS, as `erp_owner` is) and
+> `import_guard_incomplete`. The importer lock excludes only other importer executes: flip import (S5) runs alone,
+> with ERP v2 not serving and no other migration command running.
+
 5. **Dry-run execute with minting** (writes roll back):
 
    ```
