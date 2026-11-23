@@ -57,6 +57,10 @@ HEALTH_GATES = frozenset(
     }
 )
 BINDING_STATES = frozenset({"pre_staged", "active"})
+# H2: file arguments of a job are restricted to that job's own work dir, and the
+# importer's env-name overrides can never be passed.
+WORK_DIR = "/var/lib/dotmac/erp-v2/job-work"
+NEVER_FLAGS = frozenset({"--source-url-env", "--dest-url-env"})
 # Import-only OpenBao: these belong to a DISPATCHED job and to nothing else. They
 # are never a legacy_env_file name and never a material of the serving app (an
 # unscoped param); they reach the job only through its role's mint.
@@ -244,6 +248,22 @@ def check_unit(
             problems.append(f"job-trigger:{job.get('name')}")
         if job.get("role") is not None and job["role"] not in binding_roles:
             problems.append(f"job-role-unknown:{job.get('name')}")
+        timeout = job.get("timeout_seconds")
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3480:
+            problems.append(f"job-timeout:{job.get('name')}")
+        flags = [a.get("flag") for a in job.get("args", [])]
+        if len(set(flags)) != len(flags):
+            problems.append(f"job-arg-twice:{job.get('name')}")
+        for arg in job.get("args", []):
+            flag = str(arg.get("flag"))
+            if not re.fullmatch(r"--[a-z][a-z0-9-]*", flag) or flag in NEVER_FLAGS:
+                problems.append(f"job-arg-flag:{job.get('name')}:{flag}")
+            if arg.get("type") not in {"string", "path", "enum", "bool", "int", "sha256"}:
+                problems.append(f"job-arg-type:{job.get('name')}:{flag}")
+            if arg.get("type") == "path" and not str(arg.get("pattern", "")).startswith(
+                f"^{WORK_DIR}/{job.get('name')}/"
+            ):
+                problems.append(f"job-arg-path-outside-workdir:{job.get('name')}:{flag}")
         known = {p["material"] for p in params.values() if "material" in p}
         for material in job.get("materials", []):
             if material not in known | binding_names:
@@ -531,8 +551,10 @@ def test_authored_openbao_config_uses_the_descriptor_namespace() -> None:
 
 def test_the_import_job_has_its_own_role_and_two_dsn_materials() -> None:
     unit = _unit()
-    (job,) = [j for j in unit["jobs"] if j["name"] == "import"]
+    (job,) = [j for j in unit["jobs"] if j["name"] == "import_execute"]
     assert job["role"] == "import"
+    # The measured importer execute (22m56s, docs/deployment.md) needs >= 1800 s.
+    assert job["timeout_seconds"] >= 1800
     # pre_staged delivers nothing: the flip release must set BOTH to "active".
     assert {b["state"] for b in unit["bindings"] if "import" in b["roles"]} == {"pre_staged"}
     assert job["materials"] == ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
@@ -551,8 +573,8 @@ def test_the_import_job_has_its_own_role_and_two_dsn_materials() -> None:
     for name in ("MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"):
         assert "app" not in by_name[name]["roles"], name
     unknown = copy.deepcopy(unit)
-    unknown["jobs"][0]["role"] = "ghost"
-    assert "job-role-unknown:import" in _check(unknown)
+    unknown["jobs"][1]["role"] = "ghost"
+    assert f"job-role-unknown:{unknown['jobs'][1]['name']}" in _check(unknown)
 
 
 def test_job_credentials_are_never_legacy_names_or_app_materials() -> None:
@@ -568,7 +590,7 @@ def test_job_credentials_are_never_legacy_names_or_app_materials() -> None:
         assert "param-job-only-material:leak" in _check(app), name
         # Scoped to the job it is the job's own, not the app's.
         scoped = copy.deepcopy(unit)
-        scoped["params"]["mine"] = {"type": "path", "material": name, "jobs": ["import"]}
+        scoped["params"]["mine"] = {"type": "path", "material": name, "jobs": ["import_execute"]}
         assert not any("param-job-only-material" in p for p in _check(scoped)), name
     # Nor is either a product (Foundation) runtime material of the serving app.
     (app_role,) = [r for r in _spec()["roles"] if r["code"] == "app"]
@@ -586,9 +608,14 @@ def test_import_params_are_job_scoped_and_typed_as_the_importer_reads_them() -> 
         "ERP_ENROLMENT_ACTOR_ID",
         "ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF",
     } <= {p["material"] for p in scoped.values()}
-    assert all("import" in params[n]["jobs"] for n in ("import_approved", "import_apply_ok"))
-    assert params["enrolment_actor_id"]["jobs"] == ["import"]
-    assert params["payroll_net_payable_account_ref"]["jobs"] == ["import"]
+    assert "import_execute" in params["import_approved"]["jobs"]
+    assert "import_execute" in params["import_apply_ok"]["jobs"]
+    assert params["enrolment_actor_id"]["jobs"] == ["import_execute"]
+    assert params["payroll_net_payable_account_ref"]["jobs"] == ["import_execute"]
+    # M1: gate values are per-dispatch inputs, never stored: always default "0".
+    for gate in scoped.values():
+        if gate["type"] == "enum":
+            assert gate["default"] == "0", gate["material"]
     # The importer compares the two gates to the STRING "1": a bool would render
     # true/false and never approve, so they are enums of "0"/"1", default "0".
     cli = (ROOT / "src" / "erp_v2" / "importer" / "cli.py").read_text(encoding="utf-8")
@@ -628,41 +655,249 @@ def test_import_params_are_job_scoped_and_typed_as_the_importer_reads_them() -> 
     assert "param-job-material:import_approved" in _check(unmaterial)
 
 
-def test_every_command_that_reads_an_operator_dsn_is_an_import_role_job() -> None:
-    """Q-F2: no flip command reading MIGRATION/LEGACY_DATABASE_URL is left outside
-    the import role; each job carries its module command and only the DSNs it reads."""
-    unit = _unit()
-    jobs = {j["name"]: j for j in unit["jobs"]}
-    assert all(j["role"] == "import" and j["trigger"] == "operator" for j in jobs.values())
-    modules = {}
-    for job in jobs.values():
-        cmd = job["command"]
-        assert cmd[:2] == ["python", "-m"], job["name"]
-        modules[cmd[2]] = job
-    src = ROOT / "src"
-    needle = re.compile(r"os\.environ\.pop\(\"(MIGRATION|LEGACY)_DATABASE_URL\"")
+_DSN = {"MIGRATION_DATABASE_URL": "MIGRATION", "LEGACY_DATABASE_URL": "LEGACY"}
+#: Not operator commands: the schema upgrade (its own migrate credential, run by
+#: Foundation), alembic's env, the serving runtime's refusal, and the shared
+#: helper module (its readers are the modules that CALL it).
+_DSN_EXEMPT = frozenset(
+    {
+        "erp_v2.migrate",
+        "erp_v2.migrations.env",
+        "erp_v2.database",
+        "erp_v2.migration_ledger.cli_common",
+    }
+)
+#: Packages whose `__main__` is their CLI are run as the package.
+_PACKAGE_MAIN = {
+    "erp_v2.importer.cli": "erp_v2.importer",
+    "erp_v2.claims_opening.cli": "erp_v2.claims_opening",
+}
+
+
+def _is_docstring(node: ast.AST, parent: ast.AST | None) -> bool:
+    return isinstance(parent, ast.Expr) and isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _dsn_reads(tree: ast.Module) -> set[str]:
+    """Operator DSNs a module READS (not merely refuses): MIGRATION / LEGACY.
+
+    A read is a `pop`/`get`/`getenv` of the name, a `default=` of an argparse
+    option naming it, a loop that pops each name of a tuple, or a call to the
+    shared helpers `cli_common.engine()` (MIGRATION) / `legacy_engine()` (LEGACY),
+    resolved through the module's own import aliases. A bare `"X" in os.environ`
+    is a refusal and is not a read.
+    """
+    helpers: set[str] = set()  # names bound to the cli_common module
+    direct: dict[str, str] = {}  # engine/legacy_engine imported by name
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if node.module == "erp_v2.migration_ledger" and alias.name == "cli_common":
+                    helpers.add(alias.asname or alias.name)
+                if node.module == "erp_v2.migration_ledger.cli_common" and alias.name in {
+                    "engine",
+                    "legacy_engine",
+                }:
+                    direct[alias.asname or alias.name] = alias.name
+    reads: set[str] = set()
+
+    def names_in(node: ast.AST) -> set[str]:
+        return {_DSN[n.value] for n in ast.walk(node) if isinstance(n, ast.Constant) and n.value in _DSN}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in {"pop", "get", "getenv"}:
+                if node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value in _DSN:
+                    reads.add(_DSN[str(node.args[0].value)])
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in helpers:
+                if func.attr == "engine":
+                    reads.add("MIGRATION")
+                if func.attr == "legacy_engine":
+                    reads.add("LEGACY")
+            if isinstance(func, ast.Name) and direct.get(func.id) == "engine":
+                reads.add("MIGRATION")
+            if isinstance(func, ast.Name) and direct.get(func.id) == "legacy_engine":
+                reads.add("LEGACY")
+            for kw in node.keywords:
+                if kw.arg == "default" and isinstance(kw.value, ast.Constant) and kw.value.value in _DSN:
+                    reads.add(_DSN[str(kw.value.value)])
+        if isinstance(node, ast.For) and any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "pop"
+            for n in ast.walk(node)
+        ):
+            reads |= names_in(node.iter)
+    return reads
+
+
+def _module_name(path: Path) -> str:
+    return ".".join(path.relative_to(ROOT / "src").with_suffix("").parts)
+
+
+def _dsn_readers() -> dict[str, set[str]]:
     readers: dict[str, set[str]] = {}
-    for path in sorted(src.rglob("*.py")):
-        if path.name == "__main__.py" or path.name == "cli_common.py":
+    for path in sorted((ROOT / "src").rglob("*.py")):
+        if path.name == "__main__.py":
             continue
-        found = set(needle.findall(path.read_text(encoding="utf-8")))
+        module = _module_name(path)
+        if module in _DSN_EXEMPT:
+            continue
+        found = _dsn_reads(ast.parse(path.read_text(encoding="utf-8")))
         if found:
-            readers[".".join(path.relative_to(src).with_suffix("").parts)] = found
-    # Not jobs: schema upgrade (its own migrate role/credential), the shared
-    # ledger helper is used by the ledger jobs, and importer.cli is `import`.
-    exempt = {"erp_v2.migrate", "erp_v2.migrations.env", "erp_v2.database"}
-    for module, found in readers.items():
-        if module in exempt:
-            continue
-        # Packages whose __main__ is the CLI are run as the package.
-        module = {
-            "erp_v2.importer.cli": "erp_v2.importer",
-            "erp_v2.claims_opening.cli": "erp_v2.claims_opening",
-        }.get(module, module)
-        assert module in modules, f"{module} reads an operator DSN but is not a job"
-        want = {"MIGRATION_DATABASE_URL"} | ({"LEGACY_DATABASE_URL"} if "LEGACY" in found else set())
-        assert want <= set(modules[module]["materials"]), module
-    assert len(jobs) >= 14
+            readers[_PACKAGE_MAIN.get(module, module)] = found
+    return readers
+
+
+def test_the_dsn_scan_itself_sees_each_way_of_reading_a_dsn() -> None:
+    """The scan must not be vacuous: prove it on synthetic modules, both ways."""
+    cases = {
+        'import os\nx = os.environ.pop("MIGRATION_DATABASE_URL", "")': {"MIGRATION"},
+        'import os\nx = os.getenv("LEGACY_DATABASE_URL")': {"LEGACY"},
+        'def f(p):\n    p.add_argument("--s", default="LEGACY_DATABASE_URL")': {"LEGACY"},
+        ("import os\nfor n in ('MIGRATION_DATABASE_URL', 'LEGACY_DATABASE_URL'):\n    os.environ.pop(n, None)"): {
+            "MIGRATION",
+            "LEGACY",
+        },
+        "from erp_v2.migration_ledger import cli_common as cli\ncli.engine()": {"MIGRATION"},
+        "from erp_v2.migration_ledger import cli_common\ncli_common.legacy_engine()": {"LEGACY"},
+        "from erp_v2.migration_ledger.cli_common import engine as e\ne()": {"MIGRATION"},
+        # Refusals and prose are not reads.
+        'import os\nif "LEGACY_DATABASE_URL" in os.environ:\n    raise SystemExit': set(),
+        '"""Reads MIGRATION_DATABASE_URL."""': set(),
+    }
+    for source, expected in cases.items():
+        assert _dsn_reads(ast.parse(source)) == expected, source
+
+
+def test_every_command_that_reads_an_operator_dsn_is_an_import_role_job() -> None:
+    """Q-F2 / E1, both directions, by AST (not grep).
+
+    * Every module that reads an operator DSN is the command of at least one job
+      (never left outside the import role).
+    * What a module's jobs declare is exactly what the module reads: nothing
+      missing (under-declared) and nothing extra (over-declared). A job with no
+      role names no DSN at all.
+    * No job runs a module that reads neither (the serving runner included)."""
+    unit = _unit()
+    by_module: dict[str, list[dict]] = {}
+    for job in unit["jobs"]:
+        assert job["trigger"] == "operator"
+        assert job["command"][:2] == ["python", "-m"], job["name"]
+        by_module.setdefault(job["command"][2], []).append(job)
+    readers = _dsn_readers()
+    for module in readers:
+        assert module in by_module, f"{module} reads an operator DSN but is not a job"
+    for module, jobs in by_module.items():
+        assert module in readers, f"{module} is a job but reads no operator DSN"
+        declared: set[str] = set()
+        for job in jobs:
+            dsns = {_DSN[m] for m in job["materials"] if m in _DSN}
+            if job.get("role") is None:
+                assert not dsns, f"role-less job {job['name']} names a DSN"
+            else:
+                assert job["role"] == "import", job["name"]
+            declared |= dsns
+        assert declared == readers[module], (module, declared, readers[module])
+    assert "erp_v2.billing_gl" not in by_module  # the serving runner refuses operator DSNs
+    assert len(by_module) >= 14
+
+
+def _argparse_flags(tree: ast.Module) -> set[str]:
+    """Every `--flag` a module's argparse accepts, loop-generated ones included."""
+    flags: set[str] = set()
+
+    def visit(node: ast.AST, env: dict[str, str]) -> None:
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.iter, ast.Tuple | ast.List)
+            and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in node.iter.elts)
+        ):
+            for element in node.iter.elts:
+                for child in node.body:
+                    visit(child, {**env, node.target.id: str(element.value)})  # type: ignore[attr-defined]
+            return
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+            and node.args
+        ):
+            first = node.args[0]
+            flag = None
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                flag = first.value
+            elif (
+                isinstance(first, ast.BinOp)
+                and isinstance(first.left, ast.Constant)
+                and isinstance(first.right, ast.Name)
+            ):
+                if first.right.id in env:
+                    flag = str(first.left.value) + env[first.right.id]
+            elif isinstance(first, ast.JoinedStr):
+                parts = []
+                for piece in first.values:
+                    if isinstance(piece, ast.Constant):
+                        parts.append(str(piece.value))
+                    elif (
+                        isinstance(piece, ast.FormattedValue)
+                        and isinstance(piece.value, ast.Name)
+                        and piece.value.id in env
+                    ):
+                        parts.append(env[piece.value.id])
+                    else:
+                        parts = []
+                        break
+                flag = "".join(parts) or None
+            if flag and flag.startswith("--"):
+                flags.add(flag)
+        for child in ast.iter_child_nodes(node):
+            visit(child, env)
+
+    visit(tree, {})
+    return flags
+
+
+def test_job_arguments_are_declared_flags_of_the_job_module_and_closed() -> None:
+    """E2/H2: every declared argument is a real flag of that module; the env-name
+    overrides are never declared; files are confined to the job's work dir."""
+    unit = _unit()
+    for job in unit["jobs"]:
+        module = job["command"][2]
+        path = ROOT / "src" / Path(*module.split("."))
+        source = path.with_suffix(".py") if path.with_suffix(".py").exists() else path / "cli.py"
+        known = _argparse_flags(ast.parse(source.read_text(encoding="utf-8")))
+        assert known, module
+        for arg in job.get("args", []):
+            assert arg["flag"] in known, (job["name"], arg["flag"])
+            assert arg["flag"] not in NEVER_FLAGS
+            if arg["type"] == "path":
+                assert arg["pattern"].startswith(f"^{WORK_DIR}/{job['name']}/")
+                assert ".." not in arg["pattern"]
+        # A plan or dry-run job cannot carry the apply flag.
+        if job["name"].endswith(("_plan", "_census", "_verify", "_rounding")):
+            assert "--apply" not in {a["flag"] for a in job.get("args", [])}, job["name"]
+    # The NEVER flags exist in the importer (so the omission is a real choice).
+    importer = _argparse_flags(ast.parse((ROOT / "src/erp_v2/importer/cli.py").read_text(encoding="utf-8")))
+    assert NEVER_FLAGS <= importer
+    broken = copy.deepcopy(unit)
+    broken["jobs"][1]["args"] = [{"flag": "--source-url-env", "type": "string"}]
+    assert any("job-arg-flag" in p for p in _check(broken))
+    outside = copy.deepcopy(unit)
+    first = next(j for j in outside["jobs"] if any(a["type"] == "path" for a in j.get("args", [])))
+    next(a for a in first["args"] if a["type"] == "path")["pattern"] = "^/tmp/[a-z]+$"
+    assert any("path-outside-workdir" in p for p in _check(outside))
+
+
+def test_job_timeouts_are_declared_and_realistic() -> None:
+    jobs = {j["name"]: j for j in _unit()["jobs"]}
+    assert all(isinstance(j.get("timeout_seconds"), int) for j in jobs.values())
+    assert jobs["import_execute"]["timeout_seconds"] >= 1800
+    # A lease is timeout + 120: the long ones need an attended per-target ceiling
+    # above the 900 s default; the short ones fit the default.
+    short = [n for n, j in jobs.items() if j["timeout_seconds"] + 120 <= 900]
+    assert len(short) > len(jobs) // 2
+    assert max(j["timeout_seconds"] for j in jobs.values()) + 120 <= 3600
 
 
 def test_job_scoped_gates_are_declared_only_for_jobs_that_read_them() -> None:

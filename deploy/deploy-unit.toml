@@ -76,11 +76,12 @@ required_in = ["production"]
 
 # ---------------------------------------------- operator-job params (job-scoped)
 # Typed inputs of the dispatched operator jobs ONLY (each carries `jobs = [...]`).
-# Control renders them into those jobs' env and never into the serving app's
-# params.env; the scope is covered by the plan digest. Types follow what the code
-# reads: every apply/approval gate is compared to the STRING "1", so a bool
-# (rendered true/false) would never approve: they are enums of "0"/"1", default
-# "0". ERP_ENROLMENT_ACTOR_ID goes through uuid.UUID (canonical dashed UUID).
+# They are PER-DISPATCH values entered at propose (default "0" for every gate),
+# carried only in that run_job plan's dispatched_job.params; they are never stored
+# desired state and never reach the serving app's params.env. Types follow what the
+# code reads: every apply/approval gate is compared to the STRING "1", so a bool
+# (rendered true/false) would never approve: they are enums of "0"/"1".
+# ERP_ENROLMENT_ACTOR_ID goes through uuid.UUID (canonical dashed UUID).
 # ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF is only stripped and required non-empty
 # (String(240) column), so it is bounded, with no invented character set.
 # ERP_SELLER_COUNTRY defaults to NG in the code.
@@ -90,14 +91,14 @@ type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_IMPORT_APPROVED"
-jobs = ["import", "payables_history", "claims_opening", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
+jobs = ["import_execute", "payables_history", "claims_opening_apply", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
 
 [params.import_apply_ok]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_IMPORT_APPLY_OK"
-jobs = ["import", "payables_history", "claims_opening", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
+jobs = ["import_execute", "payables_history", "claims_opening_apply", "legacy_ap_recognize", "legacy_ap_settled", "legacy_ap_review", "legacy_ap_cohort", "payees_bulk"]
 
 [params.identity_import_approved]
 type = "enum"
@@ -111,35 +112,35 @@ type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_AR_OPENING_APPLY"
-jobs = ["ar_opening"]
+jobs = ["ar_opening_mint", "ar_opening_apply", "ar_opening_plan", "ar_opening_census"]
 
 [params.held_drafts_apply]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_HELD_DRAFTS_APPLY"
-jobs = ["held_drafts"]
+jobs = ["held_drafts_plan", "held_drafts_apply"]
 
 [params.holding_apply]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_HOLDING_APPLY"
-jobs = ["holdings"]
+jobs = ["holdings_plan", "holdings_apply", "holdings_verify", "holdings_t1_plan", "holdings_t1_apply", "holdings_straddle_plan", "holdings_straddle_verify", "holdings_straddle_apply", "holdings_subkobo_plan", "holdings_subkobo_verify", "holdings_subkobo_apply", "holdings_release", "holdings_writeoff_plan", "holdings_writeoff_apply"]
 
 [params.governance_apply]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_GOVERNANCE_APPLY"
-jobs = ["governance"]
+jobs = ["governance_plan", "governance_apply"]
 
 [params.access_apply]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_ACCESS_APPLY"
-jobs = ["access"]
+jobs = ["access_plan", "access_apply", "access_revoke_plan", "access_revoke_apply"]
 
 [params.cash_gl_setup_approved]
 type = "enum"
@@ -167,42 +168,42 @@ type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_BILLING_GL_VAT_OPENING_APPLY"
-jobs = ["billing_gl_vat_opening"]
+jobs = ["billing_gl_vat_opening_plan", "billing_gl_vat_opening_apply"]
 
 [params.migration_ledger_apply]
 type = "enum"
 choices = ["0", "1"]
 default = "0"
 material = "ERP_MIGRATION_LEDGER_APPLY"
-jobs = ["ledger_opening", "ledger_attribution", "ledger_bridge", "ledger_exceptions"]
+jobs = ["ledger_opening_plan", "ledger_opening_apply", "ledger_opening_gen_tb", "ledger_attribution", "ledger_bridge_build", "ledger_bridge_sign", "ledger_bridge_rounding", "ledger_exceptions_load", "ledger_exceptions_resolve", "ledger_exceptions_gate", "ledger_exceptions_add", "ledger_exceptions_declare_na"]
 
 [params.enrolment_actor_id]
 type = "string"
 pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 max_length = 36
 material = "ERP_ENROLMENT_ACTOR_ID"
-jobs = ["import"]
+jobs = ["import_execute"]
 
 [params.payroll_net_payable_account_ref]
 type = "string"
 min_length = 1
 max_length = 240
 material = "ERP_PAYROLL_NET_PAYABLE_ACCOUNT_REF"
-jobs = ["import"]
+jobs = ["import_execute"]
 
 [params.seller_legal_name]
 type = "string"
 min_length = 1
 max_length = 240
 material = "ERP_SELLER_LEGAL_NAME"
-jobs = ["import", "ar_opening"]
+jobs = ["import_billing_plan", "ar_opening_census", "ar_opening_mint", "ar_opening_plan", "ar_opening_apply"]
 
 [params.seller_address_line]
 type = "string"
 min_length = 1
 max_length = 240
 material = "ERP_SELLER_ADDRESS_LINE"
-jobs = ["import", "ar_opening"]
+jobs = ["import_billing_plan", "ar_opening_census", "ar_opening_mint", "ar_opening_plan", "ar_opening_apply"]
 
 [params.seller_country]
 type = "string"
@@ -210,7 +211,7 @@ pattern = "^[A-Z]{2}$"
 max_length = 2
 default = "NG"
 material = "ERP_SELLER_COUNTRY"
-jobs = ["import"]
+jobs = ["import_billing_plan"]
 
 # ------------------------------------------------------- legacy env file
 # M11 bridge, existing app only (ERP flip). NAMES ONLY, never values, and only
@@ -319,194 +320,3231 @@ single_use = true
 # migration step, not a job. A job runs only when the runbook step names it;
 # its arguments come from the flip runbook (docs/rehearsal.md), not from here.
 # Every flip command that reads MIGRATION_DATABASE_URL or LEGACY_DATABASE_URL is a
-# job with role = "import" (dispatch-time credentials only). Each lists the DSNs
-# it reads and, through scoped params, only the gates/inputs it reads.
-# billing_gl vat-opening/vat-extract use their own modules: the package
-# __main__ is the serving runner, which refuses operator DSNs.
+# job with role = "import" (dispatch-time credentials only), one job per mode so a
+# dispatch approval names exactly one command and its full, closed argv:
+# `command` plus the declared [[jobs.args]] (typed, bounded, secret-checked;
+# values are entered at propose). Path arguments are restricted to the job's own
+# work dir. The importer's --source-url-env/--dest-url-env and any flag not listed
+# here can never be passed. A job's gates and inputs are the job-scoped params
+# above (per-dispatch, default "0"). `timeout_seconds` follows docs/deployment.md
+# (importer execute measured 22m56s, so 3000 s; a lease is timeout + 120 and must
+# fit the target's role_job_lease_ceiling_seconds; jobs at 780 s fit the default
+# 900 s ceiling). billing_gl vat-opening/vat-extract use their own modules: the
+# package __main__ is the serving runner, which refuses operator DSNs.
+# import_census reads no database and so has no role.
 
 [[jobs]]
-name = "import"
+name = "import_census"
+command = ["python", "-m", "erp_v2.importer", "census"]
+trigger = "operator"
+timeout_seconds = 780
+materials = []
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_census/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs]]
+name = "import_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.importer", "plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs]]
+name = "import_execute"
 role = "import"
 command = ["python", "-m", "erp_v2.importer", "execute"]
 trigger = "operator"
+timeout_seconds = 3000
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--history-cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--mint"
+type = "bool"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--tax-rule-policy-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--tax-band-binding-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_execute/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--minor-units"
+type = "int"
+
+[[jobs.args]]
+flag = "--source-owner"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-version"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "import_billing_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.importer", "billing-plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--invoices-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--allocations-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--payments-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--source-account-key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--account-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--precision"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "import_billing_preflight"
+role = "import"
+command = ["python", "-m", "erp_v2.importer", "billing-preflight"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--invoices-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--allocations-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--payments-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/import_billing_preflight/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--source-account-key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--account-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--precision"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--expected-position-fingerprint"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--posting-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--economic-cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--recorded-cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--isolation"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
 
 [[jobs]]
 name = "payables_history"
 role = "import"
 command = ["python", "-m", "erp_v2.importer.payables_history_cli"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--cohort"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--reviewed-plan"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--transform-manifest-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--transform-manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payables_history/[A-Za-z0-9._-]+$"
+max_length = 240
 
 [[jobs]]
 name = "identity_import"
 role = "import"
 command = ["python", "-m", "erp_v2.importer.identity_cli"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/identity_import/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--approved-allowlist-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--approved-manifest-sha256"
+type = "sha256"
+
 [[jobs]]
-name = "ar_opening"
+name = "ar_opening_census"
 role = "import"
-command = ["python", "-m", "erp_v2.importer.ar_opening_cli"]
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "census"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_census/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_census/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_census/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
 [[jobs]]
-name = "claims_opening"
+name = "ar_opening_mint"
 role = "import"
-command = ["python", "-m", "erp_v2.claims_opening"]
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "mint"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_mint/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_mint/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_mint/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ar_opening_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ar_opening_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "apply"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ar_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--captured-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--occurred-at"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--source-schema-heads"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--source-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--migration-authority-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approved-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--coupled-watermark"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--applied-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--functional-currency"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "claims_opening_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.claims_opening", "plan"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--window-id"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--plan-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--attribution-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--fragment-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--apply-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs]]
+name = "claims_opening_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.claims_opening", "apply"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--window-id"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--plan-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--attribution-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--fragment-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--apply-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs]]
+name = "claims_opening_verify"
+role = "import"
+command = ["python", "-m", "erp_v2.claims_opening", "verify"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--window-id"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--plan-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--attribution-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--fragment-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--apply-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/claims_opening_verify/[A-Za-z0-9._-]+$"
+max_length = 240
 
 [[jobs]]
 name = "legacy_ap_recognize"
 role = "import"
 command = ["python", "-m", "erp_v2.legacy_ap.recognize_cli"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--list"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--list-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--approver-party-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--transform-manifest-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--transform-manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_recognize/[A-Za-z0-9._-]+$"
+max_length = 240
 
 [[jobs]]
 name = "legacy_ap_settled"
 role = "import"
 command = ["python", "-m", "erp_v2.legacy_ap.settled_cli"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--list"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--list-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--approver-party-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--reviewed-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--transform-manifest-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--import-params-json"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--transform-manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--unpaid-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--unpaid-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--b1b-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_settled/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--b1b-receipt-sha256"
+type = "sha256"
 
 [[jobs]]
 name = "legacy_ap_review"
 role = "import"
 command = ["python", "-m", "erp_v2.legacy_ap.review_cli"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--decisions"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_review/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--decision-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_review/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
 
 [[jobs]]
 name = "legacy_ap_cohort"
 role = "import"
 command = ["python", "-m", "erp_v2.legacy_ap.cohort_cli"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--cohort"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_cohort/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--cohort-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/legacy_ap_cohort/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
 
 [[jobs]]
 name = "payees_bulk"
 role = "import"
 command = ["python", "-m", "erp_v2.payees.bulk_cli"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payees_bulk/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--file-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--bank-reference"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payees_bulk/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--bank-reference-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payees_bulk/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--expect"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--approve"
+type = "bool"
+
 [[jobs]]
-name = "held_drafts"
+name = "held_drafts_plan"
 role = "import"
-command = ["python", "-m", "erp_v2.held_drafts.cli"]
+command = ["python", "-m", "erp_v2.held_drafts.cli", "plan"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
 [[jobs]]
-name = "holdings"
+name = "held_drafts_apply"
 role = "import"
-command = ["python", "-m", "erp_v2.holdings.cli"]
+command = ["python", "-m", "erp_v2.held_drafts.cli", "apply"]
 trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/held_drafts_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--approved-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs]]
+name = "holdings_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "plan"]
+trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
 [[jobs]]
-name = "governance"
+name = "holdings_apply"
 role = "import"
-command = ["python", "-m", "erp_v2.governance.cli"]
+command = ["python", "-m", "erp_v2.holdings.cli", "apply"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
 [[jobs]]
-name = "access"
+name = "holdings_verify"
 role = "import"
-command = ["python", "-m", "erp_v2.access_cli"]
+command = ["python", "-m", "erp_v2.holdings.cli", "verify"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_t1_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "t1", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_t1_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "t1", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_t1_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_straddle_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "straddle", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_straddle_verify"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "straddle", "verify"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_straddle_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "straddle", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_straddle_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_subkobo_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "subkobo", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_subkobo_verify"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "subkobo", "verify"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_verify/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "holdings_subkobo_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "subkobo", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_subkobo_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_release"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "release"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_release/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_release/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--exception"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--owner-command"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_release/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs]]
+name = "holdings_writeoff_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "writeoff", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--exception"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--offset-account"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--evidence-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "holdings_writeoff_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.holdings.cli", "writeoff", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/holdings_writeoff_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--plan-sha"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--exception"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--offset-account"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--evidence-sha"
+type = "sha256"
+required = true
+
+[[jobs]]
+name = "governance_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.governance.cli", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "governance_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.governance.cli", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/governance_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--approved-spec-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.access_cli", "plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.access_cli", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--approved-allowlist-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_revoke_plan"
+role = "import"
+command = ["python", "-m", "erp_v2.access_cli", "revoke-plan"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "access_revoke_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.access_cli", "revoke-apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--allowlist"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/access_revoke_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--approved-allowlist-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
 
 [[jobs]]
 name = "cash_gl_setup"
 role = "import"
 command = ["python", "-m", "erp_v2.cash_gl.setup_cli"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/cash_gl_setup/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/cash_gl_setup/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--approved-spec-sha256"
+type = "sha256"
 
 [[jobs]]
 name = "payroll_accounts"
 role = "import"
 command = ["python", "-m", "erp_v2.payroll_accounts"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payroll_accounts/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/payroll_accounts/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--approved-spec-sha256"
+type = "sha256"
 
 [[jobs]]
 name = "tax_seed"
 role = "import"
 command = ["python", "-m", "erp_v2.tax_seed"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--seed-spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/tax_seed/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs.args]]
+flag = "--approved-seed-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--approved-manifest-sha256"
+type = "sha256"
+
 [[jobs]]
-name = "billing_gl_vat_opening"
+name = "billing_gl_vat_opening_plan"
 role = "import"
-command = ["python", "-m", "erp_v2.billing_gl.vat_opening"]
+command = ["python", "-m", "erp_v2.billing_gl.vat_opening", "plan"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--input"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "billing_gl_vat_opening_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.billing_gl.vat_opening", "apply"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--input"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--approved-plan-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
 
 [[jobs]]
 name = "billing_gl_vat_extract"
 role = "import"
 command = ["python", "-m", "erp_v2.billing_gl.vat_extract"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--organization-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--cutoff"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--overrides"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--treatment-map"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/billing_gl_vat_extract/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--acknowledge-residue"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
 [[jobs]]
-name = "ledger_opening"
+name = "ledger_opening_plan"
 role = "import"
-command = ["python", "-m", "erp_v2.migration_ledger.opening_cli"]
+command = ["python", "-m", "erp_v2.migration_ledger.opening_cli", "plan"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_plan/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+
+[[jobs.args]]
+flag = "--as-of"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs]]
+name = "ledger_opening_apply"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.opening_cli", "apply"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+
+[[jobs.args]]
+flag = "--as-of"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--plan-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_apply/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--approved-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs]]
+name = "ledger_opening_gen_tb"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.opening_cli", "gen-tb"]
+trigger = "operator"
+timeout_seconds = 1800
+materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_opening_gen_tb/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+
+[[jobs.args]]
+flag = "--as-of"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
 
 [[jobs]]
 name = "ledger_attribution"
 role = "import"
 command = ["python", "-m", "erp_v2.migration_ledger.attribution_cli"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--tenant-id"
+type = "string"
+pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+max_length = 36
+required = true
+
+[[jobs.args]]
+flag = "--capture-date"
+type = "string"
+pattern = "^[0-9T:.+Z-]{8,40}$"
+max_length = 40
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-manifest"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--snapshot-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--cutoff-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--cutoff-receipt-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--p-attr-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--p-attr-receipt-sha256"
+type = "sha256"
+required = true
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--unpaid-plan"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--unpaid-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--settled-plan"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--settled-plan-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--s8-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--s8-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--s8-fragment"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--s8-fragment-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--out-dir"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_attribution/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
 [[jobs]]
-name = "ledger_bridge"
+name = "ledger_bridge_build"
 role = "import"
-command = ["python", "-m", "erp_v2.migration_ledger.bridge_report"]
+command = ["python", "-m", "erp_v2.migration_ledger.bridge_report", "build"]
 trigger = "operator"
+timeout_seconds = 1800
 materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--inputs"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--itemised-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--subkobo-side-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--straddlers-side-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_build/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--version"
+type = "int"
+
+[[jobs.args]]
+flag = "--expect-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--signed-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approval-reference"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
 [[jobs]]
-name = "ledger_exceptions"
+name = "ledger_bridge_sign"
 role = "import"
-command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register"]
+command = ["python", "-m", "erp_v2.migration_ledger.bridge_report", "sign"]
 trigger = "operator"
+timeout_seconds = 780
 materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--inputs"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--itemised-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--subkobo-side-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--straddlers-side-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_sign/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--approved-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--version"
+type = "int"
+
+[[jobs.args]]
+flag = "--expect-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--signed-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approval-reference"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs]]
+name = "ledger_bridge_rounding"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.bridge_report", "rounding"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--inputs"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--itemised-out"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-itemised"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-itemised-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--subkobo-side-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--straddlers-side-file"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_bridge_rounding/[A-Za-z0-9._-]+$"
+max_length = 240
+
+[[jobs.args]]
+flag = "--import-receipt-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--version"
+type = "int"
+
+[[jobs.args]]
+flag = "--expect-sha"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--signed-by"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--approval-reference"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ledger_exceptions_load"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "load"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_load/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_load/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs]]
+name = "ledger_exceptions_resolve"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "resolve"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_resolve/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_resolve/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs]]
+name = "ledger_exceptions_gate"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "gate"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_gate/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_gate/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs]]
+name = "ledger_exceptions_add"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "add"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_add/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_add/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
+[[jobs]]
+name = "ledger_exceptions_declare_na"
+role = "import"
+command = ["python", "-m", "erp_v2.migration_ledger.exceptions_register", "declare-na"]
+trigger = "operator"
+timeout_seconds = 780
+materials = ["MIGRATION_DATABASE_URL"]
+runbook = "docs/rehearsal.md"
+
+[[jobs.args]]
+flag = "--spec"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_declare_na/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--receipt"
+type = "path"
+pattern = "^/var/lib/dotmac/erp-v2/job-work/ledger_exceptions_declare_na/[A-Za-z0-9._-]+$"
+max_length = 240
+required = true
+
+[[jobs.args]]
+flag = "--operator-ref"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+required = true
+
+[[jobs.args]]
+flag = "--class"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--key"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--outcome"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+-]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--evidence-sha256"
+type = "sha256"
+
+[[jobs.args]]
+flag = "--reason"
+type = "string"
+pattern = "^[A-Za-z0-9._:@=,/+ -]{1,200}$"
+max_length = 200
+
+[[jobs.args]]
+flag = "--apply"
+type = "bool"
+
 
 # ------------------------------------------------------------ hold point
 # The companion's genesis grant window is opened and closed by an operator op
