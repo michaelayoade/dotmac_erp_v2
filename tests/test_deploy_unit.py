@@ -910,3 +910,43 @@ def test_job_scoped_gates_are_declared_only_for_jobs_that_read_them() -> None:
     for name, param in unit["params"].items():
         if param.get("jobs") and param["type"] == "enum":
             assert param["choices"] == ["0", "1"] and param["default"] == "0", name
+
+
+def test_per_mode_materials_are_the_hand_reviewed_ones() -> None:
+    """The both-way DSN scan is per module, so a MODE could still over-declare
+    LEGACY. These were read mode by mode against the code: a mode names exactly
+    the DSNs it reads, and one that reads none has no role at all."""
+    jobs = {j["name"]: j for j in _unit()["jobs"]}
+    mig, leg = "MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"
+    reviewed = {
+        "import_census": [],  # writes the census receipt only; no database
+        "import_billing_plan": [],  # reads JSON inputs only
+        "import_billing_preflight": [],
+        "import_plan": [leg],  # _take_env(source) only
+        "import_execute": [mig, leg],
+        "ar_opening_census": [leg],  # the destination DSN is optional there
+        "ar_opening_mint": [mig, leg],
+        "claims_opening_verify": [mig],  # `mode == "verify" or source`
+        "claims_opening_plan": [mig, leg],
+        "claims_opening_apply": [mig, leg],
+        "ledger_bridge_build": [mig, leg],
+        "ledger_bridge_sign": [mig],
+        "ledger_bridge_rounding": [mig],
+        "legacy_ap_review": [mig],
+        "legacy_ap_cohort": [mig],
+        "payees_bulk": [mig],
+        "holdings_apply": [mig],
+        "governance_apply": [mig],
+        "access_apply": [mig],
+        "cash_gl_setup": [mig],
+        "payroll_accounts": [mig],
+        "billing_gl_vat_opening_apply": [mig],
+        "ledger_exceptions_gate": [mig],
+        "held_drafts_plan": [mig, leg],
+        "tax_seed": [mig, leg],
+        "billing_gl_vat_extract": [mig, leg],
+    }
+    for name, expected in reviewed.items():
+        assert sorted(jobs[name]["materials"]) == sorted(expected), name
+        # No DSN, no role: nothing is minted for a command that reads no database.
+        assert (jobs[name].get("role") == "import") is bool(expected), name

@@ -353,7 +353,7 @@ role = "import"
 command = ["python", "-m", "erp_v2.importer", "plan"]
 trigger = "operator"
 timeout_seconds = 1800
-materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+materials = ["LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
 [[jobs.args]]
@@ -441,11 +441,10 @@ max_length = 200
 
 [[jobs]]
 name = "import_billing_plan"
-role = "import"
 command = ["python", "-m", "erp_v2.importer", "billing-plan"]
 trigger = "operator"
 timeout_seconds = 1800
-materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+materials = []
 runbook = "docs/rehearsal.md"
 
 [[jobs.args]]
@@ -502,11 +501,10 @@ max_length = 200
 
 [[jobs]]
 name = "import_billing_preflight"
-role = "import"
 command = ["python", "-m", "erp_v2.importer", "billing-preflight"]
 trigger = "operator"
 timeout_seconds = 1800
-materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+materials = []
 runbook = "docs/rehearsal.md"
 
 [[jobs.args]]
@@ -738,7 +736,7 @@ role = "import"
 command = ["python", "-m", "erp_v2.importer.ar_opening_cli", "census"]
 trigger = "operator"
 timeout_seconds = 780
-materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+materials = ["LEGACY_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
 [[jobs.args]]
@@ -1262,7 +1260,7 @@ role = "import"
 command = ["python", "-m", "erp_v2.claims_opening", "verify"]
 trigger = "operator"
 timeout_seconds = 780
-materials = ["MIGRATION_DATABASE_URL", "LEGACY_DATABASE_URL"]
+materials = ["MIGRATION_DATABASE_URL"]
 runbook = "docs/rehearsal.md"
 
 [[jobs.args]]
