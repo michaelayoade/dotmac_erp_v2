@@ -37,12 +37,16 @@ RUN --mount=type=secret,id=forgejo_token \
     UV_INDEX_FORGEJO_PASSWORD="$(cat /run/secrets/forgejo_token)" \
     uv sync --locked --no-dev
 
-# Operator one-shots (target_api v2 run_job) read /job/in and write /job/out. The
-# image ships both so Foundation's per-dispatch volumes inherit them: /job/out is
-# owned by the job uid (the roles' non-root user) at 0700; /job/in exists, world
-# readable, root-owned (inputs are mounted read-only over it).
-RUN mkdir -p /job/in /job/out \
-    && chown 10001:10001 /job/out \
+# Operator one-shots (target_api v2 run_job) read /job/in and write /job/out, as the
+# SEPARATE uid `dotmac-erp-import` (P-SEC C-29), never the serving ERP uid 10001. The
+# image ships both directories so Foundation's per-dispatch volumes inherit them:
+# /job/out is owned by that uid at 0700; /job/in exists, world readable and
+# root-owned (inputs are mounted read-only over it).
+RUN groupadd --gid 10002 dotmac-erp-import \
+    && useradd --uid 10002 --gid 10002 --no-create-home \
+        --shell /usr/sbin/nologin dotmac-erp-import \
+    && mkdir -p /job/in /job/out \
+    && chown 10002:10002 /job/out \
     && chmod 0700 /job/out \
     && chmod 0755 /job/in
 

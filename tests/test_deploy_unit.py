@@ -954,14 +954,25 @@ def test_per_mode_materials_are_the_hand_reviewed_ones() -> None:
         assert (jobs[name].get("role") == "import") is bool(expected), name
 
 
-def test_the_image_ships_job_in_and_a_job_owned_job_out() -> None:
-    """Foundation's per-dispatch output volume inherits /job/out from the image:
-    owned by the job uid at 0700, with /job/in present."""
+def test_the_image_ships_job_in_and_an_import_owned_job_out() -> None:
+    """Foundation's per-dispatch output volume inherits /job/out from the image: owned
+    by the SEPARATE import uid (C-29) at 0700, with /job/in present. The job's
+    container user names that uid and is never the serving ERP uid."""
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    uid = _spec()["roles"][0]["security"]["user"]
-    assert re.fullmatch(r"[0-9]+:[0-9]+", uid) and not uid.startswith("0:")
+    serving = _spec()["roles"][0]["security"]["user"]
+    fixture = json.loads(
+        (ROOT / "tests" / "fixtures" / "operator_commands.provisional.json").read_text(encoding="utf-8")
+    )
+    job_user = fixture["user"]  # PROVISIONAL: moves to the spec's operator table
+    assert re.fullmatch(r"[0-9]+:[0-9]+", job_user) and not job_user.startswith("0:")
+    assert job_user != serving, "import jobs never run as the serving uid"
+    uid, gid = job_user.split(":")
+    assert fixture["user_name"] == "dotmac-erp-import"
+    assert f"groupadd --gid {gid} dotmac-erp-import" in dockerfile
+    assert f"useradd --uid {uid} --gid {gid}" in dockerfile
     assert "mkdir -p /job/in /job/out" in dockerfile
-    assert f"chown {uid} /job/out" in dockerfile
+    assert f"chown {job_user} /job/out" in dockerfile
+    assert f"chown {serving} /job/out" not in dockerfile
     assert "chmod 0700 /job/out" in dockerfile
     assert "chmod 0755 /job/in" in dockerfile
     # The descriptor's paths are exactly these two directories.
