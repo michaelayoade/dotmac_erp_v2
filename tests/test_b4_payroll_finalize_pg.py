@@ -887,9 +887,8 @@ def test_leaver_on_an_input_structure_goes_through_the_erp_form_batch_approve_an
 
 
 # --- dual-control policy (D-9): default OFF ----------------------------------------------------------------------
-# The ERP checks (calculator = creator, creator != approver != finalizer) become no-ops. Until payroll a6 pins
-# ``separation_of_duties`` the Starter owner still refuses creator-approves and approver-finalizes with its own
-# error; the ERP ``sod_*`` codes must not appear.
+# The ERP checks (calculator = creator, creator != approver != finalizer) become no-ops, and ERP passes
+# ``separation_of_duties=False`` to dotmac-payroll a7, so the owner no longer refuses either.
 
 
 def test_policy_off_any_permitted_person_may_enter_calculations(engine):
@@ -899,19 +898,14 @@ def test_policy_off_any_permitted_person_may_enter_calculations(engine):
     assert batch(engine, env, run_id, party_index=1).calculated == 3  # not the creator
 
 
-def test_policy_off_erp_separation_codes_do_not_fire_for_approve_and_finalize(engine):
+def test_policy_off_one_person_may_create_approve_and_finalize(engine):
     env = world(engine)
     set_dual_control_engine(engine, env.tenant_id, False)
     run_id = new_run(engine, env)
     batch(engine, env, run_id)
-    with pytest.raises(svc.RunRefused) as exc:
-        approve(engine, env, run_id, party_index=0)  # the creator approves: the owner (payroll a5) still refuses
-    assert exc.value.code == "payroll_refused"
-    run_id = ready_to_finalize(engine, env, ref="RUN-2026-02", start=date(2026, 2, 1), end=date(2026, 2, 28))
-    try:
-        finalize(engine, env, run_id, party_index=1)  # the approver finalizes
-    except svc.RunRefused as exc:
-        assert exc.code == "payroll_refused", exc.code  # owner refusal only; never the ERP sod_* code
+    approve(engine, env, run_id, party_index=0)  # the creator approves: payroll a7 takes the policy from ERP (OFF)
+    assert finalize(engine, env, run_id, party_index=0).replayed is False  # and the same person finalizes
+    assert status(engine, run_id) == "finalized"
 
 
 def test_policy_on_keeps_the_existing_refusals(engine):

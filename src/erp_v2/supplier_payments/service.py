@@ -73,6 +73,7 @@ from erp_v2.payees.models import InstructionOrigin, InstructionStatus, PayeeBank
 from erp_v2.posting import rules
 from erp_v2.posting.bridge import post_consequence
 from erp_v2.posting.rules import PostingRefused
+from erp_v2.supplier_payments import separation
 
 AUDIT_PREPARED: Final = "erp.finance.supplier_payment.prepared"
 AUDIT_APPROVED: Final = "erp.finance.supplier_payment.approved"
@@ -81,6 +82,7 @@ AUDIT_RECORDED: Final = "erp.finance.supplier_payment.recorded_posted"
 AUDIT_REVERSED: Final = "erp.finance.supplier_payment.reversed_posted"
 AUDIT_REFUSED: Final = "erp.finance.supplier_payment.refused"
 AUDIT_FILE_GENERATED: Final = "erp.treasury.disbursement_file.generated"
+AUDIT_SOD_STAMP_FLAGGED: Final = "erp.finance.supplier_payment.sod_stamp_flagged"
 AUDIT_ACTIONS: Final = (
     AUDIT_PREPARED,
     AUDIT_APPROVED,
@@ -89,6 +91,7 @@ AUDIT_ACTIONS: Final = (
     AUDIT_REVERSED,
     AUDIT_REFUSED,
     AUDIT_FILE_GENERATED,
+    AUDIT_SOD_STAMP_FLAGGED,
 )
 
 DOCUMENT_KIND: Final = "supplier_payment"
@@ -141,6 +144,38 @@ def _audit(
         entity_id=entity_id,
         is_success=success,
         details=details,
+    )
+
+
+def _read_back_stamp(db: Session, *, tenant: Tenant, party: Party, payment: SupplierPayment, step: str) -> None:
+    """D-9: compare payables' ``separation_enforced`` stamp with the tenant policy right after a write.
+
+    At preparation any mismatch refuses; at a later step it is flagged in the
+    audit trail and the step proceeds (payables still enforces the stricter value; see ``separation``).
+    """
+    db.refresh(payment)
+    policy = governance.separation_of_duties(db, tenant.id)
+    verdict = separation.stamp_verdict(stamp=bool(payment.separation_enforced), policy=policy)
+    if verdict is separation.StampVerdict.MATCH:
+        return
+    if step == "prepare":
+        raise PaymentRefused(
+            "sod_stamp_mismatch",
+            "The payment's separation-of-duties stamp does not match the tenant policy; nothing was saved",
+        )
+    _audit(
+        db,
+        tenant=tenant,
+        party=party,
+        entity_id=str(payment.id),
+        action=AUDIT_SOD_STAMP_FLAGGED,
+        success=False,
+        details={
+            "step": step,
+            "verdict": verdict.value,
+            "stamp": bool(payment.separation_enforced),
+            "policy": policy,
+        },
     )
 
 
@@ -309,7 +344,9 @@ def _prepare(
         idempotency_key=f"erp.b3.create:{request_id}",
         idempotency_expires_at=None,
         prepared_at=now,
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
+    _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="prepare")
     replayed = existed
     if not replayed:
         _audit(
@@ -345,7 +382,9 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
         idempotency_key=f"erp.b3.approve:{payment.id}",
         idempotency_expires_at=None,
         approved_at=now,
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
+    _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="approve")
     _audit(
         db,
         tenant=tenant,
@@ -564,7 +603,9 @@ def _record(
         idempotency_key=f"erp.b3.record:{payment.id}",
         idempotency_expires_at=None,
         recorded_at=now,
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
+    _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="record")
     consequence = payables.build_payment_accounting_consequence(db, tenant_id=tenant.id, payment_id=payment.id)
     approval_ref = f"erp.b3:supplier_payment_record:{payment.id}:recorder:{actor}"
     posted = post_consequence(db, scope=scope, consequence=consequence, approval_ref=approval_ref, actor=actor, now=now)
@@ -648,7 +689,9 @@ def _reverse(
         idempotency_key=f"erp.b3.reverse:{payment.id}",
         idempotency_expires_at=None,
         reversed_at=now,
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
+    _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="reverse")
     consequence = payables.build_payment_reversal_accounting_consequence(db, tenant_id=tenant.id, payment_id=payment.id)
     approval_ref = f"erp.b3:supplier_payment_reversal:{payment.id}:reverser:{actor}"
     posted = post_consequence(db, scope=scope, consequence=consequence, approval_ref=approval_ref, actor=actor, now=now)

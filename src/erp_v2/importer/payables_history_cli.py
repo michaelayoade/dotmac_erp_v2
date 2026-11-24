@@ -1,6 +1,6 @@
 """Private, explicit historical payables cohort plan/apply operator boundary.
 
-Only the UNPAID admission path of payables 0.1.0a6 is used
+Only the UNPAID admission path of payables 0.1.0a7 is used
 (``admit_historical_unpaid_invoice`` / ``HistoricalUnpaidInvoiceCommand``); the
 settled path, reversals and approved-invoice recognition are never invoked.
 
@@ -30,8 +30,10 @@ from erp_v2.importer.identity_cli import _manifest, _safe_engine, _sha
 from erp_v2.importer.payables_history import admission_notes
 
 # The only owner release whose admission contract this command is qualified for.
-REQUIRED_PAYABLES_VERSION = "0.1.0a6"
-REQUIRED_PAYABLES_HEAD = "pa_0006_tax_release_hist_credit"
+# a7 adds only supplier-payment separation (pa_0007); the admission contract is identical to a6
+# (reviewed in REVIEW-erp87-a7-qualification.md).
+REQUIRED_PAYABLES_VERSION = "0.1.0a7"
+REQUIRED_PAYABLES_HEAD = "pa_0007_separation_policy"
 # Payables tables that must hold no tenant rows before an unpaid-cohort import:
 # the supplier-payment lifecycle, historical settlements and settlement observations
 # (the "settlements" of the ruling; payables has no table of that exact name, and the

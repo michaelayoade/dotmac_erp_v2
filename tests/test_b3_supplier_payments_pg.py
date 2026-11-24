@@ -1383,10 +1383,8 @@ def test_policy_off_erp_checks_do_not_fire_and_the_owner_still_refuses_approve_b
     env = world(engine)
     set_dual_control_engine(engine, env.tenant_id, False)
     created = prepare(engine, env, open_obligation(engine, env))
-    with pytest.raises(PaymentRefused) as exc:
-        approve(engine, env, created.payment_id, who="preparer")
-    assert not exc.value.code.startswith("sod_"), exc.value.code  # the owner (payables a5) refuses, not the ERP check
-    assert payment(engine, created.payment_id).status == SupplierPaymentStatus.DRAFT
+    approve(engine, env, created.payment_id, who="preparer")  # payables a7: ERP passes the policy (OFF), owner allows
+    assert payment(engine, created.payment_id).status == SupplierPaymentStatus.APPROVED
 
 
 def test_policy_off_instruction_party_approves_and_issues_the_file(engine):
@@ -1399,9 +1397,6 @@ def test_policy_off_instruction_party_approves_and_issues_the_file(engine):
     generate(engine, env, [created.payment_id], who="approver")  # approver issues the file: no ERP refusal
     assert record(engine, env, created.payment_id).replayed is False
     assert payment(engine, created.payment_id).status == SupplierPaymentStatus.RECORDED
-    with pytest.raises(PaymentRefused) as exc:  # payables a5 still refuses a recorder-reversal; the ERP code is gone
-        reverse(engine, env, created.payment_id, who="recorder")
-    assert not exc.value.code.startswith("sod_")
     assert reverse(engine, env, created.payment_id, who="reverser").replayed is False
     assert payment(engine, created.payment_id).status == SupplierPaymentStatus.REVERSED
 
