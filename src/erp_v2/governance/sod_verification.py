@@ -145,7 +145,7 @@ def verify(db: Session, tenant_id: UUID) -> Report:
     _reconcile(db, tenant_id, windows, last_event)
     findings: list[Finding] = []
     backfilled = 0
-    column = SupplierPayment.__table__.c.get(KEY)
+    column = SupplierPayment.__table__.c[KEY]
     if column is not None:
         prepared = {
             e.entity_id: _stamp(e)

@@ -51,7 +51,7 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-REQUIRED_PAYABLES_VERSION = "0.1.0a6"
+REQUIRED_PAYABLES_VERSION = "0.1.0a7"
 MAX_INVOICES = 1000
 DOCUMENT_KIND = "supplier_invoice"
 FINANCE_APPROVER = "finance_approver"

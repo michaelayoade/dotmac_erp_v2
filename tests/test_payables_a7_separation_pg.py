@@ -110,6 +110,36 @@ def test_the_saved_check_counts_rows_stamped_true_outside_an_on_window_read_only
     assert report.receipt()["pa_0007_stamped_true"] == 1
 
 
+def test_a_payment_prepared_inside_an_on_window_is_not_counted(engine):
+    from erp_v2.governance import cli as governance_cli
+    from erp_v2.governance import sod_verification as verify
+
+    env = b3.world(engine)
+    with Session(engine) as db, db.begin():
+        governance_cli.apply_policy(
+            db,
+            governance_cli.PolicySpec(env.tenant_id, True, "test evidence"),
+            spec_sha256="0" * 64,
+            operator_ref="test-operator",
+        )
+    created = b3.act(  # a real "now": the policy event is stamped by the database clock
+        engine,
+        env,
+        "preparer",
+        svc.prepare_payment,
+        request_id=uuid4(),
+        bank_account_id=env.bank_id,
+        value_date=b3.VALUE_DATE,
+        allocations=[AllocationRequest(b3.open_obligation(engine, env), Decimal(215))],
+        now=datetime.now(UTC),
+    )
+    assert _stamp(created.payment_id) is True
+    with Session(engine) as db:
+        report = verify.verify(db, env.tenant_id)
+    assert report.pa_0007_stamped_true == 0
+    assert report.clean
+
+
 def test_the_saved_check_finds_a_relaxed_payment_created_while_the_policy_was_on(engine, monkeypatch):
     from erp_v2.governance import cli as governance_cli
     from erp_v2.governance import sod_verification as verify
