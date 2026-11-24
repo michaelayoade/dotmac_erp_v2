@@ -115,6 +115,7 @@ def test_a_payment_prepared_inside_an_on_window_is_not_counted(engine):
     from erp_v2.governance import sod_verification as verify
 
     env = b3.world(engine)
+    set_dual_control_engine(engine, env.tenant_id, False)
     with Session(engine) as db, db.begin():
         governance_cli.apply_policy(
             db,
