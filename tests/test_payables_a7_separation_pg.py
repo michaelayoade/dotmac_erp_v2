@@ -1,6 +1,6 @@
 """Payables a7 separation policy (D-9) on PostgreSQL: the policy reaches the owner, the stamp is read back.
 
-Skipped until ``dotmac-payables==0.1.0a7`` is the pinned version (published 24-26 Nov). Reuses the B3 world.
+Runs on the pinned ``dotmac-payables==0.1.0a7``. Reuses the B3 world.
 """
 
 from __future__ import annotations
@@ -15,20 +15,24 @@ from dotmac_payables.models import SupplierPayment
 from dual_control_support import set_dual_control_engine
 from sqlalchemy.orm import Session
 
-from erp_v2.supplier_payments import separation
 from erp_v2.supplier_payments import service as svc
 from erp_v2.supplier_payments.service import AllocationRequest
-
-pytestmark = pytest.mark.skipif(
-    not separation.payables_separation_supported(),
-    reason="TODO(payables-a7): dotmac-payables 0.1.0a7 is not pinned yet",
-)
 
 engine = b3.engine
 registries = b3.registries
 
 
 _ENGINE: list = []
+
+
+def _force_relaxed(monkeypatch) -> None:
+    """Simulate a drifted caller: payables is handed ``separation_of_duties=False`` whatever the policy says."""
+    real = svc.payables.create_supplier_payment
+
+    def relaxed(*args, **kwargs):
+        return real(*args, **{**kwargs, "separation_of_duties": False})
+
+    monkeypatch.setattr(svc.payables, "create_supplier_payment", relaxed)
 
 
 def _stamp(payment_id) -> bool:
@@ -63,7 +67,7 @@ def test_a_stamp_that_disagrees_with_the_policy_at_prepare_is_refused_and_nothin
     env = b3.world(engine)
     set_dual_control_engine(engine, env.tenant_id, True)
     oid = b3.open_obligation(engine, env)
-    monkeypatch.setattr(svc.separation, "payables_kwargs", lambda db, tenant_id: {"separation_of_duties": False})
+    _force_relaxed(monkeypatch)
     before = b3.counts(engine, env)
     b3.refused(lambda: b3.prepare(engine, env, oid), "sod_stamp_mismatch")
     assert b3.counts(engine, env) == before
@@ -90,6 +94,22 @@ def test_a_stricter_row_under_policy_off_is_flagged(engine):
     assert event.details["verdict"] == "stricter_than_policy"
 
 
+def test_the_saved_check_counts_rows_stamped_true_outside_an_on_window_read_only(engine):
+    """The pa_0007 shape: stamped true while no audited ON window covers its creation. Counted, never a finding."""
+    from erp_v2.governance import sod_verification as verify
+
+    env = b3.world(engine)
+    set_dual_control_engine(engine, env.tenant_id, True)
+    created = b3.prepare(engine, env, b3.open_obligation(engine, env))  # stamped ON
+    set_dual_control_engine(engine, env.tenant_id, False)
+    with Session(engine) as db:
+        report = verify.verify(db, env.tenant_id)
+    assert _stamp(created.payment_id) is True
+    assert report.pa_0007_stamped_true == 1
+    assert report.clean
+    assert report.receipt()["pa_0007_stamped_true"] == 1
+
+
 def test_the_saved_check_finds_a_relaxed_payment_created_while_the_policy_was_on(engine, monkeypatch):
     from erp_v2.governance import cli as governance_cli
     from erp_v2.governance import sod_verification as verify
@@ -104,7 +124,7 @@ def test_the_saved_check_finds_a_relaxed_payment_created_while_the_policy_was_on
             operator_ref="test-operator",
         )
     # Drift: the policy is ON, but a relaxed payment was prepared (a bug the saved check exists to catch).
-    monkeypatch.setattr(svc.separation, "payables_kwargs", lambda db, tenant_id: {"separation_of_duties": False})
+    _force_relaxed(monkeypatch)
     monkeypatch.setattr(svc, "_read_back_stamp", lambda *a, **k: None)
     created = b3.act(  # a real "now": the policy event above is stamped by the database clock
         engine,

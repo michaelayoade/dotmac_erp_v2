@@ -11,13 +11,15 @@ be trusted: the timeline's final state differs from the current policy row, or t
 
 Findings (exit 3):
 
-* ``supplier_payments.separation_enforced = false`` (dotmac-payables a7 stamp; skipped, and reported as
-  ``payables_stamp_available: false``, until a7 is pinned) whose ERP ``prepared`` audit event falls inside an ON
-  window, or has no such event (unjudged);
+* ``supplier_payments.separation_enforced = false`` (dotmac-payables a7 stamp) whose ERP ``prepared``
+  audit event falls inside an ON window, or has no such event (unjudged);
 * ERP's payroll audit events (batch calculated, run approved, run finalized, payout line returned) inside an ON
   window whose recorded ``separation_enforced`` is false (``relaxed``) or absent (``unstamped``).
 
     MIGRATION_DATABASE_URL=... python -m erp_v2.governance.sod_verification --tenant-id <uuid>
+
+The receipt also carries ``pa_0007_stamped_true``: a read-only count (not a finding) of payments stamped true whose
+``prepared`` event is missing or outside every ON window, the shape pa_0007 gives rows that existed before a7.
 
 exits 0 when clean, 3 when findings exist (the JSON lists entity kind and id, never secrets), 2 when refused.
 """
@@ -69,6 +71,10 @@ class Report:
     findings: tuple[Finding, ...]
     payables_stamp_available: bool
     on_windows: int
+    # Read-only count (never a finding): payments stamped true whose ERP ``prepared`` event is missing or outside
+    # every ON window, i.e. the shape pa_0007 gives pre-a7 rows (stamp true, policy not ON at creation). While the
+    # policy is OFF each of them writes a ``sod_stamp_flagged`` event per step and still needs two people.
+    pa_0007_stamped_true: int = 0
 
     @property
     def clean(self) -> bool:
@@ -79,6 +85,7 @@ class Report:
             "clean": self.clean,
             "payables_stamp_available": self.payables_stamp_available,
             "on_windows": self.on_windows,
+            "pa_0007_stamped_true": self.pa_0007_stamped_true,
             "findings": [{**asdict(f), "at": f.at.isoformat() if f.at else None} for f in self.findings],
         }
 
@@ -137,6 +144,7 @@ def verify(db: Session, tenant_id: UUID) -> Report:
     windows, last_event = policy_timeline(db, tenant_id)
     _reconcile(db, tenant_id, windows, last_event)
     findings: list[Finding] = []
+    backfilled = 0
     column = SupplierPayment.__table__.c.get(KEY)
     if column is not None:
         prepared = {
@@ -149,6 +157,11 @@ def verify(db: Session, tenant_id: UUID) -> Report:
                 )
             )
         }
+        for payment in db.scalars(
+            select(SupplierPayment).where(SupplierPayment.tenant_id == tenant_id, column.is_(True))
+        ):
+            if not _inside(prepared.get(str(payment.id)), windows):
+                backfilled += 1
         for payment in db.scalars(
             select(SupplierPayment).where(SupplierPayment.tenant_id == tenant_id, column.is_(False))
         ):
@@ -176,7 +189,7 @@ def verify(db: Session, tenant_id: UUID) -> Report:
                     Finding("payroll_event", str(event.entity_id), event.action, "unstamped", _stamp(event))
                 )
     findings.sort(key=lambda f: (f.at is None, f.at or datetime.min, f.source, f.entity_id))
-    return Report(tuple(findings), column is not None, len(windows))
+    return Report(tuple(findings), column is not None, len(windows), backfilled)
 
 
 def main(argv=None) -> int:

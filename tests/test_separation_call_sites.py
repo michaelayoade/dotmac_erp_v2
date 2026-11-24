@@ -12,8 +12,7 @@ Rules (each has a negative case below):
 * The call passes ``separation_of_duties=<expr>``. ``<expr>`` is a call to ``governance.separation_of_duties`` or
   ``governance.dual_control``, or an ``or`` of operands that contains one (never ``and``, ``not`` or a constant);
   or a Name assigned exactly once in the enclosing function from such an expression.
-* Payables calls may instead spread ``**separation.payables_kwargs(...)`` where ``separation`` is the real
-  ``erp_v2.supplier_payments.separation`` module imported in that file (verified at runtime below).
+* There is no shim: payables calls pass the keyword explicitly like payroll calls (``**kwargs`` spreads fail).
 """
 
 from __future__ import annotations
@@ -35,10 +34,6 @@ PAYABLES = {
 GOVERNED = PAYROLL | PAYABLES
 KEYWORD = "separation_of_duties"
 POLICY_READERS = {"separation_of_duties", "dual_control"}
-SHIM_MODULE = "erp_v2.supplier_payments"
-# The one file allowed to name the governed payables functions as strings: the a7 signature probe (to be deleted
-# at the payables a7 pin, when the keyword is passed explicitly everywhere).
-SIGNATURE_PROBE = "supplier_payments/separation.py"
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -111,28 +106,6 @@ def _bindings(function: ast.AST, name: str) -> list[ast.AST]:
     return found
 
 
-def _has_real_shim_import(tree: ast.AST) -> bool:
-    return any(
-        isinstance(n, ast.ImportFrom)
-        and n.module == SHIM_MODULE
-        and any(a.name == "separation" and a.asname is None for a in n.names)
-        for n in ast.walk(tree)
-    )
-
-
-def _is_shim_spread(keyword: ast.keyword, tree: ast.AST) -> bool:
-    value = keyword.value
-    return (
-        keyword.arg is None
-        and isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Attribute)
-        and value.func.attr == "payables_kwargs"
-        and isinstance(value.func.value, ast.Name)
-        and value.func.value.id == "separation"
-        and _has_real_shim_import(tree)
-    )
-
-
 def _violations(source: str, filename: str = "<src>") -> tuple[list[str], int]:
     tree = ast.parse(source, filename)
     problems: list[str] = []
@@ -147,8 +120,6 @@ def _violations(source: str, filename: str = "<src>") -> tuple[list[str], int]:
         sites += 1
         checked_funcs.add(id(node.func))
         where = f"{filename}:{node.lineno} {name}"
-        if name in PAYABLES and any(_is_shim_spread(k, tree) for k in node.keywords):
-            continue
         explicit = [k for k in node.keywords if k.arg == KEYWORD]
         if len(explicit) != 1:
             problems.append(f"{where}: no single separation_of_duties= keyword")
@@ -170,12 +141,7 @@ def _violations(source: str, filename: str = "<src>") -> tuple[list[str], int]:
             reference = node.id
         elif isinstance(node, ast.alias) and node.name.split(".")[-1] in GOVERNED:
             reference = node.name
-        elif (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value in GOVERNED
-            and not filename.endswith(SIGNATURE_PROBE)
-        ):
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in GOVERNED:
             reference = node.value
         if reference is None:
             continue
@@ -213,17 +179,6 @@ def test_the_scan_sees_every_known_call_site() -> None:
     }
 
 
-def test_the_accepted_shim_is_the_real_module_function() -> None:
-    import inspect
-
-    from erp_v2.supplier_payments import separation
-    from erp_v2.supplier_payments import service as payments_service
-
-    assert payments_service.separation is separation
-    assert inspect.getmodule(separation.payables_kwargs) is separation
-    assert separation.payables_kwargs.__qualname__ == "payables_kwargs"
-
-
 @pytest.mark.parametrize(
     "snippet",
     [
@@ -242,9 +197,10 @@ def test_the_accepted_shim_is_the_real_module_function() -> None:
         "import functools\nfunctools.partial(payroll.reverse_liability_settlement, db)()",
         "from dotmac_payroll.service import approve_payroll_run as go",
         "import dotmac_payroll.service.approve_payroll_run as go",
-        # shim spoofing
+        # the retired shim and kwargs spreads no longer satisfy the rule
         "payables.record_supplier_payment(db, **evil.payables_kwargs(db, t))",
-        "separation = Fake()\npayables.record_supplier_payment(db, **separation.payables_kwargs(db, t))",
+        "from erp_v2.supplier_payments import separation\n"
+        "payables.record_supplier_payment(db, **separation.payables_kwargs(db, t))",
         # inversions, constants, reassignment
         "def f(db, t):\n    payroll.approve_payroll_run(db, separation_of_duties=not governance.dual_control(db, t))",
         "def f(db, t):\n    payroll.approve_payroll_run(\n"
@@ -273,18 +229,8 @@ def test_the_scan_fails_a_call_without_the_policy(snippet: str) -> None:
         "    payroll.reverse_liability_settlement(db, separation_of_duties=s)",
         "def f(db, t):\n    s = governance.separation_of_duties(db, t) or _recorded(db, t)\n"
         "    payroll.approve_payroll_run(db, separation_of_duties=s)",
-        "from erp_v2.supplier_payments import separation\n"
-        "payables.record_supplier_payment(db, **separation.payables_kwargs(db, t))",
         "payables.approve_supplier_payment(db, separation_of_duties=governance.separation_of_duties(db, t))",
     ],
 )
 def test_the_scan_accepts_a_call_sourced_from_the_policy(snippet: str) -> None:
     assert _violations(snippet)[0] == [], snippet
-
-
-def test_a_payroll_call_cannot_hide_behind_the_payables_shim() -> None:
-    snippet = (
-        "from erp_v2.supplier_payments import separation\n"
-        "payroll.approve_payroll_run(db, **separation.payables_kwargs(db, t))"
-    )
-    assert _violations(snippet)[0]

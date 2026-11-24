@@ -150,11 +150,9 @@ def _audit(
 def _read_back_stamp(db: Session, *, tenant: Tenant, party: Party, payment: SupplierPayment, step: str) -> None:
     """D-9: compare payables' ``separation_enforced`` stamp with the tenant policy right after a write.
 
-    Inert before payables a7 (no stamp). At preparation any mismatch refuses; at a later step it is flagged in the
+    At preparation any mismatch refuses; at a later step it is flagged in the
     audit trail and the step proceeds (payables still enforces the stricter value; see ``separation``).
     """
-    if not separation.payables_separation_supported():
-        return
     db.refresh(payment)
     policy = governance.separation_of_duties(db, tenant.id)
     verdict = separation.stamp_verdict(stamp=bool(payment.separation_enforced), policy=policy)
@@ -346,7 +344,7 @@ def _prepare(
         idempotency_key=f"erp.b3.create:{request_id}",
         idempotency_expires_at=None,
         prepared_at=now,
-        **separation.payables_kwargs(db, tenant.id),
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
     _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="prepare")
     replayed = existed
@@ -384,7 +382,7 @@ def _approve(db: Session, *, tenant: Tenant, party: Party, payment_id: UUID, now
         idempotency_key=f"erp.b3.approve:{payment.id}",
         idempotency_expires_at=None,
         approved_at=now,
-        **separation.payables_kwargs(db, tenant.id),
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
     _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="approve")
     _audit(
@@ -605,7 +603,7 @@ def _record(
         idempotency_key=f"erp.b3.record:{payment.id}",
         idempotency_expires_at=None,
         recorded_at=now,
-        **separation.payables_kwargs(db, tenant.id),
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
     _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="record")
     consequence = payables.build_payment_accounting_consequence(db, tenant_id=tenant.id, payment_id=payment.id)
@@ -691,7 +689,7 @@ def _reverse(
         idempotency_key=f"erp.b3.reverse:{payment.id}",
         idempotency_expires_at=None,
         reversed_at=now,
-        **separation.payables_kwargs(db, tenant.id),
+        separation_of_duties=governance.separation_of_duties(db, tenant.id),
     )
     _read_back_stamp(db, tenant=tenant, party=party, payment=payment, step="reverse")
     consequence = payables.build_payment_reversal_accounting_consequence(db, tenant_id=tenant.id, payment_id=payment.id)
