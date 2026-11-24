@@ -111,3 +111,26 @@ def test_readiness_probe_fails_when_dsn_declared_but_runtime_missing(monkeypatch
     monkeypatch.setattr(readiness, "resolve_database_runtime", _raise)
     ok, _ = readiness.readiness_probe()
     assert ok is False
+
+
+def test_htmx_browser_capability_is_provisioned() -> None:
+    """A packaged module surface that needs htmx 2 must not fail the boot."""
+    provided = {(c.code, c.contract_version) for c in assembly.browser_capabilities}
+    assert ("htmx", 2) in provided
+
+
+def test_surface_selection_is_explicit_and_equals_the_current_set() -> None:
+    """Selection is stated, not inferred: no packaged web surface yet, and the
+    API routers served are exactly those of the modules the assembly lists."""
+    from dotmac_kernel.modules import ModuleManifest
+
+    selection = assembly.surface_selection
+    assert selection is not None and not selection.select_all
+    assert not selection.surfaces
+    serving = {
+        (m.code if isinstance(m, ModuleManifest) else m.name)
+        for m in assembly.modules
+        if (m.api_routers if isinstance(m, ModuleManifest) else m.routers)
+    }
+    assert set(selection.api_routers) == serving
+    assert serving, "the comparison is vacuous"

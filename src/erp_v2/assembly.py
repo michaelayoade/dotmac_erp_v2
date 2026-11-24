@@ -37,6 +37,7 @@ Composition posture:
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
@@ -61,9 +62,12 @@ from dotmac_inbox.manifest import module as inbox_module
 from dotmac_inventory.manifest import module as inventory_module
 from dotmac_kernel.api_documentation import environment_api_documentation_policy
 from dotmac_kernel.assembly import ProductAssemblySpec, ProductSecurityPolicy
+from dotmac_kernel.modules import AnyManifest, ModuleManifest
+from dotmac_kernel.surface_selection import SurfaceSelection
 from dotmac_kernel.web_deps import TENANT_COOKIE_AUTHENTICATION
 from dotmac_kernel.web_surfaces import (
     AuthenticationProfileBinding,
+    BrowserCapabilityProvision,
     BrowserSecurityPlane,
     BrowserSessionPolicy,
     NavigationRegion,
@@ -104,53 +108,83 @@ _WEB_ENABLED: Final = os.environ.get("ERP_WEB_ENABLED", "true").lower() not in (
     "no",
 )
 
+# Order canonical: readiness feature first, then product modules
+# alphabetically by module code (legacy product_assembly convention).
+_MODULES: Final = (
+    *ERP_FEATURES,
+    accounting_module,
+    commercial_agreements_module,
+    ai_operations_module,
+    analytics_module,
+    approvals_module,
+    assets_module,
+    banking_module,
+    billing_module,
+    collections_module,
+    customers_module,
+    documents_module,
+    durable_timers_module,
+    expenses_module,
+    files_module,
+    finance_module,
+    forms_module,
+    imports_module,
+    inbox_module,
+    inventory_module,
+    numbering_module,
+    party_module,
+    payables_module,
+    payments_module,
+    payroll_module,
+    people_module,
+    procurement_module,
+    projects_module,
+    sales_module,
+    tax_module,
+    ticketing_module,
+    workflow_runtime_module,
+)
+
+
+def _modules_serving_api(modules: Sequence[AnyManifest]) -> frozenset[str]:
+    """Codes of the modules/features whose JSON API routers this product serves.
+
+    Selection is module-granular for API routers: every module this assembly
+    lists is served exactly as before. A NEW module only appears here by being
+    added to `_MODULES` in this file, so a pin bump alone cannot mount one.
+    """
+    served: set[str] = set()
+    for manifest in modules:
+        if isinstance(manifest, ModuleManifest):
+            code, routers = manifest.code, manifest.api_routers
+        else:
+            code, routers = manifest.name, manifest.routers
+        if routers:
+            served.add(code)
+    return frozenset(served)
+
+
 # Built at import like the reference assembly's settings reads. Engine
 # construction opens no connection; posture is proven by the startup check.
 _database_runtime = build_database_runtime()
 
 assembly: Final = ProductAssemblySpec(
     name=PRODUCT_NAME,
-    # Order canonical: readiness feature first, then product modules
-    # alphabetically by module code (legacy product_assembly convention).
-    modules=(
-        *ERP_FEATURES,
-        accounting_module,
-        commercial_agreements_module,
-        ai_operations_module,
-        analytics_module,
-        approvals_module,
-        assets_module,
-        banking_module,
-        billing_module,
-        collections_module,
-        customers_module,
-        documents_module,
-        durable_timers_module,
-        expenses_module,
-        files_module,
-        finance_module,
-        forms_module,
-        imports_module,
-        inbox_module,
-        inventory_module,
-        numbering_module,
-        party_module,
-        payables_module,
-        payments_module,
-        payroll_module,
-        people_module,
-        procurement_module,
-        projects_module,
-        sales_module,
-        tax_module,
-        ticketing_module,
-        workflow_runtime_module,
-    ),
+    modules=_MODULES,
     module_planes=ASSEMBLY_MODULE_PLANES,
+    # Explicit and fail-closed (kernel surface contract): the product serves the
+    # API routers of exactly the modules listed above and NO packaged web
+    # surface yet. A packaged surface is served only once it is added to
+    # `surfaces` here, in the same PR that wires its facet and entry routes.
+    surface_selection=SurfaceSelection(
+        surfaces=(),
+        api_routers=_modules_serving_api(_MODULES),
+    ),
     tenancy="multi",
     platform_surface_enabled=False,
     web_enabled=_WEB_ENABLED and _database_runtime is not None,
     ui_contract_version=UI_CONTRACT_VERSION,
+    browser_capabilities=(BrowserCapabilityProvision("htmx", 2),),
     web_facets=(
         WebFacetMount(
             code="staff_admin",
