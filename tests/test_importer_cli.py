@@ -179,8 +179,10 @@ def test_reflected_plan_survives_forbidden_runtime_env_names(tmp_path) -> None:
         text=True,
         timeout=180,
     )
-    assert proc.returncode == 0, proc.stderr[-2000:]
+    # exit 3: the sqlite stand-in destination has no tables, so the F23 guard honestly reports "not checked"
+    assert proc.returncode == 3, proc.stderr[-2000:]
     payload = _json.loads(receipt.read_text())
+    assert payload["destination_guard"]["refusal"] == "import_guard_incomplete"
     assert payload["mode"] == "reflected"
     assert payload["source_resolution"]["missing"], "empty sqlite must report missing sources"
 
