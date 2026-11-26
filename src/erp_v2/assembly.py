@@ -37,7 +37,6 @@ Composition posture:
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
@@ -62,7 +61,6 @@ from dotmac_inbox.manifest import module as inbox_module
 from dotmac_inventory.manifest import module as inventory_module
 from dotmac_kernel.api_documentation import environment_api_documentation_policy
 from dotmac_kernel.assembly import ProductAssemblySpec, ProductSecurityPolicy
-from dotmac_kernel.modules import AnyManifest, ModuleManifest
 from dotmac_kernel.surface_selection import SurfaceSelection
 from dotmac_kernel.web_deps import TENANT_COOKIE_AUTHENTICATION
 from dotmac_kernel.web_surfaces import (
@@ -146,23 +144,37 @@ _MODULES: Final = (
 )
 
 
-def _modules_serving_api(modules: Sequence[AnyManifest]) -> frozenset[str]:
-    """Codes of the modules/features whose JSON API routers this product serves.
+#: The module/feature codes whose JSON API routers this product serves, as a
+#: LITERAL. It is deliberately not derived from the manifests: a derived set
+#: would select any router a module gains in a later pin (for example
+#: `dotmac-files` gaining routes) with no review. Adding a code here is a
+#: decision made in the PR that wires it.
+_API_ROUTER_MODULES: Final = frozenset({"erp_shell.readiness", "erp_academy_sync"})
 
-    Selection is module-granular for API routers: every module this assembly
-    lists is served exactly as before. A NEW module only appears here by being
-    added to `_MODULES` in this file, so a pin bump alone cannot mount one.
-    """
-    served: set[str] = set()
-    for manifest in modules:
-        if isinstance(manifest, ModuleManifest):
-            code, routers = manifest.code, manifest.api_routers
-        else:
-            code, routers = manifest.name, manifest.routers
-        if routers:
-            served.add(code)
-    return frozenset(served)
-
+#: Contract-1 (`web_routers`) ERP-local features this product mounts, named
+#: explicitly as `(code, "legacy")` pairs. Packaged modules contribute none.
+_LEGACY_WEB_SURFACES: Final = frozenset(
+    (code, "legacy")
+    for code in (
+        "erp_web",
+        "erp_revenue",
+        "erp_receivables_producer",
+        "erp_customers_web",
+        "erp_revenue_approval",
+        "erp_supplier_credit_notes",
+        "erp_legacy_reentry",
+        "erp_payroll",
+        "erp_payroll_run",
+        "erp_banking",
+        "erp_journals",
+        "erp_banking_statements",
+        "erp_banking_reconciliation",
+        "erp_cash_gl",
+        "erp_payee_bank",
+        "erp_supplier_payments",
+        "erp_payroll_payouts",
+    )
+)
 
 # Built at import like the reference assembly's settings reads. Engine
 # construction opens no connection; posture is proven by the startup check.
@@ -172,13 +184,14 @@ assembly: Final = ProductAssemblySpec(
     name=PRODUCT_NAME,
     modules=_MODULES,
     module_planes=ASSEMBLY_MODULE_PLANES,
-    # Explicit and fail-closed (kernel surface contract): the product serves the
-    # API routers of exactly the modules listed above and NO packaged web
-    # surface yet. A packaged surface is served only once it is added to
-    # `surfaces` here, in the same PR that wires its facet and entry routes.
+    # Explicit and fail-closed (kernel surface contract): literal sets above.
+    # No packaged module surface or API router is served yet; a packaged
+    # surface or router is served only once it is added here, in the same PR
+    # that wires it. Routes added INSIDE a selected module are caught by
+    # tests/test_route_inventory.py.
     surface_selection=SurfaceSelection(
-        surfaces=(),
-        api_routers=_modules_serving_api(_MODULES),
+        surfaces=_LEGACY_WEB_SURFACES,
+        api_routers=_API_ROUTER_MODULES,
     ),
     tenancy="multi",
     platform_surface_enabled=False,

@@ -119,18 +119,13 @@ def test_htmx_browser_capability_is_provisioned() -> None:
     assert ("htmx", 2) in provided
 
 
-def test_surface_selection_is_explicit_and_equals_the_current_set() -> None:
-    """Selection is stated, not inferred: no packaged web surface yet, and the
-    API routers served are exactly those of the modules the assembly lists."""
-    from dotmac_kernel.modules import ModuleManifest
-
+def test_surface_selection_is_an_explicit_literal() -> None:
+    """Selection is stated, not derived from the manifests (R0 F1): no packaged
+    module surface or API router yet, ERP-local routers and legacy web routers
+    named one by one."""
     selection = assembly.surface_selection
     assert selection is not None and not selection.select_all
-    assert not selection.surfaces
-    serving = {
-        (m.code if isinstance(m, ModuleManifest) else m.name)
-        for m in assembly.modules
-        if (m.api_routers if isinstance(m, ModuleManifest) else m.routers)
-    }
-    assert set(selection.api_routers) == serving
-    assert serving, "the comparison is vacuous"
+    assert set(selection.api_routers) == {"erp_shell.readiness", "erp_academy_sync"}
+    legacy = {code for code, surface in selection.surfaces if surface == "legacy"}
+    assert len(legacy) == 17 and len(selection.surfaces) == 17
+    assert {"erp_web", "erp_journals", "erp_payroll_payouts"} <= legacy
