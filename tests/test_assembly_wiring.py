@@ -111,3 +111,21 @@ def test_readiness_probe_fails_when_dsn_declared_but_runtime_missing(monkeypatch
     monkeypatch.setattr(readiness, "resolve_database_runtime", _raise)
     ok, _ = readiness.readiness_probe()
     assert ok is False
+
+
+def test_htmx_browser_capability_is_provisioned() -> None:
+    """A packaged module surface that needs htmx 2 must not fail the boot."""
+    provided = {(c.code, c.contract_version) for c in assembly.browser_capabilities}
+    assert ("htmx", 2) in provided
+
+
+def test_surface_selection_is_an_explicit_literal() -> None:
+    """Selection is stated, not derived from the manifests (R0 F1): no packaged
+    module surface or API router yet, ERP-local routers and legacy web routers
+    named one by one."""
+    selection = assembly.surface_selection
+    assert selection is not None and not selection.select_all
+    assert set(selection.api_routers) == {"erp_shell.readiness", "erp_academy_sync"}
+    legacy = {code for code, surface in selection.surfaces if surface == "legacy"}
+    assert len(legacy) == 17 and len(selection.surfaces) == 17
+    assert {"erp_web", "erp_journals", "erp_payroll_payouts"} <= legacy
